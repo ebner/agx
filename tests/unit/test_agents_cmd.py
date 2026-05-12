@@ -73,6 +73,83 @@ def test_validate_name_accepts(good: str) -> None:
     validate_name(good)
 
 
+# ---------- _verify_hermes_image_user ----------
+
+
+def _build_verify_runner(stages):
+    """Returns a side_effect callable that walks through the given stages
+    sequentially for `docker inspect` calls. Each stage is a (stdout, rc)
+    tuple. `docker pull` returns the next stage's pull result.
+    """
+    state = {"i": 0}
+
+    def runner(vm_name: str, *cmd: str, check: bool = True):
+        from agents_cli.mp import MpResult
+
+        if "docker" in cmd and "inspect" in cmd:
+            i = state["i"]
+            stage = stages[i] if i < len(stages) else stages[-1]
+            return MpResult(stdout=stage[0], stderr="", returncode=stage[1])
+        if "docker" in cmd and "pull" in cmd:
+            state["i"] += 1
+            return MpResult(stdout="", stderr="", returncode=0)
+        return MpResult(stdout="", stderr="", returncode=0)
+
+    return runner
+
+
+def test_verify_hermes_user_pulls_then_inspects(cfg: AgentsConfig, mocker) -> None:
+    """First inspect returns empty (not pulled); after pull, returns
+    hermes/HOME=/home/hermes; verification passes."""
+    from agents_cli.agents_cmd import _verify_hermes_image_user
+
+    stages = [("", 1), ("hermes\tHOME=/home/hermes\n", 0)]
+    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_build_verify_runner(stages))
+    _verify_hermes_image_user(cfg, "v1.0.0")  # no raise
+
+
+def test_verify_hermes_user_fails_when_pull_fails(cfg: AgentsConfig, mocker) -> None:
+    """First inspect empty, pull fails -> UserError mentioning pull."""
+    from agents_cli.mp import MpResult
+
+    call_count = {"i": 0}
+
+    def runner(vm_name: str, *cmd: str, check: bool = True):
+        if "docker" in cmd and "inspect" in cmd:
+            return MpResult(stdout="", stderr="", returncode=1)
+        if "docker" in cmd and "pull" in cmd:
+            call_count["i"] += 1
+            return MpResult(stdout="", stderr="rate limit", returncode=1)
+        return MpResult(stdout="", stderr="", returncode=0)
+
+    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=runner)
+    from agents_cli.agents_cmd import _verify_hermes_image_user
+
+    with pytest.raises(UserError, match="could not pull"):
+        _verify_hermes_image_user(cfg, "v1.0.0")
+    assert call_count["i"] == 1
+
+
+def test_verify_hermes_user_refuses_post_pull_drift(cfg: AgentsConfig, mocker) -> None:
+    """First inspect empty, pull ok, second inspect returns the WRONG
+    user — verification trips with a clear error."""
+    stages = [("", 1), ("notHermes\tHOME=/wrong\n", 0)]
+    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_build_verify_runner(stages))
+    from agents_cli.agents_cmd import _verify_hermes_image_user
+
+    with pytest.raises(UserError, match="drifted"):
+        _verify_hermes_image_user(cfg, "v1.0.0")
+
+
+def test_verify_hermes_user_passes_when_already_pulled(cfg: AgentsConfig, mocker) -> None:
+    """First inspect succeeds with the canonical user; no pull needed."""
+    stages = [("hermes\tHOME=/home/hermes\n", 0)]
+    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_build_verify_runner(stages))
+    from agents_cli.agents_cmd import _verify_hermes_image_user
+
+    _verify_hermes_image_user(cfg, "v1.0.0")
+
+
 @pytest.mark.parametrize(
     "bad", ["", "Coder", "coder!", "-leading-dash", "with space", "a" * 51, "../slashy"]
 )

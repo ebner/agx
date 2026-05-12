@@ -80,20 +80,41 @@ def _sync_host_codex_to_vm(cfg: AgentsConfig) -> None:
     """Push the host-side toolkit Codex dir into the VM so per-agent
     bind-mounts (which point at the VM-side ``<vm_agents_root>/.codex``)
     see the same auth as ``agents codex login`` just wrote.
+
+    Real directory sync: tars the host ``.codex/`` (including subdirs),
+    transfers the archive, and extracts in the VM after ``rm -rf``ing
+    the VM-side target so stale files are pruned.
     """
+    import tarfile as _tarfile
+    import tempfile
+    import uuid as _uuid
+
     host_dir = _codex_home(cfg)
-    if not host_dir.exists():
+    if not host_dir.exists() or not any(host_dir.iterdir()):
         return
-    mp.exec_in_vm(
-        cfg.vm.name,
-        "mkdir",
-        "-p",
-        f"{cfg.paths.vm_agents_root}/.codex",
-        check=False,
-    )
-    for src in host_dir.iterdir():
-        if src.is_file():
-            mp.transfer_to_vm(src, cfg.vm.name, f"{cfg.paths.vm_agents_root}/.codex/{src.name}")
+
+    with tempfile.NamedTemporaryFile(
+        prefix="agents-codex-sync-", suffix=".tar", delete=False
+    ) as tf:
+        host_tar = Path(tf.name)
+    try:
+        with _tarfile.open(host_tar, "w") as tar:
+            tar.add(host_dir, arcname=".")
+        vm_tar = f"/tmp/agents-codex-sync-{os.getpid()}-{_uuid.uuid4().hex[:8]}.tar"
+        mp.transfer_to_vm(host_tar, cfg.vm.name, vm_tar)
+        target = f"{cfg.paths.vm_agents_root}/.codex"
+        mp.exec_bash(
+            cfg.vm.name,
+            (
+                f"set -eu\n"
+                f"rm -rf {target}\n"
+                f"mkdir -p {target}\n"
+                f"tar -xf {vm_tar} -C {target}\n"
+                f"rm -f {vm_tar}\n"
+            ),
+        )
+    finally:
+        host_tar.unlink(missing_ok=True)
 
 
 def refresh(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> None:
@@ -398,11 +419,15 @@ def _build_sandbox_image_in_vm(cfg: AgentsConfig, image_tag: str, base_image: st
     up on the host too (via the mount); in ``--data-dir-in-vm`` mode it
     only exists in the VM.
     """
+    import uuid as _uuid
+
     dockerfile_content = templates.render_codex_sandbox_dockerfile(base_image)
-    dockerfile_name = (
-        f".codex-sandbox-{hashlib.sha256(image_tag.encode()).hexdigest()[:8]}.Dockerfile"
-    )
-    host_temp = Path("/tmp") / f"agents-{dockerfile_name}-{os.getpid()}"
+    # uuid suffix on top of the deterministic hash so concurrent skill-enables
+    # (different processes targeting the same VM root) can't trample each
+    # other's staged Dockerfile.
+    suffix = f"{hashlib.sha256(image_tag.encode()).hexdigest()[:8]}-{os.getpid()}-{_uuid.uuid4().hex[:8]}"
+    dockerfile_name = f".codex-sandbox-{suffix}.Dockerfile"
+    host_temp = Path("/tmp") / f"agents-{dockerfile_name}"
     vm_dockerfile = f"{cfg.paths.vm_agents_root}/{dockerfile_name}"
     try:
         host_temp.write_text(dockerfile_content, encoding="utf-8")
