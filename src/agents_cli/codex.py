@@ -1,0 +1,323 @@
+"""Codex CLI integration: login / refresh / status / skill-enable / skill-disable.
+
+The toolkit-scoped Codex account lives at ``<data-dir>/.codex/`` and is
+distinct from the user's personal ``~/.codex/``. Authentication is done
+on the host via the ``codex`` CLI with ``CODEX_HOME`` pointed at the
+toolkit dir.
+
+For Hermes agents there are two Codex paths:
+
+1. **As an LLM provider** (``model.provider: openai-codex``). Doesn't
+   need the Codex CLI at all — Hermes imports the OAuth tokens from
+   the mounted ``/home/hermes/.codex`` on first setup. Always available;
+   the toolkit just provisions the mount and the auth lives at
+   ``<data-dir>/.codex/auth.json``.
+2. **As a coding skill** (the bundled ``autonomous-ai-agents/codex``
+   skill). Needs the Codex CLI inside Hermes' nested sandbox container.
+   Opt-in via ``agents codex skill-enable <hermes-agent>``: build a
+   derived sandbox image with Codex baked in, point the agent's
+   ``terminal.docker_image`` at it, and add the Codex auth as a
+   sandbox-volume entry using **VM-side** host paths.
+
+OpenClaw bundles its own Codex plugin — the toolkit refuses
+``skill-enable`` on OpenClaw agents.
+"""
+
+from __future__ import annotations
+
+import datetime
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+from pathlib import Path
+from typing import Any
+
+from agents_cli import compose_runner, hermes_config, mp, templates, ui
+from agents_cli import config as cfg_mod
+from agents_cli.agents_cmd import _detect_type_from_compose
+from agents_cli.agents_cmd import service_name as _service_name_for
+from agents_cli.config import AgentsConfig
+from agents_cli.errors import RuntimeFailure, UserError
+
+SANDBOX_IMAGE_PREFIX = "agents/hermes-sandbox-codex"
+EXPIRY_WARNING_DAYS = 7
+
+
+def _codex_home(cfg: AgentsConfig) -> Path:
+    p = cfg.paths.host_data_dir / ".codex"
+    p.mkdir(exist_ok=True)
+    return p
+
+
+def _require_host_codex() -> str:
+    binary = shutil.which("codex")
+    if binary is None:
+        raise UserError("codex CLI not found on host. Install with `npm install -g @openai/codex`.")
+    return binary
+
+
+# ---------- login / refresh / status ----------
+
+
+def login(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> None:
+    cfg = cfg_mod.load(config_path)
+    codex_bin = _require_host_codex()
+    env = dict(os.environ, CODEX_HOME=str(_codex_home(cfg)))
+    result = subprocess.run([codex_bin, "auth", "login"], env=env, check=False)
+    if result.returncode != 0:
+        raise RuntimeFailure(f"codex auth login failed (rc={result.returncode})")
+    ui.emit({"auth": "ok", "codex_home": env["CODEX_HOME"]}, human="codex auth ok")
+
+
+def refresh(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> None:
+    """Non-interactive token refresh. Fails if interactive re-auth is needed."""
+    cfg = cfg_mod.load(config_path)
+    codex_home = _codex_home(cfg)
+    if not (codex_home / "auth.json").exists():
+        raise UserError("no toolkit-scoped Codex auth yet; run `agents codex login` first")
+    codex_bin = _require_host_codex()
+    env = dict(os.environ, CODEX_HOME=str(codex_home))
+    # `codex auth status` is the lowest-impact way to trigger a silent refresh
+    # in current Codex CLI builds. If it fails with a non-zero exit, interactive
+    # re-auth is required and the user is told to run `agents codex login`.
+    result = subprocess.run(
+        [codex_bin, "auth", "status"], env=env, capture_output=True, check=False
+    )
+    if result.returncode != 0:
+        raise UserError(
+            "silent refresh not possible; run `agents codex login` for interactive re-auth"
+        )
+    ui.emit({"refresh": "ok"}, human="codex token refreshed")
+
+
+def status(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> dict[str, Any]:
+    cfg = cfg_mod.load(config_path)
+    codex_home = _codex_home(cfg)
+    auth_path = codex_home / "auth.json"
+
+    info: dict[str, Any] = {
+        "codex_home": str(codex_home),
+        "auth_present": auth_path.exists(),
+        "expires_at": None,
+        "expires_in_days": None,
+        "expiry_warning": False,
+        "per_agent_mounts": _per_agent_mount_status(cfg),
+    }
+
+    if auth_path.exists():
+        try:
+            data = json.loads(auth_path.read_text(encoding="utf-8"))
+            expires = _parse_expiry(data)
+            if expires is not None:
+                info["expires_at"] = expires.isoformat()
+                delta = expires - datetime.datetime.now(datetime.UTC)
+                info["expires_in_days"] = delta.days
+                info["expiry_warning"] = delta.days < EXPIRY_WARNING_DAYS
+        except (OSError, json.JSONDecodeError, ValueError):
+            pass
+
+    human_lines = [
+        f"auth: {'present' if info['auth_present'] else 'missing'} ({auth_path})",
+    ]
+    if info["expires_at"] is not None:
+        human_lines.append(
+            f"expires: {info['expires_at']} ({info['expires_in_days']} day(s))"
+            + ("  ⚠ less than 7 days remain" if info["expiry_warning"] else "")
+        )
+    for entry in info["per_agent_mounts"]:
+        human_lines.append(
+            f"  {entry['name']}: skill={entry['skill_enabled']}, "
+            f"sandbox_image={entry['sandbox_image'] or '(default)'}"
+        )
+
+    ui.emit(info, human="\n".join(human_lines))
+    return info
+
+
+def _parse_expiry(auth_data: dict[str, Any]) -> datetime.datetime | None:
+    """Best-effort parse of an OAuth expiry from a Codex auth.json.
+
+    Tries the common shapes: ``expires_at`` (iso or epoch), ``tokens.expires_at``,
+    and a ``last_refresh`` + ``expires_in`` combo. Returns ``None`` if nothing
+    parseable is found.
+    """
+    candidates: list[Any] = [
+        auth_data.get("expires_at"),
+        auth_data.get("tokens", {}).get("expires_at")
+        if isinstance(auth_data.get("tokens"), dict)
+        else None,
+    ]
+    for c in candidates:
+        if c is None:
+            continue
+        if isinstance(c, (int, float)):
+            try:
+                return datetime.datetime.fromtimestamp(c, datetime.UTC)
+            except (OverflowError, OSError, ValueError):
+                continue
+        if isinstance(c, str):
+            try:
+                return datetime.datetime.fromisoformat(c.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+    return None
+
+
+def _per_agent_mount_status(cfg: AgentsConfig) -> list[dict[str, Any]]:
+    """List each Hermes agent's skill-enable state."""
+    from agents_cli import compose as compose_mod
+
+    doc = compose_mod.load_compose(cfg.paths.host_data_dir / "docker-compose.yml")
+    out: list[dict[str, Any]] = []
+    for svc_name in doc.get("services") or {}:
+        if not svc_name.startswith("hermes-"):
+            continue
+        name = svc_name[len("hermes-") :]
+        state_path = _skill_state_path(cfg, name)
+        out.append(
+            {
+                "name": name,
+                "skill_enabled": state_path.exists(),
+                "sandbox_image": (
+                    json.loads(state_path.read_text())["derived_image"]
+                    if state_path.exists()
+                    else None
+                ),
+            }
+        )
+    return out
+
+
+# ---------- skill-enable / skill-disable ----------
+
+
+def _skill_state_path(cfg: AgentsConfig, name: str) -> Path:
+    return cfg.paths.host_data_dir / name / ".data" / ".codex-skill.json"
+
+
+def _sandbox_image_tag(base_image: str) -> str:
+    """Slug the derived image tag so user-supplied bases with `/` and `:`
+    produce a valid Docker reference. sha256 prefix is plenty here.
+    """
+    digest = hashlib.sha256(base_image.encode("utf-8")).hexdigest()[:12]
+    return f"{SANDBOX_IMAGE_PREFIX}:{digest}"
+
+
+def _sandbox_volume_mapping(cfg: AgentsConfig) -> str:
+    """Hermes' ``terminal.docker_volumes`` entries are interpreted by the **VM
+    Docker daemon**, so we name VM-side host paths here (NOT paths inside
+    the Hermes runtime container).
+    """
+    return f"{cfg.paths.vm_agents_root}/.codex:/root/.codex:ro"
+
+
+def skill_enable(name: str, *, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> dict[str, str]:
+    cfg = cfg_mod.load(config_path)
+    agent_type = _detect_type_from_compose(cfg, name)
+    if agent_type != "hermes":
+        raise UserError(
+            "agents codex skill-enable only applies to Hermes agents — "
+            "OpenClaw bundles its own Codex plugin (run "
+            "`openclaw models auth login --provider openai-codex` inside the container)"
+        )
+
+    doc = hermes_config.load(hermes_config.config_path(cfg, name))
+    current_image = (
+        hermes_config.get_terminal_docker_image(doc) or templates.HERMES_DEFAULT_SANDBOX_IMAGE
+    )
+
+    if current_image.startswith(SANDBOX_IMAGE_PREFIX):
+        # Already running our derived image; idempotent re-enable.
+        derived = current_image
+    else:
+        derived = _sandbox_image_tag(current_image)
+        _build_sandbox_image_in_vm(cfg, derived, current_image)
+
+    # Persist the original image so skill-disable can restore it. Skip
+    # rewrite when we're already on the derived image AND state file exists,
+    # to keep re-enable a true no-op.
+    state_path = _skill_state_path(cfg, name)
+    if not state_path.exists():
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text(
+            json.dumps(
+                {"original_docker_image": current_image, "derived_image": derived},
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+    hermes_config.set_terminal_docker_image(doc, derived)
+    hermes_config.add_docker_volume(doc, _sandbox_volume_mapping(cfg))
+    hermes_config.write_atomically(cfg, name, doc)
+
+    svc = _service_name_for(name, "hermes")
+    compose_runner.up(cfg, svc)
+
+    ui.emit(
+        {"name": name, "derived_image": derived},
+        human=(
+            f"codex skill enabled for {name!r}\n"
+            f"  sandbox image: {derived}\n"
+            f"  base image:    {current_image}\n"
+            f"  container restarted"
+        ),
+    )
+    return {"name": name, "derived_image": derived}
+
+
+def skill_disable(name: str, *, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> None:
+    cfg = cfg_mod.load(config_path)
+    agent_type = _detect_type_from_compose(cfg, name)
+    if agent_type != "hermes":
+        raise UserError("codex skill-disable only applies to Hermes agents")
+    state_path = _skill_state_path(cfg, name)
+    if not state_path.exists():
+        raise UserError(f"codex skill is not enabled for {name!r}; no .codex-skill.json found")
+
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    original_image = state["original_docker_image"]
+
+    doc = hermes_config.load(hermes_config.config_path(cfg, name))
+    hermes_config.set_terminal_docker_image(doc, original_image)
+    hermes_config.remove_docker_volume(doc, _sandbox_volume_mapping(cfg))
+    hermes_config.write_atomically(cfg, name, doc)
+
+    state_path.unlink()
+
+    svc = _service_name_for(name, "hermes")
+    compose_runner.up(cfg, svc)
+
+    ui.emit(
+        {"name": name, "restored_image": original_image},
+        human=f"codex skill disabled for {name!r}; sandbox image restored to {original_image}",
+    )
+
+
+def _build_sandbox_image_in_vm(cfg: AgentsConfig, image_tag: str, base_image: str) -> None:
+    """Stage the Dockerfile in the data dir and run `docker build` in the VM."""
+    dockerfile_content = templates.render_codex_sandbox_dockerfile(base_image)
+    dockerfile_name = (
+        f".codex-sandbox-{hashlib.sha256(image_tag.encode()).hexdigest()[:8]}.Dockerfile"
+    )
+    dockerfile_host = cfg.paths.host_data_dir / dockerfile_name
+    dockerfile_host.write_text(dockerfile_content, encoding="utf-8")
+    try:
+        vm_dockerfile = f"{cfg.paths.vm_agents_root}/{dockerfile_name}"
+        result = mp.exec_in_vm(
+            cfg.vm.name,
+            "docker",
+            "build",
+            "-t",
+            image_tag,
+            "-f",
+            vm_dockerfile,
+            str(cfg.paths.vm_agents_root),
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeFailure(f"docker build failed for {image_tag}: {result.stderr.strip()}")
+    finally:
+        dockerfile_host.unlink(missing_ok=True)
