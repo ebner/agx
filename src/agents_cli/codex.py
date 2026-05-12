@@ -101,6 +101,7 @@ def status(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> dict[str, Any]
     info: dict[str, Any] = {
         "codex_home": str(codex_home),
         "auth_present": auth_path.exists(),
+        "vm_mount_ok": _vm_mount_resolves(cfg),
         "expires_at": None,
         "expires_in_days": None,
         "expiry_warning": False,
@@ -121,6 +122,7 @@ def status(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> dict[str, Any]
 
     human_lines = [
         f"auth: {'present' if info['auth_present'] else 'missing'} ({auth_path})",
+        f"vm mount: {'ok' if info['vm_mount_ok'] else 'unreachable'} ({cfg.paths.vm_agents_root}/.codex)",
     ]
     if info["expires_at"] is not None:
         human_lines.append(
@@ -130,11 +132,28 @@ def status(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> dict[str, Any]
     for entry in info["per_agent_mounts"]:
         human_lines.append(
             f"  {entry['name']}: skill={entry['skill_enabled']}, "
+            f"container_mount={entry['container_mount']}, "
             f"sandbox_image={entry['sandbox_image'] or '(default)'}"
         )
 
     ui.emit(info, human="\n".join(human_lines))
     return info
+
+
+def _vm_mount_resolves(cfg: AgentsConfig) -> bool:
+    """Return True iff <vm_agents_root>/.codex exists in the VM and contains
+    the auth file. Conservative on errors (returns False).
+    """
+    if not cfg.vm_runtime.is_populated():
+        return False
+    result = mp.exec_in_vm(
+        cfg.vm.name,
+        "test",
+        "-r",
+        f"{cfg.paths.vm_agents_root}/.codex/auth.json",
+        check=False,
+    )
+    return result.returncode == 0
 
 
 def _parse_expiry(auth_data: dict[str, Any]) -> datetime.datetime | None:
@@ -167,7 +186,9 @@ def _parse_expiry(auth_data: dict[str, Any]) -> datetime.datetime | None:
 
 
 def _per_agent_mount_status(cfg: AgentsConfig) -> list[dict[str, Any]]:
-    """List each Hermes agent's skill-enable state."""
+    """For each Hermes agent: skill-enable state + whether the Codex
+    auth is actually readable inside its running container.
+    """
     from agents_cli import compose as compose_mod
 
     doc = compose_mod.read_compose_doc(cfg)
@@ -177,10 +198,12 @@ def _per_agent_mount_status(cfg: AgentsConfig) -> list[dict[str, Any]]:
             continue
         name = svc_name[len("hermes-") :]
         state_path = _skill_state_path(cfg, name)
+        container_mount = _container_codex_mount_probe(cfg, svc_name)
         out.append(
             {
                 "name": name,
                 "skill_enabled": state_path.exists(),
+                "container_mount": container_mount,
                 "sandbox_image": (
                     json.loads(state_path.read_text())["derived_image"]
                     if state_path.exists()
@@ -189,6 +212,36 @@ def _per_agent_mount_status(cfg: AgentsConfig) -> list[dict[str, Any]]:
             }
         )
     return out
+
+
+def _container_codex_mount_probe(cfg: AgentsConfig, svc_name: str) -> str:
+    """Return 'ok' / 'missing' / 'container-down' / 'skipped'."""
+    if not (cfg.paths.host_data_dir / ".codex" / "auth.json").exists():
+        return "skipped"
+    result = mp.exec_in_vm(
+        cfg.vm.name,
+        "docker",
+        "compose",
+        "--project-directory",
+        str(cfg.paths.vm_agents_root),
+        "-f",
+        f"{cfg.paths.vm_agents_root}/docker-compose.yml",
+        "--env-file",
+        f"{cfg.paths.vm_agents_root}/.env",
+        "exec",
+        "-T",
+        svc_name,
+        "test",
+        "-r",
+        "/home/hermes/.codex/auth.json",
+        check=False,
+    )
+    if result.returncode == 0:
+        return "ok"
+    err = (result.stderr or "").lower()
+    if "is not running" in err or "no such" in err:
+        return "container-down"
+    return "missing"
 
 
 # ---------- skill-enable / skill-disable ----------

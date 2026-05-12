@@ -140,6 +140,7 @@ def doctor(
         _check_disk_space(cfg, report)
         _check_journals(cfg, report)
         _check_port_conflicts(cfg, report)
+        _check_codex_auth(cfg, report)
     else:
         report.add("data_dir_exists", "fail", f"{cfg.paths.host_data_dir} missing")
 
@@ -147,6 +148,7 @@ def doctor(
         _check_service_container(cfg, svc, agent_name, agent_type, report)
         if agent_type == "hermes":
             _check_hermes_doctor(cfg, svc, agent_name, report)
+            _check_hermes_codex_mount(cfg, svc, agent_name, report)
 
     _emit_doctor_table(report)
     if report.failed:
@@ -399,6 +401,86 @@ def _check_hermes_doctor(
             f"{agent_name}.hermes_doctor",
             "fail",
             result.stderr.strip() or result.stdout.strip(),
+        )
+
+
+def _check_codex_auth(cfg: AgentsConfig, report: DoctorReport) -> None:
+    """Verify the toolkit-scoped Codex auth is present and not near expiry.
+
+    Reports OK if no auth file exists yet (Codex usage is optional);
+    warns when the token expires in less than 7 days; fails only on
+    malformed JSON or parse-but-already-expired.
+    """
+    import datetime
+    import json as _json
+
+    from agents_cli.codex import EXPIRY_WARNING_DAYS, _parse_expiry
+
+    auth_path = cfg.paths.host_data_dir / ".codex" / "auth.json"
+    if not auth_path.exists():
+        report.add("codex_auth", "ok", "not configured (skip `agents codex login`)")
+        return
+    try:
+        data = _json.loads(auth_path.read_text(encoding="utf-8"))
+    except (OSError, _json.JSONDecodeError) as e:
+        report.add("codex_auth", "fail", f"auth.json unreadable: {e}")
+        return
+
+    expires = _parse_expiry(data)
+    if expires is None:
+        report.add("codex_auth", "ok", "present (expiry unknown)")
+        return
+    now = datetime.datetime.now(datetime.UTC)
+    delta = expires - now
+    if delta.days < 0:
+        report.add("codex_auth", "fail", f"expired {(-delta.days)} day(s) ago")
+    elif delta.days < EXPIRY_WARNING_DAYS:
+        report.add("codex_auth", "warn", f"expires in {delta.days} day(s)")
+    else:
+        report.add("codex_auth", "ok", f"expires in {delta.days} day(s)")
+
+
+def _check_hermes_codex_mount(
+    cfg: AgentsConfig, svc: str, agent_name: str, report: DoctorReport
+) -> None:
+    """Verify the Hermes container has the toolkit-scoped Codex auth bound
+    at the container user's ``~/.codex`` so the LLM-provider import path
+    works. Tests the actual in-container file existence, not just the
+    compose declaration.
+    """
+    # If no auth file on host, no point checking the mount yet.
+    auth_path = cfg.paths.host_data_dir / ".codex" / "auth.json"
+    if not auth_path.exists():
+        report.add(f"{agent_name}.codex_mount", "ok", "skipped (no host auth)")
+        return
+
+    result = mp.exec_in_vm(
+        cfg.vm.name,
+        "docker",
+        "compose",
+        "--project-directory",
+        str(cfg.paths.vm_agents_root),
+        "-f",
+        f"{cfg.paths.vm_agents_root}/docker-compose.yml",
+        "--env-file",
+        f"{cfg.paths.vm_agents_root}/.env",
+        "exec",
+        "-T",
+        svc,
+        "test",
+        "-r",
+        "/home/hermes/.codex/auth.json",
+        check=False,
+    )
+    if result.returncode == 0:
+        report.add(f"{agent_name}.codex_mount", "ok")
+    elif result.returncode in (124, 125, 126):  # not running / not found
+        report.add(f"{agent_name}.codex_mount", "warn", "container not up; skipping")
+    else:
+        report.add(
+            f"{agent_name}.codex_mount",
+            "fail",
+            f"/home/hermes/.codex/auth.json not readable in container (rc={result.returncode})",
         )
 
 
