@@ -194,7 +194,14 @@ def _per_agent_mount_status(cfg: AgentsConfig) -> list[dict[str, Any]]:
 
 
 def _skill_state_path(cfg: AgentsConfig, name: str) -> Path:
-    return cfg.paths.host_data_dir / name / ".data" / ".codex-skill.json"
+    """Host-side state file location.
+
+    Lives under the host data-dir (always present for journals/lock,
+    works in both host-mount and --data-dir-in-vm modes) rather than
+    inside the agent's data dir, which doesn't exist on host under
+    --data-dir-in-vm.
+    """
+    return cfg.paths.host_data_dir / ".codex-skill" / f"{name}.json"
 
 
 def _sandbox_image_tag(base_image: str) -> str:

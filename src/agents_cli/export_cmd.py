@@ -73,13 +73,39 @@ def export(
     if cfg.paths.data_dir_in_vm and to is None:
         raise UserError("--to <host-path> is required when running under --data-dir-in-vm")
 
-    agent_dir = cfg.paths.host_data_dir / name
-    if not agent_dir.exists():
-        raise UserError(f"agent data dir for {name!r} not found at {agent_dir}")
+    archive_name = f"{name}-{_utc_stamp()}.tar.gz"
 
-    archive = _archive_dir(cfg, to) / f"{name}-{_utc_stamp()}.tar.gz"
-    with tarfile.open(archive, "w:gz") as tf:
-        tf.add(agent_dir, arcname=name)
+    if cfg.paths.data_dir_in_vm:
+        # Tar inside the VM, then multipass transfer the archive to the host
+        # destination. `to` is required above.
+        from agents_cli import mp
+
+        # Refuse if the VM-side agent dir is missing
+        check = mp.exec_in_vm(
+            cfg.vm.name,
+            "test",
+            "-d",
+            f"{cfg.paths.vm_agents_root}/{name}",
+            check=False,
+        )
+        if check.returncode != 0:
+            raise UserError(f"agent data dir for {name!r} not found in VM")
+        vm_archive = f"/tmp/agents-export-{name}-{_utc_stamp()}.tar.gz"
+        mp.exec_bash(
+            cfg.vm.name,
+            f"cd {cfg.paths.vm_agents_root} && tar -czf {vm_archive} {name}",
+        )
+        target_dir = _archive_dir(cfg, to)
+        archive = target_dir / archive_name
+        mp.transfer_from_vm(cfg.vm.name, vm_archive, archive)
+        mp.exec_in_vm(cfg.vm.name, "rm", "-f", vm_archive, check=False)
+    else:
+        agent_dir = cfg.paths.host_data_dir / name
+        if not agent_dir.exists():
+            raise UserError(f"agent data dir for {name!r} not found at {agent_dir}")
+        archive = _archive_dir(cfg, to) / archive_name
+        with tarfile.open(archive, "w:gz") as tf:
+            tf.add(agent_dir, arcname=name)
 
     ui.emit(
         {"name": name, "archive": str(archive), "size_bytes": archive.stat().st_size},
@@ -118,6 +144,34 @@ def import_archive(
     cfg = cfg_mod.load(config_path)
     if not archive.exists():
         raise UserError(f"archive not found: {archive}")
+
+    if cfg.paths.data_dir_in_vm:
+        from agents_cli import mp
+
+        check = mp.exec_in_vm(
+            cfg.vm.name, "test", "-d", f"{cfg.paths.vm_agents_root}/{name}", check=False
+        )
+        if (
+            check.returncode == 0
+            and not yes
+            and not ui.confirm(
+                f"overwrite existing data dir at {cfg.paths.vm_agents_root}/{name} (in VM)?",
+                default=False,
+            )
+        ):
+            raise UserError("aborted by user")
+        vm_tmp = f"/tmp/agents-import-{name}-{archive.stat().st_mtime_ns}.tar.gz"
+        mp.transfer_to_vm(archive, cfg.vm.name, vm_tmp)
+        mp.exec_bash(
+            cfg.vm.name,
+            f"set -eu\ncd {cfg.paths.vm_agents_root} && tar -xzf {vm_tmp} && rm -f {vm_tmp}\n",
+        )
+        ui.emit(
+            {"name": name, "archive": str(archive)},
+            human=f"imported {archive} into {cfg.paths.vm_agents_root}/{name} (in VM)",
+        )
+        return
+
     target = cfg.paths.host_data_dir / name
     if (
         target.exists()

@@ -254,10 +254,33 @@ def _utc_stamp() -> str:
 
 
 def _host_data_snapshot(cfg: AgentsConfig, name: str) -> Path:
-    """Tar the agent's data dir + compose + .env into <data-dir>/.upgrades/."""
+    """Tar the agent's data dir + compose + .env.
+
+    Host-mount mode: tar host-side directly.
+    --data-dir-in-vm mode: tar inside the VM, ``multipass transfer`` the
+    archive to the host's .upgrades dir.
+    """
     upgrades_dir = cfg.paths.host_data_dir / ".upgrades"
-    upgrades_dir.mkdir(exist_ok=True)
+    upgrades_dir.mkdir(parents=True, exist_ok=True)
     archive = upgrades_dir / f"{name}-{_utc_stamp()}.tar.gz"
+
+    if cfg.paths.data_dir_in_vm:
+        vm_archive = f"/tmp/agents-upgrade-snap-{name}-{_utc_stamp()}.tar.gz"
+        mp.exec_bash(
+            cfg.vm.name,
+            (
+                f"set -eu\n"
+                f"cd {cfg.paths.vm_agents_root}\n"
+                f"tar -czf {vm_archive} "
+                f"$([ -d {name} ] && echo {name} || true) "
+                f"$([ -f docker-compose.yml ] && echo docker-compose.yml || true) "
+                f"$([ -f .env ] && echo .env || true)\n"
+            ),
+        )
+        mp.transfer_from_vm(cfg.vm.name, vm_archive, archive)
+        mp.exec_in_vm(cfg.vm.name, "rm", "-f", vm_archive, check=False)
+        return archive
+
     with tarfile.open(archive, "w:gz") as tf:
         agent_dir = cfg.paths.host_data_dir / name
         if agent_dir.exists():
@@ -272,6 +295,14 @@ def _host_data_snapshot(cfg: AgentsConfig, name: str) -> Path:
 
 
 def _restore_host_snapshot(cfg: AgentsConfig, archive: Path) -> None:
+    if cfg.paths.data_dir_in_vm:
+        vm_archive = f"/tmp/agents-restore-{archive.name}"
+        mp.transfer_to_vm(archive, cfg.vm.name, vm_archive)
+        mp.exec_bash(
+            cfg.vm.name,
+            f"set -eu\ncd {cfg.paths.vm_agents_root} && tar -xzf {vm_archive} && rm -f {vm_archive}\n",
+        )
+        return
     with tarfile.open(archive, "r:gz") as tf:
         tf.extractall(cfg.paths.host_data_dir, filter="data")
 

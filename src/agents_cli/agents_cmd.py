@@ -18,7 +18,7 @@ import shutil
 from collections.abc import Iterable, Iterator
 from pathlib import Path
 
-from agents_cli import compose, compose_runner, ui
+from agents_cli import compose, compose_runner, mp, ui
 from agents_cli import config as cfg_mod
 from agents_cli.compose import HERMES_IMAGE_BASE, OPENCLAW_IMAGE_BASE
 from agents_cli.config import AgentsConfig
@@ -60,22 +60,40 @@ def _name_from_service(service_name_value: str, agent_type: str) -> str:
     return service_name_value[len(agent_type) + 1 :]
 
 
-def _agent_data_paths(cfg: AgentsConfig, name: str, agent_type: str) -> list[Path]:
-    """Per-agent directories that should exist after `data_dir_created`."""
-    root = cfg.paths.host_data_dir / name
+def _agent_data_subpaths(agent_type: str) -> list[str]:
+    """Per-agent subdirectory names relative to the agent's root dir."""
     if agent_type == "hermes":
-        return [root, root / ".data"]
+        return [".data"]
     if agent_type == "openclaw":
-        return [root, root / ".openclaw", root / "workspace"]
-    return [root]
+        return [".openclaw", "workspace"]
+    return []
+
+
+def _agent_data_paths(cfg: AgentsConfig, name: str, agent_type: str) -> list[Path]:
+    """Per-agent directories that should exist after `data_dir_created`
+    (host-side; valid only in host-mount mode)."""
+    root = cfg.paths.host_data_dir / name
+    return [root, *(root / sub for sub in _agent_data_subpaths(agent_type))]
+
+
+def _vm_agent_data_paths(cfg: AgentsConfig, name: str, agent_type: str) -> list[str]:
+    """Per-agent directories that should exist after `data_dir_created`
+    (VM-side; the canonical layout in ``--data-dir-in-vm`` mode)."""
+    root = f"{cfg.paths.vm_agents_root}/{name}"
+    return [root, *(f"{root}/{sub}" for sub in _agent_data_subpaths(agent_type))]
 
 
 def _data_dir_exists(cfg: AgentsConfig, name: str, agent_type: str) -> bool:
+    if cfg.paths.data_dir_in_vm:
+        result = mp.exec_in_vm(
+            cfg.vm.name,
+            "test",
+            "-d",
+            f"{cfg.paths.vm_agents_root}/{name}",
+            check=False,
+        )
+        return result.returncode == 0
     return any(p.exists() for p in _agent_data_paths(cfg, name, agent_type))
-
-
-def _all_data_paths_exist(cfg: AgentsConfig, name: str, agent_type: str) -> bool:
-    return all(p.exists() for p in _agent_data_paths(cfg, name, agent_type))
 
 
 def _service_in_compose(cfg: AgentsConfig, service_name_value: str) -> bool:
@@ -181,8 +199,31 @@ def create(
 
 
 def _create_data_dirs(cfg: AgentsConfig, name: str, agent_type: str) -> None:
+    if cfg.paths.data_dir_in_vm:
+        mp.exec_in_vm(
+            cfg.vm.name,
+            "mkdir",
+            "-p",
+            *_vm_agent_data_paths(cfg, name, agent_type),
+        )
+        return
     for p in _agent_data_paths(cfg, name, agent_type):
         p.mkdir(parents=True, exist_ok=True)
+
+
+def _delete_data_dir(cfg: AgentsConfig, name: str) -> None:
+    if cfg.paths.data_dir_in_vm:
+        mp.exec_in_vm(
+            cfg.vm.name,
+            "rm",
+            "-rf",
+            f"{cfg.paths.vm_agents_root}/{name}",
+            check=False,
+        )
+        return
+    target = cfg.paths.host_data_dir / name
+    if target.exists():
+        shutil.rmtree(target)
 
 
 def _add_service_to_compose(
@@ -307,9 +348,7 @@ def remove(
                 journal.advance(phase)
             elif phase == "data_dir_deleted":
                 if delete_data:
-                    target = cfg.paths.host_data_dir / name
-                    if target.exists():
-                        shutil.rmtree(target)
+                    _delete_data_dir(cfg, name)
                 journal.advance(phase)
 
         journal.complete()
@@ -371,7 +410,17 @@ def rename(
                     compose.write_compose_atomically(cfg, doc)
                 journal.advance(phase)
             elif phase == "dir_renamed":
-                if old_dir.exists() and not new_dir.exists():
+                if cfg.paths.data_dir_in_vm:
+                    mp.exec_bash(
+                        cfg.vm.name,
+                        f"set -eu\n"
+                        f"if [ -d {cfg.paths.vm_agents_root}/{old_name} ] && "
+                        f"[ ! -d {cfg.paths.vm_agents_root}/{new_name} ]; then "
+                        f"mv {cfg.paths.vm_agents_root}/{old_name} "
+                        f"{cfg.paths.vm_agents_root}/{new_name}; fi\n",
+                        check=False,
+                    )
+                elif old_dir.exists() and not new_dir.exists():
                     old_dir.rename(new_dir)
                 journal.advance(phase)
             elif phase == "container_recreated":

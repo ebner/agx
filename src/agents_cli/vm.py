@@ -345,7 +345,27 @@ def _run_bootstrap(vm_name: str) -> BootstrapStatus:
 
 
 def _seed_data_dir(cfg: AgentsConfig) -> None:
-    """Write the initial compose + .env to the data-dir (idempotent — never overwrite)."""
+    """Write the initial compose + .env + skeleton dirs.
+
+    Two paths because the layout differs by mode:
+
+    - Host-mount mode (default): everything goes to the host data-dir,
+      which the VM sees through the mount. Idempotent — never
+      overwrites an existing compose or .env.
+
+    - ``--data-dir-in-vm`` mode: agent state (compose, .env, .codex,
+      backups, .upgrades) lives only in the VM. The host data-dir
+      still holds the toolkit's lock + journals (host-filesystem
+      primitives), so we create the minimal local layout for those.
+    """
+    # Always: minimal host scaffolding for the lock and journals.
+    (cfg.paths.host_data_dir / ".journal").mkdir(exist_ok=True)
+
+    if cfg.paths.data_dir_in_vm:
+        _seed_vm_data_dir(cfg)
+        return
+
+    # Host-mount mode: everything on host, VM sees it through the mount.
     compose = cfg.paths.host_data_dir / "docker-compose.yml"
     env = cfg.paths.host_data_dir / ".env"
     if not compose.exists():
@@ -357,8 +377,27 @@ def _seed_data_dir(cfg: AgentsConfig) -> None:
         )
     (cfg.paths.host_data_dir / ".codex").mkdir(exist_ok=True)
     (cfg.paths.host_data_dir / "backups").mkdir(exist_ok=True)
-    (cfg.paths.host_data_dir / ".journal").mkdir(exist_ok=True)
     (cfg.paths.host_data_dir / ".upgrades").mkdir(exist_ok=True)
+
+
+def _seed_vm_data_dir(cfg: AgentsConfig) -> None:
+    """Seed compose + .env + skeleton dirs inside the VM for
+    ``--data-dir-in-vm`` mode. Only writes files that don't already exist.
+    """
+    root = cfg.paths.vm_agents_root
+    compose_content = templates.initial_compose_content()
+    env_content = templates.initial_env_content(
+        cfg.vm_runtime.ubuntu_uid, cfg.vm_runtime.ubuntu_gid
+    )
+    script = (
+        f"set -eu\n"
+        f"mkdir -p {root}/.codex {root}/backups {root}/.upgrades\n"
+        f"[ -f {root}/docker-compose.yml ] || cat > {root}/docker-compose.yml <<'__AGENTS_EOF__'\n"
+        f"{compose_content}__AGENTS_EOF__\n"
+        f"[ -f {root}/.env ] || cat > {root}/.env <<'__AGENTS_EOF__'\n"
+        f"{env_content}__AGENTS_EOF__\n"
+    )
+    mp.exec_bash(cfg.vm.name, script)
 
 
 def _unique_snapshot_name(vm: str, requested: str) -> str:
