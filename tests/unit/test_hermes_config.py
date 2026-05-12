@@ -13,7 +13,29 @@ from agents_cli.errors import UserError
 
 @pytest.fixture
 def cfg(tmp_path: Path) -> AgentsConfig:
-    return AgentsConfig(paths=PathsConfig(host_data_dir=str(tmp_path / "data")))
+    from agents_cli.config import VmRuntimeConfig
+
+    return AgentsConfig(
+        paths=PathsConfig(host_data_dir=str(tmp_path / "data")),
+        vm_runtime=VmRuntimeConfig(
+            docker_socket_path="/run/user/1000/docker.sock",
+            ubuntu_uid=1000,
+            ubuntu_gid=1000,
+        ),
+    )
+
+
+@pytest.fixture
+def cfg_with_dir(cfg: AgentsConfig) -> AgentsConfig:
+    cfg.paths.host_data_dir.mkdir(parents=True, exist_ok=True)
+    return cfg
+
+
+@pytest.fixture
+def vm_fs_mocks(cfg: AgentsConfig, mocker) -> dict:
+    from tests.conftest import install_vm_fs_simulation
+
+    return install_vm_fs_simulation(mocker, cfg)
 
 
 # ---------- load / dump round-trip ----------
@@ -83,20 +105,24 @@ def test_write_atomically_refuses_zero_address(cfg: AgentsConfig) -> None:
 # ---------- atomic write ----------
 
 
-def test_write_atomically_creates_path_and_file(cfg: AgentsConfig) -> None:
-    doc = hermes_config.load(hermes_config.config_path(cfg, "coder"))
+def test_write_atomically_creates_path_and_file(
+    cfg_with_dir: AgentsConfig, vm_fs_mocks: dict
+) -> None:
+    doc = hermes_config.load(hermes_config.config_path(cfg_with_dir, "coder"))
     hermes_config.set_terminal_docker_image(doc, "sandbox/base:v1")
-    hermes_config.write_atomically(cfg, "coder", doc)
-    p = hermes_config.config_path(cfg, "coder")
+    hermes_config.write_atomically(cfg_with_dir, "coder", doc)
+    p = hermes_config.config_path(cfg_with_dir, "coder")
     assert p.exists()
     assert "sandbox/base:v1" in p.read_text(encoding="utf-8")
 
 
-def test_write_atomically_leaves_no_temp_files(cfg: AgentsConfig) -> None:
-    doc = hermes_config.load(hermes_config.config_path(cfg, "coder"))
+def test_write_atomically_leaves_no_temp_files(
+    cfg_with_dir: AgentsConfig, vm_fs_mocks: dict
+) -> None:
+    doc = hermes_config.load(hermes_config.config_path(cfg_with_dir, "coder"))
     hermes_config.set_terminal_docker_image(doc, "sandbox/base:v1")
-    hermes_config.write_atomically(cfg, "coder", doc)
-    parent = hermes_config.config_path(cfg, "coder").parent
+    hermes_config.write_atomically(cfg_with_dir, "coder", doc)
+    parent = hermes_config.config_path(cfg_with_dir, "coder").parent
     assert not any(parent.glob("config.yaml.*.new"))
 
 

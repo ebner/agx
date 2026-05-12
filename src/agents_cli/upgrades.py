@@ -91,7 +91,7 @@ def upgrade(
         raise UserError(f"agent {name!r} not in compose")
     svc = _service_name_for(name, agent_type)
 
-    doc = compose.load_compose(cfg.paths.host_data_dir / "docker-compose.yml")
+    doc = compose.read_compose_doc(cfg)
     current_image = doc["services"][svc].get("image", "")
     old_tag = current_image.split(":", 1)[1] if ":" in current_image else ""
     if not old_tag:
@@ -180,7 +180,7 @@ def upgrade_all(
     config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH,
 ) -> list[UpgradeOutcome]:
     cfg = cfg_mod.load(config_path)
-    doc = compose.load_compose(cfg.paths.host_data_dir / "docker-compose.yml")
+    doc = compose.read_compose_doc(cfg)
     services = list((doc.get("services") or {}).keys())
 
     # Names sorted, optional canary first.
@@ -310,7 +310,7 @@ def _latest_vm_snapshot(vm_name: str, agent_name: str) -> str | None:
 
 
 def _set_image_tag(cfg: AgentsConfig, svc: str, base: str, tag: str) -> None:
-    doc = compose.load_compose(cfg.paths.host_data_dir / "docker-compose.yml")
+    doc = compose.read_compose_doc(cfg)
     services = doc.get("services") or {}
     if svc not in services:
         raise UserError(f"service {svc!r} not in compose")

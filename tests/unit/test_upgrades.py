@@ -56,14 +56,25 @@ def saved_config(cfg: AgentsConfig, tmp_path: Path) -> Path:
 @pytest.fixture
 def with_coder(cfg: AgentsConfig, saved_config: Path, mocker) -> Path:
     """One Hermes agent named 'coder' in compose."""
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok())
+    from tests.conftest import install_vm_fs_simulation
+
+    install_vm_fs_simulation(mocker, cfg)
     mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
     create(name="coder", agent_type="hermes", config_path=saved_config)
     return saved_config
 
 
-def _stub_happy_upgrade(mocker) -> dict:
-    """Every multipass/docker call returns success; doctor passes."""
+def _stub_happy_upgrade(mocker, cfg: AgentsConfig | None = None) -> dict:
+    """Every multipass/docker call returns success; doctor passes.
+
+    Re-installs the VM filesystem simulation so that the new compose
+    mutation path (host-temp -> multipass transfer -> VM-side mv)
+    actually moves the file in the test environment.
+    """
+    from tests.conftest import install_vm_fs_simulation
+
+    if cfg is not None:
+        install_vm_fs_simulation(mocker, cfg)
     return {
         "stop": mocker.patch("agents_cli.mp.stop_vm", return_value=_ok()),
         "start": mocker.patch("agents_cli.mp.start_vm", return_value=_ok()),
@@ -77,9 +88,6 @@ def _stub_happy_upgrade(mocker) -> dict:
             "agents_cli.compose_runner.docker_image_inspect", return_value=_ok()
         ),
         "compose_up": mocker.patch("agents_cli.compose_runner.up", return_value=_ok()),
-        # `compose.write_compose_atomically` runs `docker compose config -q`
-        # in the VM via mp.exec_in_vm. We need that to return 0 too.
-        "exec": mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok()),
         "doctor": mocker.patch(
             "agents_cli.ops.doctor", return_value=type("R", (), {"failed": False})()
         ),
@@ -89,8 +97,8 @@ def _stub_happy_upgrade(mocker) -> dict:
 # ---------- happy path ----------
 
 
-def test_upgrade_happy_path_runs_every_phase(with_coder: Path, mocker) -> None:
-    mocks = _stub_happy_upgrade(mocker)
+def test_upgrade_happy_path_runs_every_phase(with_coder: Path, mocker, cfg: AgentsConfig) -> None:
+    mocks = _stub_happy_upgrade(mocker, cfg)
     outcome = upgrades.upgrade("coder", tag="v1.0.1", config_path=with_coder)
     assert outcome.old_tag == "v1.0.0"
     assert outcome.new_tag == "v1.0.1"
@@ -104,20 +112,22 @@ def test_upgrade_happy_path_runs_every_phase(with_coder: Path, mocker) -> None:
 
 
 def test_upgrade_writes_new_tag_to_compose(with_coder: Path, mocker, cfg: AgentsConfig) -> None:
-    _stub_happy_upgrade(mocker)
+    _stub_happy_upgrade(mocker, cfg)
     upgrades.upgrade("coder", tag="v9.9.9", config_path=with_coder)
     doc = compose.load_compose(cfg.paths.host_data_dir / "docker-compose.yml")
     assert doc["services"]["hermes-coder"]["image"].endswith(":v9.9.9")
 
 
 def test_upgrade_completes_journal_on_success(with_coder: Path, mocker, cfg: AgentsConfig) -> None:
-    _stub_happy_upgrade(mocker)
+    _stub_happy_upgrade(mocker, cfg)
     upgrades.upgrade("coder", tag="v1.0.1", config_path=with_coder)
     assert Journal.find_resumable(cfg.paths.host_data_dir, "upgrade", "coder") is None
 
 
-def test_upgrade_with_no_snapshot_skips_both_snapshots(with_coder: Path, mocker) -> None:
-    mocks = _stub_happy_upgrade(mocker)
+def test_upgrade_with_no_snapshot_skips_both_snapshots(
+    with_coder: Path, mocker, cfg: AgentsConfig
+) -> None:
+    mocks = _stub_happy_upgrade(mocker, cfg)
     outcome = upgrades.upgrade("coder", tag="v1.0.1", no_snapshot=True, config_path=with_coder)
     assert outcome.host_snapshot is None
     assert outcome.vm_snapshot is None
@@ -128,7 +138,7 @@ def test_upgrade_with_no_snapshot_skips_both_snapshots(with_coder: Path, mocker)
 
 
 def test_upgrade_reverts_tag_when_pull_fails(with_coder: Path, mocker, cfg: AgentsConfig) -> None:
-    _stub_happy_upgrade(mocker)
+    _stub_happy_upgrade(mocker, cfg)
     mocker.patch("agents_cli.compose_runner.pull", return_value=_ok())
     mocker.patch(
         "agents_cli.compose_runner.docker_image_inspect",
@@ -142,7 +152,7 @@ def test_upgrade_reverts_tag_when_pull_fails(with_coder: Path, mocker, cfg: Agen
 
 
 def test_upgrade_reverts_when_doctor_fails(with_coder: Path, mocker, cfg: AgentsConfig) -> None:
-    _stub_happy_upgrade(mocker)
+    _stub_happy_upgrade(mocker, cfg)
     from agents_cli.errors import HealthCheckFailure
 
     mocker.patch("agents_cli.ops.doctor", side_effect=HealthCheckFailure("bad"))
@@ -176,7 +186,7 @@ def test_upgrade_resume_from_post_snapshot_phase(
     """If the journal already has host_data_snapshot + vm_snapshot done,
     re-running upgrade must skip the snapshot calls and pick up at tag_pinned.
     """
-    mocks = _stub_happy_upgrade(mocker)
+    mocks = _stub_happy_upgrade(mocker, cfg)
     j = Journal.begin(cfg.paths.host_data_dir, "upgrade", "coder", upgrades.UPGRADE_PHASES)
     j.advance("host_data_snapshot")
     j.advance("vm_snapshot")

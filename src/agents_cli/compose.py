@@ -1,21 +1,35 @@
 """Compose-file mutation with the strict atomicity contract from the plan.
 
-Read the local compose file (round-trip via ruamel.yaml, preserving
-comments + key order), mutate in memory, stage to a sibling
-``.compose.<pid>.new`` in the project directory, validate via
-``docker compose ... config -q`` inside the VM, then atomic same-filesystem
-``os.replace`` to swap. Every mutation runs under a ``flock`` on
-``<data-dir>/.agents.lock``.
+Pattern, plan-locked:
 
-Two design decisions worth noting:
+1. Hold ``flock`` on ``<data-dir>/.agents.lock`` for the duration.
+2. Read+mutate the compose doc with ``ruamel.yaml``. Reads come straight
+   off the host mount in host-mount mode (fast), or are pulled from the
+   VM in ``--data-dir-in-vm`` mode.
+3. Dump the new content to a host-side temp at ``/tmp/agents-compose-<pid>-<uuid>.yml``.
+4. ``multipass transfer`` the host temp into the VM's project dir at
+   ``<vm_agents_root>/.compose.<pid>.<uuid>.new`` — same filesystem as
+   the final ``docker-compose.yml``, so the subsequent rename is
+   guaranteed atomic. Staging in the project dir also means the
+   validation step sees the same relative ``volumes:`` paths that will
+   run in production.
+5. Validate inside the VM: ``docker compose --project-directory ...
+   -f <staged> --env-file ... config -q``.
+6. Atomic same-fs rename inside the VM: ``mv <staged> docker-compose.yml``.
+7. Cleanup. Host temp goes away in ``finally``; VM-side stage gets a
+   sweep on success and on any error path.
 
-- The host data-dir is the same path the VM sees through the multipass
-  mount. So we read/write on the host (fast, atomic with os.replace) and
-  use the VM only to validate via the docker-compose binary that lives
-  in it. This avoids the heredoc-through-exec antipattern entirely.
-- ``data_dir_in_vm=True`` mode is not yet supported for mutations
-  (would need multipass transfer round-trips for every write). We raise
-  ``UserError`` rather than silently falling back.
+``cleanup_stale_temps(cfg)`` is called by ``vm.start`` and at the head
+of every mutation, so stragglers from a prior crash never accumulate.
+
+Works uniformly in both modes:
+
+- **Host-mount mode** (default): the VM-side write also lands on the
+  host through the multipass mount, so ``<data-dir>/docker-compose.yml``
+  on the host is always the same file as ``/home/ubuntu/agents/docker-compose.yml``
+  in the VM.
+- **--data-dir-in-vm mode**: same VM-side mechanics; nothing lands on
+  the host. Reads pull via ``multipass transfer`` first.
 """
 
 from __future__ import annotations
@@ -88,38 +102,78 @@ def dump_compose(doc: Any) -> str:
     return buf.getvalue()
 
 
-def cleanup_stale_temps(data_dir: Path) -> None:
-    """Sweep any ``.compose.*.new`` files left behind by prior crashes."""
-    for tmp in data_dir.glob(".compose.*.new"):
+def cleanup_stale_temps(cfg: AgentsConfig) -> None:
+    """Sweep any ``.compose.*.new`` left behind in the VM project dir by
+    prior crashes. Also sweeps host-side ``/tmp/agents-compose-*.yml``
+    stragglers from this process.
+
+    Safe to call before the VM exists (it just no-ops).
+    """
+    for tmp in Path("/tmp").glob("agents-compose-*.yml"):
         with contextlib.suppress(OSError):
             tmp.unlink()
+    if not cfg.vm_runtime.is_populated():
+        return
+    mp.exec_bash(
+        cfg.vm.name,
+        f"rm -f {cfg.paths.vm_agents_root}/.compose.*.new 2>/dev/null || true",
+        check=False,
+    )
+
+
+def read_compose_doc(cfg: AgentsConfig) -> Any:
+    """Read the current compose YAML, transparent to ``data_dir_in_vm`` mode.
+
+    In host-mount mode this is a direct file read off the mount. In
+    ``--data-dir-in-vm`` mode it ``multipass transfer``s from the VM
+    into a host temp, parses, and deletes the temp.
+    """
+    if cfg.paths.data_dir_in_vm:
+        host_temp = Path("/tmp") / f"agents-compose-read-{os.getpid()}-{uuid.uuid4().hex[:8]}.yml"
+        try:
+            mp.transfer_from_vm(
+                cfg.vm.name,
+                f"{cfg.paths.vm_agents_root}/docker-compose.yml",
+                host_temp,
+            )
+            return load_compose(host_temp)
+        finally:
+            host_temp.unlink(missing_ok=True)
+    return load_compose(cfg.paths.host_data_dir / "docker-compose.yml")
 
 
 def write_compose_atomically(cfg: AgentsConfig, doc: Any) -> None:
-    """Stage in the project dir, validate via docker compose in the VM,
-    then atomic same-filesystem rename. Cleans up the temp on any error.
+    """Host-temp → multipass transfer → validate via docker compose config -q →
+    VM-side ``mv``. Same flow in both ``data_dir_in_vm`` modes.
+
+    Sweeps stale temps before staging so a half-finished previous run
+    can never confuse this one. Cleans up its own host temp in
+    ``finally`` and rms the VM stage on any error.
     """
-    if cfg.paths.data_dir_in_vm:
-        raise UserError("compose mutations not supported under --data-dir-in-vm yet")
     if not cfg.vm_runtime.is_populated():
         raise UserError("vm_runtime fields are not populated; run `agents vm init` first")
 
-    project_dir = cfg.paths.host_data_dir
+    cleanup_stale_temps(cfg)
+
     content = dump_compose(doc)
-    tmp_name = f".compose.{os.getpid()}.{uuid.uuid4().hex[:8]}.new"
-    tmp_host = project_dir / tmp_name
-    target = project_dir / "docker-compose.yml"
+    pid = os.getpid()
+    suffix = uuid.uuid4().hex[:8]
+    stage_name = f".compose.{pid}.{suffix}.new"
+    vm_stage = f"{cfg.paths.vm_agents_root}/{stage_name}"
+    vm_target = f"{cfg.paths.vm_agents_root}/docker-compose.yml"
+    host_temp = Path("/tmp") / f"agents-compose-{pid}-{suffix}.yml"
 
     try:
-        tmp_host.write_text(content, encoding="utf-8")
-        _validate_via_vm(cfg, f"{cfg.paths.vm_agents_root}/{tmp_name}")
-        os.replace(tmp_host, target)
-        ui.info(f"compose: wrote {target}")
+        host_temp.write_text(content, encoding="utf-8")
+        mp.transfer_to_vm(host_temp, cfg.vm.name, vm_stage)
+        _validate_via_vm(cfg, vm_stage)
+        mp.exec_in_vm(cfg.vm.name, "mv", vm_stage, vm_target)
+        ui.info(f"compose: wrote {vm_target}")
     except Exception:
-        if tmp_host.exists():
-            with contextlib.suppress(OSError):
-                tmp_host.unlink()
+        mp.exec_in_vm(cfg.vm.name, "rm", "-f", vm_stage, check=False)
         raise
+    finally:
+        host_temp.unlink(missing_ok=True)
 
 
 def _validate_via_vm(cfg: AgentsConfig, vm_path: str) -> None:

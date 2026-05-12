@@ -79,7 +79,7 @@ def _all_data_paths_exist(cfg: AgentsConfig, name: str, agent_type: str) -> bool
 
 
 def _service_in_compose(cfg: AgentsConfig, service_name_value: str) -> bool:
-    doc = compose.load_compose(cfg.paths.host_data_dir / "docker-compose.yml")
+    doc = compose.read_compose_doc(cfg)
     return service_name_value in (doc.get("services") or {})
 
 
@@ -193,7 +193,7 @@ def _add_service_to_compose(
     port: int,
     tag: str,
 ) -> None:
-    doc = compose.load_compose(cfg.paths.host_data_dir / "docker-compose.yml")
+    doc = compose.read_compose_doc(cfg)
     if svc in (doc.get("services") or {}):
         return  # already there from a prior partial run
     if agent_type == "hermes":
@@ -240,7 +240,7 @@ def _image_base(agent_type: str) -> str:
 
 def list_agents(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> list[dict[str, object]]:
     cfg = cfg_mod.load(config_path)
-    doc = compose.load_compose(cfg.paths.host_data_dir / "docker-compose.yml")
+    doc = compose.read_compose_doc(cfg)
     rows: list[dict[str, object]] = []
     for svc_name, svc in (doc.get("services") or {}).items():
         agent_type = _agent_type_from_service(svc_name)
@@ -300,7 +300,7 @@ def remove(
                     compose_runner.down(cfg, svc)
                 journal.advance(phase)
             elif phase == "compose_updated":
-                doc = compose.load_compose(cfg.paths.host_data_dir / "docker-compose.yml")
+                doc = compose.read_compose_doc(cfg)
                 if svc in (doc.get("services") or {}):
                     compose.remove_service(doc, svc)
                     compose.write_compose_atomically(cfg, doc)
@@ -321,7 +321,7 @@ def remove(
 
 
 def _detect_type_from_compose(cfg: AgentsConfig, name: str) -> str | None:
-    doc = compose.load_compose(cfg.paths.host_data_dir / "docker-compose.yml")
+    doc = compose.read_compose_doc(cfg)
     services = doc.get("services") or {}
     for at in AGENT_TYPES:
         if service_name(name, at) in services:
@@ -363,7 +363,7 @@ def rename(
 
         for phase in _phases_to_run(journal):
             if phase == "compose_updated":
-                doc = compose.load_compose(cfg.paths.host_data_dir / "docker-compose.yml")
+                doc = compose.read_compose_doc(cfg)
                 if old_svc in (doc.get("services") or {}):
                     compose.rename_service(doc, old_svc, new_svc)
                     # Also update container_name and any path references that mention old_name.

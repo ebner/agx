@@ -51,8 +51,14 @@ def saved_config(cfg: AgentsConfig, tmp_path: Path) -> Path:
 
 
 @pytest.fixture
-def with_coder(cfg: AgentsConfig, saved_config: Path, mocker) -> Path:
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok())
+def vm_fs_mocks(cfg: AgentsConfig, mocker) -> dict:
+    from tests.conftest import install_vm_fs_simulation
+
+    return install_vm_fs_simulation(mocker, cfg)
+
+
+@pytest.fixture
+def with_coder(cfg: AgentsConfig, saved_config: Path, mocker, vm_fs_mocks: dict) -> Path:
     mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
     create(name="coder", agent_type="hermes", config_path=saved_config)
     return saved_config
@@ -103,8 +109,9 @@ def test_sandbox_volume_mapping_uses_vm_host_path(cfg: AgentsConfig) -> None:
 # ---------- skill-enable ----------
 
 
-def test_skill_enable_refuses_openclaw(cfg: AgentsConfig, saved_config: Path, mocker) -> None:
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok())
+def test_skill_enable_refuses_openclaw(
+    cfg: AgentsConfig, saved_config: Path, mocker, vm_fs_mocks: dict
+) -> None:
     mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
     create(name="personal", agent_type="openclaw", config_path=saved_config)
     with pytest.raises(UserError, match="only applies to Hermes"):
@@ -117,12 +124,9 @@ def test_skill_enable_unknown_agent(saved_config: Path) -> None:
 
 
 def test_skill_enable_builds_image_and_updates_config(
-    with_coder: Path, mocker, cfg: AgentsConfig
+    with_coder: Path, mocker, cfg: AgentsConfig, vm_fs_mocks: dict
 ) -> None:
-    # docker build call; succeed
-    build_spy = mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok())
     up_spy = mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
-
     result = codex.skill_enable("coder", config_path=with_coder)
 
     # Derived image tag returned
@@ -137,14 +141,14 @@ def test_skill_enable_builds_image_and_updates_config(
 
     # Container restarted
     up_spy.assert_called_once()
-    # docker build was invoked
-    assert any(call.args[1] == "docker" for call in build_spy.call_args_list)
+    # docker build was invoked through the simulator's exec_in_vm
+    build_calls = vm_fs_mocks["exec_in_vm"].call_args_list
+    assert any("docker" in c.args and "build" in c.args for c in build_calls)
 
 
 def test_skill_enable_persists_original_for_restore(
     with_coder: Path, mocker, cfg: AgentsConfig
 ) -> None:
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok())
     mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
     codex.skill_enable("coder", config_path=with_coder)
     state_path = codex._skill_state_path(cfg, "coder")
@@ -155,15 +159,26 @@ def test_skill_enable_persists_original_for_restore(
 
 
 def test_skill_enable_is_idempotent(with_coder: Path, mocker) -> None:
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok())
     mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
     first = codex.skill_enable("coder", config_path=with_coder)
     second = codex.skill_enable("coder", config_path=with_coder)
     assert first["derived_image"] == second["derived_image"]
 
 
-def test_skill_enable_propagates_docker_build_failure(with_coder: Path, mocker) -> None:
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_fail())
+def test_skill_enable_propagates_docker_build_failure(
+    with_coder: Path, mocker, vm_fs_mocks: dict
+) -> None:
+    # Override the simulator so any exec_in_vm with `docker build` fails;
+    # everything else still runs the simulator's host-side side effects.
+    real_runner = vm_fs_mocks["exec_in_vm"].side_effect
+
+    def failing_build(vm_name: str, *cmd: str, check: bool = True):
+        if "docker" in cmd and "build" in cmd:
+            return _fail()
+        return real_runner(vm_name, *cmd, check=check)
+
+    vm_fs_mocks["exec_in_vm"].side_effect = failing_build
+
     with pytest.raises(RuntimeFailure, match="docker build"):
         codex.skill_enable("coder", config_path=with_coder)
 
@@ -172,7 +187,6 @@ def test_skill_enable_propagates_docker_build_failure(with_coder: Path, mocker) 
 
 
 def test_skill_disable_restores_original(with_coder: Path, mocker, cfg: AgentsConfig) -> None:
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok())
     mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
     codex.skill_enable("coder", config_path=with_coder)
     state = json.loads(codex._skill_state_path(cfg, "coder").read_text())
@@ -264,7 +278,6 @@ def test_status_no_warning_when_far_from_expiry(cfg: AgentsConfig, saved_config:
 def test_status_includes_per_agent_mount_status(
     with_coder: Path, mocker, cfg: AgentsConfig
 ) -> None:
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok())
     mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
     info = codex.status(config_path=with_coder)
     names = {entry["name"] for entry in info["per_agent_mounts"]}

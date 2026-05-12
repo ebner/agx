@@ -46,7 +46,9 @@ def saved_config(cfg: AgentsConfig, tmp_path: Path) -> Path:
 
 @pytest.fixture
 def with_coder(cfg: AgentsConfig, saved_config: Path, mocker) -> Path:
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok())
+    from tests.conftest import install_vm_fs_simulation
+
+    install_vm_fs_simulation(mocker, cfg)
     mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
     create(name="coder", agent_type="hermes", config_path=saved_config)
     # Seed some agent data
@@ -84,10 +86,11 @@ def test_export_under_data_dir_in_vm_requires_to(
     cfg: AgentsConfig, saved_config: Path, mocker
 ) -> None:
     """Toggling data_dir_in_vm in the saved config, export must demand --to."""
+    from tests.conftest import install_vm_fs_simulation
+
     cfg.paths.data_dir_in_vm = True
     cfg_mod.save(cfg, saved_config)
-    # Still need a real compose entry to get past the "not in compose" check
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok())
+    install_vm_fs_simulation(mocker, cfg)
     mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
     # Manually inject a service
     doc = compose.load_compose(cfg.paths.host_data_dir / "docker-compose.yml")
@@ -101,7 +104,9 @@ def test_export_under_data_dir_in_vm_requires_to(
 
 
 def test_export_all_iterates_every_agent(cfg: AgentsConfig, saved_config: Path, mocker) -> None:
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok())
+    from tests.conftest import install_vm_fs_simulation
+
+    install_vm_fs_simulation(mocker, cfg)
     mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
     create(name="coder", agent_type="hermes", config_path=saved_config)
     create(name="personal", agent_type="openclaw", config_path=saved_config)

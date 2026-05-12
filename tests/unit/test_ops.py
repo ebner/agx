@@ -55,7 +55,9 @@ def saved_config(cfg: AgentsConfig, tmp_path: Path) -> Path:
 @pytest.fixture
 def with_coder(cfg: AgentsConfig, saved_config: Path, mocker) -> Path:
     """Seed a compose with one Hermes agent named 'coder' and stub runners."""
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok())
+    from tests.conftest import install_vm_fs_simulation
+
+    install_vm_fs_simulation(mocker, cfg)
     mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
     create(name="coder", agent_type="hermes", config_path=saved_config)
     return saved_config

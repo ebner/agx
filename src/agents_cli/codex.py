@@ -169,7 +169,7 @@ def _per_agent_mount_status(cfg: AgentsConfig) -> list[dict[str, Any]]:
     """List each Hermes agent's skill-enable state."""
     from agents_cli import compose as compose_mod
 
-    doc = compose_mod.load_compose(cfg.paths.host_data_dir / "docker-compose.yml")
+    doc = compose_mod.read_compose_doc(cfg)
     out: list[dict[str, Any]] = []
     for svc_name in doc.get("services") or {}:
         if not svc_name.startswith("hermes-"):

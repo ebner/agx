@@ -133,11 +133,15 @@ def init(
 
 
 def start(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> None:
+    from agents_cli import compose
+
     cfg = cfg_mod.load(config_path)
     mp.start_vm(cfg.vm.name)
     if not cfg.paths.data_dir_in_vm:
         _ensure_mount(cfg)
         _mount_probe(cfg)
+    # Sweep stale .compose.*.new and host /tmp/agents-compose-* from prior crashes
+    compose.cleanup_stale_temps(cfg)
     ui.emit({"vm": cfg.vm.name, "status": "running"}, human=f"{cfg.vm.name}: running")
 
 

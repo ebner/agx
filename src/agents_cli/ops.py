@@ -176,7 +176,7 @@ def _multipass_compose_argv(cfg: AgentsConfig) -> list[str]:
 
 def _services_to_check(cfg: AgentsConfig, target: str | None) -> list[tuple[str, str, str]]:
     """List of (service_name, agent_type, agent_name) to doctor over."""
-    doc = compose.load_compose(cfg.paths.host_data_dir / "docker-compose.yml")
+    doc = compose.read_compose_doc(cfg)
     services = doc.get("services") or {}
     out: list[tuple[str, str, str]] = []
     for svc_name in services:
@@ -278,7 +278,7 @@ def _check_port_conflicts(cfg: AgentsConfig, report: DoctorReport) -> None:
     used = compose.used_ports(cfg)
     # used_ports returns a set, so duplicates are already collapsed. Re-derive
     # the list and look for repeats by counting via the compose doc.
-    doc = compose.load_compose(cfg.paths.host_data_dir / "docker-compose.yml")
+    doc = compose.read_compose_doc(cfg)
     counts: dict[int, int] = {}
     for svc in (doc.get("services") or {}).values():
         for entry in svc.get("ports", []) or []:

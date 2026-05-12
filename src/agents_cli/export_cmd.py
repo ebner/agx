@@ -94,7 +94,7 @@ def export_all(
     config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH,
 ) -> list[Path]:
     cfg = cfg_mod.load(config_path)
-    doc = compose.load_compose(cfg.paths.host_data_dir / "docker-compose.yml")
+    doc = compose.read_compose_doc(cfg)
     archives: list[Path] = []
     for svc in doc.get("services") or {}:
         for at in AGENT_TYPES:

@@ -55,9 +55,11 @@ def saved_config(cfg: AgentsConfig, tmp_path: Path) -> Path:
 
 
 @pytest.fixture
-def stub_runners(mocker):
-    """Stub every multipass / docker-compose interaction with success."""
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok())
+def stub_runners(mocker, cfg: AgentsConfig):
+    """Stub every multipass / docker-compose interaction with VM-fs simulation."""
+    from tests.conftest import install_vm_fs_simulation
+
+    install_vm_fs_simulation(mocker, cfg)
     mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
     mocker.patch("agents_cli.compose_runner.down", return_value=_ok())
     mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())

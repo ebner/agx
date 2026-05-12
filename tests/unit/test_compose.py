@@ -222,24 +222,67 @@ def test_round_trip_preserves_comments(tmp_path: Path) -> None:
 
 
 def test_write_compose_atomically_succeeds(cfg: AgentsConfig, mocker) -> None:
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok())
+    from tests.conftest import install_vm_fs_simulation
+
+    install_vm_fs_simulation(mocker, cfg)
     doc = load_compose(cfg.paths.host_data_dir / "docker-compose.yml")
     add_service(doc, "hermes-coder", {"image": "x:y"})
     write_compose_atomically(cfg, doc)
     final = (cfg.paths.host_data_dir / "docker-compose.yml").read_text()
     assert "hermes-coder" in final
-    # No leftover temp files
+    # No leftover temp files (VM staging mapped to host via mount-sim)
     assert not any(cfg.paths.host_data_dir.glob(".compose.*.new"))
+    # No host temp left in /tmp
+    assert not any(Path("/tmp").glob(f"agents-compose-{__import__('os').getpid()}-*.yml"))
 
 
 def test_write_compose_atomically_validation_failure_keeps_old_file(
     cfg: AgentsConfig, mocker
 ) -> None:
+    from tests.conftest import install_vm_fs_simulation
+
     # Seed an existing valid compose
     (cfg.paths.host_data_dir / "docker-compose.yml").write_text(
         "services:\n  existing: {image: i}\n", encoding="utf-8"
     )
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_fail("yaml error"))
+    install_vm_fs_simulation(mocker, cfg)
+    # Validation step (docker compose ... config -q) gets a failing rc. We
+    # override the `in_vm_runner` for that one call by routing every exec
+    # through a stub that returns failure when "config" is in the cmd.
+    original = mocker.patch("agents_cli.mp.exec_in_vm")
+
+    def selective(vm_name: str, *cmd: str, check: bool = True):
+        joined = " ".join(cmd)
+        if "config" in joined and "-q" in joined:
+            return _fail("yaml error")
+        # mv operation still needs to execute the host-side rename
+        if cmd and cmd[0] == "mv" and len(cmd) >= 3:
+            import os
+
+            src = Path(cmd[1])
+            dst = Path(cmd[2])
+            # Map VM paths to host
+            vm_root = str(cfg.paths.vm_agents_root)
+            if str(src).startswith(vm_root):
+                src = cfg.paths.host_data_dir / src.relative_to(vm_root)
+            if str(dst).startswith(vm_root):
+                dst = cfg.paths.host_data_dir / dst.relative_to(vm_root)
+            os.replace(src, dst)
+            return _ok()
+        if cmd and cmd[0] == "rm":
+            for arg in cmd[1:]:
+                if arg.startswith("-"):
+                    continue
+                p = Path(arg)
+                vm_root = str(cfg.paths.vm_agents_root)
+                if str(p).startswith(vm_root):
+                    p = cfg.paths.host_data_dir / p.relative_to(vm_root)
+                p.unlink(missing_ok=True)
+            return _ok()
+        return _ok()
+
+    original.side_effect = selective
+
     doc = load_compose(cfg.paths.host_data_dir / "docker-compose.yml")
     add_service(doc, "broken", {"image": "x:y"})
     with pytest.raises(UserError, match="compose file invalid"):
@@ -250,11 +293,16 @@ def test_write_compose_atomically_validation_failure_keeps_old_file(
     assert not any(cfg.paths.host_data_dir.glob(".compose.*.new"))
 
 
-def test_write_refuses_under_data_dir_in_vm(cfg: AgentsConfig) -> None:
+def test_write_supports_data_dir_in_vm_mode(cfg: AgentsConfig, mocker) -> None:
+    """Under --data-dir-in-vm the mutation pattern is identical; only
+    the read side differs. The simulator treats both modes the same."""
+    from tests.conftest import install_vm_fs_simulation
+
     cfg.paths.data_dir_in_vm = True
+    install_vm_fs_simulation(mocker, cfg)
     doc = load_compose(cfg.paths.host_data_dir / "docker-compose.yml")
-    with pytest.raises(UserError, match="data-dir-in-vm"):
-        write_compose_atomically(cfg, doc)
+    add_service(doc, "hermes-coder", {"image": "x:y"})
+    write_compose_atomically(cfg, doc)  # no UserError
 
 
 def test_write_refuses_when_vm_runtime_unpopulated(tmp_path: Path) -> None:
@@ -269,15 +317,26 @@ def test_write_refuses_when_vm_runtime_unpopulated(tmp_path: Path) -> None:
 # ---------- temp cleanup ----------
 
 
-def test_cleanup_stale_temps_removes_residue(cfg: AgentsConfig) -> None:
+def test_cleanup_stale_temps_removes_residue(cfg: AgentsConfig, mocker) -> None:
+    from tests.conftest import install_vm_fs_simulation
+
     d = cfg.paths.host_data_dir
+    install_vm_fs_simulation(mocker, cfg)
     (d / ".compose.1234.abc.new").write_text("junk", encoding="utf-8")
     (d / ".compose.5678.def.new").write_text("junk", encoding="utf-8")
     (d / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
-    cleanup_stale_temps(d)
+    # Also leave a host-side /tmp straggler from this PID
+    import os
+    import tempfile
+
+    host_temp = Path(tempfile.gettempdir()) / f"agents-compose-{os.getpid()}-stale.yml"
+    host_temp.write_text("stale", encoding="utf-8")
+    cleanup_stale_temps(cfg)
     assert not any(d.glob(".compose.*.new"))
     # Real compose untouched
     assert (d / "docker-compose.yml").exists()
+    # /tmp straggler from this PID was swept
+    assert not host_temp.exists()
 
 
 # ---------- port allocator ----------
