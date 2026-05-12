@@ -34,6 +34,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from agents_cli import compose as compose_mod_lock  # imported for acquire_lock
 from agents_cli import compose_runner, hermes_config, mp, templates, ui
 from agents_cli import config as cfg_mod
 from agents_cli.agents_cmd import _detect_type_from_compose
@@ -230,38 +231,39 @@ def skill_enable(name: str, *, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) 
             "`openclaw models auth login --provider openai-codex` inside the container)"
         )
 
-    doc = hermes_config.load(hermes_config.config_path(cfg, name))
-    current_image = (
-        hermes_config.get_terminal_docker_image(doc) or templates.HERMES_DEFAULT_SANDBOX_IMAGE
-    )
-
-    if current_image.startswith(SANDBOX_IMAGE_PREFIX):
-        # Already running our derived image; idempotent re-enable.
-        derived = current_image
-    else:
-        derived = _sandbox_image_tag(current_image)
-        _build_sandbox_image_in_vm(cfg, derived, current_image)
-
-    # Persist the original image so skill-disable can restore it. Skip
-    # rewrite when we're already on the derived image AND state file exists,
-    # to keep re-enable a true no-op.
-    state_path = _skill_state_path(cfg, name)
-    if not state_path.exists():
-        state_path.parent.mkdir(parents=True, exist_ok=True)
-        state_path.write_text(
-            json.dumps(
-                {"original_docker_image": current_image, "derived_image": derived},
-                indent=2,
-            ),
-            encoding="utf-8",
+    with compose_mod_lock.acquire_lock(cfg.paths.host_data_dir):
+        doc = hermes_config.read_doc(cfg, name)
+        current_image = (
+            hermes_config.get_terminal_docker_image(doc) or templates.HERMES_DEFAULT_SANDBOX_IMAGE
         )
 
-    hermes_config.set_terminal_docker_image(doc, derived)
-    hermes_config.add_docker_volume(doc, _sandbox_volume_mapping(cfg))
-    hermes_config.write_atomically(cfg, name, doc)
+        if current_image.startswith(SANDBOX_IMAGE_PREFIX):
+            # Already running our derived image; idempotent re-enable.
+            derived = current_image
+        else:
+            derived = _sandbox_image_tag(current_image)
+            _build_sandbox_image_in_vm(cfg, derived, current_image)
 
-    svc = _service_name_for(name, "hermes")
-    compose_runner.up(cfg, svc)
+        # Persist the original image so skill-disable can restore it. Skip
+        # rewrite when we're already on the derived image AND state file
+        # exists, to keep re-enable a true no-op.
+        state_path = _skill_state_path(cfg, name)
+        if not state_path.exists():
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            state_path.write_text(
+                json.dumps(
+                    {"original_docker_image": current_image, "derived_image": derived},
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+        hermes_config.set_terminal_docker_image(doc, derived)
+        hermes_config.add_docker_volume(doc, _sandbox_volume_mapping(cfg))
+        hermes_config.write_atomically(cfg, name, doc)
+
+        svc = _service_name_for(name, "hermes")
+        compose_runner.up(cfg, svc)
 
     ui.emit(
         {"name": name, "derived_image": derived},
@@ -284,18 +286,19 @@ def skill_disable(name: str, *, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH)
     if not state_path.exists():
         raise UserError(f"codex skill is not enabled for {name!r}; no .codex-skill.json found")
 
-    state = json.loads(state_path.read_text(encoding="utf-8"))
-    original_image = state["original_docker_image"]
+    with compose_mod_lock.acquire_lock(cfg.paths.host_data_dir):
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        original_image = state["original_docker_image"]
 
-    doc = hermes_config.load(hermes_config.config_path(cfg, name))
-    hermes_config.set_terminal_docker_image(doc, original_image)
-    hermes_config.remove_docker_volume(doc, _sandbox_volume_mapping(cfg))
-    hermes_config.write_atomically(cfg, name, doc)
+        doc = hermes_config.read_doc(cfg, name)
+        hermes_config.set_terminal_docker_image(doc, original_image)
+        hermes_config.remove_docker_volume(doc, _sandbox_volume_mapping(cfg))
+        hermes_config.write_atomically(cfg, name, doc)
 
-    state_path.unlink()
+        state_path.unlink()
 
-    svc = _service_name_for(name, "hermes")
-    compose_runner.up(cfg, svc)
+        svc = _service_name_for(name, "hermes")
+        compose_runner.up(cfg, svc)
 
     ui.emit(
         {"name": name, "restored_image": original_image},

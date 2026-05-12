@@ -36,9 +36,27 @@ def up(cfg: AgentsConfig, *services: str, detach: bool = True) -> MpResult:
 
 
 def down(cfg: AgentsConfig, *services: str, remove_orphans: bool = False) -> MpResult:
+    """Bring the whole compose project (or a service subset) down.
+
+    Note that ``docker compose down`` behavior with explicit services is
+    version-dependent; prefer ``stop`` + ``rm`` for a service-scoped
+    teardown, which is what ``agents_cmd.remove`` and ``rename`` use.
+    """
     argv = [*_base_argv(cfg), "down"]
     if remove_orphans:
         argv.append("--remove-orphans")
+    argv.extend(services)
+    return mp.exec_in_vm(cfg.vm.name, *argv)
+
+
+def rm(cfg: AgentsConfig, *services: str, force: bool = True, stop: bool = True) -> MpResult:
+    """Remove specific compose services' containers. ``force`` skips the
+    prompt; ``stop`` first stops them. Service-scoped, unlike ``down``."""
+    argv = [*_base_argv(cfg), "rm"]
+    if force:
+        argv.append("-f")
+    if stop:
+        argv.append("-s")
     argv.extend(services)
     return mp.exec_in_vm(cfg.vm.name, *argv)
 

@@ -101,6 +101,26 @@ def _service_in_compose(cfg: AgentsConfig, service_name_value: str) -> bool:
     return service_name_value in (doc.get("services") or {})
 
 
+def _has_live_container(cfg: AgentsConfig, service_name_value: str) -> bool:
+    """Return True if a running container with ``container_name = <service>``
+    is currently up. Conservatively returns False on any docker error so
+    that ``--reuse-data`` doesn't refuse based on a docker hiccup."""
+    result = mp.exec_in_vm(
+        cfg.vm.name,
+        "docker",
+        "ps",
+        "--filter",
+        f"name=^{service_name_value}$",
+        "--format",
+        "{{.Names}}",
+        check=False,
+    )
+    if result.returncode != 0:
+        return False
+    names = {ln.strip() for ln in (result.stdout or "").splitlines() if ln.strip()}
+    return service_name_value in names
+
+
 # ---------- create ----------
 
 
@@ -124,16 +144,7 @@ def create(
     cfg = cfg_mod.load(config_path)
     svc = service_name(name, agent_type)
 
-    # Allocate the port if not given.
-    if port is None:
-        base = (
-            cfg.defaults.hermes_base_port
-            if agent_type == "hermes"
-            else cfg.defaults.openclaw_base_port
-        )
-        port = compose.next_free_port(cfg, base=base)
-
-    # Decide tag.
+    # Decide tag (cheap, no race).
     tag = image_tag or (
         cfg.defaults.hermes_image_tag if agent_type == "hermes" else cfg.defaults.openclaw_image_tag
     )
@@ -143,22 +154,42 @@ def create(
             "or pass --image-tag"
         )
 
-    # Refuse if data dir is already there unless --reuse-data and no live container maps it.
-    if _data_dir_exists(cfg, name, agent_type) and not reuse_data:
-        if _service_in_compose(cfg, svc):
-            raise UserError(
-                f"agent {name!r} already exists. To re-create, run `agents remove {name}` first."
-            )
-        raise UserError(
-            f"data directory for {name!r} already exists at {cfg.paths.host_data_dir / name}. "
-            f"Pass --reuse-data to attach to it, or pick a different name."
-        )
-
     required = ["data_dir_created", "compose_updated", "service_up"]
     if run_setup:
         required.append("setup_done")
 
     with compose.acquire_lock(cfg.paths.host_data_dir):
+        # Everything that observes or mutates compose / data-dir state must
+        # be inside the lock, including port allocation (which scans the
+        # live compose) and the --reuse-data live-container check.
+        if port is None:
+            base = (
+                cfg.defaults.hermes_base_port
+                if agent_type == "hermes"
+                else cfg.defaults.openclaw_base_port
+            )
+            port = compose.next_free_port(cfg, base=base)
+
+        if _data_dir_exists(cfg, name, agent_type):
+            if not reuse_data:
+                if _service_in_compose(cfg, svc):
+                    raise UserError(
+                        f"agent {name!r} already exists. "
+                        f"To re-create, run `agents remove {name}` first."
+                    )
+                raise UserError(
+                    f"data directory for {name!r} already exists at "
+                    f"{cfg.paths.host_data_dir / name}. Pass --reuse-data to attach to it, "
+                    f"or pick a different name."
+                )
+            # --reuse-data path: refuse if a live container is currently mapping
+            # the dir, regardless of compose state. Plan rule #1.
+            if _has_live_container(cfg, svc):
+                raise UserError(
+                    f"refusing --reuse-data: container {svc!r} is currently running and maps "
+                    f"the data dir. Stop it first with `agents stop {name}`."
+                )
+
         journal = Journal.find_resumable(cfg.paths.host_data_dir, "create", name) or Journal.begin(
             cfg.paths.host_data_dir, "create", name, CREATE_PHASES
         )
@@ -337,8 +368,11 @@ def remove(
         for phase in _phases_to_run(journal):
             if phase == "container_stopped":
                 if _service_in_compose(cfg, svc):
+                    # `compose stop` + `compose rm -fs <svc>` is service-scoped;
+                    # `compose down <svc>` is version-dependent and historically
+                    # has brought the whole project down regardless of args.
                     compose_runner.stop(cfg, svc)
-                    compose_runner.down(cfg, svc)
+                    compose_runner.rm(cfg, svc)
                 journal.advance(phase)
             elif phase == "compose_updated":
                 doc = compose.read_compose_doc(cfg)
@@ -424,7 +458,11 @@ def rename(
                     old_dir.rename(new_dir)
                 journal.advance(phase)
             elif phase == "container_recreated":
-                compose_runner.down(cfg, new_svc)
+                # Old container's container_name no longer matches anything in
+                # compose; remove it explicitly so it doesn't linger. Then
+                # bring up the renamed service.
+                old_container = f"{agent_type}-{old_name}"
+                mp.exec_in_vm(cfg.vm.name, "docker", "rm", "-f", old_container, check=False)
                 compose_runner.up(cfg, new_svc)
                 journal.advance(phase)
 
