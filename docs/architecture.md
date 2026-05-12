@@ -48,20 +48,20 @@
 
 ## Data flow
 
-1. **`agents vm init`** launches the Multipass VM, mounts the host `<data-dir>` at `/home/ubuntu/agents` with explicit UID/GID mapping, installs rootless Docker, and runs the bootstrap script (`templates.VM_BOOTSTRAP_SCRIPT`). The script emits a final `BOOTSTRAP_OK ...` line; `mp.parse_bootstrap_ok` reads it. Captured fields (rootless docker socket path, ubuntu UID/GID, etc.) land in `~/.config/agents/config.toml` under `[vm_runtime]`.
-2. **`agents create`** allocates a free port, writes a service fragment into `docker-compose.yml`, then `docker compose up -d <service>` inside the VM. Per-agent paths are bind-mounted from the host so backups round-trip cleanly.
-3. **`agents upgrade`** takes two snapshots (host-data tarball + multipass VM snapshot), pins the new tag, pulls, verifies via `docker image inspect`, recreates, then runs `doctor`. Auto-reverts the compose tag on any failure.
-4. **`agents doctor`** runs a layered health probe (VM reachable, mount round-trip, rootless docker service active, container state, `docker ps` inside the Hermes container as the runtime user, `hermes doctor` itself, disk space, port conflicts, dangling journals, Codex auth expiry).
+1. **`agents vm init`** launches the Multipass VM, mounts the host `<data-dir>` at `/home/ubuntu/agents` with explicit UID/GID mapping (host-mount mode) or skips the mount (`--data-dir-in-vm`), installs rootless Docker, and runs the bootstrap script (`templates.VM_BOOTSTRAP_SCRIPT`). The script emits a final `BOOTSTRAP_OK ...` line; `mp.parse_bootstrap_ok` reads it. Captured fields (rootless docker socket path, ubuntu UID/GID, etc.) land in `~/.config/agents/config.toml` under `[vm_runtime]`. Seed files (`docker-compose.yml`, `.env`, `.codex/`, `backups/`, `.upgrades/`) are written host-side in host-mount mode; in `--data-dir-in-vm` mode they're written VM-side via `exec_bash` and only `.journal/` lives on the host.
+2. **`agents create`** allocates a free port (inside the flock), inspects the pinned Hermes image to verify USER/HOME, writes a service fragment into `docker-compose.yml` via the multipass-transfer mutation pattern, then `docker compose up -d <service>` inside the VM. Per-agent paths are bind-mounted from the host so backups round-trip cleanly. `--reuse-data` is allowed only if no live container currently maps the dir.
+3. **`agents upgrade`** takes two snapshots (host-data `.tar.zst` + multipass VM snapshot), pins the new tag via compose mutation, pulls, verifies via `docker image inspect`, recreates, then runs `doctor`. Auto-reverts the compose tag on any failure; both snapshot ids are reported so the user can `agents rollback <name>` (or `--snapshot <id>` to pick a specific one).
+4. **`agents doctor`** runs a layered health probe (VM reachable, mount round-trip, rootless docker service active, container state, `docker ps` inside the Hermes container as the runtime user, `hermes doctor` itself, disk space, port conflicts, dangling journals, Codex auth + token expiry, per-Hermes-agent in-container Codex mount).
 
 ## Why a single mount
 
-The Multipass VM's own disk is small (Ubuntu + Docker engine + image cache). Every byte of agent state — config, sessions, skills, memories, the Codex auth — lives under `<data-dir>` on the host filesystem. Three knock-on benefits:
+The Multipass VM's own disk is small (Ubuntu + Docker engine + image cache). Every byte of agent state — config, sessions, skills, memories, the Codex auth — lives under `<data-dir>` on the host filesystem (in host-mount mode) or inside the VM at `<vm_agents_root>` (in `--data-dir-in-vm` mode). Three knock-on benefits in host-mount mode:
 
 - **Backups are free.** Whatever the user already runs over `<data-dir>` (duplicity, restic, borg, …) automatically backs up agent state.
 - **VM is disposable.** `agents vm destroy` removes the VM but leaves `<data-dir>` and the toolkit-scoped Codex auth intact, so re-running `vm init` brings the agents back.
-- **Atomic mutations are easy.** Compose and per-agent config edits use `os.replace` on the host filesystem — no multipass round-trips needed for write atomicity. The VM only validates via `docker compose ... config -q`.
+- **Mutations are uniform.** Compose and per-agent config edits go through `multipass transfer` to a staged file in the VM project directory, validate via `docker compose ... config -q`, then atomic VM-side `mv`. Same code path applies in `--data-dir-in-vm` mode; only the read side differs (transfer-from-VM vs direct host read).
 
-The cost is 9p mount overhead for SQLite-heavy workloads. The opt-out is `vm init --data-dir-in-vm`, which keeps data on the VM disk and uses `multipass transfer` for export.
+The cost is 9p mount overhead for SQLite-heavy workloads. The opt-out is `vm init --data-dir-in-vm`, which keeps data on the VM disk and routes every read/write through `multipass transfer` + `tar --zstd` for exports.
 
 ## Module map
 

@@ -39,9 +39,11 @@ The toolkit handles both via `agents codex skill-enable <hermes-agent>`:
 4. Updates the agent's `terminal.docker_image` to the derived image.
 5. Adds a sandbox volume entry to `terminal.docker_volumes`:
    ```
-   /home/ubuntu/agents/.codex:/root/.codex:ro
+   /home/ubuntu/agents/.codex:/codex:ro
    ```
-   **Critical detail:** these paths are interpreted by the **VM Docker daemon**, not by paths inside the Hermes runtime container. So the host side is the VM-side mount path (`/home/ubuntu/agents/.codex`), not anything from inside the Hermes container.
+   The mount target is the fixed path `/codex` because the derived Dockerfile sets `ENV CODEX_HOME=/codex`. That makes the integration work for sandbox base images that run as root, `pn`, `node`, or anything else — Codex CLI honors `CODEX_HOME` everywhere.
+
+   **Critical detail:** the host side of the mount (`/home/ubuntu/agents/.codex`) is a VM-side host path, interpreted by the **VM Docker daemon**. NOT a path inside the Hermes runtime container.
 6. Persists the original image at `<data-dir>/<name>/.data/.codex-skill.json` so `skill-disable` can reverse the change.
 7. Restarts the agent's service.
 

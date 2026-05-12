@@ -37,13 +37,18 @@ agents export coder              # archive into <data-dir>/backups/
 agents upgrade coder --tag v1.2.4
 
 # Upgrade everything; canary first
-agents upgrade-all --canary coder
+agents upgrade --all --canary coder
 
 # Restore from the latest pre-upgrade snapshot if something went sideways
 agents rollback coder --yes
+
+# Or pick a specific snapshot id (filename, suffix-match, or pre-upgrade-*
+# multipass snapshot name to restore only the VM):
+agents rollback coder --snapshot coder-20260512T120000Z.tar.zst
+agents rollback coder --snapshot pre-upgrade-coder-20260512T120000Z
 ```
 
-`agents upgrade` takes two snapshots before touching anything: a host-data tarball at `<data-dir>/.upgrades/<name>-<utc>.tar.gz` and a multipass VM snapshot `pre-upgrade-<name>-<utc>`. Both are listed in the upgrade outcome JSON / human output.
+`agents upgrade` takes two snapshots before touching anything: a host-data `.tar.zst` at `<data-dir>/.upgrades/<name>-<utc>.tar.zst` and a multipass VM snapshot `pre-upgrade-<name>-<utc>`. Both are listed in the upgrade outcome JSON / human output. Legacy `.tar.gz` archives from pre-v0.1.1 versions still work for rollback.
 
 ## Recovery from a crashed operation
 
@@ -80,7 +85,11 @@ Whatever host backup you run over `<data-dir>` (duplicity, restic, borg, …) co
 For crash-consistent snapshots, run `agents export <name>` first — that writes a clean tarball into `<data-dir>/backups/` that the host backup will pick up on its next run.
 
 ```bash
-agents export-cron install --time 02:30   # daily export at 02:30 host time
+agents export coder              # one agent
+agents export --all              # all agents
+agents export --all --to ~/elsewhere/  # send archives somewhere other than <data-dir>/backups/
+
+agents export-cron install --time 02:30   # daily `export --all` at 02:30 host time
 agents export-cron status
 agents export-cron uninstall
 ```
@@ -88,8 +97,10 @@ agents export-cron uninstall
 ## Tearing down
 
 ```bash
-agents export-all                 # bag everything
-agents vm destroy --yes           # VM gone; <data-dir> stays
+agents export --all               # bag everything
+agents vm destroy                 # prompts to run `export --all` first unless --yes
+agents vm destroy --yes           # skip both the export offer and the destroy prompt
+agents vm destroy --export-first  # always export before destroying
 ```
 
 `vm destroy` does not touch `<data-dir>` or `~/.codex`. To reset completely, manually `rm -rf <data-dir>` afterward (irreversible).
