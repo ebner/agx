@@ -1,0 +1,54 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agents-cli"
+version = "0.1.0"
+description = "Host-side CLI for managing AI agents (Hermes, OpenClaw) in a Multipass VM"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+authors = [{ name = "Hannes Ebner", email = "hannes@ebner.se" }]
+dependencies = [
+    "click>=8.1",
+    "ruamel.yaml>=0.18",
+    "tomlkit>=0.13",
+    "pydantic>=2.6",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-mock>=3.12",
+    "ruff>=0.6",
+    "mypy>=1.10",
+]
+
+[project.scripts]
+agents = "agents_cli.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agents_cli"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unreachable = true
+warn_redundant_casts = true
+disallow_untyped_decorators = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "multipass: integration tests that require a real Multipass VM (opt-in via `pytest -m multipass`)",
+]
+addopts = "-ra --strict-markers"
