@@ -1,0 +1,145 @@
+"""Embedded templates.
+
+These are kept in a Python module rather than separate files so they ride
+with the wheel and tests can verify them without filesystem fixtures.
+
+- ``VM_BOOTSTRAP_SCRIPT`` is piped via ``multipass exec ... bash -s`` at
+  ``vm init``. The closing ``BOOTSTRAP_OK`` line is the handshake that
+  ``mp.parse_bootstrap_ok`` consumes.
+- ``FALLBACK_HERMES_IMAGE_TAG`` / ``FALLBACK_OPENCLAW_IMAGE_TAG`` are the
+  conservative defaults used when ``vm init``'s GitHub Releases query
+  times out or hits a network error. The pinned tag actually used by
+  ``agents create`` lives in ``config.toml`` and can override these at
+  any time.
+- ``render_codex_sandbox_dockerfile`` builds the FROM-base Dockerfile
+  for ``agents codex skill-enable``: derive whatever sandbox image the
+  agent currently uses, install Node + the Codex CLI on top.
+"""
+
+from __future__ import annotations
+
+from typing import Final
+
+# Hermes + OpenClaw image tags — fallbacks when GitHub Releases query
+# fails at `vm init`. Bump deliberately; let the runtime query handle
+# the moving target.
+FALLBACK_HERMES_IMAGE_TAG: Final = "v1.0.0"
+FALLBACK_OPENCLAW_IMAGE_TAG: Final = "0.1.0"
+
+# Hermes' default sandbox image (`terminal.docker_image`). Used as the
+# FROM base for `agents codex skill-enable` unless the agent has set
+# its own override.
+HERMES_DEFAULT_SANDBOX_IMAGE: Final = "nikolaik/python-nodejs:python3.11-nodejs20"
+
+
+VM_BOOTSTRAP_SCRIPT: Final = r"""#!/usr/bin/env bash
+# Idempotent rootless-Docker bootstrap for the `agents` Multipass VM.
+# Emits a final `BOOTSTRAP_OK ...` line that mp.parse_bootstrap_ok reads.
+#
+# Re-runnable: every step checks before doing. Failures land as
+# `<field>=fail` in the handshake so the host CLI can refuse to proceed
+# without burying the cause in subprocess noise.
+
+set -uo pipefail
+
+UIDMAP_OK=fail
+DBUS_OK=fail
+LINGERING_OK=fail
+DOCKER_HOST_OK=fail
+DAEMON_OK=fail
+USER_SOCKET_ACTIVE_OK=fail
+NET_OK=fail
+
+# --- 1. Rootless-Docker prerequisites ---------------------------------------
+export DEBIAN_FRONTEND=noninteractive
+sudo apt-get update -qq >/dev/null 2>&1 || true
+sudo apt-get install -y -qq \
+    uidmap dbus-user-session curl ca-certificates iptables jq slirp4netns \
+    fuse-overlayfs >/dev/null 2>&1 || true
+
+command -v newuidmap >/dev/null 2>&1 && UIDMAP_OK=ok
+[ -d /run/user ] && systemctl --version >/dev/null 2>&1 && DBUS_OK=ok
+
+# --- 2. Lingering so the user systemd survives multipass exec disconnect ----
+sudo loginctl enable-linger ubuntu >/dev/null 2>&1 || true
+if loginctl show-user ubuntu --property=Linger 2>/dev/null | grep -q "Linger=yes"; then
+    LINGERING_OK=ok
+fi
+
+# --- 3. Install rootless Docker as `ubuntu` ---------------------------------
+UBUNTU_UID=$(id -u ubuntu)
+UBUNTU_GID=$(id -g ubuntu)
+SOCKET_PATH="/run/user/${UBUNTU_UID}/docker.sock"
+
+# Run-as-ubuntu helper that mirrors a login shell so systemd-user is available.
+as_ubuntu() {
+    sudo -iu ubuntu env XDG_RUNTIME_DIR="/run/user/${UBUNTU_UID}" \
+        DOCKER_HOST="unix://${SOCKET_PATH}" bash -c "$1"
+}
+
+if ! as_ubuntu 'command -v dockerd-rootless-setuptool.sh >/dev/null 2>&1'; then
+    # Official install: pulls the standard docker-ce packages and lays down
+    # the rootless setup tool. Network failures bubble up via NET_OK.
+    as_ubuntu 'curl -fsSL https://get.docker.com/rootless | sh' >/dev/null 2>&1 || true
+fi
+
+as_ubuntu 'dockerd-rootless-setuptool.sh install --force' >/dev/null 2>&1 || true
+as_ubuntu 'systemctl --user enable docker.service' >/dev/null 2>&1 || true
+as_ubuntu 'systemctl --user start docker.service' >/dev/null 2>&1 || true
+
+# --- 4. Export DOCKER_HOST in ubuntu's shell rc files -----------------------
+EXPORT_LINE="export DOCKER_HOST=unix://${SOCKET_PATH}"
+for rc in /home/ubuntu/.profile /home/ubuntu/.bashrc; do
+    if [ -f "$rc" ] && ! sudo grep -qF "$EXPORT_LINE" "$rc"; then
+        echo "$EXPORT_LINE" | sudo tee -a "$rc" >/dev/null
+    fi
+done
+
+if as_ubuntu "test -S '${SOCKET_PATH}'"; then
+    DOCKER_HOST_OK=ok
+fi
+
+# --- 5. Daemon reachable ----------------------------------------------------
+if as_ubuntu "docker version --format '{{.Server.Version}}' >/dev/null 2>&1"; then
+    DAEMON_OK=ok
+fi
+
+# --- 6. systemd --user docker.service is-active -----------------------------
+if as_ubuntu 'systemctl --user is-active docker.service >/dev/null 2>&1'; then
+    USER_SOCKET_ACTIVE_OK=ok
+fi
+
+# --- 7. Network reach (so image pulls don't fail mysteriously later) --------
+if curl -sfI --max-time 5 https://ghcr.io >/dev/null 2>&1; then
+    NET_OK=ok
+fi
+
+# --- 8. Handshake -----------------------------------------------------------
+echo "BOOTSTRAP_OK uidmap=${UIDMAP_OK} dbus=${DBUS_OK} lingering=${LINGERING_OK} docker_host=${DOCKER_HOST_OK} daemon=${DAEMON_OK} user_socket_active=${USER_SOCKET_ACTIVE_OK} net=${NET_OK} ubuntu_uid=${UBUNTU_UID} ubuntu_gid=${UBUNTU_GID} socket_path=${SOCKET_PATH}"
+"""
+
+
+def render_codex_sandbox_dockerfile(base_image: str) -> str:
+    """Render the Dockerfile for `agents codex skill-enable`.
+
+    The derived image adds Node + the Codex CLI on top of whatever the
+    agent's current ``terminal.docker_image`` is, so user customizations
+    survive the upgrade.
+    """
+    return (
+        f"FROM {base_image}\n"
+        "RUN apt-get update \\\n"
+        " && apt-get install -y --no-install-recommends nodejs npm curl ca-certificates \\\n"
+        " && npm install -g @openai/codex \\\n"
+        " && apt-get clean && rm -rf /var/lib/apt/lists/*\n"
+    )
+
+
+def initial_compose_content() -> str:
+    """Empty compose file written into the data-dir at `vm init`."""
+    return "services: {}\n"
+
+
+def initial_env_content(host_uid: int, host_gid: int) -> str:
+    """The .env file written alongside the compose at `vm init`."""
+    return f"HERMES_UID={host_uid}\nHERMES_GID={host_gid}\n"
