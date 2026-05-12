@@ -69,7 +69,31 @@ def login(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> None:
     result = subprocess.run([codex_bin, "auth", "login"], env=env, check=False)
     if result.returncode != 0:
         raise RuntimeFailure(f"codex auth login failed (rc={result.returncode})")
+    # Under --data-dir-in-vm the containers mount <vm_agents_root>/.codex,
+    # not the host. Sync the freshly-written auth into the VM.
+    if cfg.paths.data_dir_in_vm:
+        _sync_host_codex_to_vm(cfg)
     ui.emit({"auth": "ok", "codex_home": env["CODEX_HOME"]}, human="codex auth ok")
+
+
+def _sync_host_codex_to_vm(cfg: AgentsConfig) -> None:
+    """Push the host-side toolkit Codex dir into the VM so per-agent
+    bind-mounts (which point at the VM-side ``<vm_agents_root>/.codex``)
+    see the same auth as ``agents codex login`` just wrote.
+    """
+    host_dir = _codex_home(cfg)
+    if not host_dir.exists():
+        return
+    mp.exec_in_vm(
+        cfg.vm.name,
+        "mkdir",
+        "-p",
+        f"{cfg.paths.vm_agents_root}/.codex",
+        check=False,
+    )
+    for src in host_dir.iterdir():
+        if src.is_file():
+            mp.transfer_to_vm(src, cfg.vm.name, f"{cfg.paths.vm_agents_root}/.codex/{src.name}")
 
 
 def refresh(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> None:
@@ -90,6 +114,8 @@ def refresh(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> None:
         raise UserError(
             "silent refresh not possible; run `agents codex login` for interactive re-auth"
         )
+    if cfg.paths.data_dir_in_vm:
+        _sync_host_codex_to_vm(cfg)
     ui.emit({"refresh": "ok"}, human="codex token refreshed")
 
 
@@ -365,15 +391,22 @@ def skill_disable(name: str, *, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH)
 
 
 def _build_sandbox_image_in_vm(cfg: AgentsConfig, image_tag: str, base_image: str) -> None:
-    """Stage the Dockerfile in the data dir and run `docker build` in the VM."""
+    """Write the Dockerfile to a host temp, ``multipass transfer`` it into
+    the VM project dir, then ``docker build`` against the staged file.
+
+    Works in both modes uniformly. In host-mount mode the transfer ends
+    up on the host too (via the mount); in ``--data-dir-in-vm`` mode it
+    only exists in the VM.
+    """
     dockerfile_content = templates.render_codex_sandbox_dockerfile(base_image)
     dockerfile_name = (
         f".codex-sandbox-{hashlib.sha256(image_tag.encode()).hexdigest()[:8]}.Dockerfile"
     )
-    dockerfile_host = cfg.paths.host_data_dir / dockerfile_name
-    dockerfile_host.write_text(dockerfile_content, encoding="utf-8")
+    host_temp = Path("/tmp") / f"agents-{dockerfile_name}-{os.getpid()}"
+    vm_dockerfile = f"{cfg.paths.vm_agents_root}/{dockerfile_name}"
     try:
-        vm_dockerfile = f"{cfg.paths.vm_agents_root}/{dockerfile_name}"
+        host_temp.write_text(dockerfile_content, encoding="utf-8")
+        mp.transfer_to_vm(host_temp, cfg.vm.name, vm_dockerfile)
         result = mp.exec_in_vm(
             cfg.vm.name,
             "docker",
@@ -388,4 +421,5 @@ def _build_sandbox_image_in_vm(cfg: AgentsConfig, image_tag: str, base_image: st
         if result.returncode != 0:
             raise RuntimeFailure(f"docker build failed for {image_tag}: {result.stderr.strip()}")
     finally:
-        dockerfile_host.unlink(missing_ok=True)
+        host_temp.unlink(missing_ok=True)
+        mp.exec_in_vm(cfg.vm.name, "rm", "-f", vm_dockerfile, check=False)

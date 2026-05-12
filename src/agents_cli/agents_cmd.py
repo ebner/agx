@@ -281,16 +281,24 @@ def _verify_hermes_image_user(cfg: AgentsConfig, tag: str) -> None:
     """Inspect the pinned Hermes image and refuse if the entrypoint user
     or home isn't where the toolkit mounts the Codex auth.
 
-    The Codex import path mounts ``/home/hermes/.codex``; if upstream
-    Hermes ever changes the container user, that mount target is wrong
-    and the import silently fails. This check trips early with a clear
-    error so the user knows to update the toolkit.
+    Pulls the image first if missing, so first-create runs actually
+    verify instead of silently no-op'ing on (None, None). The Codex
+    import path mounts ``/home/hermes/.codex``; if upstream Hermes ever
+    changes the container user, that mount target is wrong and the
+    import silently fails. This check trips early with a clear error so
+    the user knows to update the toolkit.
     """
     image_ref = f"{HERMES_IMAGE_BASE}:{tag}"
     user, home = mp.inspect_image_user(cfg.vm.name, image_ref)
     if user is None:
-        # Image probably not pulled yet — let `docker compose up` pull it.
-        return
+        # Image not pulled yet — do it now (idempotent) and re-inspect.
+        pull = mp.exec_in_vm(cfg.vm.name, "docker", "pull", image_ref, check=False)
+        if pull.returncode != 0:
+            raise UserError(
+                f"could not pull {image_ref} (rc={pull.returncode}): "
+                f"{pull.stderr.strip() or pull.stdout.strip()}"
+            )
+        user, home = mp.inspect_image_user(cfg.vm.name, image_ref)
     if user != "hermes" or home != "/home/hermes":
         raise UserError(
             f"Hermes image {image_ref} entrypoint user/home has drifted "

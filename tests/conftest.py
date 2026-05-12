@@ -80,6 +80,14 @@ def install_vm_fs_simulation(mocker, cfg: AgentsConfig) -> dict:
                 else:
                     p.unlink(missing_ok=True)
             return _ok()
+        # docker inspect for the Hermes image: simulate the expected
+        # USER+HOME so _verify_hermes_image_user passes without a real
+        # image pull.
+        if cmd and cmd[:2] == ("docker", "inspect") and any("hermes-agent" in c for c in cmd):
+            return _ok("hermes\tHOME=/home/hermes\n")
+        # docker pull is a no-op success in the simulator.
+        if cmd and cmd[:2] == ("docker", "pull"):
+            return _ok()
         return _ok()
 
     def bash_runner(

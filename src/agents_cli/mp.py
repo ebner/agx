@@ -244,17 +244,7 @@ def inspect_image_user(vm: str, image_ref: str) -> tuple[str | None, str | None]
     that emits ``USER\\tHOME`` separated by a tab. Conservative on errors.
     """
     fmt = "{{.Config.User}}\t{{range .Config.Env}}{{println .}}{{end}}"
-    result = mp(
-        "exec",
-        vm,
-        "--",
-        "docker",
-        "inspect",
-        "--format",
-        fmt,
-        image_ref,
-        check=False,
-    )
+    result = exec_in_vm(vm, "docker", "inspect", "--format", fmt, image_ref, check=False)
     if result.returncode != 0:
         return (None, None)
     raw = result.stdout.strip()

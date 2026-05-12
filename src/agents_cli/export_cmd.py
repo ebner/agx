@@ -246,7 +246,14 @@ def export_cron_status(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> di
     existing = _read_crontab()
     installed = any(CRON_MARKER in ln for ln in existing.splitlines())
     backups_dir = cfg.paths.host_data_dir / "backups"
-    archives = sorted(backups_dir.glob("*.tar.gz")) if backups_dir.exists() else []
+    archives = (
+        sorted(
+            list(backups_dir.glob(f"*{archive_mod.ARCHIVE_SUFFIX}"))
+            + list(backups_dir.glob("*.tar.gz"))
+        )
+        if backups_dir.exists()
+        else []
+    )
     last_archive = archives[-1] if archives else None
     info: dict[str, object] = {
         "installed": installed,

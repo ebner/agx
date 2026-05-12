@@ -59,6 +59,24 @@ class PathsConfig(BaseModel):
         _refuse_forbidden_data_dir(p)
         return p
 
+    @field_validator("vm_agents_root", mode="before")
+    @classmethod
+    def _resolve_vm_agents_root(cls, v: Any) -> Path:
+        # Path goes into VM-side shell scripts via exec_bash heredocs, so
+        # restrict to characters that don't need shell escaping. Defaults
+        # to /home/ubuntu/agents and rarely needs changing.
+        import re
+
+        p = Path(str(v))
+        if not p.is_absolute():
+            raise ValueError(f"vm_agents_root must be absolute: {v}")
+        if not re.fullmatch(r"[A-Za-z0-9_./-]+", str(p)):
+            raise ValueError(
+                f"vm_agents_root must contain only [A-Za-z0-9_./-]; got {v!r}. "
+                "Shell-meta characters in this path would break exec_bash heredocs."
+            )
+        return p
+
 
 class HostConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
