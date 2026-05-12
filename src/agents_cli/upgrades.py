@@ -207,27 +207,68 @@ def upgrade_all(
 def rollback(
     name: str,
     *,
+    snapshot_id: str | None = None,
     yes: bool = False,
     config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH,
 ) -> None:
-    """Restore the most recent ``<data-dir>/.upgrades/<name>-*.tar.gz`` and the
-    matching VM snapshot. Confirms unless ``--yes``.
+    """Restore an agent from a pre-upgrade snapshot.
+
+    Without ``snapshot_id``, the latest archive under
+    ``<data-dir>/.upgrades/<name>-*.tar.gz`` is used and the matching
+    multipass VM snapshot is restored. With an explicit ``snapshot_id``:
+
+    - If it ends in ``.tar.gz``: treated as a host-side archive filename
+      under ``.upgrades/``.
+    - If it starts with ``pre-upgrade-``: treated as a multipass snapshot
+      name; ONLY the VM is restored (host data unchanged).
+    - Otherwise: matched by suffix against archive names; if exactly one
+      matches, that's used.
+
+    Confirms unless ``--yes``.
     """
     cfg = cfg_mod.load(config_path)
-    archive = _latest_host_snapshot(cfg, name)
-    if archive is None:
-        raise UserError(f"no host snapshot found for {name!r} under .upgrades/")
 
+    archive: Path | None = None
+    vm_only = False
+
+    if snapshot_id is None:
+        archive = _latest_host_snapshot(cfg, name)
+        if archive is None:
+            raise UserError(f"no host snapshot found for {name!r} under .upgrades/")
+    elif snapshot_id.startswith("pre-upgrade-"):
+        # Multipass-snapshot form — restore the VM only.
+        vm_only = True
+    else:
+        upgrades_dir = cfg.paths.host_data_dir / ".upgrades"
+        candidates = sorted(upgrades_dir.glob(f"{name}-*.tar.gz")) if upgrades_dir.exists() else []
+        # Exact filename or suffix match
+        exact = next((p for p in candidates if p.name == snapshot_id), None)
+        if exact:
+            archive = exact
+        else:
+            partial = [p for p in candidates if snapshot_id in p.name]
+            if len(partial) == 1:
+                archive = partial[0]
+            elif len(partial) > 1:
+                raise UserError(
+                    f"snapshot id {snapshot_id!r} is ambiguous; matches "
+                    + ", ".join(p.name for p in partial)
+                )
+            else:
+                raise UserError(f"no host snapshot matches {snapshot_id!r} for {name!r}")
+
+    prompt_target = archive.name if archive else snapshot_id
     if not yes and not ui.confirm(
-        f"restore {name!r} from {archive.name}? "
+        f"restore {name!r} from {prompt_target!r}? "
         "compose, .env, and the agent's data dir will be overwritten.",
         default=False,
     ):
         raise UserError("aborted by user")
 
-    _restore_host_snapshot(cfg, archive)
+    if archive is not None:
+        _restore_host_snapshot(cfg, archive)
 
-    vm_snap_name = _latest_vm_snapshot(cfg.vm.name, name)
+    vm_snap_name = snapshot_id if vm_only else _latest_vm_snapshot(cfg.vm.name, name)
     if vm_snap_name:
         mp.stop_vm(cfg.vm.name)
         mp.restore(f"{cfg.vm.name}.{vm_snap_name}", destructive=True)
@@ -236,11 +277,14 @@ def rollback(
     ui.emit(
         {
             "name": name,
-            "restored": {"host": str(archive), "vm_snapshot": vm_snap_name},
+            "restored": {
+                "host": str(archive) if archive else None,
+                "vm_snapshot": vm_snap_name,
+            },
         },
         human=(
             f"rolled back {name!r}\n"
-            f"  host: {archive}\n"
+            f"  host: {archive or '(skipped — vm-only)'}\n"
             f"  vm snapshot: {vm_snap_name or '(none found)'}"
         ),
     )

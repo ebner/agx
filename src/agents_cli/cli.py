@@ -135,17 +135,41 @@ def vm_restore(name: str, destructive: bool) -> None:
     _run(vm_mod.restore_snapshot, name, destructive=destructive)
 
 
-@vm.command("snapshots")
-def vm_snapshots() -> None:
+@vm.group("snapshots")
+def vm_snapshots_group() -> None:
+    """Multipass snapshot management."""
+
+
+@vm_snapshots_group.command("list")
+def vm_snapshots_list() -> None:
     """List multipass snapshots for this VM."""
     _run(vm_mod.list_snapshots)
 
 
 @vm.command("destroy")
+@click.option("--export-first", is_flag=True, help="Run `agents export --all` before destroying.")
 @click.pass_context
-def vm_destroy(ctx: click.Context) -> None:
-    """Tear down the VM (host data-dir untouched)."""
-    _run(vm_mod.destroy, yes=ctx.obj.get("yes", False))
+def vm_destroy(ctx: click.Context, export_first: bool) -> None:
+    """Tear down the VM (host data-dir untouched).
+
+    Prompts to run an export of every agent first unless ``--yes`` is set.
+    Override the prompt with ``--export-first`` to always export, or
+    skip with ``--yes`` to skip the offer.
+    """
+    yes = ctx.obj.get("yes", False)
+
+    def body() -> None:
+        do_export = export_first
+        if not do_export and not yes:
+            do_export = ui.confirm(
+                "export all agents to <data-dir>/backups/ before destroying the VM?",
+                default=False,
+            )
+        if do_export:
+            export_cmd.export_all()
+        vm_mod.destroy(yes=yes)
+
+    _run(body)
 
 
 # ---------- agent CRUD ----------
@@ -188,16 +212,31 @@ def agents_list() -> None:
 
 @main.command("remove")
 @click.argument("name")
+@click.option(
+    "--export-first",
+    is_flag=True,
+    help="Run `agents export <name>` before removing.",
+)
 @click.option("--keep-data", is_flag=True, help="Leave the agent's data dir on disk.")
 @click.pass_context
-def agents_remove(ctx: click.Context, name: str, keep_data: bool) -> None:
-    """Remove an agent (and its data dir unless --keep-data)."""
-    _run(
-        agents_cmd.remove,
-        name,
-        yes=ctx.obj.get("yes", False),
-        delete_data=not keep_data,
-    )
+def agents_remove(ctx: click.Context, name: str, export_first: bool, keep_data: bool) -> None:
+    """Remove an agent (and its data dir unless --keep-data).
+
+    Pass ``--export-first`` to dump a tarball to ``<data-dir>/backups/``
+    before tearing down — convenient if you want a final snapshot
+    before deletion.
+    """
+
+    def body() -> None:
+        if export_first:
+            export_cmd.export(name)
+        agents_cmd.remove(
+            name,
+            yes=ctx.obj.get("yes", False),
+            delete_data=not keep_data,
+        )
+
+    _run(body)
 
 
 @main.command("rename")
@@ -277,45 +316,79 @@ def agents_pull(name: str | None) -> None:
 
 
 @main.command("upgrade")
-@click.argument("name")
-@click.option("--tag", default=None, help="Target image tag.")
+@click.argument("name", required=False)
+@click.option("--all", "all_agents", is_flag=True, help="Upgrade every agent in compose.")
+@click.option("--tag", default=None, help="Target image tag (single-agent upgrade only).")
 @click.option("--no-snapshot", is_flag=True, help="Skip both snapshots.")
-def agents_upgrade(name: str, tag: str | None, no_snapshot: bool) -> None:
-    """Upgrade one agent with auto-rollback on failure."""
+@click.option(
+    "--canary",
+    default=None,
+    help="With --all: roll this agent first; halt on failure.",
+)
+def agents_upgrade(
+    name: str | None,
+    all_agents: bool,
+    tag: str | None,
+    no_snapshot: bool,
+    canary: str | None,
+) -> None:
+    """Upgrade an agent (or every agent with ``--all``)."""
+    if all_agents:
+        if name:
+            raise click.UsageError("--all is mutually exclusive with NAME")
+        if tag:
+            raise click.UsageError("--tag is single-agent only")
+        _run(upgrades.upgrade_all, canary=canary)
+        return
+    if not name:
+        raise click.UsageError("provide NAME or --all")
+    if canary:
+        raise click.UsageError("--canary is meaningful only with --all")
     _run(upgrades.upgrade, name, tag=tag, no_snapshot=no_snapshot)
-
-
-@main.command("upgrade-all")
-@click.option("--canary", default=None, help="Roll this agent first; halt on failure.")
-def agents_upgrade_all(canary: str | None) -> None:
-    """Upgrade every agent, optional canary."""
-    _run(upgrades.upgrade_all, canary=canary)
 
 
 @main.command("rollback")
 @click.argument("name")
+@click.option(
+    "--snapshot",
+    "snapshot_id",
+    default=None,
+    help="Pick a specific pre-upgrade archive name (default: latest).",
+)
 @click.pass_context
-def agents_rollback(ctx: click.Context, name: str) -> None:
-    """Restore an agent from its latest pre-upgrade snapshot."""
-    _run(upgrades.rollback, name, yes=ctx.obj.get("yes", False))
+def agents_rollback(ctx: click.Context, name: str, snapshot_id: str | None) -> None:
+    """Restore an agent from a pre-upgrade snapshot.
+
+    Without ``--snapshot``, the latest archive under ``<data-dir>/.upgrades/``
+    is used. Pass ``--snapshot <name>`` (with or without the ``.tar.gz``
+    suffix) to pick a specific one.
+    """
+    _run(
+        upgrades.rollback,
+        name,
+        snapshot_id=snapshot_id,
+        yes=ctx.obj.get("yes", False),
+    )
 
 
 # ---------- export / import ----------
 
 
 @main.command("export")
-@click.argument("name")
+@click.argument("name", required=False)
+@click.option("--all", "all_agents", is_flag=True, help="Export every agent in compose.")
 @click.option("--to", "to", type=click.Path(), default=None, help="Override the output dir.")
-def agents_export(name: str, to: str | None) -> None:
-    """Export an agent's data dir as a tarball."""
-    _run(export_cmd.export, name, to=Path(to) if to else None)
-
-
-@main.command("export-all")
-@click.option("--to", "to", type=click.Path(), default=None)
-def agents_export_all(to: str | None) -> None:
-    """Export every agent in compose."""
-    _run(export_cmd.export_all, to=Path(to) if to else None)
+def agents_export(name: str | None, all_agents: bool, to: str | None) -> None:
+    """Export an agent's data dir as a tarball (or all agents with ``--all``)."""
+    to_path = Path(to) if to else None
+    if all_agents:
+        if name:
+            raise click.UsageError("--all is mutually exclusive with NAME")
+        _run(export_cmd.export_all, to=to_path)
+        return
+    if not name:
+        raise click.UsageError("provide NAME or --all")
+    _run(export_cmd.export, name, to=to_path)
 
 
 @main.command("import")
