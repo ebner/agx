@@ -137,7 +137,10 @@ def test_skill_enable_builds_image_and_updates_config(
     assert hermes_config.get_terminal_docker_image(doc) == result["derived_image"]
     # Sandbox volume uses VM-side host path
     volumes = doc["terminal"]["docker_volumes"]
-    assert any("/home/ubuntu/agents/.codex:/root/.codex:ro" in v for v in volumes)
+    # Sandbox mount target is /codex (user-independent; sandbox image sets
+    # CODEX_HOME=/codex so Codex CLI reads auth from there regardless of
+    # which user the base image runs as).
+    assert any("/home/ubuntu/agents/.codex:/codex:ro" in v for v in volumes)
 
     # Container restarted
     up_spy.assert_called_once()

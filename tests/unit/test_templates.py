@@ -78,3 +78,23 @@ def test_initial_env_content_renders_uid_gid() -> None:
 
 def test_initial_compose_content_is_empty_services_dict() -> None:
     assert templates.initial_compose_content() == "services: {}\n"
+
+
+def test_scripts_vm_bootstrap_sh_matches_template_constant() -> None:
+    """The on-disk scripts/vm-bootstrap.sh exists (for ops review) and must
+    stay in sync with templates.VM_BOOTSTRAP_SCRIPT (the source the toolkit
+    actually pipes into the VM)."""
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parents[2]
+    script_path = repo_root / "scripts" / "vm-bootstrap.sh"
+    assert script_path.exists(), (
+        "scripts/vm-bootstrap.sh is missing; regenerate with: "
+        "python -c 'from agents_cli.templates import VM_BOOTSTRAP_SCRIPT; "
+        "import sys; sys.stdout.write(VM_BOOTSTRAP_SCRIPT)' > scripts/vm-bootstrap.sh"
+    )
+    on_disk = script_path.read_text(encoding="utf-8")
+    assert on_disk == templates.VM_BOOTSTRAP_SCRIPT, (
+        "scripts/vm-bootstrap.sh has drifted from templates.VM_BOOTSTRAP_SCRIPT — "
+        "regenerate from the template."
+    )

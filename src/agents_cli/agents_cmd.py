@@ -269,11 +269,35 @@ def _add_service_to_compose(
     if svc in (doc.get("services") or {}):
         return  # already there from a prior partial run
     if agent_type == "hermes":
+        _verify_hermes_image_user(cfg, tag)
         fragment = compose.hermes_service_fragment(name=name, cfg=cfg, port=port, image_tag=tag)
     else:
         fragment = compose.openclaw_service_fragment(name=name, port=port, image_tag=tag)
     compose.add_service(doc, svc, fragment)
     compose.write_compose_atomically(cfg, doc)
+
+
+def _verify_hermes_image_user(cfg: AgentsConfig, tag: str) -> None:
+    """Inspect the pinned Hermes image and refuse if the entrypoint user
+    or home isn't where the toolkit mounts the Codex auth.
+
+    The Codex import path mounts ``/home/hermes/.codex``; if upstream
+    Hermes ever changes the container user, that mount target is wrong
+    and the import silently fails. This check trips early with a clear
+    error so the user knows to update the toolkit.
+    """
+    image_ref = f"{HERMES_IMAGE_BASE}:{tag}"
+    user, home = mp.inspect_image_user(cfg.vm.name, image_ref)
+    if user is None:
+        # Image probably not pulled yet — let `docker compose up` pull it.
+        return
+    if user != "hermes" or home != "/home/hermes":
+        raise UserError(
+            f"Hermes image {image_ref} entrypoint user/home has drifted "
+            f"(user={user!r}, home={home!r}); expected (user='hermes', home='/home/hermes'). "
+            "The Codex auth mount target in the compose template assumes the canonical "
+            "values — update agents_cli or pin an older Hermes image."
+        )
 
 
 def _run_agent_setup(cfg: AgentsConfig, svc: str, agent_type: str) -> None:

@@ -25,6 +25,7 @@ import tarfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from agents_cli import archive as archive_mod
 from agents_cli import compose, compose_runner, mp, ops, ui
 from agents_cli import config as cfg_mod
 from agents_cli import vm as vm_mod
@@ -240,7 +241,14 @@ def rollback(
         vm_only = True
     else:
         upgrades_dir = cfg.paths.host_data_dir / ".upgrades"
-        candidates = sorted(upgrades_dir.glob(f"{name}-*.tar.gz")) if upgrades_dir.exists() else []
+        candidates = (
+            sorted(
+                list(upgrades_dir.glob(f"{name}-*{archive_mod.ARCHIVE_SUFFIX}"))
+                + list(upgrades_dir.glob(f"{name}-*.tar.gz"))
+            )
+            if upgrades_dir.exists()
+            else []
+        )
         # Exact filename or suffix match
         exact = next((p for p in candidates if p.name == snapshot_id), None)
         if exact:
@@ -298,64 +306,70 @@ def _utc_stamp() -> str:
 
 
 def _host_data_snapshot(cfg: AgentsConfig, name: str) -> Path:
-    """Tar the agent's data dir + compose + .env.
+    """Tar+zstd the agent's data dir + compose + .env.
 
-    Host-mount mode: tar host-side directly.
-    --data-dir-in-vm mode: tar inside the VM, ``multipass transfer`` the
-    archive to the host's .upgrades dir.
+    Host-mount mode: stream through zstandard on the host.
+    --data-dir-in-vm mode: ``tar --zstd`` inside the VM (tar 1.34+,
+    bundled with Ubuntu 24.04+), then ``multipass transfer`` out.
     """
     upgrades_dir = cfg.paths.host_data_dir / ".upgrades"
     upgrades_dir.mkdir(parents=True, exist_ok=True)
-    archive = upgrades_dir / f"{name}-{_utc_stamp()}.tar.gz"
+    archive_path = upgrades_dir / f"{name}-{_utc_stamp()}{archive_mod.ARCHIVE_SUFFIX}"
 
     if cfg.paths.data_dir_in_vm:
-        vm_archive = f"/tmp/agents-upgrade-snap-{name}-{_utc_stamp()}.tar.gz"
+        vm_archive = f"/tmp/agents-upgrade-snap-{name}-{_utc_stamp()}{archive_mod.ARCHIVE_SUFFIX}"
         mp.exec_bash(
             cfg.vm.name,
             (
                 f"set -eu\n"
                 f"cd {cfg.paths.vm_agents_root}\n"
-                f"tar -czf {vm_archive} "
+                f"tar --zstd -cf {vm_archive} "
                 f"$([ -d {name} ] && echo {name} || true) "
                 f"$([ -f docker-compose.yml ] && echo docker-compose.yml || true) "
                 f"$([ -f .env ] && echo .env || true)\n"
             ),
         )
-        mp.transfer_from_vm(cfg.vm.name, vm_archive, archive)
+        mp.transfer_from_vm(cfg.vm.name, vm_archive, archive_path)
         mp.exec_in_vm(cfg.vm.name, "rm", "-f", vm_archive, check=False)
-        return archive
+        return archive_path
 
-    with tarfile.open(archive, "w:gz") as tf:
-        agent_dir = cfg.paths.host_data_dir / name
-        if agent_dir.exists():
-            tf.add(agent_dir, arcname=name)
-        compose_path = cfg.paths.host_data_dir / "docker-compose.yml"
-        if compose_path.exists():
-            tf.add(compose_path, arcname="docker-compose.yml")
-        env_path = cfg.paths.host_data_dir / ".env"
-        if env_path.exists():
-            tf.add(env_path, arcname=".env")
-    return archive
+    members = [
+        (cfg.paths.host_data_dir / name, name),
+        (cfg.paths.host_data_dir / "docker-compose.yml", "docker-compose.yml"),
+        (cfg.paths.host_data_dir / ".env", ".env"),
+    ]
+    archive_mod.write_tar_zst(archive_path, members)
+    return archive_path
 
 
-def _restore_host_snapshot(cfg: AgentsConfig, archive: Path) -> None:
+def _restore_host_snapshot(cfg: AgentsConfig, archive_path: Path) -> None:
     if cfg.paths.data_dir_in_vm:
-        vm_archive = f"/tmp/agents-restore-{archive.name}"
-        mp.transfer_to_vm(archive, cfg.vm.name, vm_archive)
+        vm_archive = f"/tmp/agents-restore-{archive_path.name}"
+        mp.transfer_to_vm(archive_path, cfg.vm.name, vm_archive)
+        # `tar -xf` auto-detects compression by content (gz, zst, etc).
         mp.exec_bash(
             cfg.vm.name,
-            f"set -eu\ncd {cfg.paths.vm_agents_root} && tar -xzf {vm_archive} && rm -f {vm_archive}\n",
+            f"set -eu\ncd {cfg.paths.vm_agents_root} && tar -xf {vm_archive} && rm -f {vm_archive}\n",
         )
         return
-    with tarfile.open(archive, "r:gz") as tf:
-        tf.extractall(cfg.paths.host_data_dir, filter="data")
+    if archive_path.suffix == ".zst":
+        archive_mod.extract_tar_zst(archive_path, cfg.paths.host_data_dir)
+    else:
+        # Legacy .tar.gz path (archives from pre-G6 versions).
+        with tarfile.open(archive_path, "r:gz") as tf:
+            tf.extractall(cfg.paths.host_data_dir, filter="data")
 
 
 def _latest_host_snapshot(cfg: AgentsConfig, name: str) -> Path | None:
     upgrades_dir = cfg.paths.host_data_dir / ".upgrades"
     if not upgrades_dir.exists():
         return None
-    candidates = sorted(upgrades_dir.glob(f"{name}-*.tar.gz"))
+    # Look for both the canonical .tar.zst and legacy .tar.gz archives so
+    # rollbacks of older upgrades keep working.
+    candidates = sorted(
+        list(upgrades_dir.glob(f"{name}-*{archive_mod.ARCHIVE_SUFFIX}"))
+        + list(upgrades_dir.glob(f"{name}-*.tar.gz"))
+    )
     return candidates[-1] if candidates else None
 
 

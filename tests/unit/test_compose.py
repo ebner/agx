@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import json
-import threading
-import time
 from pathlib import Path
 
 import pytest
@@ -13,7 +11,6 @@ from agents_cli.compose import (
     ALLOWED_IMAGE_BASES,
     HERMES_IMAGE_BASE,
     OPENCLAW_IMAGE_BASE,
-    acquire_lock,
     add_service,
     cleanup_stale_temps,
     dump_compose,
@@ -383,25 +380,4 @@ def test_next_free_port_finds_gap(cfg: AgentsConfig) -> None:
     assert next_free_port(cfg, base=8642, used={8642, 8644}) == 8643
 
 
-# ---------- flock ----------
-
-
-def test_acquire_lock_serializes_two_threads(cfg: AgentsConfig) -> None:
-    timeline = []
-
-    def worker(label: str, hold: float) -> None:
-        with acquire_lock(cfg.paths.host_data_dir):
-            timeline.append(f"{label}:start")
-            time.sleep(hold)
-            timeline.append(f"{label}:end")
-
-    t1 = threading.Thread(target=worker, args=("A", 0.05))
-    t2 = threading.Thread(target=worker, args=("B", 0.05))
-    t1.start()
-    time.sleep(0.01)  # ensure A acquires first
-    t2.start()
-    t1.join()
-    t2.join()
-
-    # No interleaving: A's end must come before B's start.
-    assert timeline == ["A:start", "A:end", "B:start", "B:end"]
+# flock tests moved to test_lock.py

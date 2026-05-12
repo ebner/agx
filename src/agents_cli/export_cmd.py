@@ -29,6 +29,7 @@ import sys
 import tarfile
 from pathlib import Path
 
+from agents_cli import archive as archive_mod
 from agents_cli import compose, ui
 from agents_cli import config as cfg_mod
 from agents_cli.agents_cmd import (
@@ -73,14 +74,12 @@ def export(
     if cfg.paths.data_dir_in_vm and to is None:
         raise UserError("--to <host-path> is required when running under --data-dir-in-vm")
 
-    archive_name = f"{name}-{_utc_stamp()}.tar.gz"
+    archive_name = f"{name}-{_utc_stamp()}{archive_mod.ARCHIVE_SUFFIX}"
 
     if cfg.paths.data_dir_in_vm:
-        # Tar inside the VM, then multipass transfer the archive to the host
-        # destination. `to` is required above.
+        # Tar+zstd inside the VM, then multipass transfer the archive out.
         from agents_cli import mp
 
-        # Refuse if the VM-side agent dir is missing
         check = mp.exec_in_vm(
             cfg.vm.name,
             "test",
@@ -90,28 +89,27 @@ def export(
         )
         if check.returncode != 0:
             raise UserError(f"agent data dir for {name!r} not found in VM")
-        vm_archive = f"/tmp/agents-export-{name}-{_utc_stamp()}.tar.gz"
+        vm_archive = f"/tmp/agents-export-{name}-{_utc_stamp()}{archive_mod.ARCHIVE_SUFFIX}"
         mp.exec_bash(
             cfg.vm.name,
-            f"cd {cfg.paths.vm_agents_root} && tar -czf {vm_archive} {name}",
+            f"cd {cfg.paths.vm_agents_root} && tar --zstd -cf {vm_archive} {name}",
         )
         target_dir = _archive_dir(cfg, to)
-        archive = target_dir / archive_name
-        mp.transfer_from_vm(cfg.vm.name, vm_archive, archive)
+        out = target_dir / archive_name
+        mp.transfer_from_vm(cfg.vm.name, vm_archive, out)
         mp.exec_in_vm(cfg.vm.name, "rm", "-f", vm_archive, check=False)
     else:
         agent_dir = cfg.paths.host_data_dir / name
         if not agent_dir.exists():
             raise UserError(f"agent data dir for {name!r} not found at {agent_dir}")
-        archive = _archive_dir(cfg, to) / archive_name
-        with tarfile.open(archive, "w:gz") as tf:
-            tf.add(agent_dir, arcname=name)
+        out = _archive_dir(cfg, to) / archive_name
+        archive_mod.write_tar_zst(out, [(agent_dir, name)])
 
     ui.emit(
-        {"name": name, "archive": str(archive), "size_bytes": archive.stat().st_size},
-        human=f"exported {name!r} -> {archive}",
+        {"name": name, "archive": str(out), "size_bytes": out.stat().st_size},
+        human=f"exported {name!r} -> {out}",
     )
-    return archive
+    return out
 
 
 def export_all(
@@ -135,15 +133,15 @@ def export_all(
 
 def import_archive(
     name: str,
-    archive: Path,
+    archive_path: Path,
     *,
     yes: bool = False,
     config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH,
 ) -> None:
     validate_name(name)
     cfg = cfg_mod.load(config_path)
-    if not archive.exists():
-        raise UserError(f"archive not found: {archive}")
+    if not archive_path.exists():
+        raise UserError(f"archive not found: {archive_path}")
 
     if cfg.paths.data_dir_in_vm:
         from agents_cli import mp
@@ -160,15 +158,16 @@ def import_archive(
             )
         ):
             raise UserError("aborted by user")
-        vm_tmp = f"/tmp/agents-import-{name}-{archive.stat().st_mtime_ns}.tar.gz"
-        mp.transfer_to_vm(archive, cfg.vm.name, vm_tmp)
+        # tar -xf auto-detects compression by content (zst, gz, etc).
+        vm_tmp = f"/tmp/agents-import-{name}-{archive_path.stat().st_mtime_ns}{archive_path.suffix}"
+        mp.transfer_to_vm(archive_path, cfg.vm.name, vm_tmp)
         mp.exec_bash(
             cfg.vm.name,
-            f"set -eu\ncd {cfg.paths.vm_agents_root} && tar -xzf {vm_tmp} && rm -f {vm_tmp}\n",
+            f"set -eu\ncd {cfg.paths.vm_agents_root} && tar -xf {vm_tmp} && rm -f {vm_tmp}\n",
         )
         ui.emit(
-            {"name": name, "archive": str(archive)},
-            human=f"imported {archive} into {cfg.paths.vm_agents_root}/{name} (in VM)",
+            {"name": name, "archive": str(archive_path)},
+            human=f"imported {archive_path} into {cfg.paths.vm_agents_root}/{name} (in VM)",
         )
         return
 
@@ -179,9 +178,16 @@ def import_archive(
         and not ui.confirm(f"overwrite existing data dir at {target}?", default=False)
     ):
         raise UserError("aborted by user")
-    with tarfile.open(archive, "r:gz") as tf:
-        tf.extractall(cfg.paths.host_data_dir, filter="data")
-    ui.emit({"name": name, "archive": str(archive)}, human=f"imported {archive} into {target}")
+    if archive_path.suffix == ".zst":
+        archive_mod.extract_tar_zst(archive_path, cfg.paths.host_data_dir)
+    else:
+        # Legacy .tar.gz path (archives from pre-G6 versions).
+        with tarfile.open(archive_path, "r:gz") as tf:
+            tf.extractall(cfg.paths.host_data_dir, filter="data")
+    ui.emit(
+        {"name": name, "archive": str(archive_path)},
+        human=f"imported {archive_path} into {target}",
+    )
 
 
 # ---------- host-cron integration ----------

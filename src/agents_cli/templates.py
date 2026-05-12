@@ -124,14 +124,18 @@ def render_codex_sandbox_dockerfile(base_image: str) -> str:
 
     The derived image adds Node + the Codex CLI on top of whatever the
     agent's current ``terminal.docker_image`` is, so user customizations
-    survive the upgrade.
+    survive. It also sets ``CODEX_HOME=/codex`` so we can mount the
+    toolkit-scoped auth at a fixed, user-independent path — works for
+    base images that run as root, ``pn``, ``node``, or anything else.
     """
     return (
         f"FROM {base_image}\n"
         "RUN apt-get update \\\n"
         " && apt-get install -y --no-install-recommends nodejs npm curl ca-certificates \\\n"
         " && npm install -g @openai/codex \\\n"
-        " && apt-get clean && rm -rf /var/lib/apt/lists/*\n"
+        " && apt-get clean && rm -rf /var/lib/apt/lists/* \\\n"
+        " && mkdir -p /codex\n"
+        "ENV CODEX_HOME=/codex\n"
     )
 
 

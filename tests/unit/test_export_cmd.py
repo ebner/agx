@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import tarfile
 from pathlib import Path
 
 import pytest
@@ -62,13 +61,17 @@ def with_coder(cfg: AgentsConfig, saved_config: Path, mocker) -> Path:
 
 
 def test_export_writes_archive_into_backups_dir(with_coder: Path, cfg: AgentsConfig) -> None:
+    from agents_cli.archive import ARCHIVE_SUFFIX, extract_tar_zst
+
     archive = export_cmd.export("coder", config_path=with_coder)
     assert archive.parent == cfg.paths.host_data_dir / "backups"
-    assert archive.suffix == ".gz"
+    assert archive.name.endswith(ARCHIVE_SUFFIX)
     # Archive contains the seeded file
-    with tarfile.open(archive, "r:gz") as tf:
-        names = tf.getnames()
-    assert any(n.endswith("state.db") for n in names)
+    extract_dest = cfg.paths.host_data_dir / ".test-extract"
+    extract_dest.mkdir(exist_ok=True)
+    extract_tar_zst(archive, extract_dest)
+    extracted = list(extract_dest.rglob("*"))
+    assert any(p.name == "state.db" for p in extracted)
 
 
 def test_export_respects_to_directory(with_coder: Path, cfg: AgentsConfig, tmp_path: Path) -> None:

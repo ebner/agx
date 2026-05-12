@@ -270,8 +270,13 @@ def _sandbox_volume_mapping(cfg: AgentsConfig) -> str:
     """Hermes' ``terminal.docker_volumes`` entries are interpreted by the **VM
     Docker daemon**, so we name VM-side host paths here (NOT paths inside
     the Hermes runtime container).
+
+    The mount target inside the sandbox is ``/codex`` rather than
+    ``<user-home>/.codex``: the derived sandbox image sets
+    ``CODEX_HOME=/codex`` so the Codex CLI reads auth from there
+    regardless of which user the base image runs as.
     """
-    return f"{cfg.paths.vm_agents_root}/.codex:/root/.codex:ro"
+    return f"{cfg.paths.vm_agents_root}/.codex:/codex:ro"
 
 
 def skill_enable(name: str, *, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> dict[str, str]:

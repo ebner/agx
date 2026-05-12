@@ -235,6 +235,50 @@ def restore(snapshot_id: str, *, destructive: bool = False) -> MpResult:
     return mp(*args)
 
 
+def inspect_image_user(vm: str, image_ref: str) -> tuple[str | None, str | None]:
+    """Return ``(user, home)`` for a Docker image, both possibly ``None``
+    if the image isn't pulled or the field is unset (in which case the
+    OCI default is to run as ``root``).
+
+    Calls ``docker inspect --format`` inside the VM with a Go template
+    that emits ``USER\\tHOME`` separated by a tab. Conservative on errors.
+    """
+    fmt = "{{.Config.User}}\t{{range .Config.Env}}{{println .}}{{end}}"
+    result = mp(
+        "exec",
+        vm,
+        "--",
+        "docker",
+        "inspect",
+        "--format",
+        fmt,
+        image_ref,
+        check=False,
+    )
+    if result.returncode != 0:
+        return (None, None)
+    raw = result.stdout.strip()
+    if "\t" in raw:
+        user_part, env_part = raw.split("\t", 1)
+    else:
+        user_part, env_part = raw, ""
+    user_part = user_part.strip()
+
+    user: str | None = user_part or None
+    home: str | None = None
+    for line in env_part.splitlines():
+        if line.startswith("HOME="):
+            home = line[len("HOME=") :].strip() or None
+            break
+    if home is None and user:
+        # Fall back to canonical Unix convention.
+        home = "/root" if user == "root" else f"/home/{user.split(':')[0]}"
+    elif home is None:
+        # User unset = OCI default = root.
+        home = "/root"
+    return (user, home)
+
+
 def parse_bootstrap_ok(output: str) -> BootstrapStatus:
     """Find the last ``BOOTSTRAP_OK`` line in ``output`` and parse its fields.
 
