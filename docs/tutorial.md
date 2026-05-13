@@ -161,6 +161,22 @@ agents exec coder hermes skills uninstall <skill-id>
 
 Skills are **profile-scoped** inside Hermes. With Strategy A (one container per agent) you don't have to think about this — each toolkit agent has its own skill set. With Strategy B you'd run `hermes -p <profile> skills install ...`.
 
+Most skills that talk to a third-party service need an API key. Wire one in per-agent — never in the project-level `.env`:
+
+```bash
+# prompts for the value (hidden, never printed back)
+agents secret set coder FIRECRAWL_API_KEY
+
+# or pass it on the command line (visible in shell history)
+agents secret set coder FIRECRAWL_API_KEY fc-xxxxx
+
+agents secret list coder         # names only
+agents secret unset coder FIRECRAWL_API_KEY
+agents secret clear coder        # wipe all
+```
+
+Secrets land in `<data-dir>/coder/.env` and become container env vars on the next restart (which `secret set` handles automatically). The Firecrawl skill — like every skill following the standard convention — reads `os.environ['FIRECRAWL_API_KEY']`, no further configuration needed.
+
 ### 4.3a (Optional) Pick a memory backend
 
 By default Hermes uses built-in memory (`MEMORY.md` / `USER.md`). For

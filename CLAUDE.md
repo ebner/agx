@@ -31,6 +31,7 @@
 - **`localhost` / `127.0.0.1` / `0.0.0.0` are refused in `[ollama]` URLs** (`OllamaConfig._validate_url`). Inside the VM those resolve to the VM itself, not to the host where the user is actually running Ollama. The toolkit suggests the multipass NAT gateway (`multipass info <vm>` → IPv4) when surfacing the error.
 - **Memory backends needing embeddings/LLM read from `[ollama]` only.** The toolkit does NOT manage an Ollama instance. mem0 and OpenViking refuse to install when `[ollama]` is empty (mem0 falls back to `OPENAI_API_KEY` in `.env` if present; OpenViking does not, since its fact-extraction loop would melt a personal ChatGPT subscription).
 - **Codex auth ≠ OpenAI API key.** Hermes' `openai-codex` provider knows how to drive the ChatGPT-subscription OAuth flow; nothing else does. Of the supported memory backends, only `holographic` works with Codex auth alone — it doesn't call out for embeddings or LLM. Don't introduce a "Codex proxy" path for the others; it would violate OpenAI ToS and break on every flow rotation.
+- **Per-agent secrets live in `<data-dir>/<name>/.env`**, NOT the project-level `<data-dir>/.env`. The project file is for compose `${VAR}` interpolation only (HERMES_UID/GID, OLLAMA_API_KEY). The per-agent file is wired into each container via compose `env_file: ./<name>/.env` so its KEY=VALUE pairs become container env. Managed by `agents secret {set,unset,list,clear}` — values are never printed back, key names must match `^[A-Z][A-Z0-9_]*$`. Both fragments (Hermes and OpenClaw) include the env_file clause; the file is created (empty) by `agents create` so compose validation passes before any secrets are set.
 
 ## Codex paths — how Hermes and OpenClaw differ
 
@@ -75,6 +76,7 @@ src/agents_cli/
   export_cmd.py   # export/import/export-cron (host-cron, idempotent)
   codex.py        # login/refresh/status/skill-enable/skill-disable
   ollama_cmd.py   # configure/status/clear — points the toolkit at an external Ollama / OpenAI-compatible endpoint (the toolkit does NOT run Ollama)
+  secrets_cmd.py  # per-agent .env management (API keys for skills like firecrawl); never the project .env
   memory/         # memory backend plugins (Hermes only)
     __init__.py   # registry + dispatch + state file at <data-dir>/.memory-state/<agent>.json
     holographic.py # in-process; SQLite+FTS5+HRR; doctor checks for SQLite-on-9p + NumPy

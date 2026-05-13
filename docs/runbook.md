@@ -64,6 +64,33 @@ The CLI writes a phase journal under `<data-dir>/.journal/<op>-<name>-<utc>.json
 
 `agents doctor` warns about any journal older than 24 hours. To clear a stuck journal once you've manually reconciled state, simply delete the file from `<data-dir>/.journal/`.
 
+## Per-agent secrets
+
+API keys for skills (Firecrawl, GitHub, etc.) go in a per-agent .env
+file that the toolkit wires into the container via compose
+`env_file:`. **Never** put them in `<data-dir>/.env` — that's a
+project-level file shared across every container.
+
+```bash
+agents secret set coder FIRECRAWL_API_KEY            # hidden prompt
+agents secret set coder GITHUB_TOKEN ghp_xxxx        # arg form
+agents secret list coder                             # names only
+agents secret unset coder FIRECRAWL_API_KEY
+agents secret clear coder                            # nuke them all
+```
+
+Storage: `<data-dir>/<name>/.env`. Duplicity already covers it because
+it sits under the host data-dir. The toolkit restarts the agent's
+container automatically on each mutation so the new env takes effect
+(compose only re-reads `env_file:` on container recreate).
+
+Key names must match `^[A-Z][A-Z0-9_]*$`. Values may not contain
+newlines. Secret values are never printed back — `list` returns names
+only, JSON output never includes values.
+
+Backfill: agents created before the secret command existed get their
+compose `env_file:` clause added on first `secret set`. Idempotent.
+
 ## Memory backends
 
 The toolkit manages three memory plugins for Hermes agents. Pick based

@@ -261,6 +261,12 @@ def hermes_service_fragment(
             f"{socket_path}:{socket_path}",
             "./.codex:/home/hermes/.codex:ro",
         ],
+        # Per-agent secrets: KEY=VALUE pairs in `<data-dir>/<name>/.env`
+        # become container env. Skills like firecrawl read their API keys
+        # from there. Managed via `agents secret {set,unset,list,clear}`.
+        # File is created (empty) by `agents create` so compose validation
+        # never trips on a missing path.
+        "env_file": [f"./{name}/.env"],
         "environment": {
             "DOCKER_HOST": f"unix://{socket_path}",
             "HOME": "/home/hermes",
@@ -361,6 +367,8 @@ def openclaw_service_fragment(
         "environment": {
             "OPENCLAW_DISABLE_BONJOUR": "1",
         },
+        # See hermes_service_fragment for the per-agent .env story.
+        "env_file": [f"./{name}/.env"],
     }
 
 

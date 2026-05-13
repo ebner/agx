@@ -198,9 +198,7 @@ def create(
                     f"Stop it first with `agents stop {name}`."
                 )
 
-        journal = resumable or Journal.begin(
-            cfg.paths.host_data_dir, "create", name, CREATE_PHASES
-        )
+        journal = resumable or Journal.begin(cfg.paths.host_data_dir, "create", name, CREATE_PHASES)
 
         for phase in required:
             if journal.is_phase_done(phase):
@@ -245,9 +243,19 @@ def _create_data_dirs(cfg: AgentsConfig, name: str, agent_type: str) -> None:
             "-p",
             *_vm_agent_data_paths(cfg, name, agent_type),
         )
+        # Touch per-agent .env so the compose fragment's env_file: clause
+        # validates even before the user has set any secrets.
+        mp.exec_in_vm(
+            cfg.vm.name,
+            "touch",
+            f"{cfg.paths.vm_agents_root}/{name}/.env",
+        )
         return
     for p in _agent_data_paths(cfg, name, agent_type):
         p.mkdir(parents=True, exist_ok=True)
+    env_path = cfg.paths.host_data_dir / name / ".env"
+    if not env_path.exists():
+        env_path.write_text("", encoding="utf-8")
 
 
 def _delete_data_dir(cfg: AgentsConfig, name: str) -> None:
@@ -294,9 +302,7 @@ def _ensure_hermes_image_pulled(cfg: AgentsConfig, tag: str) -> None:
     mount. We just need the image local before compose up.
     """
     image_ref = f"{HERMES_IMAGE_BASE}:{tag}"
-    inspect = mp.exec_in_vm(
-        cfg.vm.name, "docker", "image", "inspect", image_ref, check=False
-    )
+    inspect = mp.exec_in_vm(cfg.vm.name, "docker", "image", "inspect", image_ref, check=False)
     if inspect.returncode == 0:
         return
     pull = mp.exec_in_vm(cfg.vm.name, "docker", "pull", image_ref, check=False)

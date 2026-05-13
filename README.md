@@ -61,6 +61,7 @@ For the full lifecycle — Hermes profiles vs. personalities vs. skills, connect
 | `<data-dir>/.env` | `HERMES_UID` / `HERMES_GID` so files written by containers round-trip cleanly to the host user. |
 | `<data-dir>/<name>/.data/` | Each Hermes agent's `$HERMES_HOME` (auth, sessions, skills, memories, state.db). |
 | `<data-dir>/<name>/.openclaw/` | Each OpenClaw agent's persistent dir. |
+| `<data-dir>/<name>/.env` | Per-agent secrets (API keys for skills). Managed via `agents secret …`. Wired into the container via compose `env_file:`. |
 | `<data-dir>/<name>/.openviking/` | OpenViking sidecar's per-agent data (when `agents memory enable openviking <name>`). |
 | `<data-dir>/.codex/` | Toolkit-scoped Codex auth (separate from your personal `~/.codex/`). |
 | `<data-dir>/.memory-state/` | Per-agent record of which memory backend the toolkit enabled. |

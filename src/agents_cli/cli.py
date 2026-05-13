@@ -22,6 +22,7 @@ from agents_cli import (
     export_cmd,
     ollama_cmd,
     ops,
+    secrets_cmd,
     ui,
     upgrades,
 )
@@ -736,6 +737,62 @@ def memory_disable(agent: str) -> None:
 def memory_status(agent: str | None) -> None:
     """Show memory state per agent (or for a single agent if NAME is given)."""
     _run(memory_mod.status, agent)
+
+
+# ---------- secrets ----------
+
+
+@main.group("secret")
+def secret_group() -> None:
+    """Per-agent secrets (API keys etc.) wired into the container env.
+
+    Each agent has its own ``<data-dir>/<name>/.env`` whose KEY=VALUE
+    pairs become process environment inside the container — exactly
+    what skills like ``firecrawl`` read at runtime. Mutations restart
+    the container so the new env is visible.
+    """
+
+
+@secret_group.command("set")
+@click.argument("agent")
+@click.argument("key")
+@click.argument("value", required=False)
+def secret_set(agent: str, key: str, value: str | None) -> None:
+    """Set a secret. Value is prompted hidden when omitted.
+
+    Examples:
+
+        agents secret set coder FIRECRAWL_API_KEY      # hidden prompt
+        agents secret set coder FIRECRAWL_API_KEY fc-x # value as arg
+    """
+    if value is None:
+        value = click.prompt(f"value for {key}", hide_input=True, confirmation_prompt=False)
+    _run(secrets_cmd.set_secret, agent, key, value)
+
+
+@secret_group.command("unset")
+@click.argument("agent")
+@click.argument("key")
+def secret_unset(agent: str, key: str) -> None:
+    """Remove a secret from the per-agent .env."""
+    _run(secrets_cmd.unset_secret, agent, key)
+
+
+@secret_group.command("list")
+@click.argument("agent")
+def secret_list(agent: str) -> None:
+    """List secret names for an agent (values are NEVER printed)."""
+    _run(secrets_cmd.list_secrets, agent)
+
+
+@secret_group.command("clear")
+@click.argument("agent")
+@click.option("-y", "--yes", "yes_local", is_flag=True, help="Skip confirmation.")
+@click.pass_context
+def secret_clear(ctx: click.Context, agent: str, yes_local: bool) -> None:
+    """Wipe ALL secrets for an agent."""
+    yes = yes_local or ctx.obj.get("yes", False)
+    _run(secrets_cmd.clear_secrets, agent, yes=yes)
 
 
 # ---------- config (read-only convenience) ----------

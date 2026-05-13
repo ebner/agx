@@ -87,3 +87,4 @@ The cost is 9p mount overhead for SQLite-heavy workloads. The opt-out is `vm ini
 | `memory/holographic.py` | In-process Hermes plugin. Zero external deps. |
 | `memory/mem0.py` | In-process library mode. Wires Ollama or `OPENAI_API_KEY`. |
 | `memory/openviking.py` | Per-agent sibling docker service. Needs Ollama. |
+| `secrets_cmd.py` | Per-agent API keys at `<data-dir>/<name>/.env`. Wired into the container via compose `env_file:`. Backfills the directive on existing agents. Mutations restart the container. |
