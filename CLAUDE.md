@@ -14,6 +14,7 @@
 6. **Dashboard binding** is `127.0.0.1`/`localhost` only. The CLI refuses any Hermes config change to `0.0.0.0`.
 7. **Every mutation holds `<data-dir>/.agents.lock`** (`flock`). Read-only commands skip the lock. Two parallel `agents create` calls must serialize.
 8. **Every multi-phase op writes a phase journal** at `<data-dir>/.journal/<op>-<name>-<utc>.json`. Re-running the command resumes from the last completed phase. `doctor` flags journals older than 24 h.
+9. **Compose service blocks are written once and never auto-regenerated.** When the service-fragment template evolves (new env var, changed volume layout), existing agents keep their stale block forever. `agents reseat <name>` is the explicit "rewrite this agent's compose service entry from the current fragment, preserving port + image tag + env_file additions + depends_on additions, then force-recreate" command. Run after toolkit upgrades.
 
 ## Critical cross-layer pitfalls (already fixed; don't reintroduce)
 

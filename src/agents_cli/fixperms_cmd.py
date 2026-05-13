@@ -74,10 +74,10 @@ def fix_perms(
         raise UserError("aborted by user")
 
     with compose.acquire_lock(cfg.paths.host_data_dir):
-        _force_recreate(cfg, svc)
-        huid = _container_hermes_uid(cfg, svc)
-        _chown_data_dir(cfg, svc, huid)
-        _chmod_data_dir_traversable(cfg, svc)
+        force_recreate(cfg, svc)
+        huid = container_hermes_uid(cfg, svc)
+        chown_data_dir(cfg, svc, huid)
+        chmod_data_dir_traversable(cfg, svc)
 
     aligned = huid == RUNTIME_UID
     payload = {
@@ -105,7 +105,7 @@ def fix_perms(
 # ---------- internals ----------
 
 
-def _force_recreate(cfg: AgentsConfig, svc: str) -> None:
+def force_recreate(cfg: AgentsConfig, svc: str) -> None:
     """Stop, ``docker rm -f``, then ``compose up`` so the entrypoint runs
     from scratch.
 
@@ -123,7 +123,7 @@ def _force_recreate(cfg: AgentsConfig, svc: str) -> None:
         raise RuntimeFailure(f"compose up failed for {svc!r}: {result.stderr.strip()}")
 
 
-def _container_hermes_uid(cfg: AgentsConfig, svc: str) -> int:
+def container_hermes_uid(cfg: AgentsConfig, svc: str) -> int:
     """Return the numeric uid of the ``hermes`` user inside the running
     container. Runs as root so it works regardless of dir perms.
     """
@@ -140,7 +140,7 @@ def _container_hermes_uid(cfg: AgentsConfig, svc: str) -> int:
         raise RuntimeFailure(f"unparseable hermes uid from {svc!r}: {result.stdout!r}") from e
 
 
-def _chown_data_dir(cfg: AgentsConfig, svc: str, uid: int) -> None:
+def chown_data_dir(cfg: AgentsConfig, svc: str, uid: int) -> None:
     result = mp.exec_in_vm(
         cfg.vm.name,
         *_compose_exec_in_vm_argv(
@@ -159,7 +159,7 @@ def _chown_data_dir(cfg: AgentsConfig, svc: str, uid: int) -> None:
         raise RuntimeFailure(f"chown -R {uid}:{uid} /opt/data failed: {result.stderr.strip()}")
 
 
-def _chmod_data_dir_traversable(cfg: AgentsConfig, svc: str) -> None:
+def chmod_data_dir_traversable(cfg: AgentsConfig, svc: str) -> None:
     """Make ``/opt/data`` mode 755. The directory becomes world-traversable
     so the toolkit's ``RUNTIME_UID`` exec can ``cd`` in even when the
     image's entrypoint failed to align hermes with RUNTIME_UID.

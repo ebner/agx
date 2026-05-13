@@ -526,6 +526,141 @@ def _rewrite_service_paths(service: dict[str, object], old_name: str, new_name: 
         service["volumes"] = new_volumes
 
 
+# ---------- reseat ----------
+
+
+def reseat(
+    name: str,
+    *,
+    yes: bool = False,
+    config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH,
+) -> dict[str, object]:
+    """Regenerate the agent's compose service block from the current fragment.
+
+    Use case: the toolkit's service-fragment template evolves (e.g. a new
+    env var is added, a volume entry changes), but agents created before
+    the change keep their stale service block forever. ``reseat`` rewrites
+    just that block to match what ``agents create`` would produce today —
+    preserving the port, image tag, env_file additions (per-agent secrets
+    file), and depends_on additions (e.g. an OpenViking sidecar) so the
+    user doesn't lose those.
+
+    For Hermes agents, also runs the ``fix-perms`` chown/chmod dance after
+    the recreate, since a fragment that didn't include ``HERMES_UID`` will
+    have left ``/opt/data`` owned by uid 10000.
+
+    Force-recreates the container so the new fragment takes effect on the
+    next entrypoint pass.
+    """
+    from agents_cli import fixperms_cmd
+
+    validate_name(name)
+    cfg = cfg_mod.load(config_path)
+    agent_type = _detect_type_from_compose(cfg, name)
+    if agent_type is None:
+        raise UserError(f"agent {name!r} not in compose")
+    svc = service_name(name, agent_type)
+
+    if not yes and not ui.confirm(
+        f"reseat will regenerate {name!r}'s compose service block from the "
+        f"current toolkit template and force-recreate the container. Proceed?",
+        default=False,
+    ):
+        raise UserError("aborted by user")
+
+    with compose.acquire_lock(cfg.paths.host_data_dir):
+        doc = compose.read_compose_doc(cfg)
+        services = doc.get("services") or {}
+        existing = services.get(svc)
+        if not isinstance(existing, dict):
+            raise UserError(f"service {svc!r} missing from compose")
+
+        # Pull out the values worth preserving from the existing entry.
+        port = _extract_host_port(existing)
+        tag = _extract_image_tag(existing)
+        preserved_env_file = existing.get("env_file")
+        preserved_depends_on = existing.get("depends_on")
+
+        if agent_type == "hermes":
+            new_fragment: dict[str, object] = compose.hermes_service_fragment(
+                name=name, cfg=cfg, port=port, image_tag=tag
+            )
+        else:
+            new_fragment = compose.openclaw_service_fragment(name=name, port=port, image_tag=tag)
+
+        # Re-attach the additions the user/toolkit layered on top of the
+        # base fragment (secrets file, sidecar depends_on, etc).
+        if preserved_env_file is not None:
+            new_fragment["env_file"] = preserved_env_file
+        if preserved_depends_on is not None:
+            new_fragment["depends_on"] = preserved_depends_on
+
+        services[svc] = new_fragment
+        compose.write_compose_atomically(cfg, doc)
+
+        # Recreate so the new fragment is actually applied. Hermes additionally
+        # gets the chown/chmod dance — adding HERMES_UID to env will fix newly
+        # created files, but stale files from the previous container are still
+        # at the old uid.
+        fixperms_cmd.force_recreate(cfg, svc)
+        if agent_type == "hermes":
+            huid = fixperms_cmd.container_hermes_uid(cfg, svc)
+            fixperms_cmd.chown_data_dir(cfg, svc, huid)
+            fixperms_cmd.chmod_data_dir_traversable(cfg, svc)
+
+    payload: dict[str, object] = {
+        "name": name,
+        "type": agent_type,
+        "service": svc,
+        "image_tag": tag,
+        "port": port,
+        "status": "reseated",
+    }
+    ui.emit(
+        payload,
+        human=(
+            f"reseated {agent_type} agent {name!r}\n"
+            f"  service block regenerated from current fragment\n"
+            f"  container force-recreated\n"
+            + (
+                "  /opt/data ownership re-aligned"
+                if agent_type == "hermes"
+                else "  (no chown step for non-Hermes agents)"
+            )
+        ),
+    )
+    return payload
+
+
+def _extract_host_port(service: dict[str, object]) -> int:
+    """Pull the host-side port out of an existing service's ``ports:`` list.
+
+    Compose port entries look like ``"127.0.0.1:8642:8642"`` — the middle
+    field is the host port. Falls back to the agent type's base port if
+    we can't parse anything, so reseat doesn't silently drift the port.
+    """
+    ports = service.get("ports") or []
+    if isinstance(ports, list):
+        for entry in ports:
+            if isinstance(entry, str):
+                parts = entry.split(":")
+                if len(parts) >= 2:
+                    try:
+                        return int(parts[-2])
+                    except ValueError:
+                        continue
+    raise UserError(
+        "could not extract host port from existing service entry; compose file may be malformed"
+    )
+
+
+def _extract_image_tag(service: dict[str, object]) -> str:
+    image = service.get("image")
+    if not isinstance(image, str) or ":" not in image:
+        raise UserError(f"existing service has no parseable image tag (got {image!r})")
+    return image.rsplit(":", 1)[1]
+
+
 # ---------- shared journal walker ----------
 
 

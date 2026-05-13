@@ -64,6 +64,35 @@ The CLI writes a phase journal under `<data-dir>/.journal/<op>-<name>-<utc>.json
 
 `agents doctor` warns about any journal older than 24 hours. To clear a stuck journal once you've manually reconciled state, simply delete the file from `<data-dir>/.journal/`.
 
+## Reseating an agent after a toolkit upgrade
+
+Compose service blocks are written once at `agents create` time and not
+touched afterwards. If a toolkit version adds a new env var to the
+service fragment (e.g. `HERMES_UID`), pre-existing agents keep their
+stale block until you reseat them.
+
+```bash
+agents reseat coder
+```
+
+What it does:
+
+1. Reads the agent's existing compose service entry.
+2. Extracts the port, image tag, `env_file` additions (per-agent
+   secrets), and `depends_on` additions (sidecars like OpenViking) so
+   they survive the regeneration.
+3. Re-renders the service block from the current toolkit fragment —
+   picks up any new env var, volume, or other template changes.
+4. Force-recreates the container so the new block actually takes
+   effect (a plain `docker compose up -d` often decides "no drift, keep
+   the running container" and skips the entrypoint).
+5. For Hermes agents, additionally re-aligns `/opt/data` ownership
+   (same chown/chmod dance as `agents fix-perms`).
+
+When to run it: after upgrading the toolkit, if `agents doctor` flags
+something or if `agents exec <name> …` starts misbehaving. Safe to
+run any time — preserves all stateful agent data.
+
 ## /opt/data permission drift (and how `agents fix-perms` resolves it)
 
 Symptom: `agents exec coder hermes <anything>` crashes on import with

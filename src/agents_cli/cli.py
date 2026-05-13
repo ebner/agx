@@ -345,6 +345,24 @@ def agents_rename(old_name: str, new_name: str) -> None:
     _run(agents_cmd.rename, old_name, new_name)
 
 
+@main.command("reseat")
+@click.argument("name")
+@click.option("-y", "--yes", "yes_local", is_flag=True, help="Skip confirmation.")
+@click.pass_context
+def agents_reseat(ctx: click.Context, name: str, yes_local: bool) -> None:
+    """Regenerate the agent's compose service block from the current fragment.
+
+    Use this when the toolkit's service-fragment template has evolved since
+    the agent was created — new env var, changed volume layout, etc. Reseat
+    rewrites the compose entry to match what `agents create` would produce
+    today, preserving the port, image tag, env_file additions (per-agent
+    secrets), and depends_on additions (sidecars). Force-recreates the
+    container; for Hermes, also runs the fix-perms chown/chmod dance.
+    """
+    yes = yes_local or ctx.obj.get("yes", False)
+    _run(agents_cmd.reseat, name, yes=yes)
+
+
 # ---------- day-2 ops ----------
 
 
