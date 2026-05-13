@@ -311,3 +311,113 @@ def test_destroy_with_yes_skips_prompt_and_purges(mocker, tmp_path: Path) -> Non
     delete.assert_called_once()
     _, kwargs = delete.call_args
     assert kwargs.get("purge") is True
+
+
+# ---------- resize ----------
+
+
+def _stub_resize_mp(mocker) -> dict:
+    return {
+        "stop": mocker.patch("agents_cli.mp.stop_vm", return_value=_ok()),
+        "start": mocker.patch("agents_cli.mp.start_vm", return_value=_ok()),
+        "set": mocker.patch("agents_cli.mp.set_config", return_value=_ok()),
+        "info_vm": mocker.patch(
+            "agents_cli.mp.info_vm",
+            return_value=_ok(
+                json.dumps(
+                    {
+                        "info": {
+                            "agents": {
+                                "mounts": {"/home/ubuntu/agents": {}},
+                            }
+                        }
+                    }
+                )
+            ),
+        ),
+        "exec_in_vm": mocker.patch(
+            "agents_cli.mp.exec_in_vm",
+            return_value=MpResult(stdout="ok\n", stderr="", returncode=0),
+        ),
+    }
+
+
+def test_resize_refuses_without_any_arg(tmp_path: Path) -> None:
+    config_path = _saved_config(tmp_path)
+    cfg_mod.save(_make_config(tmp_path), config_path)
+    with pytest.raises(UserError, match="provide at least one"):
+        vm.resize(config_path=config_path)
+
+
+def test_resize_refuses_disk_shrink(mocker, tmp_path: Path) -> None:
+    cfg = _make_config(tmp_path)
+    cfg.vm.disk_gb = 50
+    config_path = _saved_config(tmp_path)
+    cfg_mod.save(cfg, config_path)
+    cfg.paths.host_data_dir.mkdir(exist_ok=True)
+    _stub_resize_mp(mocker)
+    with pytest.raises(UserError, match="disk shrink"):
+        vm.resize(disk_gb=25, config_path=config_path)
+
+
+def test_resize_stops_sets_starts_and_updates_config(mocker, tmp_path: Path) -> None:
+    cfg = _make_config(tmp_path)
+    config_path = _saved_config(tmp_path)
+    cfg_mod.save(cfg, config_path)
+    cfg.paths.host_data_dir.mkdir(exist_ok=True)
+
+    mocks = _stub_resize_mp(mocker)
+    vm.resize(cpus=8, memory_gb=16, disk_gb=50, config_path=config_path)
+
+    mocks["stop"].assert_called_once()
+    mocks["start"].assert_called_once()
+    # Three set calls in order
+    set_calls = [c.args for c in mocks["set"].call_args_list]
+    assert set_calls == [
+        ("local.agents.cpus", 8),
+        ("local.agents.memory", "16G"),
+        ("local.agents.disk", "50G"),
+    ]
+
+    reloaded = cfg_mod.load(config_path)
+    assert reloaded.vm.cpus == 8
+    assert reloaded.vm.memory_gb == 16
+    assert reloaded.vm.disk_gb == 50
+
+
+def test_resize_partial_only_writes_the_provided_fields(mocker, tmp_path: Path) -> None:
+    cfg = _make_config(tmp_path)
+    config_path = _saved_config(tmp_path)
+    cfg_mod.save(cfg, config_path)
+    cfg.paths.host_data_dir.mkdir(exist_ok=True)
+
+    mocks = _stub_resize_mp(mocker)
+    vm.resize(cpus=12, config_path=config_path)
+
+    set_calls = [c.args for c in mocks["set"].call_args_list]
+    assert set_calls == [("local.agents.cpus", 12)]
+
+    reloaded = cfg_mod.load(config_path)
+    assert reloaded.vm.cpus == 12
+    # memory_gb / disk_gb unchanged from the saved config
+    assert reloaded.vm.memory_gb == cfg.vm.memory_gb
+    assert reloaded.vm.disk_gb == cfg.vm.disk_gb
+
+
+def test_resize_starts_vm_even_if_set_raises(mocker, tmp_path: Path) -> None:
+    """A failed `multipass set` must not leave the VM stopped."""
+    cfg = _make_config(tmp_path)
+    config_path = _saved_config(tmp_path)
+    cfg_mod.save(cfg, config_path)
+    cfg.paths.host_data_dir.mkdir(exist_ok=True)
+
+    from agents_cli.errors import RuntimeFailure
+
+    mocks = _stub_resize_mp(mocker)
+    mocks["set"].side_effect = RuntimeFailure("multipass set failed")
+
+    with pytest.raises(RuntimeFailure):
+        vm.resize(cpus=8, config_path=config_path)
+
+    mocks["stop"].assert_called_once()
+    mocks["start"].assert_called_once()  # cleanup ran

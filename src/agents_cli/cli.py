@@ -107,6 +107,29 @@ def vm_stop() -> None:
     _run(vm_mod.stop)
 
 
+@vm.command("resize")
+@click.option("--cpus", type=int, default=None, help="New CPU count.")
+@click.option(
+    "--memory", "memory_gb", type=int, default=None, metavar="GB", help="New memory size."
+)
+@click.option(
+    "--disk",
+    "disk_gb",
+    type=int,
+    default=None,
+    metavar="GB",
+    help="New disk size (grow-only; multipass cannot shrink).",
+)
+def vm_resize(cpus: int | None, memory_gb: int | None, disk_gb: int | None) -> None:
+    """Reallocate CPUs / memory / disk on the existing VM.
+
+    The VM stops, gets the new sizing applied via `multipass set`, then
+    starts back up. Mounts are re-verified and the config is updated.
+    Disk can only grow — destroy and re-init to shrink (data-dir survives).
+    """
+    _run(vm_mod.resize, cpus=cpus, memory_gb=memory_gb, disk_gb=disk_gb)
+
+
 @vm.command("shell")
 def vm_shell() -> None:
     """Drop into the VM via `multipass shell`."""

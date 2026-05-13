@@ -151,6 +151,66 @@ def stop(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> None:
     ui.emit({"vm": cfg.vm.name, "status": "stopped"}, human=f"{cfg.vm.name}: stopped")
 
 
+def resize(
+    *,
+    cpus: int | None = None,
+    memory_gb: int | None = None,
+    disk_gb: int | None = None,
+    config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH,
+) -> None:
+    """Reallocate cpus/memory/disk on the existing VM.
+
+    Multipass requires the VM to be stopped for these changes, and disk
+    can only grow. We refuse disk shrinks with a clear error pointing at
+    ``vm destroy`` + re-init (the host data-dir is preserved across
+    destroys, so this is non-destructive for agent state).
+    """
+    if cpus is None and memory_gb is None and disk_gb is None:
+        raise UserError("provide at least one of --cpus, --memory, --disk")
+
+    cfg = cfg_mod.load(config_path)
+
+    if disk_gb is not None and disk_gb < cfg.vm.disk_gb:
+        raise UserError(
+            f"disk shrink not supported by multipass ({cfg.vm.disk_gb}G -> {disk_gb}G). "
+            "If you really need a smaller disk: `agents vm destroy` then re-run "
+            "`agents vm init --data-dir <path> --disk <size>` — your host data-dir "
+            "survives the teardown."
+        )
+
+    mp.stop_vm(cfg.vm.name)
+    try:
+        if cpus is not None:
+            mp.set_config(f"local.{cfg.vm.name}.cpus", cpus)
+        if memory_gb is not None:
+            mp.set_config(f"local.{cfg.vm.name}.memory", f"{memory_gb}G")
+        if disk_gb is not None:
+            mp.set_config(f"local.{cfg.vm.name}.disk", f"{disk_gb}G")
+    finally:
+        mp.start_vm(cfg.vm.name)
+
+    # Mount survival across stop/start isn't always guaranteed.
+    if not cfg.paths.data_dir_in_vm:
+        _ensure_mount(cfg)
+        _mount_probe(cfg)
+
+    if cpus is not None:
+        cfg.vm.cpus = cpus
+    if memory_gb is not None:
+        cfg.vm.memory_gb = memory_gb
+    if disk_gb is not None:
+        cfg.vm.disk_gb = disk_gb
+    cfg_mod.save(cfg, config_path)
+
+    ui.emit(
+        {"cpus": cfg.vm.cpus, "memory_gb": cfg.vm.memory_gb, "disk_gb": cfg.vm.disk_gb},
+        human=(
+            f"resized {cfg.vm.name!r}: "
+            f"cpus={cfg.vm.cpus}, memory={cfg.vm.memory_gb}G, disk={cfg.vm.disk_gb}G"
+        ),
+    )
+
+
 def status(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> None:
     cfg = cfg_mod.load(config_path)
     result = mp.info_vm(cfg.vm.name, fmt="json")

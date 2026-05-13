@@ -213,6 +213,13 @@ def stop_vm(vm: str) -> MpResult:
     return mp("stop", vm)
 
 
+def set_config(key: str, value: str | int) -> MpResult:
+    """``multipass set <key>=<value>``. Used by ``agents vm resize`` to
+    reallocate per-VM cpus/memory/disk on a stopped VM.
+    """
+    return mp("set", f"{key}={value}")
+
+
 def delete_vm(vm: str, *, purge: bool = False) -> MpResult:
     args = ["delete", vm]
     if purge:
