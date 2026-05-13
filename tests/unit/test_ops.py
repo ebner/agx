@@ -224,3 +224,49 @@ def test_doctor_flags_hermes_doctor_failure(with_coder: Path, mocker) -> None:
     )
     with pytest.raises(HealthCheckFailure):
         ops.doctor(config_path=with_coder)
+
+
+# ---------- runtime-user default for `docker compose exec` ----------
+
+
+def test_compose_exec_argv_defaults_to_runtime_user(cfg: AgentsConfig) -> None:
+    """`docker compose exec` defaults to the image USER (root for the Hermes
+    image). Files created by a root exec are unreadable by the long-running
+    gateway process (which is `gosu hermes` to uid 1000) — silently breaks
+    things like `hermes pairing approve` because the approval file ends up
+    root:root. Every toolkit exec must default to --user 1000:1000.
+    """
+    argv = ops.compose_exec_argv(cfg, "hermes-coder", "hermes", "pairing", "approve")
+    assert "--user" in argv
+    assert f"{ops.RUNTIME_UID}:{ops.RUNTIME_GID}" in argv
+    # The --user pair must come BETWEEN "exec" and the service name, not
+    # after the service name (which would be interpreted as args to the
+    # in-container command).
+    exec_idx = argv.index("exec")
+    svc_idx = argv.index("hermes-coder")
+    user_flag_idx = argv.index("--user")
+    assert exec_idx < user_flag_idx < svc_idx
+
+
+def test_compose_exec_argv_as_root_omits_user(cfg: AgentsConfig) -> None:
+    """The escape hatch for chown / apt install / other admin work."""
+    argv = ops.compose_exec_argv(cfg, "hermes-coder", "chown", "hermes:hermes", "/opt/data/x", as_root=True)
+    assert "--user" not in argv
+
+
+def test_in_vm_compose_exec_argv_threads_env_vars(cfg: AgentsConfig) -> None:
+    """Validation paths (hermes config validate via HERMES_CONFIG=...) need
+    env injection. Helper threads them via -e KEY=VALUE on the subcommand.
+    """
+    argv = ops._compose_exec_in_vm_argv(
+        cfg,
+        "hermes-coder",
+        "hermes",
+        "config",
+        "validate",
+        no_tty=True,
+        env={"HERMES_CONFIG": "/opt/data/config.yaml.new"},
+    )
+    assert "-e" in argv
+    assert "HERMES_CONFIG=/opt/data/config.yaml.new" in argv
+    assert "-T" in argv

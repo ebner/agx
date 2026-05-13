@@ -368,10 +368,27 @@ def agent_logs(name: str, follow: bool, since: str | None) -> None:
     context_settings={"ignore_unknown_options": True, "allow_extra_args": True},
 )
 @click.argument("name")
+@click.option(
+    "--root",
+    "as_root",
+    is_flag=True,
+    help=(
+        "Run as the container's image USER (root), not the runtime "
+        "user (uid 1000). Reach for this only for admin operations "
+        "(chown, apt install). Files created during a root exec end "
+        "up unreadable by the long-running gateway process, which "
+        "drops to uid 1000 — using --root by default silently breaks "
+        "things like `hermes pairing approve`."
+    ),
+)
 @click.argument("cmd", nargs=-1, type=click.UNPROCESSED)
-def agent_run_in(name: str, cmd: tuple[str, ...]) -> None:
-    """Run a command inside the agent's container (TTY shell if no cmd)."""
-    _run(ops.run_in_agent, name, cmd)
+def agent_run_in(name: str, as_root: bool, cmd: tuple[str, ...]) -> None:
+    """Run a command inside the agent's container (TTY shell if no cmd).
+
+    Defaults to running as the runtime user (uid 1000) so files share
+    ownership with the gateway. Pass --root for admin operations.
+    """
+    _run(ops.run_in_agent, name, cmd, as_root=as_root)
 
 
 @main.command("setup")

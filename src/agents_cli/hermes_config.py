@@ -137,28 +137,23 @@ def _validate_in_container(cfg: AgentsConfig, agent_name: str, vm_path: str) -> 
     running container. Best-effort: if the container isn't up, we skip
     (the structural ``validate_dashboard_binding`` already ran).
     """
+    from agents_cli.ops import _compose_exec_in_vm_argv
+
     svc = f"hermes-{agent_name}"
-    # `hermes config validate` reads from $HERMES_HOME/config.yaml by default;
-    # point it at the staged file by setting HERMES_CONFIG.
-    container_stage = f"/opt/data/{Path(vm_path).name}"  # /opt/data is $HERMES_HOME inside container; the staged file lives there via mount
+    # `hermes config validate` reads from $HERMES_HOME/config.yaml by
+    # default; point it at the staged file by setting HERMES_CONFIG.
+    container_stage = f"/opt/data/{Path(vm_path).name}"
     result = mp.exec_in_vm(
         cfg.vm.name,
-        "docker",
-        "compose",
-        "--project-directory",
-        str(cfg.paths.vm_agents_root),
-        "-f",
-        f"{cfg.paths.vm_agents_root}/docker-compose.yml",
-        "--env-file",
-        f"{cfg.paths.vm_agents_root}/.env",
-        "exec",
-        "-T",
-        "-e",
-        f"HERMES_CONFIG={container_stage}",
-        svc,
-        "hermes",
-        "config",
-        "validate",
+        *_compose_exec_in_vm_argv(
+            cfg,
+            svc,
+            "hermes",
+            "config",
+            "validate",
+            no_tty=True,
+            env={"HERMES_CONFIG": container_stage},
+        ),
         check=False,
     )
     if result.returncode in (0, None):

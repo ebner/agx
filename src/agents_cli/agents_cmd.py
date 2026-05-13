@@ -321,21 +321,11 @@ def _run_agent_setup(cfg: AgentsConfig, svc: str, agent_type: str) -> None:
     binary = "hermes" if agent_type == "hermes" else "openclaw"
     sub = "setup" if agent_type == "hermes" else "onboard"
     from agents_cli import mp
+    from agents_cli.ops import _compose_exec_in_vm_argv
 
     rc = mp.exec_in_vm_interactive(
         cfg.vm.name,
-        "docker",
-        "compose",
-        "--project-directory",
-        str(cfg.paths.vm_agents_root),
-        "-f",
-        f"{cfg.paths.vm_agents_root}/docker-compose.yml",
-        "--env-file",
-        f"{cfg.paths.vm_agents_root}/.env",
-        "exec",
-        svc,
-        binary,
-        sub,
+        *_compose_exec_in_vm_argv(cfg, svc, binary, sub),
     )
     if rc != 0:
         raise UserError(

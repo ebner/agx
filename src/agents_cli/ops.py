@@ -82,12 +82,22 @@ def run_in_agent(
     name: str,
     cmd: tuple[str, ...] = (),
     *,
+    as_root: bool = False,
     config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH,
 ) -> None:
-    """`agents exec <name> [--] <cmd...>`. Drops into a TTY shell when ``cmd`` is empty."""
+    """``agents exec <name> [--root] [--] <cmd...>``.
+
+    Defaults to running as the agent's runtime user (uid 1000), the
+    same uid the long-running gateway process drops to — so files
+    created here share ownership with what the gateway writes. Drops
+    into a TTY shell when ``cmd`` is empty.
+
+    Pass ``as_root=True`` (CLI: ``--root``) for admin operations like
+    ``chown`` or installing apt packages inside the container.
+    """
     cfg = cfg_mod.load(config_path)
     svc, _ = _resolve_service(cfg, name)
-    argv = [*_multipass_compose_argv(cfg), "exec", svc, *(cmd or ("bash",))]
+    argv = compose_exec_argv(cfg, svc, *(cmd or ("bash",)), as_root=as_root)
     os.execvp("multipass", argv)
 
 
@@ -99,7 +109,7 @@ def setup(name: str, *, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> None
     svc, agent_type = _resolve_service(cfg, name)
     binary = "hermes" if agent_type == "hermes" else "openclaw"
     sub = "setup" if agent_type == "hermes" else "onboard"
-    argv = [*_multipass_compose_argv(cfg), "exec", svc, binary, sub]
+    argv = compose_exec_argv(cfg, svc, binary, sub)
     os.execvp("multipass", argv)
 
 
@@ -173,6 +183,83 @@ def _multipass_compose_argv(cfg: AgentsConfig) -> list[str]:
         f"{root}/docker-compose.yml",
         "--env-file",
         f"{root}/.env",
+    ]
+
+
+# Container UID/GID for the agent's runtime user.
+#
+# Hermes' entrypoint reads HERMES_UID/HERMES_GID from env and remaps its
+# internal `hermes` user to that uid before `gosu hermes`, so the long-
+# running gateway process is uid 1000 inside the container. OpenClaw's
+# default `node` user is also 1000. We hardcode 1000:1000 for both,
+# matching the .env values the toolkit writes.
+#
+# Why this matters: `docker compose exec` defaults to the image's
+# configured USER, which for the Hermes image is `root` (uid 0). If
+# `agents exec coder hermes pairing approve ...` runs as root, the
+# files it creates are owned by root — but the gateway runs as uid 1000
+# and can't read them. Every interactive / wizard exec MUST default to
+# the runtime user. Admin operations that need root can opt in via the
+# CLI `--root` flag.
+RUNTIME_UID: int = 1000
+RUNTIME_GID: int = 1000
+
+
+def compose_exec_argv(
+    cfg: AgentsConfig,
+    svc: str,
+    *cmd: str,
+    no_tty: bool = False,
+    as_root: bool = False,
+) -> list[str]:
+    """Build the full argv (incl. ``multipass exec ...``) for a
+    ``docker compose exec`` inside the VM. Use this for ``os.execvp``
+    paths (interactive shells, wizards).
+    """
+    return [
+        *_multipass_compose_argv(cfg),
+        "exec",
+        *([] if as_root else ["--user", f"{RUNTIME_UID}:{RUNTIME_GID}"]),
+        *(["-T"] if no_tty else []),
+        svc,
+        *cmd,
+    ]
+
+
+def _compose_exec_in_vm_argv(
+    cfg: AgentsConfig,
+    svc: str,
+    *cmd: str,
+    no_tty: bool = False,
+    as_root: bool = False,
+    env: dict[str, str] | None = None,
+) -> list[str]:
+    """The in-VM half of ``compose_exec_argv`` — drops the ``multipass
+    exec <vm> --`` prefix so it can be passed as ``*cmd`` to
+    ``mp.exec_in_vm``. Same user/tty semantics.
+
+    ``env`` maps environment variables to inject via ``-e KEY=VALUE``
+    on the ``compose exec`` subcommand.
+    """
+    root = str(cfg.paths.vm_agents_root)
+    env_args: list[str] = []
+    for key, value in (env or {}).items():
+        env_args += ["-e", f"{key}={value}"]
+    return [
+        "docker",
+        "compose",
+        "--project-directory",
+        root,
+        "-f",
+        f"{root}/docker-compose.yml",
+        "--env-file",
+        f"{root}/.env",
+        "exec",
+        *([] if as_root else ["--user", f"{RUNTIME_UID}:{RUNTIME_GID}"]),
+        *(["-T"] if no_tty else []),
+        *env_args,
+        svc,
+        *cmd,
     ]
 
 
@@ -328,19 +415,7 @@ def _check_service_container(
         # the nested sandbox to ever come up.
         docker_check = mp.exec_in_vm(
             cfg.vm.name,
-            "docker",
-            "compose",
-            "--project-directory",
-            str(cfg.paths.vm_agents_root),
-            "-f",
-            f"{cfg.paths.vm_agents_root}/docker-compose.yml",
-            "--env-file",
-            f"{cfg.paths.vm_agents_root}/.env",
-            "exec",
-            "-T",
-            svc,
-            "docker",
-            "ps",
+            *_compose_exec_in_vm_argv(cfg, svc, "docker", "ps", no_tty=True),
             check=False,
         )
         if docker_check.returncode == 0:
@@ -379,19 +454,7 @@ def _check_hermes_doctor(
 ) -> None:
     result = mp.exec_in_vm(
         cfg.vm.name,
-        "docker",
-        "compose",
-        "--project-directory",
-        str(cfg.paths.vm_agents_root),
-        "-f",
-        f"{cfg.paths.vm_agents_root}/docker-compose.yml",
-        "--env-file",
-        f"{cfg.paths.vm_agents_root}/.env",
-        "exec",
-        "-T",
-        svc,
-        "hermes",
-        "doctor",
+        *_compose_exec_in_vm_argv(cfg, svc, "hermes", "doctor", no_tty=True),
         check=False,
     )
     if result.returncode == 0:
@@ -456,20 +519,9 @@ def _check_hermes_codex_mount(
 
     result = mp.exec_in_vm(
         cfg.vm.name,
-        "docker",
-        "compose",
-        "--project-directory",
-        str(cfg.paths.vm_agents_root),
-        "-f",
-        f"{cfg.paths.vm_agents_root}/docker-compose.yml",
-        "--env-file",
-        f"{cfg.paths.vm_agents_root}/.env",
-        "exec",
-        "-T",
-        svc,
-        "test",
-        "-r",
-        "/home/hermes/.codex/auth.json",
+        *_compose_exec_in_vm_argv(
+            cfg, svc, "test", "-r", "/home/hermes/.codex/auth.json", no_tty=True
+        ),
         check=False,
     )
     if result.returncode == 0:
