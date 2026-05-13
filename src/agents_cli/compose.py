@@ -264,6 +264,18 @@ def hermes_service_fragment(
             # would otherwise hit "executable file not found". Set the full
             # PATH explicitly to mirror the image default plus the venv.
             "PATH": "/opt/hermes/.venv/bin:/opt/data/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            # The Hermes image entrypoint reads HERMES_UID/GID to remap
+            # its internal `hermes` user (default uid 10000) and chown
+            # /opt/data before `gosu hermes`. WITHOUT these vars the
+            # entrypoint skips the remap, hermes stays at uid 10000, and
+            # the toolkit's `--user 1000:1000` exec ends up at a uid no
+            # in-container user matches — every `agents exec coder
+            # hermes ...` then hits "permission denied" on /opt/data
+            # (which is mode 700 owned by the entrypoint's hermes).
+            # Interpolated from `.env` (HERMES_UID/HERMES_GID are written
+            # there by `vm init` to the host user's primary uid/gid).
+            "HERMES_UID": "${HERMES_UID}",
+            "HERMES_GID": "${HERMES_GID}",
         },
         "mem_limit": cfg.defaults.hermes_mem_limit,
         "cpus": cfg.defaults.hermes_cpus,

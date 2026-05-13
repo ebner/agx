@@ -86,6 +86,15 @@ def test_hermes_fragment_has_required_mounts(cfg: AgentsConfig) -> None:
     # to the same path we mount, regardless of the image's USER/HOME drift.
     assert s["environment"]["HOME"] == "/home/hermes"
 
+    # HERMES_UID/GID are non-negotiable — the image entrypoint reads them
+    # to remap its internal hermes user (default 10000) to host uid 1000
+    # before `gosu hermes`. Without these vars the entrypoint skips the
+    # remap and the toolkit's --user 1000:1000 exec hits permission-denied
+    # on /opt/data (which the entrypoint creates as the un-remapped uid).
+    # Interpolated from .env (HERMES_UID/HERMES_GID written there by vm init).
+    assert s["environment"]["HERMES_UID"] == "${HERMES_UID}"
+    assert s["environment"]["HERMES_GID"] == "${HERMES_GID}"
+
 
 def test_hermes_fragment_never_binds_zero_address(cfg: AgentsConfig) -> None:
     s = hermes_service_fragment(name="coder", cfg=cfg, port=8642, image_tag="v1.0.0")
