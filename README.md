@@ -7,8 +7,12 @@ Defense in depth: outer isolation = VM, inner isolation = one container per agen
 ## Quickstart
 
 ```bash
-# 1. Install the host-side CLI (requires Python 3.11+)
-pip install -e .
+# 1. Install the host-side CLI (requires Python 3.11+).
+#    Recommended: pipx — installs into an isolated env, gets `agents` on $PATH,
+#    works on Homebrew / Debian / Ubuntu 24+ where pip refuses (PEP 668).
+pipx install -e .                 # macOS: brew install pipx first if missing
+# or, if you prefer a manual venv:
+#   python3 -m venv .venv && source .venv/bin/activate && pip install -e .
 
 # 2. (Optional) Install Codex CLI on the host if you want a toolkit-scoped Codex account
 npm install -g @openai/codex

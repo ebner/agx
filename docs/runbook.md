@@ -3,8 +3,9 @@
 ## First-time setup
 
 ```bash
-# Install the host CLI
-pip install -e .
+# Install the host CLI (PEP 668-aware; works on Homebrew / Debian / Ubuntu 24+).
+pipx install -e .                 # macOS: brew install pipx first if missing
+# or use a venv: python3 -m venv .venv && source .venv/bin/activate && pip install -e .
 
 # (Optional) Codex CLI on host so Hermes can use Codex as LLM provider
 npm install -g @openai/codex
