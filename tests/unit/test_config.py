@@ -25,7 +25,7 @@ def test_minimal_config_loads(tmp_path: Path) -> None:
     c = load(p)
     assert c.paths.host_data_dir == tmp_path / "data"
     assert c.vm.name == "agents"
-    assert c.vm.ubuntu_release == "26.04"
+    assert c.vm.ubuntu_release == "24.04"
 
 
 def test_load_missing_raises_user_error(tmp_path: Path) -> None:

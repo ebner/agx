@@ -77,12 +77,20 @@ def vm() -> None:
 @click.option("--cpus", type=int)
 @click.option("--memory", "memory_gb", type=int, metavar="GB")
 @click.option("--disk", "disk_gb", type=int, metavar="GB")
+@click.option(
+    "--ubuntu-release",
+    "ubuntu_release",
+    default=None,
+    metavar="VERSION",
+    help="Override Ubuntu LTS for the VM (default 24.04). Use 26.04 once Docker CE's repos include it.",
+)
 def vm_init(
     data_dir: str,
     data_dir_in_vm: bool,
     cpus: int | None,
     memory_gb: int | None,
     disk_gb: int | None,
+    ubuntu_release: str | None,
 ) -> None:
     """Provision the Multipass VM and mount the host data dir."""
     _run(
@@ -92,6 +100,7 @@ def vm_init(
         cpus=cpus,
         memory_gb=memory_gb,
         disk_gb=disk_gb,
+        ubuntu_release=ubuntu_release,
     )
 
 

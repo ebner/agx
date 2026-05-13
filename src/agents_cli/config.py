@@ -38,7 +38,11 @@ class VmConfig(BaseModel):
     cpus: int = Field(default=4, ge=1)
     memory_gb: int = Field(default=8, ge=2)
     disk_gb: int = Field(default=25, ge=10)
-    ubuntu_release: str = "26.04"
+    # 24.04 LTS is the Docker-CE stable target — `get.docker.com/rootless`
+    # supports it directly. 26.04 may not be in Docker's apt repos at any
+    # given moment (newer LTS releases lag a few months); opt in with
+    # `vm init --ubuntu-release 26.04` once that's no longer the case.
+    ubuntu_release: str = "24.04"
 
 
 class PathsConfig(BaseModel):

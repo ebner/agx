@@ -290,6 +290,50 @@ def test_init_falls_back_when_release_not_in_catalog(mocker, tmp_path: Path) -> 
     assert cfg.vm.ubuntu_release == "24.04"
 
 
+def test_init_respects_ubuntu_release_override(mocker, tmp_path: Path) -> None:
+    """`--ubuntu-release 26.04` should be honored when the catalog lists it."""
+    mocks = _stub_all_mp(mocker)
+    catalog = json.dumps({"images": {"x": {"aliases": ["24.04", "26.04"]}}})
+    mocks["find"].return_value = _ok(catalog)
+    config_path = _saved_config(tmp_path)
+    vm.init(data_dir=tmp_path / "data", ubuntu_release="26.04", config_path=config_path)
+    cfg = cfg_mod.load(config_path)
+    assert cfg.vm.ubuntu_release == "26.04"
+
+
+def test_init_dumps_bootstrap_output_on_failure(mocker, tmp_path: Path) -> None:
+    """When the handshake fails, the captured script output must surface."""
+    bad = (
+        "+ curl https://get.docker.com/rootless\n"
+        "curl: (28) Connection timed out\n"
+        "BOOTSTRAP_OK uidmap=ok dbus=ok lingering=ok docker_host=fail daemon=fail "
+        "user_socket_active=fail net=fail ubuntu_uid=1000 ubuntu_gid=1000 "
+        "socket_path=/run/user/1000/docker.sock"
+    )
+    _stub_all_mp(mocker, bootstrap_output=bad)
+    with pytest.raises(RuntimeFailure) as exc:
+        vm.init(data_dir=tmp_path / "data", config_path=_saved_config(tmp_path))
+    msg = str(exc.value)
+    assert "curl: (28) Connection timed out" in msg
+    assert "bootstrap stdout" in msg
+
+
+def test_init_hints_at_ubuntu_release_when_net_fails_on_non_24_04(mocker, tmp_path: Path) -> None:
+    bad = (
+        "BOOTSTRAP_OK uidmap=ok dbus=ok lingering=ok docker_host=fail daemon=fail "
+        "user_socket_active=fail net=fail ubuntu_uid=1000 ubuntu_gid=1000 "
+        "socket_path=/run/user/1000/docker.sock"
+    )
+    mocks = _stub_all_mp(mocker, bootstrap_output=bad)
+    mocks["find"].return_value = _ok(json.dumps({"images": {"x": {"aliases": ["26.04"]}}}))
+    with pytest.raises(RuntimeFailure, match="ubuntu_release"):
+        vm.init(
+            data_dir=tmp_path / "data",
+            ubuntu_release="26.04",
+            config_path=_saved_config(tmp_path),
+        )
+
+
 # ---------- destroy ----------
 
 

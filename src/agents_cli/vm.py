@@ -37,6 +37,7 @@ def init(
     cpus: int | None = None,
     memory_gb: int | None = None,
     disk_gb: int | None = None,
+    ubuntu_release: str | None = None,
     config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH,
 ) -> None:
     """Idempotently provision the agents VM.
@@ -66,6 +67,8 @@ def init(
         cfg.vm.memory_gb = memory_gb
     if disk_gb is not None:
         cfg.vm.disk_gb = disk_gb
+    if ubuntu_release is not None:
+        cfg.vm.ubuntu_release = ubuntu_release
 
     cfg.host = HostConfig(uid=os.getuid(), gid=os.getgid())
 
@@ -97,9 +100,26 @@ def init(
     if not data_dir_in_vm:
         _ensure_mount(cfg)
 
-    status = _run_bootstrap(cfg.vm.name)
+    status, boot_stdout, boot_stderr = _run_bootstrap(cfg.vm.name)
     if not status.is_ok():
-        raise RuntimeFailure("bootstrap failed: " + ", ".join(status.fail_reasons()))
+        # Dump the captured streams so the user sees what actually failed.
+        # The per-field flags ("net=fail", "daemon=fail") rarely tell the
+        # real story on their own.
+        tail = "\n".join(boot_stdout.splitlines()[-60:])
+        err_tail = "\n".join(boot_stderr.splitlines()[-20:]) if boot_stderr else ""
+        details = f"\n--- bootstrap stdout (last 60 lines) ---\n{tail}"
+        if err_tail:
+            details += f"\n--- bootstrap stderr (last 20 lines) ---\n{err_tail}"
+        hint = ""
+        if "net=fail" in status.fail_reasons() and cfg.vm.ubuntu_release != "24.04":
+            hint = (
+                f"\nHint: ubuntu_release={cfg.vm.ubuntu_release!r}. Docker CE's apt repos may "
+                "not include this release yet. Try `agents vm destroy --yes` and re-init with "
+                "`--ubuntu-release 24.04` (the toolkit default)."
+            )
+        raise RuntimeFailure(
+            "bootstrap failed: " + ", ".join(status.fail_reasons()) + hint + details
+        )
 
     cfg.vm_runtime.docker_socket_path = status.socket_path()
     cfg.vm_runtime.ubuntu_uid = status.ubuntu_uid()
@@ -399,9 +419,17 @@ def _mount_probe(cfg: AgentsConfig) -> None:
         probe_path.unlink(missing_ok=True)
 
 
-def _run_bootstrap(vm_name: str) -> BootstrapStatus:
+def _run_bootstrap(vm_name: str) -> tuple[BootstrapStatus, str, str]:
+    """Run the bootstrap script and return (status, stdout, stderr).
+
+    Returning the raw streams lets the caller surface them when the
+    handshake fails — the per-field `fail` flags by themselves rarely
+    explain *why* something didn't work (network blocked, distro too
+    new for Docker, etc.).
+    """
     result = mp.exec_bash(vm_name, templates.VM_BOOTSTRAP_SCRIPT, timeout=900.0)
-    return mp.parse_bootstrap_ok(result.stdout)
+    status = mp.parse_bootstrap_ok(result.stdout)
+    return status, result.stdout, result.stderr
 
 
 def _seed_data_dir(cfg: AgentsConfig) -> None:
