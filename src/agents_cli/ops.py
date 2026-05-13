@@ -66,11 +66,11 @@ def logs(
     svc, _ = _resolve_service(cfg, name)
     if follow:
         # Replace the process so the user gets a clean Ctrl-C exit.
-        argv = [*_multipass_compose_argv(cfg), "logs", "-f"]
+        argv = [*_in_vm_compose_argv(cfg), "logs", "-f"]
         if since:
             argv += ["--since", since]
         argv.append(svc)
-        os.execvp("multipass", argv)
+        os.execvp("incus", argv)
     result = compose_runner.logs(cfg, svc, follow=False, since=since)
     ui.emit({"name": name, "logs": result.stdout}, human=result.stdout.rstrip())
 
@@ -87,8 +87,8 @@ def run_in_agent(
     """`agents exec <name> [--] <cmd...>`. Drops into a TTY shell when ``cmd`` is empty."""
     cfg = cfg_mod.load(config_path)
     svc, _ = _resolve_service(cfg, name)
-    argv = [*_multipass_compose_argv(cfg), "exec", svc, *(cmd or ("bash",))]
-    os.execvp("multipass", argv)
+    argv = [*_in_vm_compose_argv(cfg), "exec", svc, *(cmd or ("bash",))]
+    os.execvp("incus", argv)
 
 
 # ---------- setup wizard ----------
@@ -99,8 +99,8 @@ def setup(name: str, *, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> None
     svc, agent_type = _resolve_service(cfg, name)
     binary = "hermes" if agent_type == "hermes" else "openclaw"
     sub = "setup" if agent_type == "hermes" else "onboard"
-    argv = [*_multipass_compose_argv(cfg), "exec", svc, binary, sub]
-    os.execvp("multipass", argv)
+    argv = [*_in_vm_compose_argv(cfg), "exec", svc, binary, sub]
+    os.execvp("incus", argv)
 
 
 # ---------- doctor ----------
@@ -158,11 +158,25 @@ def doctor(
     return report
 
 
-def _multipass_compose_argv(cfg: AgentsConfig) -> list[str]:
+def _in_vm_compose_argv(cfg: AgentsConfig) -> list[str]:
+    """Build an ``incus exec ... docker compose ...`` prefix that the
+    ``logs``/``exec``/``setup`` commands ``execvp`` into for an
+    interactive TTY. Runs as ubuntu (uid 1000) — matches ``mp.exec_in_vm``.
+    """
     root = str(cfg.paths.vm_agents_root)
     return [
-        "multipass",
+        "incus",
         "exec",
+        "--user",
+        "1000",
+        "--group",
+        "1000",
+        "--cwd",
+        "/home/ubuntu",
+        "--env",
+        "HOME=/home/ubuntu",
+        "--env",
+        mp.VM_USER_PATH,
         cfg.vm.name,
         "--",
         "docker",

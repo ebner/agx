@@ -1,8 +1,17 @@
-"""Multipass primitives.
+"""VM backend primitives (Incus).
 
 All host↔VM interaction flows through this module. The host never speaks
-to the in-VM Docker daemon directly — it shells out to ``multipass`` and
+to the in-VM Docker daemon directly — it shells out to ``incus`` and
 runs commands inside the VM.
+
+Historical note: was previously implemented against ``multipass``. We
+migrated to Incus to get **virtiofs** for the host data-dir share —
+multipass's default fuse.sshfs mount can't be bind-mounted into a
+rootless Docker container (kernel returns ``operation not supported``),
+and its 9p ``--type native`` mount doesn't fully support the file ops
+SQLite needs (Hermes' session store falls back to JSONL). Incus +
+virtiofsd solves both. The module name is kept as ``mp`` for minimum
+churn across the rest of the codebase — semantics are now Incus-backed.
 
 Two design rules:
 
@@ -11,10 +20,16 @@ Two design rules:
 2. The ``BOOTSTRAP_OK`` parser is forward-compatible (extra fields are
    accepted) and strict on required fields, so a partial bootstrap is
    caught before the toolkit tries to use the VM.
+
+The JSON returned by ``info_vm`` is normalised to a multipass-flavoured
+shape (``{"info": {"<vm>": {"state": ..., "mounts": {...},
+"snapshots": {...}, "ipv4": [...]}}}``) so the parsers in ``vm.py``,
+``upgrades.py``, and ``ops.py`` did not need to change at migration time.
 """
 
 from __future__ import annotations
 
+import json
 import subprocess
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -24,7 +39,28 @@ from typing import Final
 from agents_cli import ui
 from agents_cli.errors import RuntimeFailure
 
-MULTIPASS_BIN: Final = "multipass"
+INCUS_BIN: Final = "incus"
+
+# Standard cloud-image user. Incus's ``images:ubuntu/24.04`` ships with
+# this account preconfigured with passwordless sudo, matching the
+# multipass default — so the existing bootstrap script (which uses
+# ``sudo`` liberally) works unchanged.
+VM_USER_UID: Final = 1000
+VM_USER_GID: Final = 1000
+VM_USER_HOME: Final = "/home/ubuntu"
+# ``incus exec`` does NOT read ``/etc/environment`` (no PAM), so we
+# must pass PATH explicitly. Includes ``/home/ubuntu/bin`` because
+# rootless Docker installs its binaries there — without that on PATH
+# the toolkit's ``docker ...`` invocations fail with ``command not
+# found`` from inside the VM.
+VM_USER_PATH: Final = (
+    "PATH=/home/ubuntu/bin:/usr/local/sbin:/usr/local/bin:"
+    "/usr/sbin:/usr/bin:/sbin:/bin"
+)
+
+# Device name for the host data-dir share on the instance. Stable so
+# `_ensure_mount` and `umount` know what to remove / check for.
+DATA_DEVICE_NAME: Final = "agents-data"
 
 REQUIRED_OK_FIELDS: Final = frozenset(
     {
@@ -118,35 +154,99 @@ def run(
     return result
 
 
-def mp(
+def _incus(
     *args: str,
     check: bool = True,
     input_bytes: bytes | None = None,
     timeout: float | None = None,
 ) -> MpResult:
-    return run([MULTIPASS_BIN, *args], check=check, input_bytes=input_bytes, timeout=timeout)
+    return run([INCUS_BIN, *args], check=check, input_bytes=input_bytes, timeout=timeout)
+
+
+# Back-compat alias for any external code that still imports ``mp.mp``.
+mp = _incus
+
+
+# ---------- exec / file transfer ----------
 
 
 def exec_in_vm(vm: str, *cmd: str, check: bool = True) -> MpResult:
-    """Run a command in the VM, argv-form. Use `exec_bash` for scripts."""
-    return mp("exec", vm, "--", *cmd, check=check)
+    """Run a command in the VM as ``ubuntu`` (uid 1000), cwd /home/ubuntu.
+
+    Passwordless sudo is available for elevated steps, matching the
+    cloud-image default. Use ``exec_bash`` for piping scripts.
+    """
+    return _incus(
+        "exec",
+        "--user",
+        str(VM_USER_UID),
+        "--group",
+        str(VM_USER_GID),
+        "--cwd",
+        VM_USER_HOME,
+        "--env",
+        f"HOME={VM_USER_HOME}",
+        "--env",
+        VM_USER_PATH,
+        vm,
+        "--",
+        *cmd,
+        check=check,
+    )
 
 
 def exec_bash(
     vm: str, script: str, *, check: bool = True, timeout: float | None = None
 ) -> MpResult:
     """Pipe a bash script into the VM. Avoids quoting hell."""
-    return mp(
-        "exec", vm, "--", "bash", "-s", check=check, input_bytes=script.encode(), timeout=timeout
+    return _incus(
+        "exec",
+        "--user",
+        str(VM_USER_UID),
+        "--group",
+        str(VM_USER_GID),
+        "--cwd",
+        VM_USER_HOME,
+        "--env",
+        f"HOME={VM_USER_HOME}",
+        "--env",
+        VM_USER_PATH,
+        vm,
+        "--",
+        "bash",
+        "-s",
+        check=check,
+        input_bytes=script.encode(),
+        timeout=timeout,
     )
 
 
 def transfer_to_vm(host_path: Path, vm: str, vm_path: str) -> MpResult:
-    return mp("transfer", str(host_path), f"{vm}:{vm_path}")
+    """``incus file push`` — host file → VM path.
+
+    Uses ``--create-dirs`` so callers can transfer into freshly-named
+    targets without a separate mkdir step. UID/GID default to the
+    ubuntu user so files round-trip the host share cleanly.
+    """
+    return _incus(
+        "file",
+        "push",
+        "--create-dirs",
+        "--uid",
+        str(VM_USER_UID),
+        "--gid",
+        str(VM_USER_GID),
+        str(host_path),
+        f"{vm}{vm_path}",
+    )
 
 
 def transfer_from_vm(vm: str, vm_path: str, host_path: Path) -> MpResult:
-    return mp("transfer", f"{vm}:{vm_path}", str(host_path))
+    """``incus file pull`` — VM path → host file."""
+    return _incus("file", "pull", f"{vm}{vm_path}", str(host_path))
+
+
+# ---------- mount (virtiofs disk device on the instance) ----------
 
 
 def mount(
@@ -156,106 +256,337 @@ def mount(
     *,
     host_uid: int,
     host_gid: int,
-    vm_uid: int = 1000,
-    vm_gid: int = 1000,
-    mount_type: str = "native",
+    vm_uid: int = VM_USER_UID,
+    vm_gid: int = VM_USER_GID,
+    device_name: str = DATA_DEVICE_NAME,
 ) -> MpResult:
-    """Mount a host directory into the VM.
+    """Attach the host directory to the VM as a virtiofs share.
 
-    ``mount_type`` defaults to ``"native"`` (hypervisor-backed: 9p on
-    Linux/QEMU, virtiofs on macOS/HyperKit) rather than multipass's
-    historical default of ``"classic"`` (fuse.sshfs). Reason: rootless
-    Docker cannot bind-mount paths from a fuse.sshfs filesystem into a
-    container — the kernel returns ``operation not supported`` and every
-    Hermes/OpenClaw container fails on first start. 9p/virtiofs is fine.
+    Adds a disk device:
+    ``incus config device add <vm> <device-name> disk source=<host>
+    path=<vm-path>``. Incus auto-uses **virtiofs** for directory shares
+    on VMs when ``virtiofsd`` is installed on the host (the package is a
+    hard prereq, documented in the README). Without ``virtiofsd`` Incus
+    falls back to 9p, which has the same SQLite ``disk I/O error`` quirk
+    we hit on the multipass-era 9p mount.
 
-    Multipass requires the VM to be stopped to add a native mount;
-    classic mounts can be added on a running VM. The orchestration
-    (stop, mount, start) is done by ``vm._ensure_mount``.
+    No ``raw.idmap`` is set — see the comment in ``launch`` for why.
+    ``host_uid`` / ``host_gid`` are accepted for signature compatibility
+    with the multipass-era caller.
     """
-    return mp(
-        "mount",
-        "--type",
-        mount_type,
-        "-u",
-        f"{host_uid}:{vm_uid}",
-        "-g",
-        f"{host_gid}:{vm_gid}",
-        str(host_path),
-        f"{vm}:{vm_path}",
+    del host_uid, host_gid, vm_uid, vm_gid
+    return _incus(
+        "config",
+        "device",
+        "add",
+        vm,
+        device_name,
+        "disk",
+        f"source={host_path}",
+        f"path={vm_path}",
     )
 
 
-def umount(vm: str, vm_path: str) -> MpResult:
-    return mp("umount", f"{vm}:{vm_path}")
+def umount(vm: str, vm_path: str, *, device_name: str = DATA_DEVICE_NAME) -> MpResult:
+    """Detach the host data-dir share from the VM.
+
+    ``vm_path`` is unused at the Incus layer (devices are referenced by
+    their device name, not their in-VM path) but kept in the signature
+    for compatibility with the multipass-era callers.
+    """
+    del vm_path  # signature compat
+    return _incus("config", "device", "remove", vm, device_name, check=False)
 
 
-def launch(vm: str, *, image: str, cpus: int, memory_gb: int, disk_gb: int) -> MpResult:
-    return mp(
+# ---------- lifecycle ----------
+
+
+def launch(
+    vm: str,
+    *,
+    image: str,
+    cpus: int,
+    memory_gb: int,
+    disk_gb: int,
+    host_data_dir: Path | None = None,
+    vm_data_path: str | None = None,
+    host_uid: int | None = None,
+    host_gid: int | None = None,
+    vm_uid: int = VM_USER_UID,
+    vm_gid: int = VM_USER_GID,
+) -> MpResult:
+    """Create and start an Incus VM in one shot.
+
+    A launch-time YAML config piped via stdin wires up sizing, idmap,
+    and the host data-dir share so the VM comes up with the mount
+    already attached — no stop-mount-start dance.
+
+    ``image`` is an Incus image ref. The toolkit always passes
+    ``images:ubuntu/<release>``; the ``images:`` remote is preconfigured
+    by ``incus admin init`` and contains the community-maintained Ubuntu
+    cloud images.
+
+    ``host_data_dir`` + ``vm_data_path`` (with ``host_uid`` + ``host_gid``)
+    are optional but together set up the virtiofs share at launch. If
+    omitted, the VM comes up with no share and the caller must attach
+    one with ``mount(...)``.
+    """
+    yaml_lines = [
+        "config:",
+        f'  limits.cpu: "{cpus}"',
+        f"  limits.memory: {memory_gb}GiB",
+    ]
+    # NB: we intentionally do NOT set `raw.idmap` here.
+    #
+    # An idmap like `uid <host> 1000 / gid <host> 1000` would round-trip
+    # host-owned files through virtiofs with the right ownership inside
+    # the VM. But it breaks the Hermes container entrypoint: the
+    # entrypoint chowns /opt/data to its `hermes` user, which under
+    # rootless Docker resolves to a subuid (host uid 100000+ range).
+    # virtiofsd then refuses the chown with `Invalid argument` because
+    # that uid is outside the configured idmap, and the container falls
+    # into a permission-denied loop. Incus 6.0's raw.idmap parser only
+    # accepts single-id mappings (`uid <hostid> <nsid>`); it rejects the
+    # 4-field range form (`uid <host> <ns> <count>`) needed to cover the
+    # 65k-id rootless-docker subuid range. Without a workable extended
+    # idmap, the least-bad option is no idmap: virtiofs passes uids
+    # through 1:1, the chown succeeds, the container runs.
+    #
+    # The trade-off: files written by the container as the `hermes` user
+    # (post privilege-drop) appear on the host owned by a subuid in the
+    # 100000+ range — invisible to the regular user but still backed up
+    # correctly by host-side root tools (duplicity, restic). Host-side
+    # editing of in-container-written agent state requires sudo. Files
+    # written by user-as-ubuntu via the toolkit (host data dir seed,
+    # `agents export`, etc.) stay owned by the host user.
+    del host_uid, host_gid, vm_uid, vm_gid  # accepted for signature compat
+    yaml_lines += [
+        "devices:",
+        "  root:",
+        "    type: disk",
+        "    pool: default",
+        "    path: /",
+        f"    size: {disk_gb}GiB",
+    ]
+    if host_data_dir is not None and vm_data_path is not None:
+        yaml_lines += [
+            f"  {DATA_DEVICE_NAME}:",
+            "    type: disk",
+            f"    source: {host_data_dir}",
+            f"    path: {vm_data_path}",
+        ]
+    yaml = "\n".join(yaml_lines) + "\n"
+    return _incus(
         "launch",
-        "--name",
-        vm,
-        "--cpus",
-        str(cpus),
-        "--memory",
-        f"{memory_gb}G",
-        "--disk",
-        f"{disk_gb}G",
+        "-q",
         image,
+        vm,
+        "--vm",
+        input_bytes=yaml.encode(),
         timeout=900.0,
     )
 
 
-def info_vm(vm: str, *, fmt: str = "json") -> MpResult:
-    return mp("info", vm, "--format", fmt, check=False)
-
-
-def list_vms(*, fmt: str = "json") -> MpResult:
-    return mp("list", "--format", fmt)
-
-
-def find(*, fmt: str = "json", show_unsupported: bool = False) -> MpResult:
-    args = ["find", "--format", fmt]
-    if show_unsupported:
-        args.append("--show-unsupported")
-    return mp(*args)
-
-
 def start_vm(vm: str) -> MpResult:
-    return mp("start", vm)
+    return _incus("start", vm)
 
 
 def stop_vm(vm: str) -> MpResult:
-    return mp("stop", vm)
-
-
-def set_config(key: str, value: str | int) -> MpResult:
-    """``multipass set <key>=<value>``. Used by ``agents vm resize`` to
-    reallocate per-VM cpus/memory/disk on a stopped VM.
-    """
-    return mp("set", f"{key}={value}")
+    return _incus("stop", vm)
 
 
 def delete_vm(vm: str, *, purge: bool = False) -> MpResult:
-    args = ["delete", vm]
-    if purge:
-        args.append("--purge")
-    return mp(*args)
+    """``incus delete --force`` (force is required to delete a running VM).
+
+    ``purge`` is accepted for signature compat with the multipass era;
+    Incus always purges (instance + root volume) on delete.
+    """
+    del purge  # signature compat
+    return _incus("delete", "--force", vm)
+
+
+# ---------- config / resize ----------
+
+
+def set_cpus(vm: str, n: int) -> MpResult:
+    return _incus("config", "set", vm, f"limits.cpu={n}")
+
+
+def set_memory_gb(vm: str, gb: int) -> MpResult:
+    return _incus("config", "set", vm, f"limits.memory={gb}GiB")
+
+
+def set_disk_gb(vm: str, gb: int) -> MpResult:
+    """Resize the root disk of the VM. The ``default`` storage pool
+    needs to support online resize for this to work without a restart.
+    """
+    return _incus("config", "device", "set", vm, "root", f"size={gb}GiB")
+
+
+# ---------- info / list / find ----------
+
+
+def info_vm(vm: str, *, fmt: str = "json") -> MpResult:
+    """Return instance info, normalised to the multipass shape.
+
+    The historical callers in ``vm.py`` / ``upgrades.py`` / ``ops.py``
+    parse ``{"info": {"<vm>": {"state": ..., "mounts": {...},
+    "snapshots": {...}, "ipv4": [...]}}}``. We reshape Incus output
+    here so they keep working unchanged. ``fmt`` is accepted for
+    signature compat; only ``json`` is supported.
+    """
+    del fmt  # signature compat
+    list_result = _incus("list", vm, "--format", "json", check=False)
+    if list_result.returncode != 0:
+        return list_result
+    try:
+        instances = json.loads(list_result.stdout)
+    except json.JSONDecodeError:
+        return MpResult(stdout="{}", stderr=list_result.stderr, returncode=1)
+    if not isinstance(instances, list) or not instances:
+        return MpResult(
+            stdout=json.dumps({"info": {}}),
+            stderr=list_result.stderr,
+            returncode=1,
+        )
+    inst = instances[0]
+    snap_result = _incus("snapshot", "list", vm, "--format", "json", check=False)
+    snapshots: dict[str, dict[str, str]] = {}
+    if snap_result.returncode == 0:
+        try:
+            for snap in json.loads(snap_result.stdout) or []:
+                snapshots[snap["name"]] = {
+                    "comment": snap.get("description", "") or "",
+                    "created_at": snap.get("created_at", "") or "",
+                }
+        except (json.JSONDecodeError, KeyError, TypeError):
+            pass
+
+    mounts: dict[str, dict[str, str]] = {}
+    for dev_name, dev in (inst.get("devices") or {}).items():
+        if dev.get("type") != "disk":
+            continue
+        if "source" not in dev or "path" not in dev:
+            continue
+        if dev["path"] == "/":  # root volume, not a host share
+            continue
+        mounts[str(dev["path"])] = {
+            "source_path": str(dev["source"]),
+            "device_name": dev_name,
+        }
+
+    ipv4 = []
+    network = (inst.get("state") or {}).get("network") or {}
+    for iface in network.values():
+        for addr in iface.get("addresses") or []:
+            if addr.get("family") == "inet" and addr.get("scope") == "global":
+                ipv4.append(str(addr.get("address")))
+
+    normalized = {
+        "info": {
+            vm: {
+                "state": inst.get("status", "Unknown"),
+                "mounts": mounts,
+                "snapshots": snapshots,
+                "ipv4": ipv4,
+            }
+        }
+    }
+    return MpResult(
+        stdout=json.dumps(normalized),
+        stderr=list_result.stderr,
+        returncode=0,
+    )
+
+
+def list_vms(*, fmt: str = "json") -> MpResult:
+    """Return instance list, normalised to the multipass shape.
+
+    Multipass returned ``{"list": [{"name": ..., "state": ..., ...}]}``.
+    Incus returns a raw array. We re-shape here.
+    """
+    del fmt  # signature compat
+    result = _incus("list", "--format", "json", check=False)
+    if result.returncode != 0:
+        return result
+    try:
+        instances = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return result
+    if not isinstance(instances, list):
+        return result
+    items = [
+        {"name": inst.get("name", ""), "state": inst.get("status", "Unknown")}
+        for inst in instances
+    ]
+    return MpResult(
+        stdout=json.dumps({"list": items}),
+        stderr=result.stderr,
+        returncode=0,
+    )
+
+
+def find(*, fmt: str = "json", show_unsupported: bool = False) -> MpResult:
+    """Return available Ubuntu images from the ``images:`` remote,
+    normalised to the multipass ``find`` shape.
+
+    Multipass returned ``{"images": {"<key>": {"aliases": [...], ...}}}``;
+    callers iterate looking for a release alias (e.g. ``"24.04"``). We
+    expose the same keys here so ``_select_ubuntu_image`` keeps working.
+    """
+    del fmt, show_unsupported  # signature compat
+    result = _incus(
+        "image", "list", "images:ubuntu", "--format", "json", check=False
+    )
+    if result.returncode != 0:
+        return result
+    try:
+        images = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return result
+
+    bucket: dict[str, dict[str, list[str]]] = {}
+    for img in images or []:
+        fp = img.get("fingerprint", "")
+        aliases = [a.get("name", "") for a in (img.get("aliases") or []) if a.get("name")]
+        clean = [a.split("/", 1)[1] for a in aliases if a.startswith("ubuntu/")]
+        bucket[fp] = {
+            "aliases": aliases,
+            "aliases_no_remote": clean,
+        }
+    return MpResult(
+        stdout=json.dumps({"images": bucket}),
+        stderr=result.stderr,
+        returncode=0,
+    )
+
+
+# ---------- snapshots ----------
 
 
 def snapshot(vm: str, name: str, *, comment: str | None = None) -> MpResult:
-    args = ["snapshot", vm, "--name", name]
-    if comment:
-        args += ["--comment", comment]
-    return mp(*args)
+    args = ["snapshot", "create", vm, name]
+    return _incus(*args)
 
 
 def restore(snapshot_id: str, *, destructive: bool = False) -> MpResult:
-    """``snapshot_id`` is the multipass form ``<vm>.<name>``."""
-    args = ["restore", snapshot_id]
-    if destructive:
-        args.append("--destructive")
-    return mp(*args)
+    """Restore a snapshot.
+
+    ``snapshot_id`` is the multipass-era form ``<vm>.<snapshot-name>``;
+    we split on the first dot and call ``incus snapshot restore``.
+    ``destructive`` is accepted for signature compat (Incus is always
+    destructive on restore — the current state is overwritten).
+    """
+    del destructive  # signature compat
+    if "." not in snapshot_id:
+        raise RuntimeFailure(
+            f"snapshot id {snapshot_id!r} is not in the expected <vm>.<name> form"
+        )
+    vm, name = snapshot_id.split(".", 1)
+    return _incus("snapshot", "restore", vm, name)
+
+
+# ---------- BOOTSTRAP_OK parser (unchanged) ----------
 
 
 def parse_bootstrap_ok(output: str) -> BootstrapStatus:

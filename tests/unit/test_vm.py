@@ -1,7 +1,8 @@
-"""vm.py: orchestration tests with all multipass calls mocked.
+"""vm.py: orchestration tests with all Incus calls mocked at the mp.* boundary.
 
 The unit suite does not touch a real VM. Integration coverage lives behind
-the `multipass` pytest marker.
+the `multipass` pytest marker (kept as the name for historical compat;
+the marker now means "actually drives Incus end-to-end").
 """
 
 from __future__ import annotations
@@ -196,6 +197,21 @@ _GOOD_BOOTSTRAP = (
 
 def _stub_all_mp(mocker, *, bootstrap_output: str = _GOOD_BOOTSTRAP) -> dict[str, MagicMock]:
     catalog = json.dumps({"images": {"x": {"aliases": ["26.04"]}}})
+    # info_vm returns the mount already present (since launch sets it
+    # up inline on Incus). `state: Running` keeps `_wait_for_agent` and
+    # `_vm_running` happy.
+    running_info = json.dumps(
+        {
+            "info": {
+                "agents": {
+                    "state": "Running",
+                    "mounts": {"/home/ubuntu/agents": {"source_path": "/data"}},
+                    "snapshots": {},
+                    "ipv4": [],
+                }
+            }
+        }
+    )
     return {
         "find": mocker.patch("agents_cli.mp.find", return_value=_ok(catalog)),
         "list_vms": mocker.patch(
@@ -204,9 +220,12 @@ def _stub_all_mp(mocker, *, bootstrap_output: str = _GOOD_BOOTSTRAP) -> dict[str
         "launch": mocker.patch("agents_cli.mp.launch", return_value=_ok()),
         "info_vm": mocker.patch(
             "agents_cli.mp.info_vm",
-            return_value=_ok(json.dumps({"info": {"agents": {"mounts": {}}}})),
+            return_value=_ok(running_info),
         ),
         "mount": mocker.patch("agents_cli.mp.mount", return_value=_ok()),
+        # _wait_for_agent polls exec_in_vm. Returning success on first
+        # call keeps tests fast.
+        "exec_in_vm": mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok()),
         "bootstrap": mocker.patch(
             "agents_cli.mp.exec_bash", return_value=_ok(stdout=bootstrap_output)
         ),
@@ -221,8 +240,16 @@ def test_init_full_flow(mocker, tmp_path: Path) -> None:
 
     vm.init(data_dir=data_dir, config_path=config_path)
 
+    # Launch wires up the host-dir share inline (raw.idmap + disk device
+    # in the launch YAML). Standalone mp.mount is NOT called during
+    # init — it's only the fallback for drift in `_ensure_mount`.
     mocks["launch"].assert_called_once()
-    mocks["mount"].assert_called_once()
+    _, launch_kwargs = mocks["launch"].call_args
+    assert launch_kwargs["host_data_dir"] == data_dir
+    assert launch_kwargs["vm_data_path"] == "/home/ubuntu/agents"
+    assert launch_kwargs["host_uid"] is not None
+    assert launch_kwargs["host_gid"] is not None
+    mocks["mount"].assert_not_called()
     mocks["bootstrap"].assert_called_once()
     args, _kwargs = mocks["bootstrap"].call_args
     assert args[0] == "agents"
@@ -246,7 +273,10 @@ def test_init_skips_launch_when_vm_already_exists(mocker, tmp_path: Path) -> Non
     vm.init(data_dir=tmp_path / "data", config_path=_saved_config(tmp_path))
 
     mocks["launch"].assert_not_called()
-    mocks["mount"].assert_called_once()
+    # info_vm reports the mount is already present (fresh re-init on an
+    # existing VM whose device persisted), so _ensure_mount short-circuits
+    # and mp.mount isn't called.
+    mocks["mount"].assert_not_called()
 
 
 def test_init_uses_baked_in_fallback_tags_when_github_unreachable(mocker, tmp_path: Path) -> None:
@@ -364,7 +394,9 @@ def _stub_resize_mp(mocker) -> dict:
     return {
         "stop": mocker.patch("agents_cli.mp.stop_vm", return_value=_ok()),
         "start": mocker.patch("agents_cli.mp.start_vm", return_value=_ok()),
-        "set": mocker.patch("agents_cli.mp.set_config", return_value=_ok()),
+        "set_cpus": mocker.patch("agents_cli.mp.set_cpus", return_value=_ok()),
+        "set_memory_gb": mocker.patch("agents_cli.mp.set_memory_gb", return_value=_ok()),
+        "set_disk_gb": mocker.patch("agents_cli.mp.set_disk_gb", return_value=_ok()),
         "info_vm": mocker.patch(
             "agents_cli.mp.info_vm",
             return_value=_ok(
@@ -372,7 +404,10 @@ def _stub_resize_mp(mocker) -> dict:
                     {
                         "info": {
                             "agents": {
+                                "state": "Running",
                                 "mounts": {"/home/ubuntu/agents": {}},
+                                "snapshots": {},
+                                "ipv4": [],
                             }
                         }
                     }
@@ -415,13 +450,9 @@ def test_resize_stops_sets_starts_and_updates_config(mocker, tmp_path: Path) -> 
 
     mocks["stop"].assert_called_once()
     mocks["start"].assert_called_once()
-    # Three set calls in order
-    set_calls = [c.args for c in mocks["set"].call_args_list]
-    assert set_calls == [
-        ("local.agents.cpus", 8),
-        ("local.agents.memory", "16G"),
-        ("local.agents.disk", "50G"),
-    ]
+    mocks["set_cpus"].assert_called_once_with("agents", 8)
+    mocks["set_memory_gb"].assert_called_once_with("agents", 16)
+    mocks["set_disk_gb"].assert_called_once_with("agents", 50)
 
     reloaded = cfg_mod.load(config_path)
     assert reloaded.vm.cpus == 8
@@ -438,8 +469,9 @@ def test_resize_partial_only_writes_the_provided_fields(mocker, tmp_path: Path) 
     mocks = _stub_resize_mp(mocker)
     vm.resize(cpus=12, config_path=config_path)
 
-    set_calls = [c.args for c in mocks["set"].call_args_list]
-    assert set_calls == [("local.agents.cpus", 12)]
+    mocks["set_cpus"].assert_called_once_with("agents", 12)
+    mocks["set_memory_gb"].assert_not_called()
+    mocks["set_disk_gb"].assert_not_called()
 
     reloaded = cfg_mod.load(config_path)
     assert reloaded.vm.cpus == 12
@@ -449,7 +481,7 @@ def test_resize_partial_only_writes_the_provided_fields(mocker, tmp_path: Path) 
 
 
 def test_resize_starts_vm_even_if_set_raises(mocker, tmp_path: Path) -> None:
-    """A failed `multipass set` must not leave the VM stopped."""
+    """A failed ``incus config set`` must not leave the VM stopped."""
     cfg = _make_config(tmp_path)
     config_path = _saved_config(tmp_path)
     cfg_mod.save(cfg, config_path)
@@ -458,7 +490,7 @@ def test_resize_starts_vm_even_if_set_raises(mocker, tmp_path: Path) -> None:
     from agents_cli.errors import RuntimeFailure
 
     mocks = _stub_resize_mp(mocker)
-    mocks["set"].side_effect = RuntimeFailure("multipass set failed")
+    mocks["set_cpus"].side_effect = RuntimeFailure("incus config set failed")
 
     with pytest.raises(RuntimeFailure):
         vm.resize(cpus=8, config_path=config_path)

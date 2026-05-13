@@ -23,12 +23,18 @@ DEFAULT_CONFIG_PATH = Path.home() / ".config" / "agents" / "config.toml"
 
 
 def _refuse_forbidden_data_dir(path: Path) -> None:
-    """Multipass-snap can't read paths under /home/*/snap or /var/snap."""
+    """Refuse data-dir paths that backends tend to have trouble with.
+
+    ``/var/snap`` and ``/home/*/snap`` are snap-private subtrees with
+    unusual permission and mount semantics — neither Incus's virtiofs
+    share nor (historically) multipass's sshfs could read them
+    reliably. Force users to pick a path outside these.
+    """
     parts = path.parts
     if parts[:2] == ("/", "var") and len(parts) >= 3 and parts[2] == "snap":
-        raise ValueError(f"data-dir under /var/snap is unreadable by multipass-snap: {path}")
+        raise ValueError(f"data-dir under /var/snap is not supported: {path}")
     if len(parts) >= 4 and parts[0] == "/" and parts[1] == "home" and parts[3] == "snap":
-        raise ValueError(f"data-dir under /home/*/snap is unreadable by multipass-snap: {path}")
+        raise ValueError(f"data-dir under /home/*/snap is not supported: {path}")
 
 
 class VmConfig(BaseModel):

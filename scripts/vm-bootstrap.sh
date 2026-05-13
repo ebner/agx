@@ -125,6 +125,21 @@ as_ubuntu 'systemctl --user enable docker.service' \
 as_ubuntu 'systemctl --user start docker.service' \
     || echo "[bootstrap] systemctl --user start warned"
 
+# `incus exec` resolves the binary name BEFORE applying any --env PATH=
+# we pass, so prepending /home/ubuntu/bin to /etc/environment isn't
+# enough on its own — the incus agent runs as root with its own minimal
+# PATH and won't find /home/ubuntu/bin/docker. Symlink the rootless
+# docker binaries into /usr/local/bin (which IS in the agent's
+# resolution path) so plain `docker ...` works from `incus exec`.
+echo "[bootstrap] step 3d: symlink rootless docker binaries into /usr/local/bin"
+for binary in docker dockerd containerd ctr runc; do
+    src="/home/ubuntu/bin/${binary}"
+    dst="/usr/local/bin/${binary}"
+    if [ -e "$src" ]; then
+        sudo ln -sf "$src" "$dst" || echo "[bootstrap] symlink ${binary} warned"
+    fi
+done
+
 echo "[bootstrap] step 4: export DOCKER_HOST in ubuntu's shell rc files"
 EXPORT_LINE="export DOCKER_HOST=unix://${SOCKET_PATH}"
 for rc in /home/ubuntu/.profile /home/ubuntu/.bashrc; do

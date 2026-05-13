@@ -127,21 +127,22 @@ def vm_stop() -> None:
     type=int,
     default=None,
     metavar="GB",
-    help="New disk size (grow-only; multipass cannot shrink).",
+    help="New disk size (grow-only; root volume cannot shrink).",
 )
 def vm_resize(cpus: int | None, memory_gb: int | None, disk_gb: int | None) -> None:
     """Reallocate CPUs / memory / disk on the existing VM.
 
-    The VM stops, gets the new sizing applied via `multipass set`, then
-    starts back up. Mounts are re-verified and the config is updated.
-    Disk can only grow — destroy and re-init to shrink (data-dir survives).
+    The VM stops, gets the new sizing applied via `incus config set`,
+    then starts back up. Mounts are re-verified and the config is
+    updated. Disk can only grow — destroy and re-init to shrink
+    (data-dir survives).
     """
     _run(vm_mod.resize, cpus=cpus, memory_gb=memory_gb, disk_gb=disk_gb)
 
 
 @vm.command("shell")
 def vm_shell() -> None:
-    """Drop into the VM via `multipass shell`."""
+    """Drop into the VM as the ubuntu user via `incus exec`."""
     _run(vm_mod.shell)
 
 
@@ -155,26 +156,26 @@ def vm_status() -> None:
 @click.argument("name")
 @click.option("--comment", default=None)
 def vm_snapshot(name: str, comment: str | None) -> None:
-    """Take a multipass snapshot."""
+    """Take an Incus instance snapshot."""
     _run(vm_mod.take_snapshot, name, comment=comment)
 
 
 @vm.command("restore")
 @click.argument("name")
-@click.option("--destructive", is_flag=True, help="Skip multipass's safety check.")
+@click.option("--destructive", is_flag=True, help="Accepted for compat; Incus restore always overwrites.")
 def vm_restore(name: str, destructive: bool) -> None:
-    """Restore a multipass snapshot by name."""
+    """Restore an Incus snapshot by name."""
     _run(vm_mod.restore_snapshot, name, destructive=destructive)
 
 
 @vm.group("snapshots")
 def vm_snapshots_group() -> None:
-    """Multipass snapshot management."""
+    """Incus snapshot management."""
 
 
 @vm_snapshots_group.command("list")
 def vm_snapshots_list() -> None:
-    """List multipass snapshots for this VM."""
+    """List Incus snapshots for this VM."""
     _run(vm_mod.list_snapshots)
 
 

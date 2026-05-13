@@ -4,7 +4,7 @@ This walks the full lifecycle for one Hermes agent and one OpenClaw agent: creat
 
 ## 1. The model
 
-One toolkit-managed *agent* = one Docker container = one Hermes (or OpenClaw) installation with its own `$HERMES_HOME` bind-mounted at `<data-dir>/<name>/.data/`. The host CLI never talks to the in-VM Docker daemon directly — it shells out to `multipass`.
+One toolkit-managed *agent* = one Docker container = one Hermes (or OpenClaw) installation with its own `$HERMES_HOME` bind-mounted at `<data-dir>/<name>/.data/`. The host CLI never talks to the in-VM Docker daemon directly — it shells out to `incus`.
 
 ```
 host                       Multipass VM                     container
@@ -250,7 +250,7 @@ agents export-cron install --time 02:30
 agents upgrade coder --tag v1.2.4
 ```
 
-This takes both a multipass VM snapshot and a host-side `.tar.zst` of the agent's state before touching anything, then pulls, recreates, and runs `agents doctor`. If doctor fails, the toolkit auto-rolls-back. To roll back manually later:
+This takes both an Incus VM snapshot and a host-side `.tar.zst` of the agent's state before touching anything, then pulls, recreates, and runs `agents doctor`. If doctor fails, the toolkit auto-rolls-back. To roll back manually later:
 
 ```bash
 agents rollback coder --yes

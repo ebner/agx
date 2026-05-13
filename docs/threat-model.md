@@ -44,7 +44,7 @@ For Hermes' nested-sandbox feature to work, the rootless Docker socket (`/run/us
 **Mitigations:**
 
 - Pick a `<data-dir>` on a filesystem you're comfortable trusting agents with. Don't point it at your homedir if you keep non-agent secrets there.
-- The toolkit refuses `<data-dir>` paths under `/home/*/snap` or `/var/snap` (multipass-snap can't read those, but also: that's exactly where unrelated secrets often live).
+- The toolkit refuses `<data-dir>` paths under `/home/*/snap` or `/var/snap` — those subtrees have unusual permission and mount semantics that backends struggle with, and they're exactly where unrelated secrets often live.
 
 ### 3. Codex auth mount
 
