@@ -61,13 +61,30 @@ def _require_host_codex() -> str:
 # ---------- login / refresh / status ----------
 
 
-def login(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> None:
+def login(
+    *,
+    device_auth: bool = False,
+    config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH,
+) -> None:
+    """Run the Codex CLI login flow with CODEX_HOME pinned to the
+    toolkit-scoped dir.
+
+    Default flow is browser+localhost-callback. On a headless / remote
+    host the callback server's localhost URL isn't reachable from
+    wherever the user has a browser; pass ``device_auth=True`` (CLI
+    flag: ``--device-auth``) to get the device-code flow instead,
+    where Codex prints a URL + code for the user to enter on any
+    browser-equipped machine.
+    """
     cfg = cfg_mod.load(config_path)
     codex_bin = _require_host_codex()
     env = dict(os.environ, CODEX_HOME=str(_codex_home(cfg)))
-    result = subprocess.run([codex_bin, "auth", "login"], env=env, check=False)
+    argv = [codex_bin, "login"]
+    if device_auth:
+        argv.append("--device-auth")
+    result = subprocess.run(argv, env=env, check=False)
     if result.returncode != 0:
-        raise RuntimeFailure(f"codex auth login failed (rc={result.returncode})")
+        raise RuntimeFailure(f"codex login failed (rc={result.returncode})")
     # Under --data-dir-in-vm the containers mount <vm_agents_root>/.codex,
     # not the host. Sync the freshly-written auth into the VM.
     if cfg.paths.data_dir_in_vm:

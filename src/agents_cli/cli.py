@@ -488,9 +488,18 @@ def codex_group() -> None:
 
 
 @codex_group.command("login")
-def codex_login() -> None:
+@click.option(
+    "--device-auth",
+    is_flag=True,
+    help=(
+        "Use the device-code flow (Codex prints a URL + code you enter "
+        "on any browser-equipped machine) instead of the default "
+        "browser+localhost-callback. Required on headless / remote hosts."
+    ),
+)
+def codex_login(device_auth: bool) -> None:
     """Interactively authenticate the toolkit-scoped Codex account."""
-    _run(codex_mod.login)
+    _run(codex_mod.login, device_auth=device_auth)
 
 
 @codex_group.command("refresh")

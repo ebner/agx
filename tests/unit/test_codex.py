@@ -302,8 +302,19 @@ def test_login_invokes_codex_with_codex_home(mocker, saved_config: Path, cfg: Ag
     run_spy = mocker.patch("subprocess.run", return_value=type("R", (), {"returncode": 0})())
     codex.login(config_path=saved_config)
     args, kwargs = run_spy.call_args
-    assert args[0] == ["/usr/local/bin/codex", "auth", "login"]
+    assert args[0] == ["/usr/local/bin/codex", "login"]
     assert kwargs["env"]["CODEX_HOME"] == str(cfg.paths.host_data_dir / ".codex")
+
+
+def test_login_device_auth_appends_flag(mocker, saved_config: Path, cfg: AgentsConfig) -> None:
+    """--device-auth switches Codex to the device-code flow, required on
+    headless hosts where the localhost callback URL isn't reachable.
+    """
+    mocker.patch("shutil.which", return_value="/usr/local/bin/codex")
+    run_spy = mocker.patch("subprocess.run", return_value=type("R", (), {"returncode": 0})())
+    codex.login(device_auth=True, config_path=saved_config)
+    args, _ = run_spy.call_args
+    assert args[0] == ["/usr/local/bin/codex", "login", "--device-auth"]
 
 
 def test_login_raises_when_codex_missing(mocker, saved_config: Path) -> None:
