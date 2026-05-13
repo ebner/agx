@@ -30,18 +30,17 @@ Also: `/personality <name>` inside an interactive Hermes session is a **temporar
 
 Your instinct will be "one agent per topic" — *finance*, *family*, *health*, etc. Resist it. Start small and earn the splits.
 
-### The default: one container, one persona, many skills
+### The default: one container, one persona
 
-For most home/family deployments, the right starting point is **one toolkit agent with topical skills**:
+For most home/family deployments, the right starting point is **one toolkit agent**:
 
 ```bash
 agents create home --type hermes --setup
-agents exec home hermes skills install personal/finance
-agents exec home hermes skills install personal/family
-agents exec home hermes skills install personal/health
 ```
 
-One Mattermost bot. One `SOUL.md`. The bot replies in family chat with one neutral voice; the skills supply domain knowledge when the conversation calls for them. This is cheaper to run, easier to back up, and easier to reason about.
+One Mattermost bot. One `SOUL.md`. One neutral voice that replies in family chat. Cheaper to run, easier to back up, and easier to reason about than anything more.
+
+Add skills later as needs surface — `hermes skills browse` and `hermes skills search <keyword>` discover what's in the registry, `hermes skills install <id>` adds one. Start with zero and grow; skills are cheap to add and remove. See §4.3.
 
 ### Earn a separate toolkit agent (container) when…
 
@@ -78,7 +77,7 @@ So "one container, three profiles, one Mattermost bot routing per channel" — t
 
 ### Worked examples for the finance/family/health scenario
 
-- **A. Cheap default.** One `home` container, three skills, one Mattermost bot. Start here unless you have a reason not to.
+- **A. Cheap default.** One `home` container, one Mattermost bot, skills added on demand. Start here unless you have a reason not to.
 - **B. Privacy split.** Two containers: `home` (finance + family on the family Mattermost) and `health` (separate container, possibly a different LLM, possibly not even on Mattermost — answers via the local dashboard or a private bot). Earned by criteria 1 and 5.
 - **C. Profile as sandbox.** One `home` container in production. When you want to try a "stricter financial advisor" voice: `hermes profile create stricter-fin --clone default`, iterate, decide, then either `profile use` it or delete. Profiles shine here precisely because they're disposable.
 - **D. Three containers.** Only if each meaningfully differs. The cost is three Mattermost bot users (Hermes won't let two share one), three ports, three sets of upgrade decisions. Rare for personal use.
