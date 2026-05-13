@@ -312,12 +312,17 @@ def _run_agent_setup(cfg: AgentsConfig, svc: str, agent_type: str) -> None:
 
     Hermes:   `hermes setup`
     OpenClaw: `openclaw onboard`
+
+    Uses ``exec_in_vm_interactive`` so stdin/stdout/stderr inherit
+    from the parent process. The non-interactive ``exec_in_vm`` was
+    swallowing the wizard's prompts and reporting success — the user
+    saw "setup wizard ran" but never got to answer any questions.
     """
     binary = "hermes" if agent_type == "hermes" else "openclaw"
     sub = "setup" if agent_type == "hermes" else "onboard"
     from agents_cli import mp
 
-    mp.exec_in_vm(
+    rc = mp.exec_in_vm_interactive(
         cfg.vm.name,
         "docker",
         "compose",
@@ -332,6 +337,10 @@ def _run_agent_setup(cfg: AgentsConfig, svc: str, agent_type: str) -> None:
         binary,
         sub,
     )
+    if rc != 0:
+        raise UserError(
+            f"{binary} {sub} exited with rc={rc}. Re-run with `agents setup {_name_from_service(svc, agent_type)}`."
+        )
 
 
 def _image_base(agent_type: str) -> str:

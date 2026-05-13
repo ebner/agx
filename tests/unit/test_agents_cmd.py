@@ -56,13 +56,18 @@ def saved_config(cfg: AgentsConfig, tmp_path: Path) -> Path:
 
 @pytest.fixture
 def stub_runners(mocker, cfg: AgentsConfig):
-    """Stub every multipass / docker-compose interaction with VM-fs simulation."""
+    """Stub every multipass / docker-compose interaction with VM-fs simulation.
+
+    Returns the merged mock dict so tests can introspect specific calls
+    (e.g. ``stub_runners["exec_in_vm_interactive"].assert_called_once()``).
+    """
     from tests.conftest import install_vm_fs_simulation
 
-    install_vm_fs_simulation(mocker, cfg)
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
-    mocker.patch("agents_cli.compose_runner.down", return_value=_ok())
-    mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())
+    mocks = dict(install_vm_fs_simulation(mocker, cfg))
+    mocks["compose_up"] = mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocks["compose_down"] = mocker.patch("agents_cli.compose_runner.down", return_value=_ok())
+    mocks["compose_stop"] = mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())
+    return mocks
 
 
 # ---------- validate_name ----------
@@ -304,6 +309,27 @@ def test_create_with_setup_runs_wizard(
     setup_spy = mocker.spy(agents_cmd, "_run_agent_setup")
     create(name="coder", agent_type="hermes", run_setup=True, config_path=saved_config)
     setup_spy.assert_called_once()
+
+
+def test_create_with_setup_uses_interactive_runner(
+    cfg: AgentsConfig, saved_config: Path, stub_runners
+) -> None:
+    # The setup wizard needs stdin/stdout/stderr inherited from the parent
+    # process. The non-interactive runner captures output and would silently
+    # swallow prompts (user sees "setup wizard ran" without ever being
+    # asked anything). Assert the interactive helper is the one called.
+    create(name="coder", agent_type="hermes", run_setup=True, config_path=saved_config)
+    stub_runners["exec_in_vm_interactive"].assert_called_once()
+
+
+def test_create_with_setup_raises_on_wizard_failure(
+    cfg: AgentsConfig, saved_config: Path, stub_runners
+) -> None:
+    # Non-zero exit from the wizard must surface as a UserError pointing
+    # at `agents setup <name>` for retry — not silent success.
+    stub_runners["exec_in_vm_interactive"].return_value = 1
+    with pytest.raises(UserError, match="agents setup"):
+        create(name="coder", agent_type="hermes", run_setup=True, config_path=saved_config)
 
 
 # ---------- list ----------

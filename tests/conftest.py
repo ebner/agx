@@ -108,5 +108,10 @@ def install_vm_fs_simulation(mocker, cfg: AgentsConfig) -> dict:
         ),
         "exec_in_vm": mocker.patch("agents_cli.mp.exec_in_vm", side_effect=in_vm_runner),
         "exec_bash": mocker.patch("agents_cli.mp.exec_bash", side_effect=bash_runner),
+        # `_run_agent_setup` uses the interactive variant so the wizard
+        # actually sees stdin. The unit-test stub just reports rc=0.
+        "exec_in_vm_interactive": mocker.patch(
+            "agents_cli.mp.exec_in_vm_interactive", return_value=0
+        ),
     }
     return mocks

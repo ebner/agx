@@ -465,3 +465,129 @@ def test_resize_starts_vm_even_if_set_raises(mocker, tmp_path: Path) -> None:
 
     mocks["stop"].assert_called_once()
     mocks["start"].assert_called_once()  # cleanup ran
+
+
+# ---------- rebuild ----------
+
+
+def _stub_rebuild(mocker, cfg: AgentsConfig, services: dict[str, str]):
+    """Stub everything rebuild needs.
+
+    ``services`` is ``{service_name: agent_type}``.
+    Returns the mock dict so tests can assert on call sequence.
+    """
+    import json as _json
+
+
+    # Pre-populate the compose doc so the rebuild planner sees the
+    # services it needs to round-trip.
+    cfg.paths.host_data_dir.mkdir(parents=True, exist_ok=True)
+    compose_doc = {
+        "services": {name: {"image": "x:y"} for name in services},
+    }
+    (cfg.paths.host_data_dir / "docker-compose.yml").write_text(
+        _json.dumps(compose_doc), encoding="utf-8"
+    )
+
+    return {
+        "export": mocker.patch(
+            "agents_cli.export_cmd.export",
+            side_effect=lambda name, **kw: kw["to"] / f"{name}-stamp.tar.zst",
+        ),
+        "import_archive": mocker.patch("agents_cli.export_cmd.import_archive"),
+        "init": mocker.patch("agents_cli.vm.init"),
+        "delete_vm": mocker.patch("agents_cli.mp.delete_vm", return_value=_ok()),
+        "_vm_exists": mocker.patch("agents_cli.vm._vm_exists", return_value=True),
+        "up": mocker.patch("agents_cli.compose_runner.up", return_value=_ok()),
+        "confirm": mocker.patch("agents_cli.ui.confirm", return_value=True),
+    }
+
+
+def test_rebuild_runs_phases_in_order(mocker, tmp_path: Path) -> None:
+    """Full phase walk: export every agent → destroy → init → import → up.
+    The order matters — destroying before exporting would lose state.
+    """
+    import json as _json
+
+    cfg = _make_config(tmp_path)
+    config_path = _saved_config(tmp_path)
+    cfg_mod.save(cfg, config_path)
+    mocks = _stub_rebuild(mocker, cfg, {"hermes-coder": "hermes", "openclaw-personal": "openclaw"})
+
+    # Pre-create the staging-dir archives that import_archive expects.
+    staging = cfg.paths.host_data_dir / ".rebuild-staging"
+    staging.mkdir(parents=True, exist_ok=True)
+    (staging / "coder-stamp.tar.zst").write_bytes(b"")
+    (staging / "personal-stamp.tar.zst").write_bytes(b"")
+
+    vm.rebuild(yes=True, config_path=config_path)
+
+    # Both agents exported, then VM destroyed, then init, then both
+    # imported and brought up.
+    assert mocks["export"].call_count == 2
+    mocks["delete_vm"].assert_called_once()
+    mocks["init"].assert_called_once()
+    assert mocks["import_archive"].call_count == 2
+    assert mocks["up"].call_count == 2
+    del _json  # silence unused-import warning under strict ruff settings
+
+
+def test_rebuild_overrides_sizing(mocker, tmp_path: Path) -> None:
+    """User-provided cpus/memory/disk override the existing config when
+    passed; otherwise current config is reused.
+    """
+    cfg = _make_config(tmp_path)
+    cfg.vm.cpus = 4
+    cfg.vm.memory_gb = 8
+    cfg.vm.disk_gb = 25
+    config_path = _saved_config(tmp_path)
+    cfg_mod.save(cfg, config_path)
+    mocks = _stub_rebuild(mocker, cfg, {})
+
+    vm.rebuild(disk_gb=10, yes=True, config_path=config_path)
+
+    init_kwargs = mocks["init"].call_args.kwargs
+    assert init_kwargs["cpus"] == 4         # kept
+    assert init_kwargs["memory_gb"] == 8    # kept
+    assert init_kwargs["disk_gb"] == 10     # overridden (shrink)
+
+
+def test_rebuild_requires_confirmation_unless_yes(mocker, tmp_path: Path) -> None:
+    cfg = _make_config(tmp_path)
+    config_path = _saved_config(tmp_path)
+    cfg_mod.save(cfg, config_path)
+    mocks = _stub_rebuild(mocker, cfg, {})
+    mocks["confirm"].return_value = False
+
+    with pytest.raises(UserError, match="aborted"):
+        vm.rebuild(config_path=config_path)
+    mocks["delete_vm"].assert_not_called()
+
+
+def test_rebuild_resumes_from_journal(mocker, tmp_path: Path) -> None:
+    """A resumable journal skips already-done phases — re-running after
+    a crash mid-init doesn't re-export (which could overwrite the staged
+    archives) nor re-destroy (no-op anyway, but the test pins behaviour).
+    """
+    from agents_cli.journal import Journal
+
+    cfg = _make_config(tmp_path)
+    config_path = _saved_config(tmp_path)
+    cfg_mod.save(cfg, config_path)
+    mocks = _stub_rebuild(mocker, cfg, {"hermes-coder": "hermes"})
+    staging = cfg.paths.host_data_dir / ".rebuild-staging"
+    staging.mkdir(parents=True, exist_ok=True)
+    (staging / "coder-stamp.tar.zst").write_bytes(b"")
+
+    # Pre-seed a journal as if a previous run completed exports + destroy.
+    j = Journal.begin(cfg.paths.host_data_dir, "rebuild", cfg.vm.name, vm.REBUILD_PHASES)
+    j.advance("staged_exports")
+    j.advance("vm_destroyed")
+
+    vm.rebuild(yes=True, config_path=config_path)
+
+    mocks["export"].assert_not_called()       # already done
+    mocks["delete_vm"].assert_not_called()    # already done
+    mocks["init"].assert_called_once()
+    mocks["import_archive"].assert_called_once()
+    mocks["up"].assert_called_once()

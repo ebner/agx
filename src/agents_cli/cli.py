@@ -134,9 +134,55 @@ def vm_resize(cpus: int | None, memory_gb: int | None, disk_gb: int | None) -> N
 
     The VM stops, gets the new sizing applied via `multipass set`, then
     starts back up. Mounts are re-verified and the config is updated.
-    Disk can only grow — destroy and re-init to shrink (data-dir survives).
+    Disk can only grow — use `agents vm rebuild --disk N` to shrink.
     """
     _run(vm_mod.resize, cpus=cpus, memory_gb=memory_gb, disk_gb=disk_gb)
+
+
+@vm.command("rebuild")
+@click.option("--cpus", type=int, default=None, help="New CPU count (default: keep current).")
+@click.option(
+    "--memory", "memory_gb", type=int, default=None, metavar="GB",
+    help="New memory size (default: keep current).",
+)
+@click.option(
+    "--disk", "disk_gb", type=int, default=None, metavar="GB",
+    help="New disk size — can shrink or grow (default: keep current).",
+)
+@click.option(
+    "--ubuntu-release", default=None,
+    help="New Ubuntu release for the VM (default: keep current).",
+)
+@click.option("-y", "--yes", "yes_local", is_flag=True, help="Skip confirmation.")
+@click.pass_context
+def vm_rebuild(
+    ctx: click.Context,
+    cpus: int | None,
+    memory_gb: int | None,
+    disk_gb: int | None,
+    ubuntu_release: str | None,
+    yes_local: bool,
+) -> None:
+    """Non-destructively re-create the VM.
+
+    Phased + journaled: exports all agents → destroys VM → re-inits with
+    the new sizing → imports each agent back → starts services. A crashed
+    rebuild can be resumed by re-running the command — completed phases
+    are skipped via the on-disk journal.
+
+    The case this exists for: disk SHRINK (which `vm resize` can't do),
+    bumping the Ubuntu release, or fixing a wedged VM without losing
+    agent state.
+    """
+    yes = bool(ctx.obj.get("yes")) or yes_local
+    _run(
+        vm_mod.rebuild,
+        cpus=cpus,
+        memory_gb=memory_gb,
+        disk_gb=disk_gb,
+        ubuntu_release=ubuntu_release,
+        yes=yes,
+    )
 
 
 @vm.command("shell")

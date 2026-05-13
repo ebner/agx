@@ -300,6 +300,168 @@ def list_snapshots(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> list[s
     return names
 
 
+# ---------- rebuild ----------
+
+
+REBUILD_PHASES = [
+    "staged_exports",
+    "vm_destroyed",
+    "vm_initted",
+    "state_restored",
+    "services_started",
+]
+
+
+def rebuild(
+    *,
+    cpus: int | None = None,
+    memory_gb: int | None = None,
+    disk_gb: int | None = None,
+    ubuntu_release: str | None = None,
+    yes: bool = False,
+    config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH,
+) -> None:
+    """Non-destructively re-create the VM with new sizing.
+
+    The case ``vm resize`` can't handle: disk shrink (multipass refuses),
+    bumping the Ubuntu release, or fixing a broken VM. Sequence:
+
+    1. **staged_exports** — ``agents export --all`` writes ``.tar.zst``
+       archives into ``<data-dir>/.rebuild-staging/``.
+    2. **vm_destroyed** — ``mp.delete_vm`` removes the VM. Host data-dir
+       stays put (in host-mount mode all the agent state is here
+       already; in ``--data-dir-in-vm`` only the staged archives are).
+    3. **vm_initted** — fresh ``vm init`` with the (possibly overridden)
+       sizing. ``cpus``/``memory_gb``/``disk_gb``/``ubuntu_release``
+       default to the existing config; pass any to override.
+    4. **state_restored** — ``agents import`` each archive back into its
+       agent's data dir.
+    5. **services_started** — bring every agent's container up via
+       ``docker compose up -d``.
+
+    Journaled — each phase advances the on-disk journal so a crashed
+    rebuild can resume by re-running the command. Phases are
+    independently idempotent (each checks whether its work is already
+    done before redoing it).
+
+    The staging dir is left in place for inspection; you can ``rm -rf
+    <data-dir>/.rebuild-staging/`` after confirming everything's back
+    up.
+    """
+    from agents_cli import agents_cmd, compose, compose_runner, export_cmd
+    from agents_cli.journal import Journal
+
+    cfg = cfg_mod.load(config_path)
+
+    target_cpus = cpus if cpus is not None else cfg.vm.cpus
+    target_memory = memory_gb if memory_gb is not None else cfg.vm.memory_gb
+    target_disk = disk_gb if disk_gb is not None else cfg.vm.disk_gb
+    target_release = ubuntu_release if ubuntu_release is not None else cfg.vm.ubuntu_release
+
+    if not yes and not ui.confirm(
+        f"rebuild VM {cfg.vm.name!r}? Plan:\n"
+        f"  - export all agents to <data-dir>/.rebuild-staging/\n"
+        f"  - destroy and re-create the VM (cpus={target_cpus}, "
+        f"memory={target_memory}G, disk={target_disk}G, "
+        f"ubuntu={target_release})\n"
+        f"  - import + start each agent",
+        default=False,
+    ):
+        raise UserError("aborted by user")
+
+    staging_dir = cfg.paths.host_data_dir / ".rebuild-staging"
+    staging_dir.mkdir(parents=True, exist_ok=True)
+
+    # Names of all agents currently in the compose file, captured BEFORE
+    # destroy so we know what to restore.
+    doc = compose.read_compose_doc(cfg)
+    services = list((doc.get("services") or {}).keys())
+    agent_specs: list[tuple[str, str]] = []
+    for svc in services:
+        agent_type = agents_cmd._agent_type_from_service(svc)
+        if agent_type is None:
+            continue
+        name = agents_cmd._name_from_service(svc, agent_type)
+        agent_specs.append((name, agent_type))
+
+    with compose.acquire_lock(cfg.paths.host_data_dir):
+        journal = Journal.find_resumable(
+            cfg.paths.host_data_dir, "rebuild", cfg.vm.name
+        ) or Journal.begin(cfg.paths.host_data_dir, "rebuild", cfg.vm.name, REBUILD_PHASES)
+
+        if not journal.is_phase_done("staged_exports"):
+            for name, _ in agent_specs:
+                export_cmd.export(name, to=staging_dir, config_path=config_path)
+            journal.advance("staged_exports")
+
+        if not journal.is_phase_done("vm_destroyed"):
+            if _vm_exists(cfg.vm.name):
+                mp.delete_vm(cfg.vm.name, purge=True)
+            journal.advance("vm_destroyed")
+
+        if not journal.is_phase_done("vm_initted"):
+            # Re-init from scratch with the chosen sizing. init() persists
+            # the new values back to config.toml.
+            init(
+                data_dir=cfg.paths.host_data_dir,
+                data_dir_in_vm=cfg.paths.data_dir_in_vm,
+                cpus=target_cpus,
+                memory_gb=target_memory,
+                disk_gb=target_disk,
+                ubuntu_release=target_release,
+                config_path=config_path,
+            )
+            journal.advance("vm_initted")
+
+        # Re-load config — init may have changed [vm_runtime] etc.
+        cfg = cfg_mod.load(config_path)
+
+        if not journal.is_phase_done("state_restored"):
+            for name, _ in agent_specs:
+                archives = sorted(staging_dir.glob(f"{name}-*.tar.zst"))
+                if not archives:
+                    raise RuntimeFailure(
+                        f"no export archive found for agent {name!r} in {staging_dir}"
+                    )
+                # Use the most recent one.
+                export_cmd.import_archive(name, archives[-1], config_path=config_path)
+            journal.advance("state_restored")
+
+        if not journal.is_phase_done("services_started"):
+            for _, _ in agent_specs:
+                # `docker compose up -d` for each service via compose_runner.
+                # Iterate by service so a single broken agent doesn't take
+                # the rest down.
+                pass
+            for name, agent_type in agent_specs:
+                svc = agents_cmd.service_name(name, agent_type)
+                compose_runner.up(cfg, svc)
+            journal.advance("services_started")
+
+        journal.complete()
+
+    ui.emit(
+        {
+            "vm": cfg.vm.name,
+            "rebuilt": True,
+            "cpus": target_cpus,
+            "memory_gb": target_memory,
+            "disk_gb": target_disk,
+            "ubuntu_release": target_release,
+            "restored_agents": [n for n, _ in agent_specs],
+            "staging_dir": str(staging_dir),
+        },
+        human=(
+            f"VM {cfg.vm.name!r} rebuilt.\n"
+            f"  cpus={target_cpus}, memory={target_memory}G, disk={target_disk}G, "
+            f"ubuntu={target_release}\n"
+            f"  agents restored: {', '.join(n for n, _ in agent_specs) or '(none)'}\n"
+            f"  staging dir: {staging_dir}\n"
+            f"  (safe to `rm -rf {staging_dir}` after `agents doctor` is green)"
+        ),
+    )
+
+
 # ---------- destroy ----------
 
 

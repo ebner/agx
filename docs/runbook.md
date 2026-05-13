@@ -123,6 +123,35 @@ For strict crash consistency on a specific agent, stop it first: `agents stop co
 - Let your host backup tool (duplicity etc.) prune `<data-dir>/backups/` per its own retention policy.
 - Or add a separate cron entry like `find <data-dir>/backups -name '*.tar.zst' -mtime +14 -delete` to drop archives older than 14 days. The toolkit deliberately doesn't manage retention — that's the user's policy call.
 
+## Rebuilding the VM (disk shrink, Ubuntu bump, wedged-VM recovery)
+
+`agents vm resize` handles grow operations in place. The cases it can't:
+
+- **Disk shrink** — multipass refuses; the only way to a smaller disk is destroy + re-init.
+- **Bump the Ubuntu release** (e.g. 24.04 → 26.04 once Docker CE supports it).
+- **The VM is wedged** — bootstrap stuck, kernel borked, network plumbing wrong — and you want a clean slate without losing agent state.
+
+`agents vm rebuild` is the journaled, non-destructive flow for all three:
+
+```bash
+agents vm rebuild --disk 30                         # shrink (or grow) disk; keep other sizing
+agents vm rebuild --ubuntu-release 26.04            # try a newer release
+agents vm rebuild --cpus 4 --memory 4               # downsize the whole VM
+agents vm rebuild                                   # same sizing as today (effectively a clean-room reboot)
+```
+
+Phases (each idempotent, journaled at `<data-dir>/.journal/rebuild-<vm>-<utc>.json`):
+
+| phase | what it does |
+|---|---|
+| `staged_exports` | `agents export` every agent into `<data-dir>/.rebuild-staging/` |
+| `vm_destroyed` | `multipass delete --purge` the old VM |
+| `vm_initted` | fresh `agents vm init` with the (overridden or kept) sizing |
+| `state_restored` | `agents import` each agent from its staging archive |
+| `services_started` | `docker compose up -d` each service |
+
+If something crashes mid-rebuild, re-running `agents vm rebuild` picks up where the journal left off. The staging dir is left in place after success so you can inspect; safe to `rm -rf <data-dir>/.rebuild-staging/` once `agents doctor` is green.
+
 ## Tearing down
 
 ```bash

@@ -141,6 +141,27 @@ def exec_bash(
     )
 
 
+def exec_in_vm_interactive(vm: str, *cmd: str) -> int:
+    """Run a command in the VM with stdin/stdout/stderr inherited from
+    the parent process — necessary for interactive wizards (``hermes
+    setup``, ``openclaw onboard``) so the user can actually see prompts
+    and respond.
+
+    Unlike ``exec_in_vm`` (which uses ``subprocess.run`` with
+    ``capture_output=True`` and would swallow the wizard's prompts),
+    this returns the raw exit code and produces no ``MpResult``. The
+    Python process stays alive after the wizard finishes — caller can
+    still emit success messages or advance a phase journal.
+    """
+    argv = [MULTIPASS_BIN, "exec", vm, "--", *cmd]
+    ui.info(f"$ {' '.join(argv)}")
+    try:
+        result = subprocess.run(argv, check=False)
+    except FileNotFoundError as e:
+        raise RuntimeFailure(f"command not found: {argv[0]} ({e})") from e
+    return result.returncode
+
+
 def transfer_to_vm(host_path: Path, vm: str, vm_path: str) -> MpResult:
     return mp("transfer", str(host_path), f"{vm}:{vm_path}")
 
