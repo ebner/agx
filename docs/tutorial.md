@@ -24,27 +24,64 @@ Hermes uses three terms that all sound related but aren't. Get this straight up 
 
 Also: `/personality <name>` inside an interactive Hermes session is a **temporary** overlay (preset like `concise`, `technical`, `kawaii`, … or a custom one defined in `config.yaml`). It doesn't modify `SOUL.md`.
 
-## 3. Profiles: pick a strategy before you create
+## 3. How many agents do you actually need?
 
-You have two ways to run multiple "personas":
+Your instinct will be "one agent per topic" — *finance*, *family*, *health*, etc. Resist it. Start small and earn the splits.
 
-**Strategy A — one toolkit agent per persona (recommended for most users).**
+### The default: one container, one persona, many skills
+
+For most home/family deployments, the right starting point is **one toolkit agent with topical skills**:
+
 ```bash
-agents create coder    --type hermes --setup
-agents create reviewer --type hermes --setup
-agents create writer   --type hermes --setup
+agents create home --type hermes --setup
+agents exec home hermes skills install personal/finance
+agents exec home hermes skills install personal/family
+agents exec home hermes skills install personal/health
 ```
-Each lives in its own container with its own port, logs, auth, and skill set. Upgrades, backups, and removal are per-agent. This is what the toolkit is built around.
 
-**Strategy B — one toolkit agent, multiple Hermes profiles inside it.**
-```bash
-agents create work --type hermes --setup
-agents exec work hermes profile create reviewer --clone default
-agents exec work hermes -p reviewer chat
-```
-Same LLM credentials, same skill base image, smaller footprint. Use this when the personas only differ in `SOUL.md` and a few skills, and you don't need separate ports.
+One Mattermost bot. One `SOUL.md`. The bot replies in family chat with one neutral voice; the skills supply domain knowledge when the conversation calls for them. This is cheaper to run, easier to back up, and easier to reason about.
 
-Mixing is fine, but Strategy A is what the rest of this tutorial assumes.
+### Earn a separate toolkit agent (container) when…
+
+…at least one of these is genuinely true:
+
+1. **Different LLM provider per agent.** *Health* runs against a local Llama for privacy; *finance* uses Codex.
+2. **Different messaging connectivity.** *Family* on Mattermost, *work* on Slack — isolated so a Slack adapter bug can't kill the family bot. (Each toolkit agent runs its own gateway against its own bot token — see §4.4.)
+3. **Different upgrade cadence.** You want to canary a new Hermes version on the low-stakes agent first.
+4. **Hard resource isolation.** Different CPU/mem caps, different restart policy.
+5. **Strong blast-radius isolation between domains.** A compromised skill in *finance* must not even *see* the *health* agent's auth or data.
+
+If none of those apply, you probably don't need a second container.
+
+### Earn a Hermes-internal profile when…
+
+…you want a *cheap, disposable* second `$HERMES_HOME` inside one container. Real use cases:
+
+1. **Scratch persona.** `hermes profile create scratch --clone default` → experiment → `hermes profile delete scratch`. Faster than `agents create`/`agents remove`.
+2. **Sandbox a risky change.** Clone to `experiment`, test a new `SOUL.md` or a flaky skill, then promote (`hermes profile use experiment`) or discard.
+3. **A/B test personalities** without container churn.
+4. **Shared VM with another human.** Each person gets their own profile so sessions, skills, and auth don't cross-pollute. (Rare in personal use.)
+
+### What profiles are NOT for
+
+**Profiles are not a way to multiplex one Mattermost (or Slack/Discord) bot across personas.** Each profile that runs a gateway runs its own gateway process bound to its own bot token; two profiles cannot share a bot. The Hermes docs are explicit:
+
+> Each profile runs its own gateway as a separate process with its own bot token. If two profiles accidentally share a token, the second gateway will be blocked with a clear error naming the conflicting profile.
+
+So "one container, three profiles, one Mattermost bot routing per channel" — that pattern does not exist natively. If you want channel-aware persona switching, you have three options:
+
+- **One bot, one voice, topical skills** (the default above; the bot adapts to context via skills).
+- **One bot, one voice, `/personality <name>` runtime overlay** (manual: the bot still defaults to the agent's `SOUL.md`, but interactive users can switch the voice mid-session).
+- **Separate bot users + separate toolkit agents** — one container per persona, each with its own Mattermost bot user. Use this when the personas really are different agents with different skills, different LLM, or different data-blast-radius needs.
+
+### Worked examples for the finance/family/health scenario
+
+- **A. Cheap default.** One `home` container, three skills, one Mattermost bot. Start here unless you have a reason not to.
+- **B. Privacy split.** Two containers: `home` (finance + family on the family Mattermost) and `health` (separate container, possibly a different LLM, possibly not even on Mattermost — answers via the local dashboard or a private bot). Earned by criteria 1 and 5.
+- **C. Profile as sandbox.** One `home` container in production. When you want to try a "stricter financial advisor" voice: `hermes profile create stricter-fin --clone default`, iterate, decide, then either `profile use` it or delete. Profiles shine here precisely because they're disposable.
+- **D. Three containers.** Only if each meaningfully differs. The cost is three Mattermost bot users (Hermes won't let two share one), three ports, three sets of upgrade decisions. Rare for personal use.
+
+The rest of this tutorial assumes the default — one toolkit agent named `coder` — but the commands apply identically whether you have one agent or several.
 
 ## 4. Walk-through: create, customize, connect, use
 
@@ -243,32 +280,52 @@ agents remove personal
 
 The toolkit does **not** mount Codex auth into OpenClaw — OpenClaw's plugin manages it itself. Don't try to "share" your toolkit-scoped Codex with OpenClaw via mounts; you'll end up with two managers fighting over the same `auth.json`.
 
-## 6. Multi-profile inside one Hermes container (Strategy B)
+## 6. Working with Hermes profiles inside one container
 
-If you decided Strategy B is right for your case:
+Profiles are most useful as **disposable second `$HERMES_HOME`s** for sandboxing, A/B-testing personalities, or cheap experimentation — see §3 for when this earns its keep and when it doesn't.
 
 ```bash
-# create a Hermes profile that clones the default's auth + skills, then diverges
-agents exec coder hermes profile create reviewer --clone default
+# create a profile that clones the default's auth + skills, then diverges
+agents exec coder hermes profile create scratch --clone default
 
 # use it
-agents exec coder hermes -p reviewer chat
-agents exec coder hermes -p reviewer skills install official/codereview/standards
-agents exec coder hermes -p reviewer setup --section agent      # different SOUL.md
+agents exec coder hermes -p scratch chat
+agents exec coder hermes -p scratch skills install official/codereview/standards
+agents exec coder hermes -p scratch setup --section agent      # different SOUL.md
 
 # day-to-day
 agents exec coder hermes profile list
-agents exec coder hermes profile rename reviewer pr-reviewer
+agents exec coder hermes profile rename scratch reviewer
 agents exec coder hermes profile export reviewer -o /opt/data/reviewer.zip
 agents exec coder hermes profile delete reviewer
 ```
 
 Profile data lives at `<data-dir>/coder/.data/profiles/<profile-name>/` on the host, so `agents export coder` and your host backup cover all profiles inside that container.
 
+### Profile + gateway: one bot token per profile
+
+The gateway model is strict: each profile that runs a gateway runs its own gateway process with its own bot token. From the Hermes docs:
+
+> Each profile runs its own gateway as a separate process with its own bot token. Each profile gets its own service name. They run independently. If two profiles accidentally share a token, the second gateway will be blocked with a clear error naming the conflicting profile.
+
+Practical consequences:
+
+- You start each profile's gateway independently: `agents exec coder hermes -p reviewer gateway start`.
+- Each profile needs its own Slack/Mattermost/Discord bot account (or bot token within an account that supports multiple). You can't have profile A and profile B both reply as the same bot on the same workspace.
+- At that point ask yourself: if I'm paying for a second bot user anyway, is a profile actually cheaper than a second toolkit agent? Often the answer is no — separate toolkit agents give you separate upgrade cadence, separate logs, separate resource limits, and isolation between domains, at the cost of a bit more disk.
+- Profiles win when the second persona is **not gateway-exposed at all** — purely interactive via `hermes -p <profile> chat` or via the dashboard. Those are the use cases in §3.
+
 ## 7. Common questions
 
-**Q: I want a different LLM provider per persona — Strategy A or B?**
-Strategy A. The provider is per-`$HERMES_HOME` and lives in `config.yaml`. Using two profiles inside one container would technically work, but you'd be sharing the same image and skill base layer, which is rarely what you want when providers differ.
+**Q: I want a different LLM provider per persona — separate agent or profile?**
+Separate toolkit agent. The provider is per-`$HERMES_HOME` and lives in `config.yaml`, so profiles technically support it, but providers usually come with different cost/privacy/upgrade profiles you'll want to track separately anyway.
+
+**Q: Can one Mattermost bot route incoming messages to different personas based on channel or sender?**
+Not natively in Hermes — each profile that runs a gateway needs its own bot token, so you can't have one bot replying as different personas. Three options:
+1. **One bot, topical skills** (simplest): the bot has one neutral voice and loads finance/family/health skills as the conversation calls for them.
+2. **One bot, `/personality` overlay**: interactive users can switch the bot's voice mid-session with `/personality <name>` — but it doesn't auto-switch by channel.
+3. **One bot per persona, one toolkit agent per bot**: real separation, real cost (multiple bot users).
+If you want true auto-routing by channel, you'd need a custom gateway adapter that selects an LLM + skill set per message — not a profile-switching trick.
 
 **Q: Where does Codex auth live for a Hermes agent that uses Codex as its LLM?**
 After the first `hermes setup`, persistent auth is at `<data-dir>/coder/.data/.hermes/auth.json` *inside* the agent's data dir. The toolkit-scoped `<data-dir>/.codex/` is only a one-time import bridge — bind-mounted read-only at `/home/hermes/.codex` in the container so Hermes can pick it up.
