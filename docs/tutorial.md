@@ -26,6 +26,8 @@ Also: `/personality <name>` inside an interactive Hermes session is a **temporar
 
 ## 3. How many agents do you actually need?
 
+**Rule of thumb: one container = one agent = one Hermes installation = one bot identity.** Profiles are a within-container tool for *throwaway* second `$HERMES_HOME`s (sandbox, A/B, scratch) — they don't unlock more bots, more dashboards, or auto-routing, and any of those needs another container.
+
 Your instinct will be "one agent per topic" — *finance*, *family*, *health*, etc. Resist it. Start small and earn the splits.
 
 ### The default: one container, one persona, many skills
