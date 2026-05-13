@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import os
-import pwd
 import urllib.error
 import urllib.request
 import uuid
@@ -71,7 +70,7 @@ def init(
     if ubuntu_release is not None:
         cfg.vm.ubuntu_release = ubuntu_release
 
-    cfg.host = HostConfig(uid=os.getuid(), gid=_primary_gid())
+    cfg.host = HostConfig(uid=os.getuid(), gid=os.getgid())
 
     _prepare_host_data_dir(cfg.paths.host_data_dir)
 
@@ -90,26 +89,15 @@ def init(
             {"action": "vm_launch", "vm": cfg.vm.name, "image": image},
             human=f"launching VM {cfg.vm.name!r} ({image}) — this can take a few minutes...",
         )
-        # Launch wires up the data-dir share at instance-creation time
-        # (Incus disk device + raw.idmap in the launch YAML), so the VM
-        # comes up with the mount already attached and we skip the
-        # multipass-era stop-mount-start dance.
-        launch_kwargs: dict[str, object] = {
-            "image": f"images:ubuntu/{cfg.vm.ubuntu_release}",
-            "cpus": cfg.vm.cpus,
-            "memory_gb": cfg.vm.memory_gb,
-            "disk_gb": cfg.vm.disk_gb,
-        }
-        if not data_dir_in_vm:
-            launch_kwargs.update(
-                host_data_dir=cfg.paths.host_data_dir,
-                vm_data_path=str(cfg.paths.vm_agents_root),
-                host_uid=cfg.host.uid,
-                host_gid=cfg.host.gid,
-            )
-        mp.launch(cfg.vm.name, **launch_kwargs)  # type: ignore[arg-type]
-        _wait_for_agent(cfg.vm.name)
-    elif not data_dir_in_vm:
+        mp.launch(
+            cfg.vm.name,
+            image=image,
+            cpus=cfg.vm.cpus,
+            memory_gb=cfg.vm.memory_gb,
+            disk_gb=cfg.vm.disk_gb,
+        )
+
+    if not data_dir_in_vm:
         _ensure_mount(cfg)
 
     status, boot_stdout, boot_stderr = _run_bootstrap(cfg.vm.name)
@@ -214,11 +202,11 @@ def resize(
     mp.stop_vm(cfg.vm.name)
     try:
         if cpus is not None:
-            mp.set_cpus(cfg.vm.name, cpus)
+            mp.set_config(f"local.{cfg.vm.name}.cpus", cpus)
         if memory_gb is not None:
-            mp.set_memory_gb(cfg.vm.name, memory_gb)
+            mp.set_config(f"local.{cfg.vm.name}.memory", f"{memory_gb}G")
         if disk_gb is not None:
-            mp.set_disk_gb(cfg.vm.name, disk_gb)
+            mp.set_config(f"local.{cfg.vm.name}.disk", f"{disk_gb}G")
     finally:
         mp.start_vm(cfg.vm.name)
 
@@ -267,31 +255,9 @@ def status(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> None:
 
 
 def shell(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> None:
-    """Drop into an interactive shell in the VM. Replaces the process so
-    click can't wrap. Runs as ``ubuntu`` (uid 1000) with passwordless
-    sudo, matching ``exec_in_vm``.
-    """
+    """Drop into a multipass shell. Replaces the process so click can't wrap."""
     cfg = cfg_mod.load(config_path)
-    os.execvp(
-        "incus",
-        [
-            "incus",
-            "exec",
-            "--user",
-            "1000",
-            "--group",
-            "1000",
-            "--cwd",
-            "/home/ubuntu",
-            "--env",
-            "HOME=/home/ubuntu",
-            "--env",
-            mp.VM_USER_PATH,
-            cfg.vm.name,
-            "--",
-            "bash",
-        ],
-    )
+    os.execvp("multipass", ["multipass", "shell", cfg.vm.name])
 
 
 # ---------- snapshots ----------
@@ -351,20 +317,6 @@ def destroy(*, yes: bool = False, config_path: Path = cfg_mod.DEFAULT_CONFIG_PAT
 # ---------- private helpers ----------
 
 
-def _primary_gid() -> int:
-    """Return the invoking user's primary GID from ``/etc/passwd``.
-
-    ``os.getgid()`` returns the *effective* GID, which can be wrong: if
-    the user invokes the toolkit through ``sg <group>`` (or ``newgrp``)
-    — common when picking up ``incus-admin`` group membership before
-    a logout/login — the effective GID is the group's GID (e.g. 981
-    for ``incus-admin``), not the user's primary group. That GID then
-    lands in the toolkit's ``raw.idmap``, mapping host-side files to
-    the wrong group inside the VM.
-    """
-    return pwd.getpwuid(os.getuid()).pw_gid
-
-
 def _load_or_default_config(path: Path) -> AgentsConfig:
     if path.exists():
         return cfg_mod.load(path)
@@ -376,7 +328,7 @@ def _load_or_default_config(path: Path) -> AgentsConfig:
             vm_agents_root=Path("/home/ubuntu/agents"),
             data_dir_in_vm=False,
         ),
-        host=HostConfig(uid=os.getuid(), gid=_primary_gid()),
+        host=HostConfig(uid=os.getuid(), gid=os.getgid()),
         defaults=cfg_mod.DefaultsConfig(),
         export_cron=ExportCronConfig(),
         vm_runtime=cfg_mod.VmRuntimeConfig(),
@@ -428,15 +380,14 @@ def _vm_exists(name: str) -> bool:
 
 
 def _ensure_mount(cfg: AgentsConfig) -> None:
-    """Attach the host data-dir share to the VM if it isn't already.
+    """Mount the host data-dir into the VM if it isn't already.
 
-    On Incus the share is a disk device on the instance plus a
-    ``raw.idmap`` entry. Both persist across stop/start and reboot, so
-    after ``vm init`` (which wires the share up at launch time) this
-    function is a no-op in the steady state — it only kicks in if a
-    user manually removed the device. ``raw.idmap`` changes require the
-    VM stopped, so we stop, attach, and restart only when actually
-    needed.
+    Multipass ``--type native`` requires the VM stopped. If the VM is
+    running we stop, mount, and restart — accepting the ~30s cost in
+    exchange for a mount type that supports rootless Docker bind mounts
+    (the default ``classic`` / fuse.sshfs does not — see ``mp.mount``).
+    Mounts persist across reboots, so this only triggers when the mount
+    is genuinely absent (fresh ``vm init`` or after an external umount).
     """
     if _has_mount(cfg):
         return
@@ -453,31 +404,6 @@ def _ensure_mount(cfg: AgentsConfig) -> None:
     )
     if was_running:
         mp.start_vm(cfg.vm.name)
-        _wait_for_agent(cfg.vm.name)
-
-
-def _wait_for_agent(vm: str, *, timeout_s: float = 120.0) -> None:
-    """Block until ``incus exec`` works inside the VM.
-
-    ``incus launch`` returns once the instance is "started" (kernel
-    booted), but the Incus agent that serves ``exec`` comes up during
-    cloud-init, which is a further 10-30 s on a fresh image. Without
-    this wait, ``_run_bootstrap`` races and fails with ``VM agent isn't
-    currently running``.
-    """
-    import time
-
-    deadline = time.monotonic() + timeout_s
-    last_err = ""
-    while time.monotonic() < deadline:
-        result = mp.exec_in_vm(vm, "true", check=False)
-        if result.returncode == 0:
-            return
-        last_err = result.stderr.strip() or result.stdout.strip()
-        time.sleep(2.0)
-    raise RuntimeFailure(
-        f"VM {vm!r} agent did not come up within {timeout_s:.0f}s: {last_err}"
-    )
 
 
 def _has_mount(cfg: AgentsConfig) -> bool:

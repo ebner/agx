@@ -44,12 +44,12 @@ agents upgrade --all --canary coder
 agents rollback coder --yes
 
 # Or pick a specific snapshot id (filename, suffix-match, or pre-upgrade-*
-# Incus snapshot name to restore only the VM):
+# multipass snapshot name to restore only the VM):
 agents rollback coder --snapshot coder-20260512T120000Z.tar.zst
 agents rollback coder --snapshot pre-upgrade-coder-20260512T120000Z
 ```
 
-`agents upgrade` takes two snapshots before touching anything: a host-data `.tar.zst` at `<data-dir>/.upgrades/<name>-<utc>.tar.zst` and an Incus VM snapshot `pre-upgrade-<name>-<utc>`. Both are listed in the upgrade outcome JSON / human output. Legacy `.tar.gz` archives from pre-v0.1.1 versions still work for rollback.
+`agents upgrade` takes two snapshots before touching anything: a host-data `.tar.zst` at `<data-dir>/.upgrades/<name>-<utc>.tar.zst` and a multipass VM snapshot `pre-upgrade-<name>-<utc>`. Both are listed in the upgrade outcome JSON / human output. Legacy `.tar.gz` archives from pre-v0.1.1 versions still work for rollback.
 
 ## Recovery from a crashed operation
 
@@ -111,8 +111,7 @@ agents vm destroy --export-first  # always export before destroying
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | `agents vm init` errors with `bootstrap failed: docker_host=fail` | Rootless Docker setup didn't finish (often a transient network issue mid-install) | Re-run `agents vm init` — it's idempotent. |
-| `agents create` fails with `disk I/O error` from SQLite inside the agent | virtiofsd is not installed on the host, so Incus fell back to 9p for the data-dir share. SQLite doesn't tolerate 9p's locking semantics. | `sudo apt install -y virtiofsd && sudo systemctl restart incus && agents vm stop && agents vm start` — Incus picks up virtiofsd on next VM start. |
-| VMs on `incusbr0` can't reach the internet (DNS resolution fails, apt times out) | ufw's default `FORWARD=DROP` policy blocks bridged traffic. Hits anyone running ufw + Docker on the host. | `sudo ufw route allow in on incusbr0 && sudo ufw route allow out on incusbr0 && sudo ufw reload`. Persistent through ufw config. |
+| `agents create` fails with `operation not supported` on container start | The host data-dir mount is a `classic` (fuse.sshfs) multipass mount; rootless Docker can't bind-mount from sshfs. Pre-v0.1.2 VMs are affected. | Stop the VM, drop the classic mount, let `agents vm start` re-create it as native: `agents vm stop && multipass umount agents:/home/ubuntu/agents && agents vm start`. |
 | `agents doctor` reports `user_docker_service=fail` | systemd-user died (lingering disabled, OOM, …) | `agents vm shell` then `loginctl enable-linger ubuntu && systemctl --user start docker.service`. |
 | `agents doctor` reports `<agent>.docker_socket=fail` | Hermes container can't reach the rootless socket | Container UID drift. Stop the agent, `cat <data-dir>/.env` to confirm `HERMES_UID/GID` match the VM's `ubuntu` user, recreate. |
 | `agents codex skill-enable` fails on `docker build` | Network from VM blocked, base image missing, or `nodejs`/`npm` apt repo blocked | Run `agents doctor`; check `agents vm shell` then `docker info`. The Dockerfile lives at `<data-dir>/.codex-sandbox-*.Dockerfile` if you want to inspect it. |

@@ -1,48 +1,8 @@
 # `agents` — multi-agent VM toolkit
 
-Host-side CLI for managing AI agents (Hermes Agent from Nous Research, OpenClaw) inside a single Incus-managed VM with rootless Docker.
+Host-side CLI for managing AI agents (Hermes Agent from Nous Research, OpenClaw) inside a single Multipass VM with rootless Docker.
 
-Defense in depth: outer isolation = VM, inner isolation = one container per agent, host calls only `incus`.
-
-## Host prerequisites (Ubuntu 24.04+)
-
-```bash
-# Incus + QEMU + virtiofs daemon. virtiofs is load-bearing — without
-# virtiofsd, the host-data-dir share falls back to 9p, which breaks
-# SQLite (Hermes' session store fails with `disk I/O error`).
-sudo apt install -y incus qemu-system-x86 ovmf virtiofsd
-
-# One-time daemon init: creates the `default` storage pool and `incusbr0`
-# bridge network. The defaults (dir-backed pool, NAT'd bridge) are fine.
-sudo adduser $USER incus-admin
-sudo incus admin init --auto
-
-# If you use ufw AND have Docker installed on the host, ufw blocks
-# both forwarded VM traffic AND DHCP packets reaching dnsmasq on
-# `incusbr0`. The three rules below cover both. They persist across
-# reboots and ufw reloads.
-#
-# Why three rules:
-# - `route allow in/out on incusbr0`: opens the FORWARD chain for traffic
-#   crossing the bridge (VMs → internet and back).
-# - `allow in on incusbr0`: opens the INPUT chain for traffic that
-#   *terminates* on the host's incusbr0 interface — most importantly
-#   DHCP DISCOVER packets that dnsmasq needs to see. (Docker turns on
-#   net.bridge.bridge-nf-call-iptables=1, so even bridged broadcast
-#   packets pass through iptables INPUT; without the rule, ufw's
-#   default INPUT=DROP eats DHCP and the VM never gets an IPv4 lease.)
-#
-# `incusbr0` is a private bridge with only your Incus VMs on it — trusting
-# it is reasonable. Your host's external interface stays firewalled.
-sudo ufw route allow in on incusbr0
-sudo ufw route allow out on incusbr0
-sudo ufw allow in on incusbr0
-sudo ufw reload
-
-# Pick up the group membership in your current shell (or log out and back
-# in for the same effect):
-newgrp incus-admin
-```
+Defense in depth: outer isolation = VM, inner isolation = one container per agent, host calls only `multipass`.
 
 ## Quickstart
 

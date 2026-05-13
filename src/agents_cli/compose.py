@@ -264,15 +264,6 @@ def hermes_service_fragment(
             # would otherwise hit "executable file not found". Set the full
             # PATH explicitly to mirror the image default plus the venv.
             "PATH": "/opt/hermes/.venv/bin:/opt/data/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-            # The image entrypoint reads HERMES_UID/GID and remaps the
-            # container's `hermes` user to that uid before chown'ing
-            # /opt/data and exec'ing `gosu hermes`. Setting these to
-            # 1000 makes the privilege drop a no-op under rootless
-            # docker (container uid 0 == ubuntu/uid 1000 == data-dir
-            # owner == hermes after remap), so the entrypoint's mkdir
-            # calls land on a writable directory.
-            "HERMES_UID": "${HERMES_UID}",
-            "HERMES_GID": "${HERMES_GID}",
         },
         "mem_limit": cfg.defaults.hermes_mem_limit,
         "cpus": cfg.defaults.hermes_cpus,

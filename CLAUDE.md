@@ -2,24 +2,7 @@
 
 ## What this is
 
-`agents` is a host-side Python CLI that manages AI agents (Hermes Agent from Nous Research, OpenClaw) inside a single Incus-managed VM with rootless Docker. The host invokes only `incus` — it never talks to the in-VM Docker daemon directly. Outer trust boundary = VM. Inner trust boundary = one Docker container per agent. The defense-in-depth motivation is the 2026 wave of agent-marketplace malware and skill-execution CVEs.
-
-The toolkit was previously implemented against multipass. Migrated to Incus to get virtiofs for the host data-dir share — multipass's default fuse.sshfs can't be bind-mounted into a rootless Docker container, and its 9p `--type native` doesn't support the file ops SQLite needs.
-
-## Host prerequisites
-
-- Linux + KVM (no macOS support after the Incus migration).
-- `apt install incus qemu-system-x86 ovmf virtiofsd` on Ubuntu 24.04+. **virtiofsd is load-bearing** — without it, Incus falls back to 9p for directory shares and SQLite breaks the same way it did on multipass.
-- `sudo incus admin init --auto` once, to create the default storage pool + `incusbr0` bridge.
-- User in `incus-admin` group (`sudo adduser $USER incus-admin`).
-- If the host runs ufw AND Docker is installed on the host: ufw blocks both forwarded VM traffic AND DHCP packets reaching dnsmasq. Three rules — all persistent in ufw config:
-  ```bash
-  sudo ufw route allow in on incusbr0   # FORWARD: VM ↔ internet
-  sudo ufw route allow out on incusbr0
-  sudo ufw allow in on incusbr0          # INPUT: DHCP DISCOVER reaches dnsmasq
-  sudo ufw reload
-  ```
-  Why the INPUT rule: Docker enables `net.bridge.bridge-nf-call-iptables=1` globally, which makes bridged broadcast packets (DHCP) traverse iptables INPUT. ufw's default INPUT=DROP then eats them and the VM never gets an IPv4 lease — silent failure mode where `incus list` shows IPv6-only and the VM can't resolve DNS. Full rationale in README.
+`agents` is a host-side Python CLI that manages AI agents (Hermes Agent from Nous Research, OpenClaw) inside a single Multipass VM with rootless Docker. The host invokes only `multipass` — it never talks to the in-VM Docker daemon directly. Outer trust boundary = VM. Inner trust boundary = one Docker container per agent. The defense-in-depth motivation is the 2026 wave of agent-marketplace malware and skill-execution CVEs.
 
 ## Locked architecture rules (do not relitigate)
 

@@ -13,7 +13,6 @@ Service-name conventions:
 
 from __future__ import annotations
 
-import os
 import re
 import shutil
 from collections.abc import Iterable, Iterator
@@ -249,14 +248,6 @@ def _create_data_dirs(cfg: AgentsConfig, name: str, agent_type: str) -> None:
         return
     for p in _agent_data_paths(cfg, name, agent_type):
         p.mkdir(parents=True, exist_ok=True)
-        # Pin ownership to the host primary uid/gid even if the toolkit
-        # was invoked under `sg` (which switches the effective gid to the
-        # supplementary group, e.g. `incus-admin`). The Hermes container
-        # entrypoint chowns /opt/data to its `hermes` user (remapped via
-        # HERMES_UID/GID) and that chown fails under rootless docker if
-        # the current gid is outside the container's subgid range —
-        # ending in permission-denied mkdir spam.
-        os.chown(p, cfg.host.uid, cfg.host.gid)
 
 
 def _delete_data_dir(cfg: AgentsConfig, name: str) -> None:
