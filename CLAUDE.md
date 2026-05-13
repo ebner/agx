@@ -31,6 +31,20 @@
 | Hermes | `model.provider: openai-codex`. Mounted Codex auth at `/home/hermes/.codex:ro` is an import bridge; once `hermes setup` runs, persistent auth lives at `/opt/data/.hermes/auth.json` on the bind-mounted data dir. Container USER+HOME are verified via `docker inspect` at `agents create` time — refuses if upstream Hermes ever changes the entrypoint user. | Opt in via `agents codex skill-enable`. CLI builds a derived sandbox image with Codex CLI baked in and `ENV CODEX_HOME=/codex`; volume entry mounts the toolkit Codex auth at `/codex:ro`. User-independent — works for sandbox images running as root, pn, node, etc. The whole operation holds `<data-dir>/.agents.lock`. |
 | OpenClaw | OpenClaw bundles its own Codex plugin. Run `openclaw models auth login --provider openai-codex` inside the container. **Never** mount Codex into OpenClaw — would conflict. | Same plugin path. |
 
+## Hermes terminology — don't conflate
+
+Three distinct concepts that all sound related. Future doc work and any tooling we add must keep them separate:
+
+| Term | What it is | Where it lives | CLI |
+|---|---|---|---|
+| **Profile** | An isolated Hermes instance — separate `$HERMES_HOME` with its own auth/sessions/skills/config | `$HERMES_HOME/profiles/<name>/` | `hermes profile {list,create --clone,use,delete,rename,export,import}` |
+| **Personality** (SOUL.md + `/personality`) | The agent's persistent voice/identity (file) plus session-level overlays (preset or custom in `agent.personalities` in `config.yaml`) | `$HERMES_HOME/SOUL.md` | edit file directly; `hermes setup --section agent` |
+| **Skill** | Folder of procedural knowledge in the open Agent-Skills format; loaded on demand | `$HERMES_HOME/skills/<id>/SKILL.md` | `hermes skills {browse,search,install,update,uninstall}` |
+
+The toolkit's model is **one container per toolkit "agent"** = one `$HERMES_HOME`. Hermes-internal profiles are an *advanced* path for users who want multiple personas in one container; documented in `docs/tutorial.md` as Strategy B. Default Strategy A = one toolkit agent per persona.
+
+**Messaging-platform connectivity** is via `hermes gateway` (long-running messaging gateway in-container) plus platform-specific subcommands: `hermes slack` (manifest generator), `hermes whatsapp` (pairing). Mattermost / Matrix / Discord / Teams / IRC / Rocket.Chat are **not** built-in as of Hermes v1.x — users go via community skills (`hermes skills search <platform>`) or a custom gateway adapter. The toolkit's `0.0.0.0` refusal applies to dashboards specifically; if a connector strictly needs an inbound webhook port, document users to add it via `docker-compose.override.yml` (and prefer outbound modes like Slack Socket Mode where possible).
+
 ## How the code is organized
 
 ```

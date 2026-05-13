@@ -37,6 +37,8 @@ agents logs coder -f
 agents exec coder -- hermes shell
 ```
 
+For the full lifecycle — Hermes profiles vs. personalities vs. skills, connecting to Slack / WhatsApp / Mattermost / Matrix, and the OpenClaw flow — see [docs/tutorial.md](docs/tutorial.md). The [runbook](docs/runbook.md) is the cheat-sheet.
+
 ## What lives where
 
 | Path | Role |
