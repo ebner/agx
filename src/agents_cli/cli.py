@@ -20,6 +20,7 @@ from agents_cli import (
     __version__,
     agents_cmd,
     export_cmd,
+    ollama_cmd,
     ops,
     ui,
     upgrades,
@@ -29,6 +30,9 @@ from agents_cli import (
 )
 from agents_cli import (
     config as cfg_mod,
+)
+from agents_cli import (
+    memory as memory_mod,
 )
 from agents_cli import (
     vm as vm_mod,
@@ -142,15 +146,24 @@ def vm_resize(cpus: int | None, memory_gb: int | None, disk_gb: int | None) -> N
 @vm.command("rebuild")
 @click.option("--cpus", type=int, default=None, help="New CPU count (default: keep current).")
 @click.option(
-    "--memory", "memory_gb", type=int, default=None, metavar="GB",
+    "--memory",
+    "memory_gb",
+    type=int,
+    default=None,
+    metavar="GB",
     help="New memory size (default: keep current).",
 )
 @click.option(
-    "--disk", "disk_gb", type=int, default=None, metavar="GB",
+    "--disk",
+    "disk_gb",
+    type=int,
+    default=None,
+    metavar="GB",
     help="New disk size — can shrink or grow (default: keep current).",
 )
 @click.option(
-    "--ubuntu-release", default=None,
+    "--ubuntu-release",
+    default=None,
     help="New Ubuntu release for the VM (default: keep current).",
 )
 @click.option("-y", "--yes", "yes_local", is_flag=True, help="Skip confirmation.")
@@ -589,6 +602,140 @@ def codex_skill_enable(name: str) -> None:
 def codex_skill_disable(name: str) -> None:
     """Disable the Codex skill — restore the original sandbox image."""
     _run(codex_mod.skill_disable, name)
+
+
+# ---------- ollama ----------
+
+
+@main.group("ollama")
+def ollama_group() -> None:
+    """Configure an external Ollama / OpenAI-compatible endpoint.
+
+    The toolkit does NOT run Ollama for you — point it at one you
+    already run (host, LAN, Tailscale, or hosted vendor). Memory
+    plugins read this configuration when they need embeddings or LLM
+    fact-extraction.
+    """
+
+
+@ollama_group.command("configure")
+@click.option(
+    "--url",
+    required=True,
+    help=(
+        "OpenAI-compatible endpoint URL. Must be reachable from inside "
+        "the VM; `localhost` is refused because it would resolve to "
+        "the VM itself."
+    ),
+)
+@click.option(
+    "--api-key",
+    default=None,
+    help=(
+        "Bearer token for the endpoint (vanilla Ollama needs none; pass "
+        "for nginx-protected Ollama or hosted vendors). Stored in "
+        "<data-dir>/.env, never in config.toml. Pass `--api-key ''` to "
+        "clear a previously-stored token."
+    ),
+)
+@click.option(
+    "--api-key-env",
+    default=None,
+    help="Name of the env var to store the token under (default: OLLAMA_API_KEY).",
+)
+@click.option(
+    "--embed-model", default=None, help="Embeddings model name (default: nomic-embed-text)."
+)
+@click.option("--llm-model", default=None, help="LLM model name (default: qwen2.5:7b-instruct).")
+def ollama_configure(
+    url: str,
+    api_key: str | None,
+    api_key_env: str | None,
+    embed_model: str | None,
+    llm_model: str | None,
+) -> None:
+    """Persist the endpoint and probe reachability from VM + containers."""
+    _run(
+        ollama_cmd.configure,
+        url=url,
+        api_key=api_key,
+        api_key_env=api_key_env,
+        embed_model=embed_model,
+        llm_model=llm_model,
+    )
+
+
+@ollama_group.command("status")
+def ollama_status() -> None:
+    """Show the configured URL + last probe results."""
+    _run(ollama_cmd.status)
+
+
+@ollama_group.command("clear")
+def ollama_clear() -> None:
+    """Drop the Ollama configuration and any stored API key."""
+    _run(ollama_cmd.clear)
+
+
+# ---------- memory ----------
+
+
+@main.group("memory")
+def memory_group() -> None:
+    """Manage memory backends for Hermes agents."""
+
+
+@memory_group.command("list")
+def memory_list() -> None:
+    """List memory plugins the toolkit knows about."""
+
+    def body() -> None:
+        rows = memory_mod.list_plugins()
+        ui.table(rows, ["name", "tier", "summary"])
+
+    _run(body)
+
+
+@memory_group.command("enable")
+@click.argument("plugin")
+@click.argument("agent")
+@click.option(
+    "--embedder",
+    type=click.Choice(["auto", "ollama", "openai"]),
+    default="auto",
+    help="Embeddings provider (mem0 only). 'auto' picks Ollama if configured, else OpenAI.",
+)
+@click.option(
+    "--llm",
+    type=click.Choice(["auto", "ollama", "openai"]),
+    default="auto",
+    help="LLM provider (mem0 only). 'auto' picks Ollama if configured, else OpenAI.",
+)
+@click.option(
+    "--image-tag",
+    default=None,
+    help="Override the pinned image tag for sibling-service backends (openviking).",
+)
+def memory_enable(plugin: str, agent: str, embedder: str, llm: str, image_tag: str | None) -> None:
+    """Enable a memory backend for an agent."""
+    opts: dict[str, Any] = {"embedder": embedder, "llm": llm}
+    if image_tag is not None:
+        opts["image_tag"] = image_tag
+    _run(memory_mod.enable, plugin, agent, **opts)
+
+
+@memory_group.command("disable")
+@click.argument("agent")
+def memory_disable(agent: str) -> None:
+    """Disable the currently-enabled memory backend for an agent."""
+    _run(memory_mod.disable, agent)
+
+
+@memory_group.command("status")
+@click.argument("agent", required=False)
+def memory_status(agent: str | None) -> None:
+    """Show memory state per agent (or for a single agent if NAME is given)."""
+    _run(memory_mod.status, agent)
 
 
 # ---------- config (read-only convenience) ----------

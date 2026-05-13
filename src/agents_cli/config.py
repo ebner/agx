@@ -113,6 +113,55 @@ class DefaultsConfig(BaseModel):
     hermes_cpus: float = 1.5
 
 
+class OllamaConfig(BaseModel):
+    """Optional OpenAI-compatible endpoint used by memory backends.
+
+    The toolkit does NOT manage an Ollama instance — the user points the
+    toolkit at one they already run (host-side, on a LAN box, behind
+    Tailscale, or a hosted Ollama-compatible service). Memory plugins
+    that need embeddings/LLM read from this block and translate it into
+    each backend's own config dialect.
+
+    ``url`` must be reachable *from inside the VM* (and, indirectly, from
+    inside the Hermes container). ``localhost`` resolves to the VM
+    itself, not the user's host — ``agents ollama configure`` rejects it
+    explicitly and suggests the right form (multipass NAT gateway IP,
+    LAN/Tailscale IP, or a public OpenAI-compatible URL).
+
+    ``api_key_env`` references a key name in ``<data-dir>/.env`` so the
+    actual credential never lands in this TOML file. Empty string means
+    no auth (vanilla Ollama, no reverse proxy).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    url: str = ""
+    api_key_env: str = ""
+    embed_model: str = "nomic-embed-text"
+    llm_model: str = "qwen2.5:7b-instruct"
+
+    def is_configured(self) -> bool:
+        return bool(self.url)
+
+    @field_validator("url")
+    @classmethod
+    def _validate_url(cls, v: str) -> str:
+        if not v:
+            return v
+        if not (v.startswith("http://") or v.startswith("https://")):
+            raise ValueError(f"ollama.url must be http(s)://... — got {v!r}")
+        # Reject the obvious host-vs-VM trap. Memory backends called from
+        # the Hermes container would route localhost back to the VM.
+        host = v.split("://", 1)[1].split("/", 1)[0].split(":", 1)[0]
+        if host in {"localhost", "127.0.0.1", "::1", "0.0.0.0"}:
+            raise ValueError(
+                f"ollama.url host {host!r} is not reachable from inside the "
+                "VM. Use the multipass NAT gateway (typically 10.x.x.1), a "
+                "LAN/Tailscale IP, or a public hostname."
+            )
+        return v
+
+
 class ExportCronConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -155,6 +204,7 @@ class AgentsConfig(BaseModel):
     host: HostConfig = Field(default_factory=HostConfig)
     vm_runtime: VmRuntimeConfig = Field(default_factory=VmRuntimeConfig)
     defaults: DefaultsConfig = Field(default_factory=DefaultsConfig)
+    ollama: OllamaConfig = Field(default_factory=OllamaConfig)
     export_cron: ExportCronConfig = Field(default_factory=ExportCronConfig)
 
 

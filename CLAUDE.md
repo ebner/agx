@@ -10,7 +10,7 @@
 2. **One mount, one source of truth.** Host `<data-dir>` is mounted at VM `/home/ubuntu/agents` with explicit `multipass mount -u <host-uid>:1000 -g <host-gid>:1000`. All per-agent data, the compose file, the `.env`, exports, and the toolkit-scoped Codex auth live under this path. The VM disk only holds OS + Docker engine + image cache. Opt-out is `vm init --data-dir-in-vm` — **recommended for SQLite-heavy workloads** (Hermes' kanban/sessions/insights stores use WAL, which doesn't work over the 9p share; in-VM ext4 fixes that). Under `--data-dir-in-vm` agent state is host-visible only via `agents export` archives; `agents export-cron install --time 02:30,08:30,14:30,20:30` gives you 6-hourly archives that duplicity picks up natively.
 3. **Toolkit-scoped Codex auth** at `<data-dir>/.codex/` — NEVER the user's personal `~/.codex/`. `agents codex login` sets `CODEX_HOME=<data-dir>/.codex`.
 4. **The CLI owns the compose file.** Users get `docker-compose.override.yml` for hand edits. Never heredoc through `multipass exec` — always: flock → ruamel.yaml round-trip → write host temp via `compose.host_staging_dir(cfg)` (= `<host_data_dir>/.staging/`) → `multipass transfer` to `<vm_agents_root>/.compose.<pid>.<uuid>.new` → `docker compose --project-directory <vm_agents_root> -f ... --env-file <vm_agents_root>/.env config -q` validation → VM-side `mv` to `docker-compose.yml` (atomic same-fs rename) → cleanup. Host staging path is NOT under `/tmp/` (snap-confined `multipass` — the default Ubuntu install — cannot SFTP from `/tmp`: `cannot access`) and NOT under `$HOME/.cache/` (snap's home interface excludes dotfile paths: `Permission denied`). Staging under the host data dir works because that dir is already `multipass mount`ed into the VM, so multipass has explicit access — guaranteed on both snap and deb installs. Every module that `multipass transfer`s a host file into the VM (`compose`, `hermes_config`, `codex` for Dockerfile + auth-tar sync) uses `compose.host_staging_dir(cfg)` — do NOT introduce new `/tmp` or `~/.cache` paths. `compose.cleanup_stale_temps(cfg)` is invoked by `vm.start` and at the head of every mutation. Same pattern applies to per-agent `config.yaml` writes via `hermes_config.write_atomically`, which validates via `hermes config validate` exec'd inside the running container (best-effort — silently skipped if the container isn't up yet).
-5. **Image-source allowlist** is a parsed `(registry, repo)` tuple match — `nousresearch/hermes-agent` and `openclaw/openclaw` only. Reject `hermes-agent.org` and any registry-prefixed variant.
+5. **Image-source allowlist** is a parsed `(registry, repo)` tuple match — `nousresearch/hermes-agent`, `openclaw/openclaw`, and `volcengine/openviking` (memory sidecar) only. Reject `hermes-agent.org` and any registry-prefixed variant. New sibling-service memory backends require an explicit allowlist addition in `compose.py`.
 6. **Dashboard binding** is `127.0.0.1`/`localhost` only. The CLI refuses any Hermes config change to `0.0.0.0`.
 7. **Every mutation holds `<data-dir>/.agents.lock`** (`flock`). Read-only commands skip the lock. Two parallel `agents create` calls must serialize.
 8. **Every multi-phase op writes a phase journal** at `<data-dir>/.journal/<op>-<name>-<utc>.json`. Re-running the command resumes from the last completed phase. `doctor` flags journals older than 24 h.
@@ -28,6 +28,9 @@
 - **`/home/ubuntu/bin` MUST be on the system PATH** (`/etc/environment`). The rootless install puts `docker` there; `multipass exec` doesn't source `.profile` so without this the toolkit hits `bash: docker: command not found`. The bootstrap prepends it idempotently.
 - **OpenClaw service paths are per-agent** (`./<name>/.openclaw`, `./<name>/workspace`) so multiple named OpenClaw agents don't collide.
 - **Codex sandbox image tag** must be slugified (`agents/hermes-sandbox-codex:<sha256(base)[:12]>`) — base refs contain `/` and `:`.
+- **`localhost` / `127.0.0.1` / `0.0.0.0` are refused in `[ollama]` URLs** (`OllamaConfig._validate_url`). Inside the VM those resolve to the VM itself, not to the host where the user is actually running Ollama. The toolkit suggests the multipass NAT gateway (`multipass info <vm>` → IPv4) when surfacing the error.
+- **Memory backends needing embeddings/LLM read from `[ollama]` only.** The toolkit does NOT manage an Ollama instance. mem0 and OpenViking refuse to install when `[ollama]` is empty (mem0 falls back to `OPENAI_API_KEY` in `.env` if present; OpenViking does not, since its fact-extraction loop would melt a personal ChatGPT subscription).
+- **Codex auth ≠ OpenAI API key.** Hermes' `openai-codex` provider knows how to drive the ChatGPT-subscription OAuth flow; nothing else does. Of the supported memory backends, only `holographic` works with Codex auth alone — it doesn't call out for embeddings or LLM. Don't introduce a "Codex proxy" path for the others; it would violate OpenAI ToS and break on every flow rotation.
 
 ## Codex paths — how Hermes and OpenClaw differ
 
@@ -71,6 +74,12 @@ src/agents_cli/
   upgrades.py     # state machine: host-data-snapshot → vm-snapshot → pull → recreate → doctor → rollback
   export_cmd.py   # export/import/export-cron (host-cron, idempotent)
   codex.py        # login/refresh/status/skill-enable/skill-disable
+  ollama_cmd.py   # configure/status/clear — points the toolkit at an external Ollama / OpenAI-compatible endpoint (the toolkit does NOT run Ollama)
+  memory/         # memory backend plugins (Hermes only)
+    __init__.py   # registry + dispatch + state file at <data-dir>/.memory-state/<agent>.json
+    holographic.py # in-process; SQLite+FTS5+HRR; doctor checks for SQLite-on-9p + NumPy
+    mem0.py       # in-process library mode; reads [ollama] or OPENAI_API_KEY
+    openviking.py # sibling docker service per agent; needs [ollama]
   templates.py    # bootstrap script body, sandbox Dockerfile, fallback image tags
 scripts/vm-bootstrap.sh   # idempotent rootless Docker + Node-less / Codex-less setup; emits BOOTSTRAP_OK line
 ```
@@ -83,7 +92,7 @@ The user runs **duplicity on the host** as the only backup layer. The toolkit do
 
 `pytest` (unit, no network), `mypy --strict`, `ruff check + ruff format --check`. Integration tests live behind `@pytest.mark.multipass`; opt in via `pytest -m multipass`. Never in CI.
 
-The unit suite covers: compose round-trip and golden files, port allocator with override files, mp argv quoting, BOOTSTRAP_OK parser failure modes, upgrade state machine with injected runner, codex skill-enable / skill-disable, Hermes config round-trip, journal resume, flock serialization, sandbox-image-tag slugification.
+The unit suite covers: compose round-trip and golden files, port allocator with override files, mp argv quoting, BOOTSTRAP_OK parser failure modes, upgrade state machine with injected runner, codex skill-enable / skill-disable, Hermes config round-trip, journal resume, flock serialization, sandbox-image-tag slugification, memory plugin enable/disable round-trip per plugin (holographic, mem0, openviking), Ollama URL schema validation (localhost refusal).
 
 ## Conventions
 

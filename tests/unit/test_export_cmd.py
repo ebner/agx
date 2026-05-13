@@ -85,9 +85,7 @@ def test_export_refuses_unknown_agent(saved_config: Path) -> None:
         export_cmd.export("ghost", config_path=saved_config)
 
 
-def test_archive_dir_defaults_to_backups_in_both_modes(
-    cfg: AgentsConfig, tmp_path: Path
-) -> None:
+def test_archive_dir_defaults_to_backups_in_both_modes(cfg: AgentsConfig, tmp_path: Path) -> None:
     """``--to`` was previously required under ``--data-dir-in-vm`` —
     forcing the user to type a path on every invocation. The default
     ``<data-dir>/backups/`` is a valid host path in both modes (the
@@ -95,13 +93,9 @@ def test_archive_dir_defaults_to_backups_in_both_modes(
     there in both modes.
     """
     cfg.paths.data_dir_in_vm = False
-    assert (
-        export_cmd._archive_dir(cfg, None) == cfg.paths.host_data_dir / "backups"
-    )
+    assert export_cmd._archive_dir(cfg, None) == cfg.paths.host_data_dir / "backups"
     cfg.paths.data_dir_in_vm = True
-    assert (
-        export_cmd._archive_dir(cfg, None) == cfg.paths.host_data_dir / "backups"
-    )
+    assert export_cmd._archive_dir(cfg, None) == cfg.paths.host_data_dir / "backups"
     # --to overrides the default regardless of mode.
     override = tmp_path / "elsewhere"
     cfg.paths.data_dir_in_vm = False
@@ -232,9 +226,7 @@ def test_cron_install_accepts_comma_separated_times(
 ) -> None:
     """Multi-times-a-day backups: comma-separated --time installs one
     crontab line per time, all carrying the same marker."""
-    export_cmd.export_cron_install(
-        time="02:30,08:30,14:30,20:30", config_path=saved_config
-    )
+    export_cmd.export_cron_install(time="02:30,08:30,14:30,20:30", config_path=saved_config)
     # Four marker lines, one per time.
     assert fake_crontab.body.count(export_cmd.CRON_MARKER) == 4
     assert "30 2 * * *" in fake_crontab.body

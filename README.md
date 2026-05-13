@@ -61,7 +61,9 @@ For the full lifecycle — Hermes profiles vs. personalities vs. skills, connect
 | `<data-dir>/.env` | `HERMES_UID` / `HERMES_GID` so files written by containers round-trip cleanly to the host user. |
 | `<data-dir>/<name>/.data/` | Each Hermes agent's `$HERMES_HOME` (auth, sessions, skills, memories, state.db). |
 | `<data-dir>/<name>/.openclaw/` | Each OpenClaw agent's persistent dir. |
+| `<data-dir>/<name>/.openviking/` | OpenViking sidecar's per-agent data (when `agents memory enable openviking <name>`). |
 | `<data-dir>/.codex/` | Toolkit-scoped Codex auth (separate from your personal `~/.codex/`). |
+| `<data-dir>/.memory-state/` | Per-agent record of which memory backend the toolkit enabled. |
 | `<data-dir>/backups/` | Output of `agents export`. Host backup (e.g. duplicity) picks this up. |
 | `~/.config/agents/config.toml` | CLI config — VM name, sizes, pinned image tags, captured VM runtime fields. |
 
@@ -73,6 +75,26 @@ Two distinct ways Hermes can use your toolkit-scoped Codex account, both support
 2. **As a coding skill** (the bundled `autonomous-ai-agents/codex` skill): opt in with `agents codex skill-enable <name>`. The CLI builds a sandbox image with Codex CLI baked in and points the agent's `terminal.docker_image` at it. The sandbox container — not the Hermes runtime — is where `codex` runs when Hermes delegates coding tasks.
 
 OpenClaw bundles its own Codex plugin; the toolkit does **not** mount Codex into OpenClaw. Run `openclaw models auth login --provider openai-codex --device-code` inside the container after creation.
+
+## Memory backends
+
+Hermes agents start with built-in memory. The toolkit ships three managed alternatives:
+
+| Plugin       | What it needs                                            |
+|--------------|----------------------------------------------------------|
+| `holographic`| Nothing — works with Codex auth alone, fully local       |
+| `mem0`       | Ollama (preferred) or `OPENAI_API_KEY`                   |
+| `openviking` | Ollama (sibling docker service from Volcengine)          |
+
+```bash
+agents memory list                            # plugins + tier + summary
+agents memory enable holographic coder       # zero-dep, in-process
+agents ollama configure --url http://10.20.30.1:11434  # point at an existing Ollama
+agents memory enable openviking coder        # sibling service
+agents memory status coder
+```
+
+The toolkit does NOT run Ollama for you — you point it at one you already run (host, LAN, Tailscale, or a hosted OpenAI-compatible service). `localhost` URLs are refused at config time because they'd resolve to the VM, not the host.
 
 ## Backups
 

@@ -64,6 +64,48 @@ The CLI writes a phase journal under `<data-dir>/.journal/<op>-<name>-<utc>.json
 
 `agents doctor` warns about any journal older than 24 hours. To clear a stuck journal once you've manually reconciled state, simply delete the file from `<data-dir>/.journal/`.
 
+## Memory backends
+
+The toolkit manages three memory plugins for Hermes agents. Pick based
+on what credentials / infrastructure you already have:
+
+```bash
+agents memory list                          # show what's available
+agents memory enable holographic coder     # zero-dep, works with Codex alone
+agents memory enable mem0 coder            # in-process, needs Ollama or OPENAI_API_KEY
+agents memory enable openviking coder      # sibling docker service, needs Ollama
+agents memory disable coder                # back to built-in
+agents memory status coder                 # what's wired
+```
+
+Backends that need an embeddings + LLM provider read it from the
+toolkit's `[ollama]` config. The toolkit does NOT run Ollama for you —
+point it at an existing one:
+
+```bash
+agents ollama configure --url http://10.20.30.1:11434
+agents ollama configure --url https://hosted.example/v1 --api-key sk_…
+agents ollama status                        # probe reachability from VM + containers
+agents ollama clear
+```
+
+`localhost` / `127.0.0.1` / `0.0.0.0` URLs are refused — they resolve
+to the VM itself, not to the host where Ollama actually runs. Use the
+multipass NAT gateway (`multipass info <vm>` shows it; typically
+`10.<x>.<y>.1`), a LAN/Tailscale IP, or a public hostname.
+
+**Doctor checks worth knowing:**
+
+- `holographic` + default host-mount: the SQLite WAL on 9p risk
+  (matches the Hermes kanban/sessions trap). Switch to
+  `agents vm init --data-dir-in-vm` if you're seeing `database is
+  locked` errors.
+- `holographic` requires NumPy inside the Hermes container — without
+  it, the plugin silently degrades to FTS5-only (upstream issue
+  #17350). The status command probes this.
+- `mem0` and `openviking` need a reachable Ollama URL — `agents ollama
+  status` is the fastest way to confirm.
+
 ## Codex skill (Hermes only)
 
 ```bash

@@ -11,6 +11,7 @@ from agents_cli.compose import (
     ALLOWED_IMAGE_BASES,
     HERMES_IMAGE_BASE,
     OPENCLAW_IMAGE_BASE,
+    OPENVIKING_IMAGE_BASE,
     add_service,
     cleanup_stale_temps,
     dump_compose,
@@ -158,7 +159,10 @@ def test_allowlist_rejects_unknown_repo() -> None:
 
 
 def test_allowlist_set_is_what_we_advertise() -> None:
-    assert frozenset({HERMES_IMAGE_BASE, OPENCLAW_IMAGE_BASE}) == ALLOWED_IMAGE_BASES
+    assert (
+        frozenset({HERMES_IMAGE_BASE, OPENCLAW_IMAGE_BASE, OPENVIKING_IMAGE_BASE})
+        == ALLOWED_IMAGE_BASES
+    )
 
 
 # ---------- service ops ----------

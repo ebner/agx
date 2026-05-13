@@ -82,3 +82,8 @@ The cost is 9p mount overhead for SQLite-heavy workloads. The opt-out is `vm ini
 | `upgrades.py` | Two-snapshot state machine with rollback. |
 | `export_cmd.py` | export / import / host-cron integration. |
 | `codex.py` | Codex login / refresh / status / skill-enable / skill-disable. |
+| `ollama_cmd.py` | configure / status / clear for an external Ollama / OpenAI-compatible endpoint. Stores URL + model names in `[ollama]`; stores bearer token (if any) in `<data-dir>/.env`, never in TOML. Refuses `localhost` URLs. |
+| `memory/__init__.py` | Registry + dispatch for memory backend plugins (Hermes only). State at `<data-dir>/.memory-state/<agent>.json`. |
+| `memory/holographic.py` | In-process Hermes plugin. Zero external deps. |
+| `memory/mem0.py` | In-process library mode. Wires Ollama or `OPENAI_API_KEY`. |
+| `memory/openviking.py` | Per-agent sibling docker service. Needs Ollama. |

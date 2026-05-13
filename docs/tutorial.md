@@ -161,6 +161,54 @@ agents exec coder hermes skills uninstall <skill-id>
 
 Skills are **profile-scoped** inside Hermes. With Strategy A (one container per agent) you don't have to think about this — each toolkit agent has its own skill set. With Strategy B you'd run `hermes -p <profile> skills install ...`.
 
+### 4.3a (Optional) Pick a memory backend
+
+By default Hermes uses built-in memory (`MEMORY.md` / `USER.md`). For
+longer-lived semantic recall the toolkit ships three managed backends:
+
+```bash
+agents memory list
+```
+
+| Plugin       | Tier             | What it needs                                                |
+|--------------|------------------|--------------------------------------------------------------|
+| `holographic`| in-process       | nothing — works with Codex auth alone, fully local           |
+| `mem0`       | in-process       | Ollama (recommended) or an `OPENAI_API_KEY`                  |
+| `openviking` | sibling-service  | Ollama (or any OpenAI-compatible endpoint)                   |
+
+`holographic` is the easiest starting point: no extra services, no extra
+credentials, no network calls.
+
+```bash
+agents memory enable holographic coder
+```
+
+`mem0` and `openviking` need an embeddings + LLM provider. The toolkit
+talks to whichever **existing** Ollama instance (or OpenAI-compatible
+service) you already run — it does not start one for you:
+
+```bash
+# point the toolkit at an Ollama you already run (host, LAN, Tailscale,
+# or a hosted vendor — but not `localhost`, which the VM can't reach)
+agents ollama configure --url http://10.20.30.1:11434
+
+# now use it
+agents memory enable mem0 coder           # in-process inside Hermes
+agents memory enable openviking coder     # sibling docker service
+```
+
+For a hosted OpenAI-compatible endpoint with bearer-token auth, pass
+`--api-key` — it lands in `<data-dir>/.env`, never in `config.toml`:
+
+```bash
+agents ollama configure --url https://api.groq.example/v1 --api-key gsk_…
+```
+
+Switch backends with `agents memory disable coder` followed by another
+`enable`. `agents memory status` shows what's wired and (for
+holographic) flags the SQLite-on-9p / missing-NumPy risks described in
+`CLAUDE.md`.
+
 ### 4.4 Connect to a messaging platform
 
 Hermes ships a *messaging gateway* (`hermes gateway`) plus a few platform-specific subcommands. Coverage and the exact flow depend on the platform.

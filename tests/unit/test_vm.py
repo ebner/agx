@@ -478,7 +478,6 @@ def _stub_rebuild(mocker, cfg: AgentsConfig, services: dict[str, str]):
     """
     import json as _json
 
-
     # Pre-populate the compose doc so the rebuild planner sees the
     # services it needs to round-trip.
     cfg.paths.host_data_dir.mkdir(parents=True, exist_ok=True)
@@ -547,9 +546,9 @@ def test_rebuild_overrides_sizing(mocker, tmp_path: Path) -> None:
     vm.rebuild(disk_gb=10, yes=True, config_path=config_path)
 
     init_kwargs = mocks["init"].call_args.kwargs
-    assert init_kwargs["cpus"] == 4         # kept
-    assert init_kwargs["memory_gb"] == 8    # kept
-    assert init_kwargs["disk_gb"] == 10     # overridden (shrink)
+    assert init_kwargs["cpus"] == 4  # kept
+    assert init_kwargs["memory_gb"] == 8  # kept
+    assert init_kwargs["disk_gb"] == 10  # overridden (shrink)
 
 
 def test_rebuild_requires_confirmation_unless_yes(mocker, tmp_path: Path) -> None:
@@ -586,8 +585,8 @@ def test_rebuild_resumes_from_journal(mocker, tmp_path: Path) -> None:
 
     vm.rebuild(yes=True, config_path=config_path)
 
-    mocks["export"].assert_not_called()       # already done
-    mocks["delete_vm"].assert_not_called()    # already done
+    mocks["export"].assert_not_called()  # already done
+    mocks["delete_vm"].assert_not_called()  # already done
     mocks["init"].assert_called_once()
     mocks["import_archive"].assert_called_once()
     mocks["up"].assert_called_once()

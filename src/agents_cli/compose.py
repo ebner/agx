@@ -52,7 +52,13 @@ from agents_cli.errors import RuntimeFailure, UserError
 
 HERMES_IMAGE_BASE: Final = "nousresearch/hermes-agent"
 OPENCLAW_IMAGE_BASE: Final = "openclaw/openclaw"
-ALLOWED_IMAGE_BASES: Final = frozenset({HERMES_IMAGE_BASE, OPENCLAW_IMAGE_BASE})
+# Sibling-service memory backends managed by the toolkit. Whitelisted by
+# the same parsed (registry, repo) tuple check as the agent images so an
+# attacker-controlled compose can't sneak in a typo-squatted variant.
+OPENVIKING_IMAGE_BASE: Final = "volcengine/openviking"
+ALLOWED_IMAGE_BASES: Final = frozenset(
+    {HERMES_IMAGE_BASE, OPENCLAW_IMAGE_BASE, OPENVIKING_IMAGE_BASE}
+)
 
 
 def _yaml() -> YAML:
@@ -279,6 +285,55 @@ def hermes_service_fragment(
         },
         "mem_limit": cfg.defaults.hermes_mem_limit,
         "cpus": cfg.defaults.hermes_cpus,
+    }
+
+
+def openviking_sidecar_fragment(
+    *,
+    agent_name: str,
+    image_tag: str,
+    api_key_env: str | None,
+    embed_provider_url: str,
+    embed_model: str,
+    llm_provider_url: str,
+    llm_model: str,
+) -> dict[str, Any]:
+    """Compose service block for a per-agent OpenViking memory sidecar.
+
+    OpenViking ships as a long-running HTTP service. We bind it to
+    ``127.0.0.1`` only — the Hermes container reaches it over the
+    docker default network using the service name as DNS. The data
+    volume sits under the agent's host dir so ``agents export``
+    captures it.
+
+    ``api_key_env``, if set, is the name of an env var present in the
+    project ``.env`` carrying the user's OpenAI-compatible bearer
+    token (for vendor-cloud Ollama endpoints, or an nginx-protected
+    Ollama). Vanilla Ollama uses no auth — leave it None.
+    """
+    env: dict[str, str] = {
+        "OPENVIKING_EMBEDDING_PROVIDER": "openai_compatible",
+        "OPENVIKING_EMBEDDING_BASE_URL": embed_provider_url,
+        "OPENVIKING_EMBEDDING_MODEL": embed_model,
+        "OPENVIKING_LLM_PROVIDER": "openai_compatible",
+        "OPENVIKING_LLM_BASE_URL": llm_provider_url,
+        "OPENVIKING_LLM_MODEL": llm_model,
+    }
+    if api_key_env:
+        env["OPENVIKING_EMBEDDING_API_KEY"] = "${" + api_key_env + "}"
+        env["OPENVIKING_LLM_API_KEY"] = "${" + api_key_env + "}"
+    return {
+        "image": f"{OPENVIKING_IMAGE_BASE}:{image_tag}",
+        "container_name": f"openviking-{agent_name}",
+        "restart": "unless-stopped",
+        "volumes": [
+            f"./{agent_name}/.openviking:/home/openviking/data",
+        ],
+        "environment": env,
+        # No host port mapping — only the Hermes container talks to it
+        # via the default docker network. Reachable inside the network
+        # as `http://openviking-<agent>:1933`.
+        "expose": ["1933"],
     }
 
 
