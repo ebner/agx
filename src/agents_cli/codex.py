@@ -34,8 +34,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from agents_cli import compose as compose_mod_lock  # imported for acquire_lock
-from agents_cli import compose_runner, hermes_config, mp, templates, ui
+from agents_cli import compose, compose_runner, hermes_config, mp, templates, ui
 from agents_cli import config as cfg_mod
 from agents_cli.agents_cmd import _detect_type_from_compose
 from agents_cli.agents_cmd import service_name as _service_name_for
@@ -94,7 +93,10 @@ def _sync_host_codex_to_vm(cfg: AgentsConfig) -> None:
         return
 
     with tempfile.NamedTemporaryFile(
-        prefix="agents-codex-sync-", suffix=".tar", delete=False
+        prefix="codex-sync-",
+        suffix=".tar",
+        dir=compose.host_staging_dir(cfg),
+        delete=False,
     ) as tf:
         host_tar = Path(tf.name)
     try:
@@ -336,7 +338,7 @@ def skill_enable(name: str, *, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) 
             "`openclaw models auth login --provider openai-codex` inside the container)"
         )
 
-    with compose_mod_lock.acquire_lock(cfg.paths.host_data_dir):
+    with compose.acquire_lock(cfg.paths.host_data_dir):
         doc = hermes_config.read_doc(cfg, name)
         current_image = (
             hermes_config.get_terminal_docker_image(doc) or templates.HERMES_DEFAULT_SANDBOX_IMAGE
@@ -391,7 +393,7 @@ def skill_disable(name: str, *, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH)
     if not state_path.exists():
         raise UserError(f"codex skill is not enabled for {name!r}; no .codex-skill.json found")
 
-    with compose_mod_lock.acquire_lock(cfg.paths.host_data_dir):
+    with compose.acquire_lock(cfg.paths.host_data_dir):
         state = json.loads(state_path.read_text(encoding="utf-8"))
         original_image = state["original_docker_image"]
 
@@ -427,7 +429,7 @@ def _build_sandbox_image_in_vm(cfg: AgentsConfig, image_tag: str, base_image: st
     # other's staged Dockerfile.
     suffix = f"{hashlib.sha256(image_tag.encode()).hexdigest()[:8]}-{os.getpid()}-{_uuid.uuid4().hex[:8]}"
     dockerfile_name = f".codex-sandbox-{suffix}.Dockerfile"
-    host_temp = Path("/tmp") / f"agents-{dockerfile_name}"
+    host_temp = compose.host_staging_dir(cfg) / dockerfile_name
     vm_dockerfile = f"{cfg.paths.vm_agents_root}/{dockerfile_name}"
     try:
         host_temp.write_text(dockerfile_content, encoding="utf-8")

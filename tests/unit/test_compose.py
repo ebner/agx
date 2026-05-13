@@ -66,7 +66,11 @@ def test_hermes_fragment_has_required_mounts(cfg: AgentsConfig) -> None:
     assert s["image"] == "nousresearch/hermes-agent:v1.0.0"
     assert s["container_name"] == "hermes-coder"
     assert s["ports"] == ["127.0.0.1:8642:8642"]
-    assert s["user"] == "${HERMES_UID}:${HERMES_GID}"
+    # No `user:` override — rootless docker maps container uid 0 to the
+    # rootless host user, which owns the multipass-mounted data dir.
+    # Forcing user: 1000:1000 would push the container into a subuid that
+    # cannot write to that mount.
+    assert "user" not in s
 
     # Three required mounts: data dir, socket, codex auth at the
     # *container user's* home (NOT /opt/data).
@@ -77,6 +81,10 @@ def test_hermes_fragment_has_required_mounts(cfg: AgentsConfig) -> None:
     # DOCKER_HOST env must be set so the Hermes-bundled docker CLI finds
     # the rootless socket.
     assert s["environment"]["DOCKER_HOST"] == "unix:///run/user/1000/docker.sock"
+
+    # HOME must be pinned in env so the Codex auth import bridge resolves
+    # to the same path we mount, regardless of the image's USER/HOME drift.
+    assert s["environment"]["HOME"] == "/home/hermes"
 
 
 def test_hermes_fragment_never_binds_zero_address(cfg: AgentsConfig) -> None:
@@ -315,6 +323,7 @@ def test_write_refuses_when_vm_runtime_unpopulated(tmp_path: Path) -> None:
 
 
 def test_cleanup_stale_temps_removes_residue(cfg: AgentsConfig, mocker) -> None:
+    from agents_cli.compose import host_staging_dir
     from tests.conftest import install_vm_fs_simulation
 
     d = cfg.paths.host_data_dir
@@ -322,17 +331,14 @@ def test_cleanup_stale_temps_removes_residue(cfg: AgentsConfig, mocker) -> None:
     (d / ".compose.1234.abc.new").write_text("junk", encoding="utf-8")
     (d / ".compose.5678.def.new").write_text("junk", encoding="utf-8")
     (d / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
-    # Also leave a host-side /tmp straggler from this PID
-    import os
-    import tempfile
-
-    host_temp = Path(tempfile.gettempdir()) / f"agents-compose-{os.getpid()}-stale.yml"
+    # Also leave a host-side staging-dir straggler.
+    host_temp = host_staging_dir(cfg) / "stale.yml"
     host_temp.write_text("stale", encoding="utf-8")
     cleanup_stale_temps(cfg)
     assert not any(d.glob(".compose.*.new"))
     # Real compose untouched
     assert (d / "docker-compose.yml").exists()
-    # /tmp straggler from this PID was swept
+    # Host staging-dir straggler was swept
     assert not host_temp.exists()
 
 

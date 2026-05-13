@@ -158,9 +158,25 @@ def mount(
     host_gid: int,
     vm_uid: int = 1000,
     vm_gid: int = 1000,
+    mount_type: str = "native",
 ) -> MpResult:
+    """Mount a host directory into the VM.
+
+    ``mount_type`` defaults to ``"native"`` (hypervisor-backed: 9p on
+    Linux/QEMU, virtiofs on macOS/HyperKit) rather than multipass's
+    historical default of ``"classic"`` (fuse.sshfs). Reason: rootless
+    Docker cannot bind-mount paths from a fuse.sshfs filesystem into a
+    container — the kernel returns ``operation not supported`` and every
+    Hermes/OpenClaw container fails on first start. 9p/virtiofs is fine.
+
+    Multipass requires the VM to be stopped to add a native mount;
+    classic mounts can be added on a running VM. The orchestration
+    (stop, mount, start) is done by ``vm._ensure_mount``.
+    """
     return mp(
         "mount",
+        "--type",
+        mount_type,
         "-u",
         f"{host_uid}:{vm_uid}",
         "-g",
@@ -240,40 +256,6 @@ def restore(snapshot_id: str, *, destructive: bool = False) -> MpResult:
     if destructive:
         args.append("--destructive")
     return mp(*args)
-
-
-def inspect_image_user(vm: str, image_ref: str) -> tuple[str | None, str | None]:
-    """Return ``(user, home)`` for a Docker image, both possibly ``None``
-    if the image isn't pulled or the field is unset (in which case the
-    OCI default is to run as ``root``).
-
-    Calls ``docker inspect --format`` inside the VM with a Go template
-    that emits ``USER\\tHOME`` separated by a tab. Conservative on errors.
-    """
-    fmt = "{{.Config.User}}\t{{range .Config.Env}}{{println .}}{{end}}"
-    result = exec_in_vm(vm, "docker", "inspect", "--format", fmt, image_ref, check=False)
-    if result.returncode != 0:
-        return (None, None)
-    raw = result.stdout.strip()
-    if "\t" in raw:
-        user_part, env_part = raw.split("\t", 1)
-    else:
-        user_part, env_part = raw, ""
-    user_part = user_part.strip()
-
-    user: str | None = user_part or None
-    home: str | None = None
-    for line in env_part.splitlines():
-        if line.startswith("HOME="):
-            home = line[len("HOME=") :].strip() or None
-            break
-    if home is None and user:
-        # Fall back to canonical Unix convention.
-        home = "/root" if user == "root" else f"/home/{user.split(':')[0]}"
-    elif home is None:
-        # User unset = OCI default = root.
-        home = "/root"
-    return (user, home)
 
 
 def parse_bootstrap_ok(output: str) -> BootstrapStatus:

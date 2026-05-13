@@ -6,7 +6,7 @@ Pattern, plan-locked:
 2. Read+mutate the compose doc with ``ruamel.yaml``. Reads come straight
    off the host mount in host-mount mode (fast), or are pulled from the
    VM in ``--data-dir-in-vm`` mode.
-3. Dump the new content to a host-side temp at ``/tmp/agents-compose-<pid>-<uuid>.yml``.
+3. Dump the new content to a host-side temp at ``<host_data_dir>/.staging/<pid>-<uuid>.yml``.
 4. ``multipass transfer`` the host temp into the VM's project dir at
    ``<vm_agents_root>/.compose.<pid>.<uuid>.new`` — same filesystem as
    the final ``docker-compose.yml``, so the subsequent rename is
@@ -102,14 +102,33 @@ def dump_compose(doc: Any) -> str:
     return buf.getvalue()
 
 
+def host_staging_dir(cfg: AgentsConfig) -> Path:
+    """Host-side scratch dir for anything that's about to be
+    ``multipass transfer``\\ -ed into the VM (compose files, Hermes
+    config.yaml writes, codex sandbox Dockerfiles, codex auth tars).
+
+    Lives under ``<host_data_dir>/.staging/``. Two reasons:
+
+    - Snap-confined ``multipass`` (the default Ubuntu install) cannot
+      SFTP from ``/tmp/`` (``cannot access``) and the snap home
+      interface excludes dotfiles in ``$HOME`` (so ``~/.cache/`` also
+      fails with ``Permission denied``).
+    - The host data dir is already ``multipass mount``ed into the VM,
+      which means multipass has explicit access to it — guaranteed
+      readable across both snap and deb installs of multipass.
+    """
+    d = cfg.paths.host_data_dir / ".staging"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 def cleanup_stale_temps(cfg: AgentsConfig) -> None:
     """Sweep any ``.compose.*.new`` left behind in the VM project dir by
-    prior crashes. Also sweeps host-side ``/tmp/agents-compose-*.yml``
-    stragglers from this process.
+    prior crashes. Also sweeps host-side stragglers from this process.
 
     Safe to call before the VM exists (it just no-ops).
     """
-    for tmp in Path("/tmp").glob("agents-compose-*.yml"):
+    for tmp in host_staging_dir(cfg).glob("*.yml"):
         with contextlib.suppress(OSError):
             tmp.unlink()
     if not cfg.vm_runtime.is_populated():
@@ -129,7 +148,7 @@ def read_compose_doc(cfg: AgentsConfig) -> Any:
     into a host temp, parses, and deletes the temp.
     """
     if cfg.paths.data_dir_in_vm:
-        host_temp = Path("/tmp") / f"agents-compose-read-{os.getpid()}-{uuid.uuid4().hex[:8]}.yml"
+        host_temp = host_staging_dir(cfg) / f"read-{os.getpid()}-{uuid.uuid4().hex[:8]}.yml"
         try:
             mp.transfer_from_vm(
                 cfg.vm.name,
@@ -161,7 +180,7 @@ def write_compose_atomically(cfg: AgentsConfig, doc: Any) -> None:
     stage_name = f".compose.{pid}.{suffix}.new"
     vm_stage = f"{cfg.paths.vm_agents_root}/{stage_name}"
     vm_target = f"{cfg.paths.vm_agents_root}/docker-compose.yml"
-    host_temp = Path("/tmp") / f"agents-compose-{pid}-{suffix}.yml"
+    host_temp = host_staging_dir(cfg) / f"{pid}-{suffix}.yml"
 
     try:
         host_temp.write_text(content, encoding="utf-8")
@@ -212,8 +231,17 @@ def hermes_service_fragment(
     Mounts the per-agent data dir at /opt/data ($HERMES_HOME for the
     official image), the rootless Docker socket so Hermes can spawn its
     nested sandbox, and the toolkit-scoped Codex auth at the container
-    user's ~/.codex for setup-time import. Sets DOCKER_HOST explicitly
-    so Hermes' Docker CLI finds the socket.
+    user's ~/.codex for setup-time import.
+
+    No ``user:`` override. Under rootless Docker, container UID 0 (the
+    image's default entrypoint user) maps to the rootless host user
+    (``ubuntu`` / uid 1000 in the VM), which through the multipass
+    ``-u 1000:1000`` mapping is the host user owning the data dir on
+    the host. Setting ``user: 1000:1000`` would force the container into
+    a subuid that does NOT match the multipass mount ownership, breaking
+    every write into ``/opt/data``. HOME is pinned in env so the Codex
+    import bridge resolves to the same path we mount, independent of
+    image USER/HOME drift.
     """
     socket_path = cfg.vm_runtime.docker_socket_path
     return {
@@ -221,7 +249,6 @@ def hermes_service_fragment(
         "container_name": f"hermes-{name}",
         "restart": "unless-stopped",
         "command": "gateway run",
-        "user": "${HERMES_UID}:${HERMES_GID}",
         "ports": [f"127.0.0.1:{port}:8642"],
         "volumes": [
             f"./{name}/.data:/opt/data",
@@ -230,6 +257,13 @@ def hermes_service_fragment(
         ],
         "environment": {
             "DOCKER_HOST": f"unix://{socket_path}",
+            "HOME": "/home/hermes",
+            # The image entrypoint prepends /opt/hermes/.venv/bin to PATH
+            # internally, but `docker exec` bypasses the entrypoint, so
+            # `agents doctor` (which exec's `hermes doctor` in the container)
+            # would otherwise hit "executable file not found". Set the full
+            # PATH explicitly to mirror the image default plus the venv.
+            "PATH": "/opt/hermes/.venv/bin:/opt/data/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
         },
         "mem_limit": cfg.defaults.hermes_mem_limit,
         "cpus": cfg.defaults.hermes_cpus,

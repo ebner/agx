@@ -170,8 +170,15 @@ def create(
             )
             port = compose.next_free_port(cfg, base=base)
 
+        # A resumable journal is an explicit "this is a continuation, not a
+        # fresh attempt" signal, so it bypasses the data-dir-exists refusal
+        # below — that guard exists to protect orphaned dirs without a
+        # journal, not to block the resume path the journal was built for.
+        # The live-container guard still applies in both cases.
+        resumable = Journal.find_resumable(cfg.paths.host_data_dir, "create", name)
+
         if _data_dir_exists(cfg, name, agent_type):
-            if not reuse_data:
+            if resumable is None and not reuse_data:
                 if _service_in_compose(cfg, svc):
                     raise UserError(
                         f"agent {name!r} already exists. "
@@ -182,15 +189,16 @@ def create(
                     f"{cfg.paths.host_data_dir / name}. Pass --reuse-data to attach to it, "
                     f"or pick a different name."
                 )
-            # --reuse-data path: refuse if a live container is currently mapping
-            # the dir, regardless of compose state. Plan rule #1.
+            # Both --reuse-data and resume paths must refuse if a live
+            # container is currently mapping the dir. Plan rule #1.
             if _has_live_container(cfg, svc):
                 raise UserError(
-                    f"refusing --reuse-data: container {svc!r} is currently running and maps "
-                    f"the data dir. Stop it first with `agents stop {name}`."
+                    f"refusing to {'resume' if resumable else 'attach'}: "
+                    f"container {svc!r} is currently running and maps the data dir. "
+                    f"Stop it first with `agents stop {name}`."
                 )
 
-        journal = Journal.find_resumable(cfg.paths.host_data_dir, "create", name) or Journal.begin(
+        journal = resumable or Journal.begin(
             cfg.paths.host_data_dir, "create", name, CREATE_PHASES
         )
 
@@ -269,7 +277,7 @@ def _add_service_to_compose(
     if svc in (doc.get("services") or {}):
         return  # already there from a prior partial run
     if agent_type == "hermes":
-        _verify_hermes_image_user(cfg, tag)
+        _ensure_hermes_image_pulled(cfg, tag)
         fragment = compose.hermes_service_fragment(name=name, cfg=cfg, port=port, image_tag=tag)
     else:
         fragment = compose.openclaw_service_fragment(name=name, port=port, image_tag=tag)
@@ -277,34 +285,25 @@ def _add_service_to_compose(
     compose.write_compose_atomically(cfg, doc)
 
 
-def _verify_hermes_image_user(cfg: AgentsConfig, tag: str) -> None:
-    """Inspect the pinned Hermes image and refuse if the entrypoint user
-    or home isn't where the toolkit mounts the Codex auth.
-
-    Pulls the image first if missing, so first-create runs actually
-    verify instead of silently no-op'ing on (None, None). The Codex
-    import path mounts ``/home/hermes/.codex``; if upstream Hermes ever
-    changes the container user, that mount target is wrong and the
-    import silently fails. This check trips early with a clear error so
-    the user knows to update the toolkit.
+def _ensure_hermes_image_pulled(cfg: AgentsConfig, tag: str) -> None:
+    """Pull the Hermes image up front so `docker compose up` doesn't hit a
+    network failure mid-mutation. We used to also verify the image's
+    entrypoint USER/HOME, but the compose fragment now sets both
+    `user:` and `HOME` explicitly — the runtime user is fully ours to
+    own, so image drift in those fields doesn't break the Codex import
+    mount. We just need the image local before compose up.
     """
     image_ref = f"{HERMES_IMAGE_BASE}:{tag}"
-    user, home = mp.inspect_image_user(cfg.vm.name, image_ref)
-    if user is None:
-        # Image not pulled yet — do it now (idempotent) and re-inspect.
-        pull = mp.exec_in_vm(cfg.vm.name, "docker", "pull", image_ref, check=False)
-        if pull.returncode != 0:
-            raise UserError(
-                f"could not pull {image_ref} (rc={pull.returncode}): "
-                f"{pull.stderr.strip() or pull.stdout.strip()}"
-            )
-        user, home = mp.inspect_image_user(cfg.vm.name, image_ref)
-    if user != "hermes" or home != "/home/hermes":
+    inspect = mp.exec_in_vm(
+        cfg.vm.name, "docker", "image", "inspect", image_ref, check=False
+    )
+    if inspect.returncode == 0:
+        return
+    pull = mp.exec_in_vm(cfg.vm.name, "docker", "pull", image_ref, check=False)
+    if pull.returncode != 0:
         raise UserError(
-            f"Hermes image {image_ref} entrypoint user/home has drifted "
-            f"(user={user!r}, home={home!r}); expected (user='hermes', home='/home/hermes'). "
-            "The Codex auth mount target in the compose template assumes the canonical "
-            "values — update agents_cli or pin an older Hermes image."
+            f"could not pull {image_ref} (rc={pull.returncode}): "
+            f"{pull.stderr.strip() or pull.stdout.strip()}"
         )
 
 

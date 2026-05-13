@@ -73,81 +73,66 @@ def test_validate_name_accepts(good: str) -> None:
     validate_name(good)
 
 
-# ---------- _verify_hermes_image_user ----------
+# ---------- _ensure_hermes_image_pulled ----------
 
 
-def _build_verify_runner(stages):
-    """Returns a side_effect callable that walks through the given stages
-    sequentially for `docker inspect` calls. Each stage is a (stdout, rc)
-    tuple. `docker pull` returns the next stage's pull result.
+def _build_pull_runner(inspect_rc: int, pull_rc: int, pull_stderr: str = ""):
+    """Stub for mp.exec_in_vm that fakes a `docker image inspect` then
+    `docker pull` sequence. Other docker subcommands return success.
     """
-    state = {"i": 0}
+    from agents_cli.mp import MpResult
 
     def runner(vm_name: str, *cmd: str, check: bool = True):
-        from agents_cli.mp import MpResult
-
-        if "docker" in cmd and "inspect" in cmd:
-            i = state["i"]
-            stage = stages[i] if i < len(stages) else stages[-1]
-            return MpResult(stdout=stage[0], stderr="", returncode=stage[1])
-        if "docker" in cmd and "pull" in cmd:
-            state["i"] += 1
-            return MpResult(stdout="", stderr="", returncode=0)
+        if "image" in cmd and "inspect" in cmd:
+            return MpResult(stdout="", stderr="", returncode=inspect_rc)
+        if "pull" in cmd:
+            return MpResult(stdout="", stderr=pull_stderr, returncode=pull_rc)
         return MpResult(stdout="", stderr="", returncode=0)
 
     return runner
 
 
-def test_verify_hermes_user_pulls_then_inspects(cfg: AgentsConfig, mocker) -> None:
-    """First inspect returns empty (not pulled); after pull, returns
-    hermes/HOME=/home/hermes; verification passes."""
-    from agents_cli.agents_cmd import _verify_hermes_image_user
+def test_ensure_hermes_image_pulled_skips_if_already_local(cfg: AgentsConfig, mocker) -> None:
+    """`docker image inspect` succeeding means the image is already cached;
+    no `docker pull` should be issued."""
+    from agents_cli.agents_cmd import _ensure_hermes_image_pulled
 
-    stages = [("", 1), ("hermes\tHOME=/home/hermes\n", 0)]
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_build_verify_runner(stages))
-    _verify_hermes_image_user(cfg, "v1.0.0")  # no raise
-
-
-def test_verify_hermes_user_fails_when_pull_fails(cfg: AgentsConfig, mocker) -> None:
-    """First inspect empty, pull fails -> UserError mentioning pull."""
-    from agents_cli.mp import MpResult
-
-    call_count = {"i": 0}
+    calls: list[tuple[str, ...]] = []
 
     def runner(vm_name: str, *cmd: str, check: bool = True):
-        if "docker" in cmd and "inspect" in cmd:
-            return MpResult(stdout="", stderr="", returncode=1)
-        if "docker" in cmd and "pull" in cmd:
-            call_count["i"] += 1
-            return MpResult(stdout="", stderr="rate limit", returncode=1)
+        from agents_cli.mp import MpResult
+
+        calls.append(cmd)
+        if "image" in cmd and "inspect" in cmd:
+            return MpResult(stdout="", stderr="", returncode=0)
         return MpResult(stdout="", stderr="", returncode=0)
 
     mocker.patch("agents_cli.mp.exec_in_vm", side_effect=runner)
-    from agents_cli.agents_cmd import _verify_hermes_image_user
+    _ensure_hermes_image_pulled(cfg, "v1.0.0")
+    assert not any("pull" in c for c in calls), "pull should be skipped when inspect succeeds"
 
+
+def test_ensure_hermes_image_pulled_pulls_when_missing(cfg: AgentsConfig, mocker) -> None:
+    """Inspect rc=1 (missing) triggers a pull. Success is silent."""
+    from agents_cli.agents_cmd import _ensure_hermes_image_pulled
+
+    mocker.patch(
+        "agents_cli.mp.exec_in_vm",
+        side_effect=_build_pull_runner(inspect_rc=1, pull_rc=0),
+    )
+    _ensure_hermes_image_pulled(cfg, "v1.0.0")  # no raise
+
+
+def test_ensure_hermes_image_pulled_raises_on_pull_failure(cfg: AgentsConfig, mocker) -> None:
+    """Inspect rc=1, pull rc=1 -> UserError with the stderr."""
+    from agents_cli.agents_cmd import _ensure_hermes_image_pulled
+
+    mocker.patch(
+        "agents_cli.mp.exec_in_vm",
+        side_effect=_build_pull_runner(inspect_rc=1, pull_rc=1, pull_stderr="rate limit"),
+    )
     with pytest.raises(UserError, match="could not pull"):
-        _verify_hermes_image_user(cfg, "v1.0.0")
-    assert call_count["i"] == 1
-
-
-def test_verify_hermes_user_refuses_post_pull_drift(cfg: AgentsConfig, mocker) -> None:
-    """First inspect empty, pull ok, second inspect returns the WRONG
-    user — verification trips with a clear error."""
-    stages = [("", 1), ("notHermes\tHOME=/wrong\n", 0)]
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_build_verify_runner(stages))
-    from agents_cli.agents_cmd import _verify_hermes_image_user
-
-    with pytest.raises(UserError, match="drifted"):
-        _verify_hermes_image_user(cfg, "v1.0.0")
-
-
-def test_verify_hermes_user_passes_when_already_pulled(cfg: AgentsConfig, mocker) -> None:
-    """First inspect succeeds with the canonical user; no pull needed."""
-    stages = [("hermes\tHOME=/home/hermes\n", 0)]
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_build_verify_runner(stages))
-    from agents_cli.agents_cmd import _verify_hermes_image_user
-
-    _verify_hermes_image_user(cfg, "v1.0.0")
+        _ensure_hermes_image_pulled(cfg, "v1.0.0")
 
 
 @pytest.mark.parametrize(
@@ -211,6 +196,26 @@ def test_create_refuses_existing_data_dir_without_reuse(
     (cfg.paths.host_data_dir / "coder" / ".data").mkdir(parents=True)
     with pytest.raises(UserError, match="already exists"):
         create(name="coder", agent_type="hermes", config_path=saved_config)
+
+
+def test_create_resumes_when_journal_exists_despite_existing_data_dir(
+    cfg: AgentsConfig, saved_config: Path, stub_runners
+) -> None:
+    """A resumable journal means a prior run crashed mid-op. Re-running must
+    pick up where it left off — the data-dir-exists guard must not block this
+    path, which is the whole point of the journal.
+    """
+    j = Journal.begin(cfg.paths.host_data_dir, "create", "coder", agents_cmd.CREATE_PHASES)
+    (cfg.paths.host_data_dir / "coder" / ".data").mkdir(parents=True)
+    j.advance("data_dir_created")
+
+    create(name="coder", agent_type="hermes", config_path=saved_config)
+
+    assert (
+        "hermes-coder"
+        in compose.load_compose(cfg.paths.host_data_dir / "docker-compose.yml")["services"]
+    )
+    assert Journal.find_resumable(cfg.paths.host_data_dir, "create", "coder") is None
 
 
 def test_create_with_reuse_data_attaches_to_existing_dir(

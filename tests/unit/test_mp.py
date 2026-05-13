@@ -49,7 +49,7 @@ def test_transfer_from_vm_argv(mocker) -> None:
     assert args[0] == ["multipass", "transfer", "agents:/home/ubuntu/x", "/tmp/x"]
 
 
-def test_mount_includes_uid_gid_mapping(mocker) -> None:
+def test_mount_includes_uid_gid_mapping_and_native_type(mocker) -> None:
     mocker.patch("subprocess.run", return_value=_stub_run())
     mp.mount(
         Path("/data/agents"),
@@ -61,9 +61,14 @@ def test_mount_includes_uid_gid_mapping(mocker) -> None:
         vm_gid=1000,
     )
     args, _ = subprocess.run.call_args
+    # `--type native` is load-bearing: classic / fuse.sshfs mounts cannot
+    # be bind-mounted into a rootless Docker container (operation not
+    # supported), which breaks every agent on first start.
     assert args[0] == [
         "multipass",
         "mount",
+        "--type",
+        "native",
         "-u",
         "1001:1000",
         "-g",
@@ -71,6 +76,20 @@ def test_mount_includes_uid_gid_mapping(mocker) -> None:
         "/data/agents",
         "agents:/home/ubuntu/agents",
     ]
+
+
+def test_mount_type_is_overridable(mocker) -> None:
+    mocker.patch("subprocess.run", return_value=_stub_run())
+    mp.mount(
+        Path("/data/agents"),
+        "agents",
+        "/home/ubuntu/agents",
+        host_uid=1000,
+        host_gid=1000,
+        mount_type="classic",
+    )
+    args, _ = subprocess.run.call_args
+    assert "classic" in args[0]
 
 
 def test_launch_argv(mocker) -> None:

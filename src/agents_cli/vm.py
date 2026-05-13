@@ -160,7 +160,8 @@ def start(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> None:
     if not cfg.paths.data_dir_in_vm:
         _ensure_mount(cfg)
         _mount_probe(cfg)
-    # Sweep stale .compose.*.new and host /tmp/agents-compose-* from prior crashes
+    # Sweep stale .compose.*.new in the VM and host-side compose-staging
+    # files from prior crashes.
     compose.cleanup_stale_temps(cfg)
     ui.emit({"vm": cfg.vm.name, "status": "running"}, human=f"{cfg.vm.name}: running")
 
@@ -379,16 +380,21 @@ def _vm_exists(name: str) -> bool:
 
 
 def _ensure_mount(cfg: AgentsConfig) -> None:
-    """Mount the host data-dir into the VM. Idempotent: skips if already mounted."""
-    result = mp.info_vm(cfg.vm.name, fmt="json")
-    if result.returncode == 0:
-        try:
-            info = json.loads(result.stdout)
-            mounts = info.get("info", {}).get(cfg.vm.name, {}).get("mounts", {})
-            if str(cfg.paths.vm_agents_root) in mounts:
-                return
-        except json.JSONDecodeError:
-            pass
+    """Mount the host data-dir into the VM if it isn't already.
+
+    Multipass ``--type native`` requires the VM stopped. If the VM is
+    running we stop, mount, and restart — accepting the ~30s cost in
+    exchange for a mount type that supports rootless Docker bind mounts
+    (the default ``classic`` / fuse.sshfs does not — see ``mp.mount``).
+    Mounts persist across reboots, so this only triggers when the mount
+    is genuinely absent (fresh ``vm init`` or after an external umount).
+    """
+    if _has_mount(cfg):
+        return
+
+    was_running = _vm_running(cfg.vm.name)
+    if was_running:
+        mp.stop_vm(cfg.vm.name)
     mp.mount(
         cfg.paths.host_data_dir,
         cfg.vm.name,
@@ -396,6 +402,32 @@ def _ensure_mount(cfg: AgentsConfig) -> None:
         host_uid=cfg.host.uid,
         host_gid=cfg.host.gid,
     )
+    if was_running:
+        mp.start_vm(cfg.vm.name)
+
+
+def _has_mount(cfg: AgentsConfig) -> bool:
+    result = mp.info_vm(cfg.vm.name, fmt="json")
+    if result.returncode != 0:
+        return False
+    try:
+        info = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return False
+    mounts = info.get("info", {}).get(cfg.vm.name, {}).get("mounts", {})
+    return str(cfg.paths.vm_agents_root) in mounts
+
+
+def _vm_running(vm: str) -> bool:
+    result = mp.info_vm(vm, fmt="json")
+    if result.returncode != 0:
+        return False
+    try:
+        info = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return False
+    state = info.get("info", {}).get(vm, {}).get("state", "")
+    return bool(state == "Running")
 
 
 def _mount_probe(cfg: AgentsConfig) -> None:

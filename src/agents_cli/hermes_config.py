@@ -8,7 +8,7 @@ the user's comments and key order.
 Write pattern (same contract as compose.py):
 
 1. Mutate in memory.
-2. Dump to host temp at ``/tmp/agents-hermesconf-<pid>-<uuid>.yml``.
+2. Dump to host temp via ``compose.host_staging_dir(cfg)``.
 3. ``multipass transfer`` to a VM-side stage at
    ``<vm_agents_root>/<name>/.data/config.yaml.<pid>.<uuid>.new``.
 4. Validate by exec'ing ``hermes config validate -f <staged>`` inside
@@ -31,7 +31,7 @@ from typing import Any
 
 from ruamel.yaml import YAML
 
-from agents_cli import mp
+from agents_cli import compose, mp
 from agents_cli.config import AgentsConfig
 from agents_cli.errors import UserError
 
@@ -73,7 +73,8 @@ def read_doc(cfg: AgentsConfig, agent_name: str) -> Any:
     """Read the agent's config.yaml, transparent to ``--data-dir-in-vm``."""
     if cfg.paths.data_dir_in_vm:
         host_temp = (
-            Path("/tmp") / f"agents-hermesconf-read-{os.getpid()}-{uuid.uuid4().hex[:8]}.yml"
+            compose.host_staging_dir(cfg)
+            / f"hermesconf-read-{os.getpid()}-{uuid.uuid4().hex[:8]}.yml"
         )
         try:
             mp.transfer_from_vm(cfg.vm.name, vm_config_path(cfg, agent_name), host_temp)
@@ -108,7 +109,7 @@ def write_atomically(cfg: AgentsConfig, agent_name: str, doc: Any) -> None:
     suffix = uuid.uuid4().hex[:8]
     vm_target = vm_config_path(cfg, agent_name)
     vm_stage = f"{vm_target}.{pid}.{suffix}.new"
-    host_temp = Path("/tmp") / f"agents-hermesconf-{pid}-{suffix}.yml"
+    host_temp = compose.host_staging_dir(cfg) / f"hermesconf-{pid}-{suffix}.yml"
 
     try:
         host_temp.write_text(dump(doc), encoding="utf-8")
