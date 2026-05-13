@@ -88,3 +88,4 @@ The cost is 9p mount overhead for SQLite-heavy workloads. The opt-out is `vm ini
 | `memory/mem0.py` | In-process library mode. Wires Ollama or `OPENAI_API_KEY`. |
 | `memory/openviking.py` | Per-agent sibling docker service. Needs Ollama. |
 | `secrets_cmd.py` | Per-agent API keys at `<data-dir>/<name>/.env`. Wired into the container via compose `env_file:`. Backfills the directive on existing agents. Mutations restart the container. |
+| `fixperms_cmd.py` | `agents fix-perms <agent>`: stops, force-removes, recreates the container so the entrypoint runs fresh, then chowns `/opt/data` to the resulting hermes uid and chmods it 755 so the toolkit's `agents exec` (uid 1000) can traverse. Remediation for the recurring "files at uid 10000, EACCES" bug. |

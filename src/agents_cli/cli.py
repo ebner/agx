@@ -20,6 +20,7 @@ from agents_cli import (
     __version__,
     agents_cmd,
     export_cmd,
+    fixperms_cmd,
     ollama_cmd,
     ops,
     secrets_cmd,
@@ -417,6 +418,23 @@ def agent_setup(name: str) -> None:
 def agent_doctor(name: str | None) -> None:
     """Health-check the VM, mount, and agents."""
     _run(ops.doctor, target=name)
+
+
+@main.command("fix-perms")
+@click.argument("name")
+@click.option("-y", "--yes", "yes_local", is_flag=True, help="Skip confirmation.")
+@click.pass_context
+def agent_fix_perms(ctx: click.Context, name: str, yes_local: bool) -> None:
+    """Re-create the container and align ``/opt/data`` ownership.
+
+    Fixes the recurring "files at uid 10000, agents exec at uid 1000 hits
+    EACCES on /opt/data" class of bug. Stops the container, force-removes
+    it so compose can't decide "no drift, skip entrypoint", brings it back
+    up so the entrypoint runs fresh, then chowns and chmod's /opt/data to
+    line up with whatever uid hermes ends up at inside the container.
+    """
+    yes = yes_local or ctx.obj.get("yes", False)
+    _run(fixperms_cmd.fix_perms, name, yes=yes)
 
 
 # ---------- upgrades ----------

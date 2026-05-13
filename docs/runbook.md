@@ -64,6 +64,50 @@ The CLI writes a phase journal under `<data-dir>/.journal/<op>-<name>-<utc>.json
 
 `agents doctor` warns about any journal older than 24 hours. To clear a stuck journal once you've manually reconciled state, simply delete the file from `<data-dir>/.journal/`.
 
+## /opt/data permission drift (and how `agents fix-perms` resolves it)
+
+Symptom: `agents exec coder hermes <anything>` crashes on import with
+`PermissionError: '/opt/data/.env'` (or similar files under
+`/opt/data`).
+
+Cause: The Hermes image entrypoint *should* `usermod -u $HERMES_UID
+hermes` on container start so the in-container `hermes` user matches
+the toolkit's runtime uid (1000). When it doesn't (entrypoint skipped
+on a stale running container, image-level changes, env-var
+interpolation failure), `/opt/data` ends up owned by uid 10000 with
+mode 700. `agents exec` runs as uid 1000 → falls to "other" perms on
+a 700 dir → EACCES on every traversal.
+
+Detection: `agents doctor` runs a per-Hermes-agent probe that stats
+`/opt/data` as the runtime uid and flags failures or owner mismatches
+with the precise remediation command.
+
+Remediation: `agents fix-perms <agent>`.
+
+```bash
+agents fix-perms coder
+```
+
+This is the one-shot fix:
+
+1. Stops the container.
+2. Force-removes it (so `compose up` can't decide "no drift, keep
+   running" and skip the entrypoint).
+3. Brings it back up — entrypoint runs from scratch.
+4. Queries the *actual* hermes uid that resulted (whether the
+   entrypoint did or didn't honour HERMES_UID).
+5. `chown -R <huid>:<huid> /opt/data` so files line up with the live
+   runtime user.
+6. `chmod 755 /opt/data` so the toolkit's `agents exec` at uid 1000
+   can traverse the dir even when the entrypoint failed to align
+   hermes (band-aid for the worst case). Per-file modes are untouched
+   — secrets at mode 600 (`auth.json`, `auth.lock`) stay private.
+
+When the entrypoint succeeded, output is `ok` and hermes uid = 1000.
+When it didn't, output is `PARTIAL`: traversal works, but the
+underlying image issue persists and you should investigate the
+entrypoint of your pinned Hermes image tag.
+
 ## Per-agent secrets
 
 API keys for skills (Firecrawl, GitHub, etc.) go in a per-agent .env

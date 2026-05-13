@@ -121,6 +121,10 @@ def _stub_minimal_doctor(mocker, vm_state: str = "Running") -> None:
         joined = " ".join(cmd)
         if "is-active" in joined:
             return _ok("active\n")
+        # `stat -c %a %u /opt/data` probe (data-dir access check) expects
+        # "<mode> <uid>" — return a healthy mode/owner.
+        if "stat" in cmd and "/opt/data" in cmd:
+            return _ok("755 1000\n")
         return _ok("ok\n")
 
     mocker.patch("agents_cli.mp.exec_in_vm", side_effect=vm_command)
@@ -204,6 +208,66 @@ def test_doctor_passes_on_healthy_setup(with_coder: Path, mocker) -> None:
     assert not report.failed
 
 
+def test_doctor_flags_data_dir_eacces(with_coder: Path, mocker) -> None:
+    """Reproduce the canonical `agents exec` permission failure: stat
+    /opt/data returns EACCES because the dir is owned by uid 10000 and
+    the toolkit's RUNTIME_UID exec is uid 1000. The doctor check must
+    fail and point the user at `agents fix-perms`.
+    """
+    mocker.patch(
+        "agents_cli.mp.info_vm",
+        return_value=_ok(json.dumps({"info": {"agents": {"state": "Running"}}})),
+    )
+
+    def runner(vm_name: str, *cmd: str, check: bool = True) -> MpResult:
+        joined = " ".join(cmd)
+        if "is-active" in joined:
+            return _ok("active\n")
+        if "stat" in cmd and "/opt/data" in cmd:
+            return MpResult(
+                stdout="",
+                stderr="stat: cannot stat '/opt/data': Permission denied\n",
+                returncode=1,
+            )
+        return _ok("ok\n")
+
+    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=runner)
+    mocker.patch(
+        "agents_cli.compose_runner.ps",
+        return_value=_ok(json.dumps([{"Service": "hermes-coder", "State": "running"}])),
+    )
+    with pytest.raises(HealthCheckFailure):
+        ops.doctor(config_path=with_coder)
+
+
+def test_doctor_warns_on_data_dir_owner_mismatch(with_coder: Path, mocker) -> None:
+    """stat succeeds but owner uid != RUNTIME_UID — warns (not fails) with
+    a remediation hint pointing at `agents fix-perms`. The user can still
+    function (e.g. running `agents exec --root`) but real exec at uid 1000
+    will hit issues, so flag it loudly.
+    """
+    _stub_minimal_doctor(mocker)
+    # Override the stat probe to return a mismatched owner.
+
+    def runner(vm_name: str, *cmd: str, check: bool = True) -> MpResult:
+        joined = " ".join(cmd)
+        if "is-active" in joined:
+            return _ok("active\n")
+        if "stat" in cmd and "/opt/data" in cmd:
+            return _ok("700 10000\n")
+        return _ok("ok\n")
+
+    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=runner)
+    mocker.patch(
+        "agents_cli.compose_runner.ps",
+        return_value=_ok(json.dumps([{"Service": "hermes-coder", "State": "running"}])),
+    )
+    report = ops.doctor(config_path=with_coder)
+    matches = [c for c in report.checks if c.name == "coder.data_dir_access" and c.status == "warn"]
+    assert matches, "expected a warn for the data_dir_access check"
+    assert "fix-perms" in matches[0].detail
+
+
 def test_doctor_flags_hermes_doctor_failure(with_coder: Path, mocker) -> None:
     """Pass every check except the in-container `hermes doctor` call."""
     mocker.patch(
@@ -250,7 +314,9 @@ def test_compose_exec_argv_defaults_to_runtime_user(cfg: AgentsConfig) -> None:
 
 def test_compose_exec_argv_as_root_omits_user(cfg: AgentsConfig) -> None:
     """The escape hatch for chown / apt install / other admin work."""
-    argv = ops.compose_exec_argv(cfg, "hermes-coder", "chown", "hermes:hermes", "/opt/data/x", as_root=True)
+    argv = ops.compose_exec_argv(
+        cfg, "hermes-coder", "chown", "hermes:hermes", "/opt/data/x", as_root=True
+    )
     assert "--user" not in argv
 
 

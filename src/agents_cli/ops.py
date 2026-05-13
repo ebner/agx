@@ -157,6 +157,7 @@ def doctor(
     for svc, agent_type, agent_name in _services_to_check(cfg, target):
         _check_service_container(cfg, svc, agent_name, agent_type, report)
         if agent_type == "hermes":
+            _check_hermes_data_dir_accessible(cfg, svc, agent_name, report)
             _check_hermes_doctor(cfg, svc, agent_name, report)
             _check_hermes_codex_mount(cfg, svc, agent_name, report)
 
@@ -447,6 +448,61 @@ def _container_state_for(ps_json: str, service: str) -> str:
         if entry.get("Service") == service or entry.get("Name", "").endswith(f"-{service}"):
             return str(entry.get("State", "?"))
     return "absent"
+
+
+def _check_hermes_data_dir_accessible(
+    cfg: AgentsConfig, svc: str, agent_name: str, report: DoctorReport
+) -> None:
+    """Probe whether ``agents exec`` (running as :data:`RUNTIME_UID`) can
+    actually stat ``/opt/data``.
+
+    The recurring failure mode: image entrypoint didn't ``usermod`` the
+    in-container ``hermes`` user to ``HERMES_UID``, so ``/opt/data`` is
+    owned by uid 10000 with mode 700, and ``agents exec`` (which runs
+    as uid 1000) hits ``EACCES`` on every traversal. Symptom is
+    ``hermes <anything>`` crashing on import with
+    ``PermissionError: '/opt/data/.env'``.
+
+    This probe mimics what an ordinary exec would do — runs as the
+    runtime user (no ``as_root``), tries to ``stat /opt/data``. If it
+    fails, the remediation is ``agents fix-perms <agent>``.
+    """
+    result = mp.exec_in_vm(
+        cfg.vm.name,
+        *_compose_exec_in_vm_argv(cfg, svc, "stat", "-c", "%a %u", "/opt/data", no_tty=True),
+        check=False,
+    )
+    if result.returncode == 0:
+        parts = result.stdout.strip().split()
+        if len(parts) == 2:
+            mode, uid = parts
+            try:
+                uid_int = int(uid)
+            except ValueError:
+                uid_int = -1
+            detail = f"mode={mode} owner={uid}"
+            if uid_int == RUNTIME_UID:
+                report.add(f"{agent_name}.data_dir_access", "ok", detail)
+            else:
+                report.add(
+                    f"{agent_name}.data_dir_access",
+                    "warn",
+                    f"{detail}; toolkit exec runs as uid {RUNTIME_UID}. "
+                    f"`agents exec {agent_name} hermes ...` may hit EACCES — "
+                    f"run `agents fix-perms {agent_name}`.",
+                )
+            return
+    err = (result.stderr or "").lower()
+    if "is not running" in err or "no such" in err:
+        report.add(f"{agent_name}.data_dir_access", "warn", "container not up")
+        return
+    report.add(
+        f"{agent_name}.data_dir_access",
+        "fail",
+        f"`stat /opt/data` as uid {RUNTIME_UID} failed: "
+        f"{(result.stderr or '').strip() or 'rc=' + str(result.returncode)}. "
+        f"Run `agents fix-perms {agent_name}`.",
+    )
 
 
 def _check_hermes_doctor(
