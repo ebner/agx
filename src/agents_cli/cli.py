@@ -180,15 +180,16 @@ def vm_snapshots_list() -> None:
 
 @vm.command("destroy")
 @click.option("--export-first", is_flag=True, help="Run `agents export --all` before destroying.")
+@click.option("-y", "--yes", "yes_local", is_flag=True, help="Skip the confirmation prompt.")
 @click.pass_context
-def vm_destroy(ctx: click.Context, export_first: bool) -> None:
+def vm_destroy(ctx: click.Context, export_first: bool, yes_local: bool) -> None:
     """Tear down the VM (host data-dir untouched).
 
     Prompts to run an export of every agent first unless ``--yes`` is set.
     Override the prompt with ``--export-first`` to always export, or
     skip with ``--yes`` to skip the offer.
     """
-    yes = ctx.obj.get("yes", False)
+    yes = yes_local or ctx.obj.get("yes", False)
 
     def body() -> None:
         do_export = export_first
@@ -250,21 +251,25 @@ def agents_list() -> None:
     help="Run `agents export <name>` before removing.",
 )
 @click.option("--keep-data", is_flag=True, help="Leave the agent's data dir on disk.")
+@click.option("-y", "--yes", "yes_local", is_flag=True, help="Skip the confirmation prompt.")
 @click.pass_context
-def agents_remove(ctx: click.Context, name: str, export_first: bool, keep_data: bool) -> None:
+def agents_remove(
+    ctx: click.Context, name: str, export_first: bool, keep_data: bool, yes_local: bool
+) -> None:
     """Remove an agent (and its data dir unless --keep-data).
 
     Pass ``--export-first`` to dump a tarball to ``<data-dir>/backups/``
     before tearing down — convenient if you want a final snapshot
     before deletion.
     """
+    yes = yes_local or ctx.obj.get("yes", False)
 
     def body() -> None:
         if export_first:
             export_cmd.export(name)
         agents_cmd.remove(
             name,
-            yes=ctx.obj.get("yes", False),
+            yes=yes,
             delete_data=not keep_data,
         )
 
@@ -387,8 +392,11 @@ def agents_upgrade(
     default=None,
     help="Pick a specific pre-upgrade archive name (default: latest).",
 )
+@click.option("-y", "--yes", "yes_local", is_flag=True, help="Skip the confirmation prompt.")
 @click.pass_context
-def agents_rollback(ctx: click.Context, name: str, snapshot_id: str | None) -> None:
+def agents_rollback(
+    ctx: click.Context, name: str, snapshot_id: str | None, yes_local: bool
+) -> None:
     """Restore an agent from a pre-upgrade snapshot.
 
     Without ``--snapshot``, the latest archive under ``<data-dir>/.upgrades/``
@@ -399,7 +407,7 @@ def agents_rollback(ctx: click.Context, name: str, snapshot_id: str | None) -> N
         upgrades.rollback,
         name,
         snapshot_id=snapshot_id,
-        yes=ctx.obj.get("yes", False),
+        yes=yes_local or ctx.obj.get("yes", False),
     )
 
 
@@ -426,14 +434,15 @@ def agents_export(name: str | None, all_agents: bool, to: str | None) -> None:
 @main.command("import")
 @click.argument("name")
 @click.argument("archive", type=click.Path(exists=True))
+@click.option("-y", "--yes", "yes_local", is_flag=True, help="Skip the confirmation prompt.")
 @click.pass_context
-def agents_import(ctx: click.Context, name: str, archive: str) -> None:
+def agents_import(ctx: click.Context, name: str, archive: str, yes_local: bool) -> None:
     """Restore an agent from an archive."""
     _run(
         export_cmd.import_archive,
         name,
         Path(archive),
-        yes=ctx.obj.get("yes", False),
+        yes=yes_local or ctx.obj.get("yes", False),
     )
 
 
