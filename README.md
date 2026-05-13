@@ -19,7 +19,14 @@ npm install -g @openai/codex
 
 # 3. Bring up the VM. Pick a host path for all agent state — duplicity or whatever
 #    host backup you run will back this up directly.
-agents vm init --data-dir /data/agents
+#
+#    For SQLite-heavy use (Hermes' kanban/sessions/insights stores use SQLite
+#    WAL, which doesn't work across multipass's 9p share), pass --data-dir-in-vm
+#    so per-agent state lives on the VM's ext4 disk where WAL is native. The
+#    host then sees agent state only via `agents export` archives (next step
+#    below shows how to schedule those for multi-times-a-day backups).
+agents vm init --data-dir /data/agents                      # SQLite WAL falls back to JSONL; files live on host
+agents vm init --data-dir /data/agents --data-dir-in-vm     # SQLite WAL works; files visible only via archives
 
 # 4. (Optional) Authenticate a toolkit-scoped Codex account, separate from your personal ~/.codex/
 agents codex login
@@ -30,7 +37,14 @@ agents create coder --type hermes --setup
 # 6. Create an OpenClaw agent
 agents create personal --type openclaw --setup
 
-# 7. Day-to-day
+# 7. Schedule host-side backups. One crontab entry per time; replaces
+#    any prior toolkit-managed entries on re-install.
+agents export-cron install --time 02:30                     # once a day
+agents export-cron install --time 02:30,14:30               # twice a day
+agents export-cron install --time 02:30,08:30,14:30,20:30   # 6-hourly
+agents export-cron status
+
+# 8. Day-to-day
 agents list
 agents doctor
 agents logs coder -f

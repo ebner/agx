@@ -223,6 +223,34 @@ def test_cron_install_handles_first_ever_empty_crontab(
     assert export_cmd.CRON_MARKER in fake_crontab.body
 
 
+def test_cron_install_accepts_comma_separated_times(
+    saved_config: Path, fake_crontab: FakeCrontab
+) -> None:
+    """Multi-times-a-day backups: comma-separated --time installs one
+    crontab line per time, all carrying the same marker."""
+    export_cmd.export_cron_install(
+        time="02:30,08:30,14:30,20:30", config_path=saved_config
+    )
+    # Four marker lines, one per time.
+    assert fake_crontab.body.count(export_cmd.CRON_MARKER) == 4
+    assert "30 2 * * *" in fake_crontab.body
+    assert "30 8 * * *" in fake_crontab.body
+    assert "30 14 * * *" in fake_crontab.body
+    assert "30 20 * * *" in fake_crontab.body
+
+
+def test_cron_install_replaces_all_existing_marker_entries(
+    saved_config: Path, fake_crontab: FakeCrontab
+) -> None:
+    """Re-installing with a new schedule must replace ALL prior toolkit
+    entries, not append. Otherwise running install twice doubles them."""
+    export_cmd.export_cron_install(time="02:30,14:30", config_path=saved_config)
+    export_cmd.export_cron_install(time="06:00", config_path=saved_config)
+    assert fake_crontab.body.count(export_cmd.CRON_MARKER) == 1
+    assert "0 6 * * *" in fake_crontab.body
+    assert "30 2" not in fake_crontab.body  # the old 02:30 is gone
+
+
 def test_invalid_time_rejected(saved_config: Path) -> None:
     with pytest.raises(UserError, match="HH:MM"):
         export_cmd.export_cron_install(time="2:30", config_path=saved_config)

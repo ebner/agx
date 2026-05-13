@@ -90,10 +90,38 @@ agents export coder              # one agent
 agents export --all              # all agents
 agents export --all --to ~/elsewhere/  # send archives somewhere other than <data-dir>/backups/
 
-agents export-cron install --time 02:30   # daily `export --all` at 02:30 host time
+# Schedule one or more daily runs via host cron. Comma-separated times
+# install one crontab line per time — re-running install replaces all
+# prior toolkit-managed entries (clean idempotent).
+agents export-cron install --time 02:30                       # once a day at 02:30
+agents export-cron install --time 02:30,08:30,14:30,20:30     # four times a day
 agents export-cron status
 agents export-cron uninstall
 ```
+
+### Picking a schedule for SQLite-heavy use
+
+Hermes' kanban/sessions/insights databases use SQLite WAL. In `--data-dir-in-vm` mode they live on the VM's ext4 disk and work normally (WAL doesn't function over the host shared-FS share — see [architecture.md](architecture.md) for the why). The trade-off is that those files are not directly host-visible — your only host-side view of recent agent state is the most recent `agents export` archive.
+
+A reasonable cadence:
+
+| Use case | Schedule | Rationale |
+|---|---|---|
+| Single home/family bot, casual use | `02:30` (default) | One archive a day, ≤24 h of potential loss after a VM crash. |
+| Active multi-bot, daily-driver host | `02:30,14:30` | ≤12 h. Two archives a day is enough headroom for most accidents. |
+| Heavy SQLite write (kanban, sessions, insights) | `02:30,08:30,14:30,20:30` | ≤6 h. Each archive is a few MB; disk cost is trivial. |
+| You really care | `*/2` (every two hours, hand-installed) | The toolkit's HH:MM cron syntax doesn't express step intervals; use `crontab -e` and add `0 */2 * * * /usr/local/bin/agents --yes export --all` with the `# agents toolkit — managed export-cron entry` marker omitted (the toolkit won't manage it, but it won't trip over it either). |
+
+`agents export` shells out to `tar --zstd` for the agent's per-agent data dir. For Hermes, this captures `state.db`, `kanban.db`, sessions, skills, SOUL.md, config.yaml. Under `--data-dir-in-vm` the tar runs inside the VM (where the data lives on ext4), then the archive is `multipass transfer`-ed out to the host. tar isn't aware of SQLite WAL mid-flight, so each individual run is *near-consistent* rather than guaranteed crash-consistent — if a write is in progress at the exact moment tar copies the file, the captured `.db` may be missing the corresponding WAL entries. SQLite's recovery on next open handles most such cases, and frequent backups give you many fallback points.
+
+For strict crash consistency on a specific agent, stop it first: `agents stop coder && agents export coder && agents start coder` — but that's rarely necessary in practice given how cheap the multi-archive approach is.
+
+### Backup retention
+
+`agents export` only writes new archives — it never deletes old ones. Either:
+
+- Let your host backup tool (duplicity etc.) prune `<data-dir>/backups/` per its own retention policy.
+- Or add a separate cron entry like `find <data-dir>/backups -name '*.tar.zst' -mtime +14 -delete` to drop archives older than 14 days. The toolkit deliberately doesn't manage retention — that's the user's policy call.
 
 ## Tearing down
 

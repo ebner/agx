@@ -117,22 +117,31 @@ class ExportCronConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     enabled: bool = False
+    # Comma-separated zero-padded HH:MM list. One crontab entry per
+    # time. Allows multi-times-a-day backups (e.g. "02:30,08:30,14:30,
+    # 20:30") for SQLite-heavy workloads where 24h granularity is too
+    # coarse.
     time: str = "02:30"
 
     @field_validator("time")
     @classmethod
     def _validate_hhmm(cls, v: str) -> str:
-        parts = v.split(":")
-        if (
-            len(parts) != 2
-            or len(parts[0]) != 2
-            or len(parts[1]) != 2
-            or not all(p.isdigit() for p in parts)
-        ):
-            raise ValueError(f"export_cron.time must be zero-padded HH:MM, got {v!r}")
-        hh, mm = int(parts[0]), int(parts[1])
-        if not (0 <= hh < 24 and 0 <= mm < 60):
-            raise ValueError(f"export_cron.time out of range: {v!r}")
+        for piece in v.split(","):
+            piece = piece.strip()
+            parts = piece.split(":")
+            if (
+                len(parts) != 2
+                or len(parts[0]) != 2
+                or len(parts[1]) != 2
+                or not all(p.isdigit() for p in parts)
+            ):
+                raise ValueError(
+                    f"export_cron.time must be zero-padded HH:MM "
+                    f"(or comma-separated HH:MM,HH:MM,...), got {v!r}"
+                )
+            hh, mm = int(parts[0]), int(parts[1])
+            if not (0 <= hh < 24 and 0 <= mm < 60):
+                raise ValueError(f"export_cron.time out of range: {v!r}")
         return v
 
 

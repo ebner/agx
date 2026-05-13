@@ -452,7 +452,16 @@ def export_cron_group() -> None:
 
 
 @export_cron_group.command("install")
-@click.option("--time", "time_", default="02:30", help="HH:MM (zero-padded), host local time.")
+@click.option(
+    "--time",
+    "time_",
+    default="02:30",
+    help=(
+        "HH:MM (zero-padded), host local time. "
+        "Pass a comma-separated list for multi-times-a-day backups, "
+        "e.g. `--time 02:30,08:30,14:30,20:30`."
+    ),
+)
 def export_cron_install(time_: str) -> None:
     """Install the host cron entry."""
     _run(export_cmd.export_cron_install, time=time_)

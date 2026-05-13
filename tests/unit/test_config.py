@@ -80,6 +80,9 @@ def test_export_cron_time_validation() -> None:
 
     ExportCronConfig(time="02:30")
     ExportCronConfig(time="23:59")
+    # Comma-separated multi-time schedules are valid.
+    ExportCronConfig(time="02:30,08:30,14:30,20:30")
+    ExportCronConfig(time="06:00,18:00")
     with pytest.raises(ValueError):
         ExportCronConfig(time="25:00")
     with pytest.raises(ValueError):
@@ -88,6 +91,11 @@ def test_export_cron_time_validation() -> None:
         ExportCronConfig(time="x:y")
     with pytest.raises(ValueError):
         ExportCronConfig(time="0230")
+    # If ANY time in the list is invalid, the whole value is rejected.
+    with pytest.raises(ValueError):
+        ExportCronConfig(time="02:30,25:00")
+    with pytest.raises(ValueError):
+        ExportCronConfig(time="02:30,2:30")
 
 
 def test_round_trip_preserves_comments(tmp_path: Path) -> None:

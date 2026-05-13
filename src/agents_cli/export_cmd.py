@@ -199,33 +199,46 @@ def export_cron_install(
     binary: str | None = None,
     config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH,
 ) -> None:
-    """Install a host cron entry that runs `agents export --all` daily.
+    """Install host cron entries that run `agents export --all` at one
+    or more times each day.
 
-    Idempotent: re-running replaces any existing toolkit-managed entry.
-    The binary defaults to the current python's installed `agents` script.
+    ``time`` accepts a single HH:MM (`"02:30"`) or a comma-separated
+    list (`"02:30,08:30,14:30,20:30"`) for multi-times-a-day backups.
+    One crontab line per time; all share a single marker so uninstall
+    removes them together.
+
+    Idempotent: re-running replaces any existing toolkit-managed
+    entries with the new schedule.
     """
     cfg = cfg_mod.load(config_path)  # validates config first
     if binary is None:
         binary = shutil.which("agents") or sys.argv[0]
-    hh, mm = _parse_hhmm(time)
-    line = (
-        f"{mm} {hh} * * * {binary} --yes export --all "
-        f">> {cfg.paths.host_data_dir}/.export-cron.log 2>&1 {CRON_MARKER}"
-    )
+    times = [t.strip() for t in time.split(",") if t.strip()]
+    if not times:
+        raise UserError("at least one HH:MM time is required")
+    lines = []
+    for t in times:
+        hh, mm = _parse_hhmm(t)
+        lines.append(
+            f"{mm} {hh} * * * {binary} --yes export --all "
+            f">> {cfg.paths.host_data_dir}/.export-cron.log 2>&1 {CRON_MARKER}"
+        )
 
     existing = _read_crontab()
     filtered = [ln for ln in existing.splitlines() if CRON_MARKER not in ln]
-    new = "\n".join([*filtered, line]).strip() + "\n"
+    new = "\n".join([*filtered, *lines]).strip() + "\n"
     _write_crontab(new)
 
-    # Update config (record installed state + chosen time)
     cfg.export_cron.enabled = True
-    cfg.export_cron.time = time
+    cfg.export_cron.time = ",".join(times)
     cfg_mod.save(cfg, config_path)
 
     ui.emit(
-        {"installed": True, "time": time, "line": line},
-        human=f"export-cron installed: daily at {time}",
+        {"installed": True, "times": times, "lines": lines},
+        human=(
+            f"export-cron installed: {len(times)} daily entr"
+            f"{'y' if len(times) == 1 else 'ies'} at {', '.join(times)}"
+        ),
     )
 
 
