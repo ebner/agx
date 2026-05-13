@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from agents_cli import compose, export_cmd
 from agents_cli import config as cfg_mod
+from agents_cli import export_cmd
 from agents_cli.agents_cmd import create
 from agents_cli.config import AgentsConfig, DefaultsConfig, HostConfig, PathsConfig, VmRuntimeConfig
 from agents_cli.errors import RuntimeFailure, UserError
@@ -85,25 +85,29 @@ def test_export_refuses_unknown_agent(saved_config: Path) -> None:
         export_cmd.export("ghost", config_path=saved_config)
 
 
-def test_export_under_data_dir_in_vm_requires_to(
-    cfg: AgentsConfig, saved_config: Path, mocker
+def test_archive_dir_defaults_to_backups_in_both_modes(
+    cfg: AgentsConfig, tmp_path: Path
 ) -> None:
-    """Toggling data_dir_in_vm in the saved config, export must demand --to."""
-    from tests.conftest import install_vm_fs_simulation
-
-    cfg.paths.data_dir_in_vm = True
-    cfg_mod.save(cfg, saved_config)
-    install_vm_fs_simulation(mocker, cfg)
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
-    # Manually inject a service
-    doc = compose.load_compose(cfg.paths.host_data_dir / "docker-compose.yml")
-    compose.add_service(doc, "hermes-coder", {"image": "x:y"})
-    (cfg.paths.host_data_dir / "docker-compose.yml").write_text(
-        compose.dump_compose(doc), encoding="utf-8"
+    """``--to`` was previously required under ``--data-dir-in-vm`` —
+    forcing the user to type a path on every invocation. The default
+    ``<data-dir>/backups/`` is a valid host path in both modes (the
+    host backup tool sees it either way), so the toolkit defaults
+    there in both modes.
+    """
+    cfg.paths.data_dir_in_vm = False
+    assert (
+        export_cmd._archive_dir(cfg, None) == cfg.paths.host_data_dir / "backups"
     )
-    (cfg.paths.host_data_dir / "coder" / ".data").mkdir(parents=True)
-    with pytest.raises(UserError, match="--to"):
-        export_cmd.export("coder", config_path=saved_config)
+    cfg.paths.data_dir_in_vm = True
+    assert (
+        export_cmd._archive_dir(cfg, None) == cfg.paths.host_data_dir / "backups"
+    )
+    # --to overrides the default regardless of mode.
+    override = tmp_path / "elsewhere"
+    cfg.paths.data_dir_in_vm = False
+    assert export_cmd._archive_dir(cfg, override) == override
+    cfg.paths.data_dir_in_vm = True
+    assert export_cmd._archive_dir(cfg, override) == override
 
 
 def test_export_all_iterates_every_agent(cfg: AgentsConfig, saved_config: Path, mocker) -> None:

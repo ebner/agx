@@ -6,9 +6,11 @@ sure each agent's data is a tidy, host-visible archive that the host
 backup picks up.
 
 - ``export <name>``: tar the agent's data dir into
-  ``<data-dir>/backups/<name>-<utc>.tar.gz``. Under ``--data-dir-in-vm``,
-  ``--to <host-path>`` is required and the toolkit ``multipass transfer``s
-  the archive out.
+  ``<data-dir>/backups/<name>-<utc>.tar.zst``. Under ``--data-dir-in-vm``,
+  the tar runs inside the VM and the toolkit ``multipass transfer``s
+  the archive out. Default output is the same ``<data-dir>/backups/``
+  in either mode; pass ``--to <host-path>`` only when you want a
+  different destination.
 - ``export --all``: loop.
 - ``export-cron install``: install a host cron entry that runs
   ``agents export --all`` at the chosen time. Handles the first-ever
@@ -71,9 +73,11 @@ def export(
     if agent_type is None:
         raise UserError(f"agent {name!r} not in compose")
 
-    if cfg.paths.data_dir_in_vm and to is None:
-        raise UserError("--to <host-path> is required when running under --data-dir-in-vm")
-
+    # In both modes the default output dir is `<data-dir>/backups/`. Under
+    # ``--data-dir-in-vm`` the data dir on the host is mostly empty (the
+    # agent state lives inside the VM), but `<data-dir>/backups/` is still
+    # a valid host path that the host backup (duplicity etc.) sees; the
+    # toolkit ``multipass transfer``s the archive there from the VM.
     archive_name = f"{name}-{_utc_stamp()}{archive_mod.ARCHIVE_SUFFIX}"
 
     if cfg.paths.data_dir_in_vm:
