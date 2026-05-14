@@ -197,6 +197,56 @@ def test_up_wires_existing_hermes_agents_passthrough(
     assert "FIRECRAWL_API_URL" in passthrough
 
 
+def test_up_reports_openclaw_agents_as_wired_via_fragment_env(
+    cfg: AgentsConfig, saved_config: Path, mocker: Any, vm_fs_mocks: dict[str, Any]
+) -> None:
+    """OpenClaw agents have no terminal.env_passthrough analogue —
+    their wiring is purely compose-fragment env interpolation. The
+    fragment template carries ``FIRECRAWL_API_KEY=${FIRECRAWL_API_KEY:-}``
+    and ``FIRECRAWL_BASE_URL=${FIRECRAWL_API_URL:-}`` (bridging the
+    Hermes-vs-OpenClaw env-var-name asymmetry), so fresh OpenClaw
+    agents pick up firecrawl automatically once the project .env
+    has the values.
+    """
+    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    create(name="personal", agent_type="openclaw", config_path=saved_config)
+    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+
+    payload = firecrawl_cmd.up(config_path=saved_config)
+
+    assert "personal" in payload["wired_agents"]
+    doc = compose.read_compose_doc(cfg)
+    env = doc["services"]["openclaw-personal"]["environment"]
+    assert env["FIRECRAWL_API_KEY"] == "${FIRECRAWL_API_KEY:-}"
+    assert env["FIRECRAWL_BASE_URL"] == "${FIRECRAWL_API_URL:-}"
+
+
+def test_up_flags_stale_openclaw_fragments(
+    cfg: AgentsConfig, saved_config: Path, mocker: Any, vm_fs_mocks: dict[str, Any]
+) -> None:
+    """An OpenClaw agent created before this auto-wire change has an
+    environment block missing the firecrawl entries. ``firecrawl up``
+    must surface it as stale (alongside any Hermes stale agents) so
+    the user knows to recreate it — there's no ``agents reseat`` for
+    OpenClaw yet.
+    """
+    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    create(name="personal", agent_type="openclaw", config_path=saved_config)
+
+    # Simulate a pre-auto-wire fragment: strip the firecrawl entries.
+    doc = compose.read_compose_doc(cfg)
+    env = doc["services"]["openclaw-personal"]["environment"]
+    del env["FIRECRAWL_API_KEY"]
+    del env["FIRECRAWL_BASE_URL"]
+    compose.write_compose_atomically(cfg, doc)
+
+    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+    payload = firecrawl_cmd.up(config_path=saved_config)
+
+    assert "personal" in payload["stale_agents"]
+    assert "personal" not in payload["wired_agents"]
+
+
 def test_up_is_idempotent_does_not_regenerate_digests(
     with_coder: Path, cfg: AgentsConfig, mocker: Any, vm_fs_mocks: dict[str, Any]
 ) -> None:

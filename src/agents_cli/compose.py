@@ -390,6 +390,23 @@ def openclaw_service_fragment(
         ],
         "environment": {
             "OPENCLAW_DISABLE_BONJOUR": "1",
+            # Firecrawl self-host wiring (project-level, set by
+            # `agents firecrawl up`). OpenClaw's bundled Firecrawl
+            # plugin reads ``FIRECRAWL_API_KEY`` + ``FIRECRAWL_BASE_URL``
+            # — NOT ``FIRECRAWL_API_URL`` like Hermes — so we bridge
+            # the env-var-name asymmetry here via compose interpolation
+            # from the same project ``.env`` entry. ``${X:-}`` keeps
+            # the values empty when firecrawl is off so OpenClaw's
+            # "plugin configured?" check correctly reports unconfigured.
+            #
+            # Note: setting the env vars is NOT enough on its own —
+            # OpenClaw also needs ``plugins.entries.firecrawl.enabled:
+            # true`` flipped in its in-container config, which happens
+            # the first time the user picks Firecrawl during
+            # ``openclaw onboard`` / ``openclaw configure``. The toolkit
+            # stays out of OpenClaw's plugin lifecycle by design.
+            "FIRECRAWL_API_KEY": "${FIRECRAWL_API_KEY:-}",
+            "FIRECRAWL_BASE_URL": "${FIRECRAWL_API_URL:-}",
         },
         # See hermes_service_fragment for the per-agent .env story.
         "env_file": [f"./{name}/.env"],

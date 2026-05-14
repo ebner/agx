@@ -120,6 +120,20 @@ def test_openclaw_fragment_uses_per_agent_paths(cfg: AgentsConfig) -> None:
     assert s["environment"]["OPENCLAW_DISABLE_BONJOUR"] == "1"
 
 
+def test_openclaw_fragment_carries_firecrawl_env_interp(cfg: AgentsConfig) -> None:
+    """OpenClaw's bundled Firecrawl plugin reads FIRECRAWL_API_KEY +
+    FIRECRAWL_BASE_URL from container env. The fragment bridges the
+    name asymmetry (Hermes uses FIRECRAWL_API_URL) via compose
+    interpolation from the same project .env entry.
+    """
+    s = openclaw_service_fragment(name="personal", port=18789, image_tag="0.1.0")
+    env = s["environment"]
+    # OpenClaw-specific spelling, not the Hermes FIRECRAWL_API_URL.
+    assert env["FIRECRAWL_API_KEY"] == "${FIRECRAWL_API_KEY:-}"
+    assert env["FIRECRAWL_BASE_URL"] == "${FIRECRAWL_API_URL:-}"
+    assert "FIRECRAWL_API_URL" not in env
+
+
 def test_openclaw_named_agents_dont_collide(cfg: AgentsConfig) -> None:
     a = openclaw_service_fragment(name="personal", port=18789, image_tag="0.1.0")
     b = openclaw_service_fragment(name="home", port=18790, image_tag="0.1.0")

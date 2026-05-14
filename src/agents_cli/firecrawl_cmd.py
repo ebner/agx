@@ -95,6 +95,18 @@ AGENT_PASSTHROUGH_KEYS: tuple[str, ...] = (
     "FIRECRAWL_API_URL",
 )
 
+# Env vars OpenClaw's bundled Firecrawl plugin reads from its container.
+# Different from Hermes' pair because OpenClaw spells the base-URL as
+# ``FIRECRAWL_BASE_URL`` (Hermes uses ``FIRECRAWL_API_URL``). The
+# OpenClaw compose fragment bridges the asymmetry via interpolation —
+# both ultimately resolve to the same project ``.env`` value.
+# No ``terminal.env_passthrough`` analogue: OpenClaw has no sandbox env
+# filter, its shell tools inherit container env directly.
+OPENCLAW_ENV_KEYS: tuple[str, ...] = (
+    "FIRECRAWL_API_KEY",
+    "FIRECRAWL_BASE_URL",
+)
+
 # `agents firecrawl status` returns these payload keys so JSON callers
 # can rely on them.
 STATUS_KEYS: tuple[str, ...] = ("running", "api_url", "wired_agents", "images")
@@ -186,12 +198,17 @@ def up(
         write_state(cfg, state)
 
         # Auto-wire every existing Hermes agent's passthrough.
-        wired = _ensure_all_agents_wired(cfg)
+        # OpenClaw agents are wired purely via compose-fragment env
+        # interpolation (no passthrough analogue) — see
+        # ``compose.openclaw_service_fragment``.
+        wired_hermes = _ensure_all_agents_wired(cfg)
 
     # Bring the stack up. Healthchecks declared in the fragments mean
     # `compose up -d` returns after the api is healthy.
     compose_runner.up(cfg, *fragments.keys())
 
+    wired_openclaw = _openclaw_agents_with_env(cfg)
+    wired = wired_hermes + wired_openclaw
     stale = _agents_with_stale_fragment(cfg)
     payload = {
         "running": True,
@@ -200,20 +217,26 @@ def up(
         "stale_agents": stale,
         "images": images,
     }
-    ui.emit(
-        payload,
-        human=(
-            f"firecrawl: up at {state['api_url']}\n"
-            f"  wired agents: {', '.join(wired) or '(none)'}\n"
-            f"  images:\n" + "\n".join(f"    {k}: {v}" for k, v in images.items())
-        ),
-    )
+    human_lines = [
+        f"firecrawl: up at {state['api_url']}",
+        f"  wired agents: {', '.join(wired) or '(none)'}",
+    ]
+    if wired_openclaw:
+        human_lines.append(
+            "  note: OpenClaw agents have the env wiring in place, but the "
+            "bundled Firecrawl plugin must still be enabled in-container "
+            "via `openclaw configure` (or picked during onboarding)."
+        )
+    human_lines.append("  images:")
+    human_lines.extend(f"    {k}: {v}" for k, v in images.items())
+    ui.emit(payload, human="\n".join(human_lines))
     if stale:
         ui.warn(
             "Agents created before the firecrawl interpolation entries "
-            "landed in the compose fragment don't yet have FIRECRAWL_API_URL "
-            "in their container env. Reseat them to pick it up:\n  "
-            + "\n  ".join(f"agents reseat {n}" for n in stale)
+            "landed in the compose fragment don't have firecrawl env in "
+            "their container yet. Hermes: `agents reseat <name>`. OpenClaw "
+            "has no reseat path — recreate via remove + create, or hand-edit "
+            "the compose service block.\nAffected:\n  " + "\n  ".join(stale)
         )
     return payload
 
@@ -594,12 +617,20 @@ def _remove_postgres_dir(cfg: AgentsConfig) -> None:
 
 
 def _agents_with_stale_fragment(cfg: AgentsConfig) -> list[str]:
-    """Return Hermes agents whose compose service ``environment`` block
-    doesn't yet have ``FIRECRAWL_API_URL`` (and friends) as
-    ``${VAR:-}`` interpolation entries. These were created before the
-    firecrawl wiring landed in the service fragment template — running
-    ``agents reseat <name>`` regenerates the block from the current
-    template, picking up the missing entries.
+    """Return agents whose compose service ``environment`` block doesn't
+    yet have the firecrawl interpolation entries.
+
+    Hermes needs ``FIRECRAWL_API_KEY`` + ``FIRECRAWL_API_URL`` (see
+    ``AGENT_PASSTHROUGH_KEYS``); OpenClaw needs ``FIRECRAWL_API_KEY``
+    + ``FIRECRAWL_BASE_URL`` (see ``OPENCLAW_ENV_KEYS``). Both classes
+    were originally created before the firecrawl wiring landed in
+    their respective service fragment templates.
+
+    Hermes agents are remediated with ``agents reseat <name>`` (which
+    rewrites the service block from the current template, preserving
+    port/tag/env_file/depends_on additions); OpenClaw doesn't have a
+    reseat path yet, so its stale agents need ``agents remove`` +
+    ``agents create`` or a manual compose edit.
 
     Auto-reseating from within ``firecrawl up`` would force-recreate
     the agent's container and interrupt its gateway — too disruptive
@@ -612,17 +643,48 @@ def _agents_with_stale_fragment(cfg: AgentsConfig) -> list[str]:
     out: list[str] = []
     services = doc.get("services") or {}
     for svc_name, svc in services.items():
-        if not svc_name.startswith("hermes-") or not isinstance(svc, dict):
+        if not isinstance(svc, dict):
             continue
         env = svc.get("environment") or {}
-        if not all(k in env for k in AGENT_PASSTHROUGH_KEYS):
-            out.append(svc_name[len("hermes-") :])
+        if svc_name.startswith("hermes-"):
+            required = AGENT_PASSTHROUGH_KEYS
+            prefix = "hermes-"
+        elif svc_name.startswith("openclaw-"):
+            required = OPENCLAW_ENV_KEYS
+            prefix = "openclaw-"
+        else:
+            continue
+        if not all(k in env for k in required):
+            out.append(svc_name[len(prefix) :])
     return out
 
 
 def _hermes_agents(cfg: AgentsConfig) -> list[str]:
     doc = compose.read_compose_doc(cfg)
     return [s[len("hermes-") :] for s in (doc.get("services") or {}) if s.startswith("hermes-")]
+
+
+def _openclaw_agents_with_env(cfg: AgentsConfig) -> list[str]:
+    """OpenClaw agents whose compose fragment has the firecrawl env
+    interpolation entries. Used as the OpenClaw side of "wired
+    agents" — there's no ``terminal.env_passthrough`` analogue to
+    check, so fragment presence IS the wiring on the toolkit side.
+    Whether OpenClaw's bundled Firecrawl *plugin* is also enabled
+    is a question for ``openclaw configure`` — out of the toolkit's
+    scope.
+    """
+    try:
+        doc = compose.read_compose_doc(cfg)
+    except (RuntimeFailure, UserError):
+        return []
+    out: list[str] = []
+    for svc_name, svc in (doc.get("services") or {}).items():
+        if not svc_name.startswith("openclaw-") or not isinstance(svc, dict):
+            continue
+        env = svc.get("environment") or {}
+        if all(k in env for k in OPENCLAW_ENV_KEYS):
+            out.append(svc_name[len("openclaw-") :])
+    return out
 
 
 def _ensure_all_agents_wired(cfg: AgentsConfig) -> list[str]:
@@ -653,6 +715,19 @@ def _unwire_agent(cfg: AgentsConfig, agent_name: str) -> None:
 
 
 def _list_wired_agents(cfg: AgentsConfig) -> list[str]:
+    """Agents whose toolkit-side firecrawl wiring is in place.
+
+    Hermes: ``terminal.env_passthrough`` contains the API key/URL
+    pair (the most restrictive Hermes-side check — passthrough is
+    added only after the compose env interpolation is present, so
+    this also implies the container env is wired).
+
+    OpenClaw: compose service fragment has the env interpolation
+    entries. There's no passthrough analogue to check. Note that
+    "wired" here means the toolkit has done its part; the OpenClaw
+    bundled Firecrawl plugin still needs ``plugins.entries.firecrawl
+    .enabled: true`` flipped via ``openclaw configure``.
+    """
     out: list[str] = []
     for agent in _hermes_agents(cfg):
         try:
@@ -662,6 +737,7 @@ def _list_wired_agents(cfg: AgentsConfig) -> list[str]:
         passthrough = (doc.get("terminal") or {}).get("env_passthrough") or []
         if all(k in passthrough for k in AGENT_PASSTHROUGH_KEYS):
             out.append(agent)
+    out.extend(_openclaw_agents_with_env(cfg))
     return out
 
 
