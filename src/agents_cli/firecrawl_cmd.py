@@ -192,10 +192,12 @@ def up(
     # `compose up -d` returns after the api is healthy.
     compose_runner.up(cfg, *fragments.keys())
 
+    stale = _agents_with_stale_fragment(cfg)
     payload = {
         "running": True,
         "api_url": state["api_url"],
         "wired_agents": wired,
+        "stale_agents": stale,
         "images": images,
     }
     ui.emit(
@@ -206,6 +208,13 @@ def up(
             f"  images:\n" + "\n".join(f"    {k}: {v}" for k, v in images.items())
         ),
     )
+    if stale:
+        ui.warn(
+            "Agents created before the firecrawl interpolation entries "
+            "landed in the compose fragment don't yet have FIRECRAWL_API_URL "
+            "in their container env. Reseat them to pick it up:\n  "
+            + "\n  ".join(f"agents reseat {n}" for n in stale)
+        )
     return payload
 
 
@@ -363,12 +372,14 @@ def _resolve_digests(cfg: AgentsConfig) -> dict[str, str]:
 
 def _ensure_project_env(cfg: AgentsConfig) -> None:
     """Write the four project-level env vars (api key, url, bull auth,
-    postgres password) into ``<data-dir>/.env`` if not already set.
+    postgres password) into the project ``.env`` if not already set.
     Existing values are preserved across re-ups.
+
+    Picks the right ``.env`` for the current mode: host file in
+    host-mount mode (visible to VM via the multipass mount), VM-side
+    file in ``--data-dir-in-vm`` mode (where the host has no copy).
     """
-    env_path = cfg.paths.host_data_dir / ".env"
-    env_path.parent.mkdir(parents=True, exist_ok=True)
-    existing = _read_env_file(env_path)
+    existing = _read_project_env_file(cfg)
     if not existing.get("FIRECRAWL_API_KEY"):
         existing["FIRECRAWL_API_KEY"] = f"fc-self-hosted-{secrets.token_hex(8)}"
     if not existing.get("FIRECRAWL_API_URL"):
@@ -377,24 +388,77 @@ def _ensure_project_env(cfg: AgentsConfig) -> None:
         existing["FIRECRAWL_BULL_AUTH_KEY"] = secrets.token_hex(32)
     if not existing.get("FIRECRAWL_POSTGRES_PASSWORD"):
         existing["FIRECRAWL_POSTGRES_PASSWORD"] = secrets.token_hex(16)
-    _write_env_file(env_path, existing)
+    _write_project_env_file(cfg, existing)
 
 
 def _drop_project_env_keys(cfg: AgentsConfig) -> None:
-    env_path = cfg.paths.host_data_dir / ".env"
-    if not env_path.exists():
+    existing = _read_project_env_file(cfg)
+    if not existing:
         return
-    existing = _read_env_file(env_path)
     for k in PROJECT_ENV_KEYS:
         existing.pop(k, None)
-    _write_env_file(env_path, existing)
+    _write_project_env_file(cfg, existing)
 
 
-def _read_env_file(path: Path) -> dict[str, str]:
+def _read_project_env_file(cfg: AgentsConfig) -> dict[str, str]:
+    """Mode-aware read of the project ``.env``. Returns ``{}`` when the
+    file is missing.
+    """
+    if cfg.paths.data_dir_in_vm:
+        import os as _os
+        import uuid as _uuid
+
+        vm_path = f"{cfg.paths.vm_agents_root}/.env"
+        check = mp.exec_in_vm(cfg.vm.name, "test", "-f", vm_path, check=False)
+        if check.returncode != 0:
+            return {}
+        host_temp = (
+            compose.host_staging_dir(cfg)
+            / f"projectenv-read-{_os.getpid()}-{_uuid.uuid4().hex[:8]}.env"
+        )
+        try:
+            mp.transfer_from_vm(cfg.vm.name, vm_path, host_temp)
+            return _parse_env_string(host_temp.read_text(encoding="utf-8"))
+        finally:
+            host_temp.unlink(missing_ok=True)
+    path = cfg.paths.host_data_dir / ".env"
     if not path.exists():
         return {}
+    return _parse_env_string(path.read_text(encoding="utf-8"))
+
+
+def _write_project_env_file(cfg: AgentsConfig, env: dict[str, str]) -> None:
+    """Mode-aware write to the project ``.env``. In ``--data-dir-in-vm``
+    mode, stages on host and ``multipass transfer``s into the VM.
+
+    The project ``.env`` is at ``<vm_agents_root>/.env`` (ubuntu-owned),
+    NOT inside any container — so SFTP works in both modes. Unlike
+    per-agent ``.env`` files which live under subuid-owned ``/opt/data``.
+    """
+    content = _render_env_string(env)
+    if cfg.paths.data_dir_in_vm:
+        import os as _os
+        import uuid as _uuid
+
+        vm_path = f"{cfg.paths.vm_agents_root}/.env"
+        host_temp = (
+            compose.host_staging_dir(cfg)
+            / f"projectenv-write-{_os.getpid()}-{_uuid.uuid4().hex[:8]}.env"
+        )
+        try:
+            host_temp.write_text(content, encoding="utf-8")
+            mp.transfer_to_vm(host_temp, cfg.vm.name, vm_path)
+        finally:
+            host_temp.unlink(missing_ok=True)
+        return
+    path = cfg.paths.host_data_dir / ".env"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+
+
+def _parse_env_string(content: str) -> dict[str, str]:
     out: dict[str, str] = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in content.splitlines():
         if not line.strip() or line.lstrip().startswith("#") or "=" not in line:
             continue
         k, _, v = line.partition("=")
@@ -402,10 +466,8 @@ def _read_env_file(path: Path) -> dict[str, str]:
     return out
 
 
-def _write_env_file(path: Path, env: dict[str, str]) -> None:
-    # Preserve insertion order of existing keys for human-readable diffs.
-    content = "\n".join(f"{k}={v}" for k, v in env.items())
-    path.write_text(content + ("\n" if env else ""), encoding="utf-8")
+def _render_env_string(env: dict[str, str]) -> str:
+    return "\n".join(f"{k}={v}" for k, v in env.items()) + ("\n" if env else "")
 
 
 def _ensure_postgres_dir(cfg: AgentsConfig) -> None:
@@ -440,6 +502,33 @@ def _remove_postgres_dir(cfg: AgentsConfig) -> None:
     path = cfg.paths.host_data_dir / "firecrawl"
     if path.exists():
         shutil.rmtree(path, ignore_errors=True)
+
+
+def _agents_with_stale_fragment(cfg: AgentsConfig) -> list[str]:
+    """Return Hermes agents whose compose service ``environment`` block
+    doesn't yet have ``FIRECRAWL_API_URL`` (and friends) as
+    ``${VAR:-}`` interpolation entries. These were created before the
+    firecrawl wiring landed in the service fragment template — running
+    ``agents reseat <name>`` regenerates the block from the current
+    template, picking up the missing entries.
+
+    Auto-reseating from within ``firecrawl up`` would force-recreate
+    the agent's container and interrupt its gateway — too disruptive
+    as a silent side-effect, so we surface a hint instead.
+    """
+    try:
+        doc = compose.read_compose_doc(cfg)
+    except (RuntimeFailure, UserError):
+        return []
+    out: list[str] = []
+    services = doc.get("services") or {}
+    for svc_name, svc in services.items():
+        if not svc_name.startswith("hermes-") or not isinstance(svc, dict):
+            continue
+        env = svc.get("environment") or {}
+        if not all(k in env for k in AGENT_PASSTHROUGH_KEYS):
+            out.append(svc_name[len("hermes-") :])
+    return out
 
 
 def _hermes_agents(cfg: AgentsConfig) -> list[str]:

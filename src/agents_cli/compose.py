@@ -443,6 +443,14 @@ def firecrawl_service_fragments(
                 "USE_DB_AUTHENTICATION": "false",
                 "BULL_AUTH_KEY": "${FIRECRAWL_BULL_AUTH_KEY}",
                 "REDIS_URL": "redis://firecrawl-redis:6379",
+                # Firecrawl uses TWO distinct Redis clients: REDIS_URL
+                # for the job queue, REDIS_RATE_LIMIT_URL for the
+                # rate-limiter + session store. Both default to
+                # 127.0.0.1:6379 in-source if unset, which fails
+                # silently in a multi-container setup — the api logs
+                # ECONNREFUSED on the rate-limit client and every
+                # /v1/scrape request 408s.
+                "REDIS_RATE_LIMIT_URL": "redis://firecrawl-redis:6379",
                 "PLAYWRIGHT_MICROSERVICE_URL": "http://firecrawl-playwright:3000/scrape",
                 "NUQ_RABBITMQ_URL": "amqp://firecrawl-rabbitmq:5672",
                 "POSTGRES_HOST": "firecrawl-postgres",

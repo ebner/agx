@@ -155,6 +155,30 @@ def test_up_populates_project_env_with_secrets(
     assert "FIRECRAWL_POSTGRES_PASSWORD=" in env
 
 
+def test_up_writes_project_env_to_vm_in_data_dir_in_vm_mode(
+    cfg: AgentsConfig, saved_config: Path, mocker: Any, vm_fs_mocks: dict[str, Any]
+) -> None:
+    """Regression: in --data-dir-in-vm mode the project .env lives at
+    `<vm_agents_root>/.env` (see vm._seed_vm_data_dir). Compose reads
+    from there via `--env-file`. Writing to the host's `<data-dir>/.env`
+    in this mode is a no-op silent bug — postgres init fails because
+    POSTGRES_PASSWORD never reaches compose.
+    """
+    cfg.paths.data_dir_in_vm = True
+    cfg_mod.save(cfg, saved_config)
+    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+
+    firecrawl_cmd.up(config_path=saved_config)
+
+    # The simulator maps <vm_agents_root>/.env back to <host_data_dir>/.env
+    # (via host_path), so we can read it from the host side to assert.
+    env = (cfg.paths.host_data_dir / ".env").read_text(encoding="utf-8")
+    assert "FIRECRAWL_API_KEY=fc-self-hosted-" in env
+    assert "FIRECRAWL_BULL_AUTH_KEY=" in env
+    assert "FIRECRAWL_POSTGRES_PASSWORD=" in env
+
+
 def test_up_wires_existing_hermes_agents_passthrough(
     with_coder: Path, cfg: AgentsConfig, mocker: Any, vm_fs_mocks: dict[str, Any]
 ) -> None:
