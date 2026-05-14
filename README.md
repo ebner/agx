@@ -62,6 +62,8 @@ For the full lifecycle — Hermes profiles vs. personalities vs. skills, connect
 | `<data-dir>/<name>/.data/` | Each Hermes agent's `$HERMES_HOME` (auth, sessions, skills, memories, state.db). |
 | `<data-dir>/<name>/.openclaw/` | Each OpenClaw agent's persistent dir. |
 | `<data-dir>/<name>/.env` | Per-agent secrets (API keys for skills). Managed via `agents secret …`. Wired into the container via compose `env_file:`. |
+| `<data-dir>/.firecrawl-state.json` | Captured image digests for the self-hosted Firecrawl stack (managed by `agents firecrawl …`). |
+| `<data-dir>/firecrawl/postgres/` | Postgres data for self-hosted Firecrawl. Bind-mounted, duplicity-friendly. |
 | `<data-dir>/<name>/.openviking/` | OpenViking sidecar's per-agent data (when `agents memory enable openviking <name>`). |
 | `<data-dir>/.codex/` | Toolkit-scoped Codex auth (separate from your personal `~/.codex/`). |
 | `<data-dir>/.memory-state/` | Per-agent record of which memory backend the toolkit enabled. |

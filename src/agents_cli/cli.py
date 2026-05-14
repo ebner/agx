@@ -20,6 +20,7 @@ from agents_cli import (
     __version__,
     agents_cmd,
     export_cmd,
+    firecrawl_cmd,
     fixperms_cmd,
     ollama_cmd,
     ops,
@@ -773,6 +774,61 @@ def memory_disable(agent: str) -> None:
 def memory_status(agent: str | None) -> None:
     """Show memory state per agent (or for a single agent if NAME is given)."""
     _run(memory_mod.status, agent)
+
+
+# ---------- firecrawl ----------
+
+
+@main.group("firecrawl")
+def firecrawl_group() -> None:
+    """Self-hosted Firecrawl backend (shared across all Hermes agents).
+
+    One stack per VM: api + playwright + redis + rabbitmq + postgres.
+    Auto-wires every Hermes agent's terminal.env_passthrough on `up`
+    so the FIRECRAWL_API_KEY / FIRECRAWL_API_URL pair reaches both the
+    Hermes Python tools AND the LLM's shell-based diagnostics.
+    """
+
+
+@firecrawl_group.command("up")
+@click.option(
+    "--upgrade",
+    is_flag=True,
+    help="Re-resolve upstream floating tags into fresh digests (refreshes images).",
+)
+def firecrawl_up(upgrade: bool) -> None:
+    """Install (or upgrade) the firecrawl stack and wire all Hermes agents."""
+    _run(firecrawl_cmd.up, upgrade=upgrade)
+
+
+@firecrawl_group.command("down")
+def firecrawl_down() -> None:
+    """Stop the firecrawl stack; postgres data preserved on disk."""
+    _run(firecrawl_cmd.down)
+
+
+@firecrawl_group.command("destroy")
+@click.option("-y", "--yes", "yes_local", is_flag=True, help="Skip confirmation.")
+@click.pass_context
+def firecrawl_destroy(ctx: click.Context, yes_local: bool) -> None:
+    """Stop and remove the stack, drop compose entries, wipe postgres data."""
+    yes = yes_local or ctx.obj.get("yes", False)
+    _run(firecrawl_cmd.destroy, yes=yes)
+
+
+@firecrawl_group.command("status")
+def firecrawl_status() -> None:
+    """Show whether the stack is running and which agents are wired."""
+    _run(firecrawl_cmd.status)
+
+
+@firecrawl_group.command("logs")
+@click.argument("service", required=False)
+@click.option("-f", "--follow", is_flag=True, help="Stream logs.")
+@click.option("--since", default=None, help="docker compose --since value (e.g. 10m).")
+def firecrawl_logs(service: str | None, follow: bool, since: str | None) -> None:
+    """Tail logs from a firecrawl service (default: api)."""
+    _run(firecrawl_cmd.logs, service=service, follow=follow, since=since)
 
 
 # ---------- secrets ----------

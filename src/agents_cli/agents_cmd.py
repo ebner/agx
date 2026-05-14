@@ -209,6 +209,15 @@ def create(
                 _add_service_to_compose(cfg, name, agent_type, svc, port, tag)
             elif phase == "service_up":
                 compose_runner.up(cfg, svc)
+                # If firecrawl is already up project-wide, auto-wire
+                # the new Hermes agent's terminal.env_passthrough so
+                # the LLM's sandboxed shell tool sees the existing
+                # FIRECRAWL_API_KEY / FIRECRAWL_API_URL env vars.
+                # No-op for OpenClaw and when firecrawl isn't installed.
+                if agent_type == "hermes":
+                    from agents_cli import firecrawl_cmd
+
+                    firecrawl_cmd.ensure_agent_wired(cfg, name)
             elif phase == "setup_done":
                 _run_agent_setup(cfg, svc, agent_type)
             journal.advance(phase)

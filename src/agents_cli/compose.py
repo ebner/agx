@@ -56,8 +56,26 @@ OPENCLAW_IMAGE_BASE: Final = "openclaw/openclaw"
 # the same parsed (registry, repo) tuple check as the agent images so an
 # attacker-controlled compose can't sneak in a typo-squatted variant.
 OPENVIKING_IMAGE_BASE: Final = "volcengine/openviking"
+# Firecrawl (self-hosted web-scrape backend). Five images; upstream
+# publishes only floating tags (linux-amd64, latest) on GHCR — `agents
+# firecrawl up` self-pins to the resolved digest on first run, so the
+# compose file only ever references images by `@sha256:…`.
+FIRECRAWL_API_IMAGE_BASE: Final = "ghcr.io/firecrawl/firecrawl"
+FIRECRAWL_PLAYWRIGHT_IMAGE_BASE: Final = "ghcr.io/firecrawl/playwright-service"
+FIRECRAWL_POSTGRES_IMAGE_BASE: Final = "ghcr.io/firecrawl/nuq-postgres"
+FIRECRAWL_REDIS_IMAGE_BASE: Final = "redis"
+FIRECRAWL_RABBITMQ_IMAGE_BASE: Final = "rabbitmq"
 ALLOWED_IMAGE_BASES: Final = frozenset(
-    {HERMES_IMAGE_BASE, OPENCLAW_IMAGE_BASE, OPENVIKING_IMAGE_BASE}
+    {
+        HERMES_IMAGE_BASE,
+        OPENCLAW_IMAGE_BASE,
+        OPENVIKING_IMAGE_BASE,
+        FIRECRAWL_API_IMAGE_BASE,
+        FIRECRAWL_PLAYWRIGHT_IMAGE_BASE,
+        FIRECRAWL_POSTGRES_IMAGE_BASE,
+        FIRECRAWL_REDIS_IMAGE_BASE,
+        FIRECRAWL_RABBITMQ_IMAGE_BASE,
+    }
 )
 
 
@@ -288,6 +306,12 @@ def hermes_service_fragment(
             # there by `vm init` to the host user's primary uid/gid).
             "HERMES_UID": "${HERMES_UID}",
             "HERMES_GID": "${HERMES_GID}",
+            # Firecrawl self-host wiring (project-level, set by
+            # `agents firecrawl up`). ``${X:-}`` keeps these empty when
+            # firecrawl is off so firecrawl-py's "non-empty key" check
+            # only succeeds when the user actually opted in.
+            "FIRECRAWL_API_KEY": "${FIRECRAWL_API_KEY:-}",
+            "FIRECRAWL_API_URL": "${FIRECRAWL_API_URL:-}",
         },
         "mem_limit": cfg.defaults.hermes_mem_limit,
         "cpus": cfg.defaults.hermes_cpus,
@@ -372,12 +396,150 @@ def openclaw_service_fragment(
     }
 
 
-def validate_image_ref(image_ref: str) -> str:
-    """Return the ``<registry>/<repo>`` base (without tag), raising
-    ``UserError`` if it isn't on the allowlist. Handles refs with or
-    without a tag.
+# ---------- firecrawl (project-level self-host) ----------
+
+
+FIRECRAWL_SERVICE_PREFIX: Final = "firecrawl-"
+
+
+def firecrawl_service_fragments(
+    *,
+    images: dict[str, str],
+) -> dict[str, dict[str, Any]]:
+    """Build the five compose service blocks for a self-hosted Firecrawl
+    stack: ``firecrawl-api``, ``firecrawl-playwright``, ``firecrawl-redis``,
+    ``firecrawl-rabbitmq``, ``firecrawl-postgres``.
+
+    ``images`` keys: ``api``, ``playwright``, ``redis``, ``rabbitmq``,
+    ``postgres`` — each maps to a digest-pinned image reference
+    (``ghcr.io/firecrawl/firecrawl@sha256:…``). The toolkit resolves
+    floating upstream tags to digests on first ``agents firecrawl up``
+    so the compose file only ever sees pinned refs.
+
+    Design notes:
+
+    - Only the api expects to be reachable from sibling containers; it
+      listens on port 3002 over the project's default docker network
+      and is NOT published on the host (use ``agents firecrawl logs``
+      / shell-into-VM debugging if you need to inspect it).
+    - Postgres is on a bind-mount under ``./firecrawl/postgres/`` so
+      ``agents export`` and duplicity cover it. Redis + RabbitMQ stay
+      ephemeral — losing in-flight scrape jobs on restart is fine.
+    - Playwright is the resource hog. We cap concurrency at 2 pages
+      and block media downloads via env, which keeps idle RAM under
+      ~600 MB on a single-user setup.
+    - ``host.docker.internal:host-gateway`` mirrors upstream's
+      compose so the api can reach the host where applicable; it
+      works fine under rootless Docker on Linux 6.x.
     """
-    repo, _, _tag = image_ref.partition(":")
+    return {
+        "firecrawl-api": {
+            "image": images["api"],
+            "container_name": "firecrawl-api",
+            "restart": "unless-stopped",
+            "environment": {
+                "PORT": "3002",
+                "HOST": "0.0.0.0",
+                "USE_DB_AUTHENTICATION": "false",
+                "BULL_AUTH_KEY": "${FIRECRAWL_BULL_AUTH_KEY}",
+                "REDIS_URL": "redis://firecrawl-redis:6379",
+                "PLAYWRIGHT_MICROSERVICE_URL": "http://firecrawl-playwright:3000/scrape",
+                "NUQ_RABBITMQ_URL": "amqp://firecrawl-rabbitmq:5672",
+                "POSTGRES_HOST": "firecrawl-postgres",
+                "POSTGRES_USER": "postgres",
+                "POSTGRES_PASSWORD": "${FIRECRAWL_POSTGRES_PASSWORD}",
+                "POSTGRES_DB": "postgres",
+            },
+            "depends_on": {
+                "firecrawl-redis": {"condition": "service_started"},
+                "firecrawl-playwright": {"condition": "service_started"},
+                "firecrawl-rabbitmq": {"condition": "service_healthy"},
+                "firecrawl-postgres": {"condition": "service_healthy"},
+            },
+            "extra_hosts": ["host.docker.internal:host-gateway"],
+            "expose": ["3002"],
+            "mem_limit": "3g",
+            "cpus": 2.0,
+        },
+        "firecrawl-playwright": {
+            "image": images["playwright"],
+            "container_name": "firecrawl-playwright",
+            "restart": "unless-stopped",
+            "environment": {
+                "PORT": "3000",
+                "BLOCK_MEDIA": "true",
+                "MAX_CONCURRENT_PAGES": "2",
+            },
+            "tmpfs": ["/tmp/.cache:size=1g"],
+            "expose": ["3000"],
+            "mem_limit": "2g",
+            "cpus": 2.0,
+        },
+        "firecrawl-redis": {
+            "image": images["redis"],
+            "container_name": "firecrawl-redis",
+            "restart": "unless-stopped",
+            # Disable both RDB snapshots and AOF — queue state is fine
+            # to drop on restart for a single-user setup, and avoids the
+            # SQLite-WAL-on-9p class of issue documented in CLAUDE.md
+            # for redis' append-only-log under host-mount mode.
+            "command": ["redis-server", "--save", "", "--appendonly", "no"],
+            "expose": ["6379"],
+            "mem_limit": "512m",
+        },
+        "firecrawl-rabbitmq": {
+            "image": images["rabbitmq"],
+            "container_name": "firecrawl-rabbitmq",
+            "restart": "unless-stopped",
+            "expose": ["5672"],
+            "healthcheck": {
+                "test": ["CMD", "rabbitmq-diagnostics", "ping"],
+                "interval": "10s",
+                "timeout": "5s",
+                "retries": 6,
+            },
+            "mem_limit": "512m",
+        },
+        "firecrawl-postgres": {
+            "image": images["postgres"],
+            "container_name": "firecrawl-postgres",
+            "restart": "unless-stopped",
+            "environment": {
+                "POSTGRES_USER": "postgres",
+                "POSTGRES_PASSWORD": "${FIRECRAWL_POSTGRES_PASSWORD}",
+                "POSTGRES_DB": "postgres",
+            },
+            "volumes": ["./firecrawl/postgres:/var/lib/postgresql/data"],
+            "expose": ["5432"],
+            "healthcheck": {
+                "test": ["CMD-SHELL", "pg_isready -U postgres"],
+                "interval": "5s",
+                "timeout": "3s",
+                "retries": 10,
+            },
+            "mem_limit": "512m",
+        },
+    }
+
+
+def is_firecrawl_service(svc_name: str) -> bool:
+    return svc_name.startswith(FIRECRAWL_SERVICE_PREFIX)
+
+
+def validate_image_ref(image_ref: str) -> str:
+    """Return the ``<registry>/<repo>`` base, raising ``UserError`` if
+    it isn't on the allowlist. Handles three ref shapes:
+
+    - bare ``repo``
+    - tag-pinned ``repo:tag``
+    - digest-pinned ``repo@sha256:...`` (used by firecrawl self-pinning)
+
+    Strips the ``@sha256:...`` part first, then the ``:tag`` part — so
+    ``ghcr.io/firecrawl/firecrawl@sha256:abc`` resolves to the right
+    base without the digest's leading-colon confusing the tag split.
+    """
+    repo_and_tag = image_ref.split("@", 1)[0]
+    repo, _, _tag = repo_and_tag.partition(":")
     if repo not in ALLOWED_IMAGE_BASES:
         raise UserError(
             f"image base {repo!r} not on the allowlist; permitted: {sorted(ALLOWED_IMAGE_BASES)}"

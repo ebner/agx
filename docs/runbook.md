@@ -137,6 +137,61 @@ When it didn't, output is `PARTIAL`: traversal works, but the
 underlying image issue persists and you should investigate the
 entrypoint of your pinned Hermes image tag.
 
+## Self-hosted Firecrawl
+
+One Firecrawl deployment per VM, shared across every Hermes agent the
+toolkit manages — no per-agent setup needed.
+
+```bash
+agents firecrawl up                # first-time install + start
+agents firecrawl up --upgrade      # re-resolve floating tags into fresh digests
+agents firecrawl down              # stop; postgres data preserved
+agents firecrawl status            # running? which agents are wired?
+agents firecrawl logs              # tail api logs
+agents firecrawl logs playwright -f
+agents firecrawl destroy --yes     # nuke everything including postgres data
+```
+
+What `up` does:
+
+1. Pulls each upstream floating tag (linux-amd64, latest, alpine,
+   3-management).
+2. Captures the resolved digest via `docker image inspect` and writes
+   it to `<data-dir>/.firecrawl-state.json`. The compose file only
+   ever references images by `@sha256:…` so the toolkit's "no
+   `:latest` outside canary" rule still holds.
+3. Generates the 5-service stack (`firecrawl-api`,
+   `firecrawl-playwright`, `firecrawl-redis`, `firecrawl-rabbitmq`,
+   `firecrawl-postgres`) and writes it into the project compose file
+   via the atomic flock-protected path.
+4. Populates `<data-dir>/.env` with `FIRECRAWL_API_KEY` (a generated
+   `fc-self-hosted-...` placeholder — firecrawl-py insists on a
+   non-empty key even when the server has auth disabled),
+   `FIRECRAWL_API_URL=http://firecrawl-api:3002`, `BULL_AUTH_KEY`,
+   `POSTGRES_PASSWORD`.
+5. Adds `FIRECRAWL_API_KEY` and `FIRECRAWL_API_URL` to every existing
+   Hermes agent's `terminal.env_passthrough` so the LLM's
+   shell-based diagnostics also see the config.
+6. `docker compose up -d` the five services. Healthchecks gate the
+   api on rabbitmq + postgres being ready.
+
+Agents created **after** `firecrawl up`: `agents create` checks
+firecrawl state during the `service_up` phase and adds the
+passthrough entries automatically. Zero extra steps.
+
+Storage: `<data-dir>/firecrawl/postgres/` is the only durable volume
+(captured by duplicity / `agents export`). Redis and RabbitMQ are
+ephemeral — losing in-flight scrape jobs on restart is acceptable
+for a single-user setup.
+
+Resource caps in the generated compose: api 2 CPU / 3 GB, playwright
+2 CPU / 2 GB (with `BLOCK_MEDIA=true`, `MAX_CONCURRENT_PAGES=2`),
+others 512 MB each. Idle target ~1.5–2 GB total.
+
+Networking: only `firecrawl-api` is reachable, and only over the
+docker network as `http://firecrawl-api:3002`. No host port is
+published; debug via `agents firecrawl logs` or `agents vm shell`.
+
 ## Per-agent secrets
 
 API keys for skills (Firecrawl, GitHub, etc.) go in a per-agent .env

@@ -161,7 +161,7 @@ agents exec coder hermes skills uninstall <skill-id>
 
 Skills are **profile-scoped** inside Hermes. With Strategy A (one container per agent) you don't have to think about this — each toolkit agent has its own skill set. With Strategy B you'd run `hermes -p <profile> skills install ...`.
 
-Most skills that talk to a third-party service need an API key. Wire one in per-agent — never in the project-level `.env`:
+Most skills that talk to a third-party service need an API key. Wire one in per-agent — never in the project-level `.env`. (Exception: Firecrawl can be self-hosted via `agents firecrawl up` — see `docs/runbook.md`. No per-agent setup needed, every agent picks it up automatically.)
 
 ```bash
 # prompts for the value (hidden, never printed back)

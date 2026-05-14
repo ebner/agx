@@ -1,0 +1,415 @@
+"""firecrawl_cmd: up/down/destroy/status + agent auto-wiring."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from agents_cli import compose, firecrawl_cmd, hermes_config
+from agents_cli import config as cfg_mod
+from agents_cli.agents_cmd import create
+from agents_cli.compose import FIRECRAWL_SERVICE_PREFIX
+from agents_cli.config import (
+    AgentsConfig,
+    DefaultsConfig,
+    HostConfig,
+    PathsConfig,
+    VmRuntimeConfig,
+)
+from agents_cli.errors import UserError
+from agents_cli.mp import MpResult
+
+
+def _ok(stdout: str = "") -> MpResult:
+    return MpResult(stdout=stdout, stderr="", returncode=0)
+
+
+# Stable digest stub returned by `docker image inspect`. Each pull
+# resolves to a per-role digest so tests can assert that distinct images
+# land in compose.
+DIGEST_FOR: dict[str, str] = {
+    "ghcr.io/firecrawl/firecrawl:linux-amd64": ("ghcr.io/firecrawl/firecrawl@sha256:" + "a" * 64),
+    "ghcr.io/firecrawl/playwright-service:latest": (
+        "ghcr.io/firecrawl/playwright-service@sha256:" + "b" * 64
+    ),
+    "ghcr.io/firecrawl/nuq-postgres:latest": ("ghcr.io/firecrawl/nuq-postgres@sha256:" + "c" * 64),
+    "redis:alpine": "redis@sha256:" + "d" * 64,
+    "rabbitmq:3-management": "rabbitmq@sha256:" + "e" * 64,
+}
+
+
+@pytest.fixture
+def cfg(tmp_path: Path) -> AgentsConfig:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+    (data_dir / ".env").write_text("HERMES_UID=1000\nHERMES_GID=1000\n", encoding="utf-8")
+    return AgentsConfig(
+        paths=PathsConfig(host_data_dir=str(data_dir)),
+        host=HostConfig(uid=1000, gid=1000),
+        vm_runtime=VmRuntimeConfig(
+            docker_socket_path="/run/user/1000/docker.sock",
+            ubuntu_uid=1000,
+            ubuntu_gid=1000,
+        ),
+        defaults=DefaultsConfig(hermes_image_tag="v1.0.0", openclaw_image_tag="0.1.0"),
+    )
+
+
+@pytest.fixture
+def saved_config(cfg: AgentsConfig, tmp_path: Path) -> Path:
+    p = tmp_path / "config.toml"
+    cfg_mod.save(cfg, p)
+    return p
+
+
+@pytest.fixture
+def vm_fs_mocks(cfg: AgentsConfig, mocker: Any) -> dict[str, Any]:
+    from tests.conftest import install_vm_fs_simulation
+
+    return install_vm_fs_simulation(mocker, cfg)
+
+
+def _firecrawl_runner(vm_fs_mocks: dict[str, Any]) -> Any:
+    """Layer firecrawl-aware responses (docker pull + image inspect) onto
+    the FS simulator so digest resolution succeeds in tests.
+    """
+    sim_runner = vm_fs_mocks["exec_in_vm"].side_effect
+
+    def runner(vm_name: str, *cmd: str, check: bool = True) -> MpResult:
+        if cmd[:2] == ("docker", "pull"):
+            return _ok()
+        if cmd[:3] == ("docker", "image", "inspect"):
+            for ref, digest in DIGEST_FOR.items():
+                if ref in cmd:
+                    return _ok(stdout=digest + "\n")
+            return _ok(stdout="unknown\n")
+        return sim_runner(vm_name, *cmd, check=check)
+
+    return runner
+
+
+@pytest.fixture
+def with_coder(
+    cfg: AgentsConfig, saved_config: Path, mocker: Any, vm_fs_mocks: dict[str, Any]
+) -> Path:
+    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    create(name="coder", agent_type="hermes", config_path=saved_config)
+    return saved_config
+
+
+# ---------- up ----------
+
+
+def test_up_resolves_digests_and_writes_state(
+    with_coder: Path, cfg: AgentsConfig, mocker: Any, vm_fs_mocks: dict[str, Any]
+) -> None:
+    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+
+    payload = firecrawl_cmd.up(config_path=with_coder)
+
+    assert payload["running"] is True
+    assert payload["api_url"] == "http://firecrawl-api:3002"
+    state = firecrawl_cmd.read_state(cfg)
+    assert state["images"]["api"].startswith("ghcr.io/firecrawl/firecrawl@sha256:")
+    assert state["images"]["playwright"].startswith("ghcr.io/firecrawl/playwright-service@sha256:")
+    assert state["images"]["redis"].startswith("redis@sha256:")
+
+
+def test_up_writes_five_compose_services(
+    with_coder: Path, cfg: AgentsConfig, mocker: Any, vm_fs_mocks: dict[str, Any]
+) -> None:
+    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+
+    firecrawl_cmd.up(config_path=with_coder)
+
+    doc = compose.read_compose_doc(cfg)
+    services = doc["services"]
+    expected = {
+        "firecrawl-api",
+        "firecrawl-playwright",
+        "firecrawl-redis",
+        "firecrawl-rabbitmq",
+        "firecrawl-postgres",
+    }
+    assert expected.issubset(set(services))
+
+
+def test_up_populates_project_env_with_secrets(
+    with_coder: Path, cfg: AgentsConfig, mocker: Any, vm_fs_mocks: dict[str, Any]
+) -> None:
+    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+
+    firecrawl_cmd.up(config_path=with_coder)
+    env = (cfg.paths.host_data_dir / ".env").read_text(encoding="utf-8")
+    assert "FIRECRAWL_API_KEY=fc-self-hosted-" in env
+    assert "FIRECRAWL_API_URL=http://firecrawl-api:3002" in env
+    # BULL auth and postgres password are also generated.
+    assert "FIRECRAWL_BULL_AUTH_KEY=" in env
+    assert "FIRECRAWL_POSTGRES_PASSWORD=" in env
+
+
+def test_up_wires_existing_hermes_agents_passthrough(
+    with_coder: Path, cfg: AgentsConfig, mocker: Any, vm_fs_mocks: dict[str, Any]
+) -> None:
+    """The whole point: every Hermes agent's terminal.env_passthrough
+    gets the FIRECRAWL pair so the LLM's shell-based diagnostic doesn't
+    falsely report "not configured".
+    """
+    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+
+    firecrawl_cmd.up(config_path=with_coder)
+
+    doc = hermes_config.load(hermes_config.config_path(cfg, "coder"))
+    passthrough = doc["terminal"]["env_passthrough"]
+    assert "FIRECRAWL_API_KEY" in passthrough
+    assert "FIRECRAWL_API_URL" in passthrough
+
+
+def test_up_is_idempotent_does_not_regenerate_digests(
+    with_coder: Path, cfg: AgentsConfig, mocker: Any, vm_fs_mocks: dict[str, Any]
+) -> None:
+    """Calling `up` again must reuse the captured digests — even if the
+    upstream tags' digests would resolve differently — so the toolkit
+    never silently pulls a new image version.
+    """
+    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    in_vm_spy = mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+
+    firecrawl_cmd.up(config_path=with_coder)
+    first_state = json.loads(json.dumps(firecrawl_cmd.read_state(cfg)))
+
+    # Drop the docker pull call count; we'll verify the second `up`
+    # doesn't pull again.
+    pull_count_before = sum(
+        1 for c in in_vm_spy.call_args_list if c.args[1:3] == ("docker", "pull")
+    )
+
+    firecrawl_cmd.up(config_path=with_coder)
+    second_state = firecrawl_cmd.read_state(cfg)
+    assert first_state == second_state
+
+    pull_count_after = sum(1 for c in in_vm_spy.call_args_list if c.args[1:3] == ("docker", "pull"))
+    # No new pulls between the two ups.
+    assert pull_count_after == pull_count_before
+
+
+def test_up_upgrade_re_resolves_digests(
+    with_coder: Path, cfg: AgentsConfig, mocker: Any, vm_fs_mocks: dict[str, Any]
+) -> None:
+    """`--upgrade` re-pulls the floating tags and refreshes digests."""
+    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    in_vm_spy = mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+
+    firecrawl_cmd.up(config_path=with_coder)
+    pull_count_before = sum(
+        1 for c in in_vm_spy.call_args_list if c.args[1:3] == ("docker", "pull")
+    )
+
+    firecrawl_cmd.up(upgrade=True, config_path=with_coder)
+    pull_count_after = sum(1 for c in in_vm_spy.call_args_list if c.args[1:3] == ("docker", "pull"))
+    # Five new pulls (one per image) on upgrade.
+    assert pull_count_after - pull_count_before == 5
+
+
+# ---------- down ----------
+
+
+def test_down_removes_agent_passthrough_wiring(
+    with_coder: Path, cfg: AgentsConfig, mocker: Any, vm_fs_mocks: dict[str, Any]
+) -> None:
+    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())
+    mocker.patch("agents_cli.compose_runner.rm", return_value=_ok())
+    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+
+    firecrawl_cmd.up(config_path=with_coder)
+    firecrawl_cmd.down(config_path=with_coder)
+
+    doc = hermes_config.load(hermes_config.config_path(cfg, "coder"))
+    passthrough = (doc.get("terminal") or {}).get("env_passthrough") or []
+    assert "FIRECRAWL_API_KEY" not in passthrough
+    assert "FIRECRAWL_API_URL" not in passthrough
+
+
+def test_down_keeps_compose_entries(
+    with_coder: Path, cfg: AgentsConfig, mocker: Any, vm_fs_mocks: dict[str, Any]
+) -> None:
+    """`down` is reversible — compose entries stay so a subsequent
+    `up` can bring the same digests back without re-resolving.
+    """
+    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())
+    mocker.patch("agents_cli.compose_runner.rm", return_value=_ok())
+    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+
+    firecrawl_cmd.up(config_path=with_coder)
+    firecrawl_cmd.down(config_path=with_coder)
+
+    doc = compose.read_compose_doc(cfg)
+    services = doc.get("services") or {}
+    assert any(s.startswith(FIRECRAWL_SERVICE_PREFIX) for s in services)
+    # State file still present (digests preserved for next up).
+    assert "images" in firecrawl_cmd.read_state(cfg)
+
+
+def test_down_refuses_when_not_installed(saved_config: Path) -> None:
+    with pytest.raises(UserError, match="not installed"):
+        firecrawl_cmd.down(config_path=saved_config)
+
+
+# ---------- destroy ----------
+
+
+def test_destroy_strips_everything(
+    with_coder: Path, cfg: AgentsConfig, mocker: Any, vm_fs_mocks: dict[str, Any]
+) -> None:
+    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())
+    mocker.patch("agents_cli.compose_runner.rm", return_value=_ok())
+    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+
+    firecrawl_cmd.up(config_path=with_coder)
+    firecrawl_cmd.destroy(yes=True, config_path=with_coder)
+
+    doc = compose.read_compose_doc(cfg)
+    services = doc.get("services") or {}
+    assert not any(s.startswith(FIRECRAWL_SERVICE_PREFIX) for s in services)
+    assert firecrawl_cmd.read_state(cfg) == {}
+
+    env_text = (cfg.paths.host_data_dir / ".env").read_text(encoding="utf-8")
+    assert "FIRECRAWL_API_KEY" not in env_text
+    assert "FIRECRAWL_API_URL" not in env_text
+    assert "FIRECRAWL_BULL_AUTH_KEY" not in env_text
+
+
+def test_destroy_aborts_without_yes(
+    with_coder: Path, cfg: AgentsConfig, mocker: Any, vm_fs_mocks: dict[str, Any]
+) -> None:
+    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+    mocker.patch("agents_cli.ui.confirm", return_value=False)
+    firecrawl_cmd.up(config_path=with_coder)
+
+    with pytest.raises(UserError, match="aborted by user"):
+        firecrawl_cmd.destroy(yes=False, config_path=with_coder)
+
+
+# ---------- agents create auto-wiring ----------
+
+
+def test_agents_create_auto_wires_when_firecrawl_is_up(
+    saved_config: Path, cfg: AgentsConfig, mocker: Any, vm_fs_mocks: dict[str, Any]
+) -> None:
+    """A Hermes agent created AFTER `firecrawl up` should pick up the
+    passthrough automatically — no second user step needed.
+    """
+    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+
+    # Bring firecrawl up first, with no agents yet.
+    firecrawl_cmd.up(config_path=saved_config)
+    # Now create a fresh Hermes agent.
+    create(name="newbie", agent_type="hermes", config_path=saved_config)
+
+    doc = hermes_config.load(hermes_config.config_path(cfg, "newbie"))
+    passthrough = doc["terminal"]["env_passthrough"]
+    assert "FIRECRAWL_API_KEY" in passthrough
+    assert "FIRECRAWL_API_URL" in passthrough
+
+
+def test_agents_create_skips_wiring_when_firecrawl_is_down(
+    saved_config: Path, cfg: AgentsConfig, mocker: Any, vm_fs_mocks: dict[str, Any]
+) -> None:
+    """No firecrawl installed → no passthrough wired (clean baseline)."""
+    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    create(name="solo", agent_type="hermes", config_path=saved_config)
+
+    config_path_file = hermes_config.config_path(cfg, "solo")
+    if config_path_file.exists():
+        doc = hermes_config.load(config_path_file)
+        passthrough = (doc.get("terminal") or {}).get("env_passthrough") or []
+        assert "FIRECRAWL_API_KEY" not in passthrough
+
+
+# ---------- compose fragment shape ----------
+
+
+def test_firecrawl_fragments_use_only_digest_pinned_images() -> None:
+    """The compose fragments must never reference a floating tag —
+    every image must be ``<repo>@sha256:…``. Reflects the toolkit's
+    locked "no :latest outside canary" rule.
+    """
+    digest_images = {
+        "api": DIGEST_FOR["ghcr.io/firecrawl/firecrawl:linux-amd64"],
+        "playwright": DIGEST_FOR["ghcr.io/firecrawl/playwright-service:latest"],
+        "postgres": DIGEST_FOR["ghcr.io/firecrawl/nuq-postgres:latest"],
+        "redis": DIGEST_FOR["redis:alpine"],
+        "rabbitmq": DIGEST_FOR["rabbitmq:3-management"],
+    }
+    fragments = compose.firecrawl_service_fragments(images=digest_images)
+    for svc_name, fragment in fragments.items():
+        assert "@sha256:" in fragment["image"], f"{svc_name} not digest-pinned"
+
+
+def test_firecrawl_postgres_bind_mounts_data_dir() -> None:
+    """Postgres data must live on the host-mount (covered by duplicity)
+    via a bind mount, NOT a docker-managed volume.
+    """
+    digest_images = {
+        "api": DIGEST_FOR["ghcr.io/firecrawl/firecrawl:linux-amd64"],
+        "playwright": DIGEST_FOR["ghcr.io/firecrawl/playwright-service:latest"],
+        "postgres": DIGEST_FOR["ghcr.io/firecrawl/nuq-postgres:latest"],
+        "redis": DIGEST_FOR["redis:alpine"],
+        "rabbitmq": DIGEST_FOR["rabbitmq:3-management"],
+    }
+    fragments = compose.firecrawl_service_fragments(images=digest_images)
+    volumes = fragments["firecrawl-postgres"]["volumes"]
+    assert any("./firecrawl/postgres" in v for v in volumes)
+
+
+def test_firecrawl_api_not_exposed_on_host() -> None:
+    """The api service must only `expose:` the internal port, never
+    publish it via `ports:`. Reach it from sibling containers via the
+    docker network.
+    """
+    digest_images = {
+        "api": DIGEST_FOR["ghcr.io/firecrawl/firecrawl:linux-amd64"],
+        "playwright": DIGEST_FOR["ghcr.io/firecrawl/playwright-service:latest"],
+        "postgres": DIGEST_FOR["ghcr.io/firecrawl/nuq-postgres:latest"],
+        "redis": DIGEST_FOR["redis:alpine"],
+        "rabbitmq": DIGEST_FOR["rabbitmq:3-management"],
+    }
+    fragments = compose.firecrawl_service_fragments(images=digest_images)
+    api = fragments["firecrawl-api"]
+    assert "ports" not in api
+    assert "3002" in api["expose"]
+
+
+# ---------- status ----------
+
+
+def test_status_when_not_installed(saved_config: Path) -> None:
+    info = firecrawl_cmd.status(config_path=saved_config)
+    assert info["installed"] is False
+    assert info["running"] is False
+
+
+def test_status_reports_wired_agents(
+    with_coder: Path, cfg: AgentsConfig, mocker: Any, vm_fs_mocks: dict[str, Any]
+) -> None:
+    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agents_cli.compose_runner.ps", return_value=_ok(""))
+    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+
+    firecrawl_cmd.up(config_path=with_coder)
+    info = firecrawl_cmd.status(config_path=with_coder)
+    assert info["installed"] is True
+    assert "coder" in info["wired_agents"]

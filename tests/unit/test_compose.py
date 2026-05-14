@@ -9,6 +9,11 @@ import pytest
 
 from agents_cli.compose import (
     ALLOWED_IMAGE_BASES,
+    FIRECRAWL_API_IMAGE_BASE,
+    FIRECRAWL_PLAYWRIGHT_IMAGE_BASE,
+    FIRECRAWL_POSTGRES_IMAGE_BASE,
+    FIRECRAWL_RABBITMQ_IMAGE_BASE,
+    FIRECRAWL_REDIS_IMAGE_BASE,
     HERMES_IMAGE_BASE,
     OPENCLAW_IMAGE_BASE,
     OPENVIKING_IMAGE_BASE,
@@ -160,9 +165,33 @@ def test_allowlist_rejects_unknown_repo() -> None:
 
 def test_allowlist_set_is_what_we_advertise() -> None:
     assert (
-        frozenset({HERMES_IMAGE_BASE, OPENCLAW_IMAGE_BASE, OPENVIKING_IMAGE_BASE})
+        frozenset(
+            {
+                HERMES_IMAGE_BASE,
+                OPENCLAW_IMAGE_BASE,
+                OPENVIKING_IMAGE_BASE,
+                FIRECRAWL_API_IMAGE_BASE,
+                FIRECRAWL_PLAYWRIGHT_IMAGE_BASE,
+                FIRECRAWL_POSTGRES_IMAGE_BASE,
+                FIRECRAWL_REDIS_IMAGE_BASE,
+                FIRECRAWL_RABBITMQ_IMAGE_BASE,
+            }
+        )
         == ALLOWED_IMAGE_BASES
     )
+
+
+def test_validate_image_ref_handles_digest() -> None:
+    """Firecrawl pins by digest (``image@sha256:…``); the allowlist
+    check must not be confused by the colon inside the digest.
+    """
+    digest = f"{FIRECRAWL_API_IMAGE_BASE}@sha256:abc123def456"
+    assert validate_image_ref(digest) == FIRECRAWL_API_IMAGE_BASE
+
+
+def test_validate_image_ref_rejects_digest_on_unknown_repo() -> None:
+    with pytest.raises(UserError, match="allowlist"):
+        validate_image_ref("evil/typosquat@sha256:abc")
 
 
 # ---------- service ops ----------
