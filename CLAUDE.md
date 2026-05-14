@@ -45,6 +45,29 @@
 | Hermes | `model.provider: openai-codex`. Mounted Codex auth at `/home/hermes/.codex:ro` is an import bridge; once `hermes setup` runs, persistent auth lives at `/opt/data/.hermes/auth.json` on the bind-mounted data dir. The compose fragment pins BOTH the runtime user (`user: ${HERMES_UID}:${HERMES_GID}`) AND HOME (`HOME=/home/hermes` in env), so the import target is a function of compose settings — NOT of the image's USER/HOME, which have drifted between Hermes releases (newer images run as `root` with no explicit HOME). `agents create` only ensures the image is pulled; it no longer refuses on USER/HOME drift. | Opt in via `agents codex skill-enable`. CLI builds a derived sandbox image with Codex CLI baked in and `ENV CODEX_HOME=/codex`; volume entry mounts the toolkit Codex auth at `/codex:ro`. User-independent — works for sandbox images running as root, pn, node, etc. The whole operation holds `<data-dir>/.agents.lock`. |
 | OpenClaw | OpenClaw bundles its own Codex plugin. Run `openclaw models auth login --provider openai-codex` inside the container. **Never** mount Codex into OpenClaw — would conflict. | Same plugin path. |
 
+## Toolkit feature coverage — Hermes vs OpenClaw
+
+Most of the toolkit's day-2 ergonomics are Hermes-shaped. OpenClaw owns more of its own configuration surface (credentials, memory, plugin lifecycle) by design, so the toolkit deliberately stays out of those layers — touching them would race or conflict with OpenClaw's plugin manager. The matrix below is the canonical map; **anything not listed as "works" must explicitly gate on `agent_type == "hermes"` or do a no-op for OpenClaw**.
+
+| Feature | Hermes | OpenClaw | Notes |
+|---|---|---|---|
+| VM lifecycle, `create`/`list`/`remove`/`rename`/`start`/`stop`/`restart`/`logs`/`exec` | works | works | universal CRUD + lifecycle |
+| `agents setup <name>` | runs `hermes setup` | runs `openclaw onboard` | dispatched in `ops.py` / `agents_cmd.py` (`binary = "hermes" if agent_type == "hermes" else "openclaw"`) |
+| `agents upgrade` / `rollback` / `pull` | works | works | type-agnostic state machine; image base differs (`HERMES_IMAGE_BASE` vs `OPENCLAW_IMAGE_BASE`) |
+| `agents export` / `import` / `export-cron` | works | works | `tar` path for both |
+| `agents doctor` | full surface | partial | VM checks universal; per-agent Hermes probes (`hermes doctor`, `/opt/data` access, Codex mount, `fixperms` traversal) skip for OpenClaw |
+| `agents secret {set,unset,list,clear}` | full | env-only | per-agent `.env` written for both (compose `env_file:`); **`terminal.env_passthrough` editing is Hermes-only** — OpenClaw has no equivalent sandbox env filter, its shell tools inherit container env directly |
+| `agents firecrawl up/down/status` | up runs stack, auto-wires Hermes agents | up runs stack, **does NOT touch OpenClaw agents** | self-host stack is project-scoped, but `firecrawl_cmd._hermes_agents` only walks `hermes-*` services. OpenClaw bundles Firecrawl as a first-party plugin and reads `FIRECRAWL_API_KEY` + `FIRECRAWL_BASE_URL` (note: different env-var name than Hermes' `FIRECRAWL_API_URL`); auto-wire would need a separate code path |
+| `agents memory enable/disable` (holographic / mem0 / openviking) | works | refused | `memory/__init__._require_hermes` raises. OpenClaw has its own memory architecture |
+| `agents fix-perms` | works | refused | `fixperms_cmd.fix_perms` raises on non-Hermes. The `/opt/data` permission drift + image-baked-path classes don't apply to OpenClaw (`/home/node/.openclaw`, no `usermod`/HERMES_UID dance) |
+| `agents reseat` | works | refused | reseat rewrites Hermes service fragment; no OpenClaw fragment evolution path yet |
+| Auto-chown of image-baked paths (`HERMES_WRITABLE_PATHS`) | runs after every recreate | not applicable | targets `/opt/hermes/scripts` + `/home/hermes` specifically |
+| `agents codex skill-enable/disable` | works | refused by design | `codex.py` raises `if agent_type != "hermes"`. OpenClaw owns its Codex plugin — mounting toolkit-Codex on top would conflict |
+| `agents ollama configure/status` | feeds Hermes config | not wired | OpenClaw reads its own provider config; toolkit's `[ollama]` block isn't propagated |
+| LLM/provider credentials, vision provider, web-search provider | edited via toolkit (`hermes auth add ...` etc.) | **managed entirely inside OpenClaw** — `openclaw configure`, in-container UI, `models auth login` | the toolkit never writes OpenClaw credential files |
+
+The rationale, restated: the toolkit's job is **infrastructure** (VM, compose, networking, host data, image pinning, upgrade safety) — not **agent-internal configuration**. For Hermes we leaned in because `hermes_config.py` could safely round-trip its YAML; OpenClaw's plugin manager owns mutation, so the toolkit stays at the env-and-mount boundary unless we add a comparable `openclaw_config.py` module with the same atomicity guarantees.
+
 ## Hermes terminology — don't conflate
 
 Three distinct concepts that all sound related. Future doc work and any tooling we add must keep them separate:
