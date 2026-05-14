@@ -319,16 +319,20 @@ def status(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> dict[str, Any]
         for mode, n in sorted(rl.items()):
             human_lines.append(f"    {mode:<22} {n} req/min")
     else:
-        # When `USE_DB_AUTHENTICATION=false` (the toolkit's default for
-        # self-host), Firecrawl's auth middleware skips the per-token
-        # rate-limiter setup entirely — there are no counter keys in
-        # redis to read. Caps in the api source (e.g. scrape=100/min)
-        # apply only in DB-auth mode. Surface the situation so the
-        # absence of numbers isn't read as "rate-limiter broken".
+        # `USE_DB_AUTHENTICATION=false` (the toolkit default) doesn't
+        # just skip the redis counter STORAGE — it short-circuits the
+        # auth middleware before any `consume()` call, so the in-source
+        # caps (scrape=100/min etc) never fire either. Effectively
+        # unbounded. Verified empirically: 30 parallel scrapes return
+        # 30x 200s with zero 429s. Real saturation manifests as
+        # container resource pressure (CPU% / mem) above, not as 429s.
         human_lines.append(
-            "  rate-limit counters: not tracked "
-            "(USE_DB_AUTHENTICATION=false skips per-token limiting; "
-            "in-source caps still apply: scrape=100/min, crawl=15/min, …)"
+            "  rate-limit counters: not tracked — auth disabled, "
+            "in-source caps are not enforced either."
+        )
+        human_lines.append(
+            "  saturation signals: watch the container CPU% + mem above; "
+            "playwright OOM = real ceiling."
         )
     ui.emit(payload, human="\n".join(human_lines))
     return payload

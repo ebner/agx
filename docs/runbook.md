@@ -164,10 +164,13 @@ rate-limit counters when present, image digests, list of agents
 wired in. No side effects, safe to poll.
 
 Rate-limit counters only exist when Firecrawl runs with DB auth
-enabled. Self-host defaults to `USE_DB_AUTHENTICATION=false` which
-skips the per-token counter setup entirely; the in-source caps
-(scrape=100/min, crawl=15/min, …) still apply but aren't observable
-via the toolkit.
+enabled. Self-host defaults to `USE_DB_AUTHENTICATION=false`, which
+makes the auth middleware short-circuit before any rate-limiter call
+fires — so the in-source caps (scrape=100/min etc) aren't enforced
+either. Verified empirically: 30 parallel scrapes returned 30 × 200,
+zero 429s. **Real saturation manifests as container resource
+pressure**, not as 429s. Watch CPU% and memory in the `containers`
+section — playwright OOM is the practical ceiling.
 
 ## Self-hosted Firecrawl
 
