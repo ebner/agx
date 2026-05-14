@@ -5,8 +5,11 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import textwrap
 from dataclasses import dataclass, field
 from pathlib import Path
+
+import click
 
 from agents_cli import compose, compose_runner, mp, ui
 from agents_cli import config as cfg_mod
@@ -17,7 +20,7 @@ from agents_cli.agents_cmd import (
 )
 from agents_cli.agents_cmd import service_name as _service_name_for
 from agents_cli.config import AgentsConfig
-from agents_cli.errors import HealthCheckFailure, UserError
+from agents_cli.errors import HealthCheckFailure, RuntimeFailure, UserError
 from agents_cli.journal import Journal
 
 
@@ -488,9 +491,20 @@ def _check_service_container(
         return
 
     if agent_type == "hermes":
-        # Verify the mounted rootless socket + DOCKER_HOST env actually let
-        # the Hermes container talk to the in-VM Docker daemon. Required for
-        # the nested sandbox to ever come up.
+        # The nested-sandbox docker socket only matters when the agent's
+        # ``terminal.backend`` is ``docker``. Default is ``local`` post
+        # Hermes setup; for that case the in-container ``docker ps``
+        # would fail (rootless socket isn't reachable from a non-root
+        # container user under userns), but that's not a real problem —
+        # Hermes won't try to use it. Skip with a clear note.
+        backend = _hermes_terminal_backend(cfg, agent_name)
+        if backend != "docker":
+            report.add(
+                f"{agent_name}.docker_socket",
+                "ok",
+                f"skipped (terminal.backend={backend!r}; nested sandbox not in use)",
+            )
+            return
         docker_check = mp.exec_in_vm(
             cfg.vm.name,
             *_compose_exec_in_vm_argv(cfg, svc, "docker", "ps", no_tty=True),
@@ -504,6 +518,24 @@ def _check_service_container(
                 "fail",
                 f"docker ps inside {svc!r} failed: {docker_check.stderr.strip()}",
             )
+
+
+def _hermes_terminal_backend(cfg: AgentsConfig, agent_name: str) -> str:
+    """Read ``terminal.backend`` from the agent's config.yaml. Falls
+    back to ``"local"`` (Hermes' default after setup) when the field
+    is absent or the config can't be read.
+    """
+    from agents_cli import hermes_config
+
+    try:
+        doc = hermes_config.read_doc(cfg, agent_name)
+    except (RuntimeFailure, UserError):
+        return "local"
+    terminal = doc.get("terminal")
+    if not isinstance(terminal, dict):
+        return "local"
+    backend = terminal.get("backend", "local")
+    return str(backend) if backend else "local"
 
 
 def _container_state_for(ps_json: str, service: str) -> str:
@@ -641,34 +673,102 @@ def _check_hermes_codex_mount(
 ) -> None:
     """Verify the Hermes container has the toolkit-scoped Codex auth bound
     at the container user's ``~/.codex`` so the LLM-provider import path
-    works. Tests the actual in-container file existence, not just the
-    compose declaration.
+    works on FIRST setup.
+
+    The mount is a one-time import bridge. After ``hermes setup`` runs,
+    persistent auth lives at ``/opt/data/auth.json`` (hermes-owned)
+    and the bind-mounted ``/home/hermes/.codex/auth.json`` is no longer
+    consulted. Critically, under rootless Docker the host-uid-1000-owned
+    auth file appears as root-owned mode 600 inside the container, which
+    is NOT readable by the runtime hermes user — so after setup, the
+    mount being unreadable is expected, not a failure.
+
+    Decision tree:
+
+    - No host auth → skip (Codex not configured).
+    - Host auth + persistent in-container auth → ok (post-import).
+    - Host auth + no persistent + mount readable → ok (pre-import,
+      bridge available).
+    - Host auth + no persistent + mount unreadable → fail (setup
+      can't import; investigate).
     """
-    # If no auth file on host, no point checking the mount yet.
     auth_path = cfg.paths.host_data_dir / ".codex" / "auth.json"
     if not auth_path.exists():
         report.add(f"{agent_name}.codex_mount", "ok", "skipped (no host auth)")
         return
 
-    result = mp.exec_in_vm(
+    # Did Hermes already import the auth into its persistent home?
+    post_import = mp.exec_in_vm(
+        cfg.vm.name,
+        *_compose_exec_in_vm_argv(cfg, svc, "test", "-r", "/opt/data/auth.json", no_tty=True),
+        check=False,
+    )
+    if post_import.returncode == 0:
+        report.add(
+            f"{agent_name}.codex_mount",
+            "ok",
+            "post-import; persistent auth at /opt/data/auth.json",
+        )
+        return
+
+    # Pre-setup state: the mount must be readable so `hermes setup`
+    # can import it. Probe through the container.
+    bridge = mp.exec_in_vm(
         cfg.vm.name,
         *_compose_exec_in_vm_argv(
             cfg, svc, "test", "-r", "/home/hermes/.codex/auth.json", no_tty=True
         ),
         check=False,
     )
-    if result.returncode == 0:
-        report.add(f"{agent_name}.codex_mount", "ok")
-    elif result.returncode in (124, 125, 126):  # not running / not found
+    if bridge.returncode == 0:
+        report.add(f"{agent_name}.codex_mount", "ok", "pre-import; bridge mount readable")
+    elif bridge.returncode in (124, 125, 126):
         report.add(f"{agent_name}.codex_mount", "warn", "container not up; skipping")
     else:
         report.add(
             f"{agent_name}.codex_mount",
             "fail",
-            f"/home/hermes/.codex/auth.json not readable in container (rc={result.returncode})",
+            f"/home/hermes/.codex/auth.json unreadable AND no persistent "
+            f"/opt/data/auth.json — `hermes setup` won't be able to import "
+            f"(rc={bridge.returncode})",
         )
 
 
 def _emit_doctor_table(report: DoctorReport) -> None:
+    """Render the doctor results, wrapping the ``detail`` column to the
+    terminal width so a long detail message doesn't push the column
+    headers + separator off the right edge.
+
+    The first two columns (check name, status) have bounded widths
+    derived from the rows; the third (detail) takes whatever's left of
+    the terminal width and wraps onto continuation lines indented under
+    the detail column.
+
+    Under ``--json`` falls through to ``ui.table`` which emits the
+    full unwrapped JSON form for machine consumers.
+    """
     rows = [{"check": c.name, "status": c.status, "detail": c.detail} for c in report.checks]
-    ui.table(rows, ["check", "status", "detail"])
+    if ui.is_json():
+        ui.table(rows, ["check", "status", "detail"])
+        return
+
+    term_width = shutil.get_terminal_size((120, 20)).columns
+    check_w = max(len("check"), max((len(r["check"]) for r in rows), default=0))
+    status_w = max(len("status"), max((len(r["status"]) for r in rows), default=0))
+    # 2-space gutters between columns. Floor at 20 so wrapping doesn't
+    # produce a comically narrow detail column on tiny terminals.
+    detail_w = max(20, term_width - check_w - status_w - 4)
+
+    sep = "  "
+    indent = f"{'':<{check_w}}{sep}{'':<{status_w}}{sep}"
+
+    def row_lines(check: str, status: str, detail: str) -> list[str]:
+        wrapped = textwrap.wrap(detail or "", width=detail_w) or [""]
+        first = f"{check:<{check_w}}{sep}{status:<{status_w}}{sep}{wrapped[0]}"
+        return [first, *(f"{indent}{cont}" for cont in wrapped[1:])]
+
+    click.echo(f"{'check':<{check_w}}{sep}{'status':<{status_w}}{sep}{'detail':<{detail_w}}")
+    click.echo(f"{'-' * check_w}{sep}{'-' * status_w}{sep}{'-' * detail_w}")
+    for r in rows:
+        for line in row_lines(r["check"], r["status"], r["detail"]):
+            click.echo(line)

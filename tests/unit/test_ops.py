@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -336,6 +337,121 @@ def test_doctor_load_check_fails_on_severe_oversub(with_coder: Path, mocker) -> 
     )
     with pytest.raises(HealthCheckFailure):
         ops.doctor(config_path=with_coder)
+
+
+def test_doctor_skips_docker_socket_when_backend_local(with_coder: Path, mocker) -> None:
+    """When the agent's terminal.backend is `local` (Hermes default),
+    the nested-sandbox docker socket is irrelevant — failing to
+    reach it would be a false positive. The check must skip with
+    a clear note instead.
+    """
+    from agents_cli import hermes_config
+
+    cfg = cfg_mod.load(with_coder)
+    doc = hermes_config.read_doc(cfg, "coder")
+    if "terminal" not in doc:
+        doc["terminal"] = {}
+    doc["terminal"]["backend"] = "local"
+    hermes_config.write_atomically(cfg, "coder", doc)
+
+    _stub_minimal_doctor(mocker)
+    mocker.patch(
+        "agents_cli.compose_runner.ps",
+        return_value=_ok(json.dumps([{"Service": "hermes-coder", "State": "running"}])),
+    )
+    report = ops.doctor(config_path=with_coder)
+    [check] = [c for c in report.checks if c.name == "coder.docker_socket"]
+    assert check.status == "ok"
+    assert "skipped" in check.detail
+    assert "local" in check.detail
+
+
+def test_doctor_codex_mount_ok_when_persistent_auth_exists(with_coder: Path, mocker) -> None:
+    """Post-import state: the bind-mounted /home/hermes/.codex/auth.json
+    is unreadable to the runtime user (root-owned via rootless userns
+    mapping), but Hermes already imported it to /opt/data/auth.json.
+    This is the expected steady state — must not fail.
+    """
+    cfg = cfg_mod.load(with_coder)
+    (cfg.paths.host_data_dir / ".codex").mkdir(exist_ok=True)
+    (cfg.paths.host_data_dir / ".codex" / "auth.json").write_text(
+        '{"expires_at": "2099-01-01T00:00:00Z"}', encoding="utf-8"
+    )
+    # Pretend /opt/data/auth.json exists in the container.
+    persistent = cfg.paths.host_data_dir / "coder" / ".data" / "auth.json"
+    persistent.parent.mkdir(parents=True, exist_ok=True)
+    persistent.write_text("imported", encoding="utf-8")
+
+    mocker.patch(
+        "agents_cli.mp.info_vm",
+        return_value=_ok(json.dumps({"info": {"agents": {"state": "Running"}}})),
+    )
+
+    def runner(vm_name: str, *cmd: str, check: bool = True) -> MpResult:
+        joined = " ".join(cmd)
+        if "is-active" in joined:
+            return _ok("active\n")
+        if "stat" in cmd and "/opt/data" in cmd:
+            return _ok("755 1000\n")
+        if cmd[:2] == ("cat", "/proc/meminfo"):
+            return _ok("MemTotal: 8388608 kB\nMemAvailable: 4194304 kB\n")
+        if cmd[:1] == ("nproc",):
+            return _ok("4\n")
+        if cmd[:2] == ("cat", "/proc/loadavg"):
+            return _ok("0.5 0.3 0.2 1/100 999\n")
+        # test -r /opt/data/auth.json (post-import probe): persistent exists → rc 0
+        if "test" in cmd and "/opt/data/auth.json" in cmd:
+            return _ok("")
+        # test -r /home/hermes/.codex/auth.json (bridge probe): not reachable
+        if "test" in cmd and "/home/hermes/.codex/auth.json" in cmd:
+            return MpResult(stdout="", stderr="", returncode=1)
+        return _ok("ok\n")
+
+    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=runner)
+    mocker.patch(
+        "agents_cli.compose_runner.ps",
+        return_value=_ok(json.dumps([{"Service": "hermes-coder", "State": "running"}])),
+    )
+    report = ops.doctor(config_path=with_coder)
+    [check] = [c for c in report.checks if c.name == "coder.codex_mount"]
+    assert check.status == "ok"
+    assert "post-import" in check.detail
+
+
+def test_doctor_table_wraps_long_detail_in_human_mode(with_coder: Path, mocker, capsys) -> None:
+    """A very long detail string would otherwise blow out the column
+    width and break the separator. Confirm we wrap onto continuation
+    lines (the first line fits in a sensible width, no single line
+    exceeds the simulated terminal width).
+    """
+    import shutil
+
+    _stub_minimal_doctor(mocker)
+    mocker.patch(
+        "agents_cli.compose_runner.ps",
+        return_value=_ok(json.dumps([{"Service": "hermes-coder", "State": "running"}])),
+    )
+    mocker.patch.object(shutil, "get_terminal_size", return_value=os_terminal_size(80))
+    # Force a long detail by injecting a fail check into doctor's run.
+    real_doctor = ops.doctor
+
+    def patched_doctor(**kw):
+        report = real_doctor(**kw)
+        return report
+
+    long_msg = "x " * 200
+    # Easiest: invoke _emit_doctor_table directly with a fabricated report.
+    report = ops.DoctorReport()
+    report.add("a.long.check.name", "fail", long_msg.strip())
+    ops._emit_doctor_table(report)
+    out = capsys.readouterr().out
+    for line in out.splitlines():
+        assert len(line) <= 80, f"line exceeds 80 cols: {line!r}"
+
+
+def os_terminal_size(cols: int) -> os.terminal_size:
+    """Helper: build an os.terminal_size-like object."""
+    return os.terminal_size((cols, 24))
 
 
 def test_doctor_flags_data_dir_eacces(with_coder: Path, mocker) -> None:
