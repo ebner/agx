@@ -301,6 +301,7 @@ def status(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> dict[str, Any]
     payload["api_health"] = _api_health(cfg)
     payload["rate_limits"] = _rate_limit_snapshot(cfg) if running else {}
     payload["queues"] = _queue_stats(cfg) if running else {"rabbitmq": [], "bull": []}
+    payload["requests"] = _request_counts(cfg) if running else {}
 
     human_lines = [
         f"firecrawl: {'running' if running else 'stopped'} at {state.get('api_url', '?')}",
@@ -314,19 +315,27 @@ def status(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> dict[str, Any]
             f"cpu={stats.get('cpu_pct', '?'):<7} "
             f"mem={stats.get('mem_usage', '?')}"
         )
+    req = payload.get("requests", {})
+    if req:
+        human_lines.append(
+            f"  requests served: {req.get('lifetime', '?')} lifetime, "
+            f"{req.get('last_hour', '?')} in last hour"
+        )
+
     queues = payload["queues"]
     rmq_qs = queues.get("rabbitmq") or []
     bull_qs = queues.get("bull") or []
     if rmq_qs or bull_qs:
+        # Shared name-column width across both blocks so the first
+        # value column (RabbitMQ "pending=" / Bull "active=") lines
+        # up vertically across the two sections — visually treats
+        # them as one logical table.
+        name_w = max((len(q["name"]) for q in rmq_qs + bull_qs), default=12)
         if rmq_qs:
-            # Compute column width from actual data so a short queue
-            # name like "extract.jobs" doesn't sit in 30 chars of
-            # trailing whitespace before the next column.
-            rmq_name_w = max(len(q["name"]) for q in rmq_qs)
             human_lines.append("  queues (RabbitMQ — current depth):")
             for q in rmq_qs:
                 human_lines.append(
-                    f"    {q['name']:<{rmq_name_w}}  "
+                    f"    {q['name']:<{name_w}}  "
                     f"pending={q['pending']:<3}  "
                     f"in-flight={q['in_flight']:<3}  "
                     f"consumers={q['consumers']}"
@@ -335,7 +344,6 @@ def status(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> dict[str, Any]
             bull_any = any(
                 any(q.get(k, 0) for k in ("active", "completed", "failed", "wait")) for q in bull_qs
             )
-            bull_name_w = max(len(q["name"]) for q in bull_qs)
             human_lines.append(
                 "  queues (Bull / redis — lifetime totals):"
                 if bull_any
@@ -343,7 +351,7 @@ def status(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> dict[str, Any]
             )
             for q in bull_qs:
                 human_lines.append(
-                    f"    {q['name']:<{bull_name_w}}  "
+                    f"    {q['name']:<{name_w}}  "
                     f"active={q.get('active', 0):<3}  "
                     f"completed={q.get('completed', 0):<4}  "
                     f"failed={q.get('failed', 0):<3}  "
@@ -817,6 +825,51 @@ def _rate_limit_snapshot(cfg: AgentsConfig) -> dict[str, int]:
             continue
         counters[mode] = counters.get(mode, 0) + int(token)
     return counters
+
+
+def _request_counts(cfg: AgentsConfig) -> dict[str, int]:
+    """Count completed api requests from firecrawl-api container logs.
+
+    Why log-grep and not a metrics endpoint? The synchronous
+    ``v1/scrape`` / ``v1/extract`` paths bypass the queue
+    infrastructure entirely — controller handles them in-process,
+    calls playwright, returns. They never touch the rabbitmq or
+    redis queues we report depth for, so queue stats always show
+    zero even under load. Firecrawl's api emits a
+    ``"request completed"`` log line once per finished request,
+    which is the most reliable signal that "real traffic flowed
+    through this stack" for the synchronous paths.
+
+    Brittle to upstream log-format changes — the markers we grep for
+    (``"request completed"``) might rename across versions. When that
+    happens the counts go to zero; queue stats and container CPU%
+    are the unaffected fallbacks.
+
+    Returns ``{lifetime, last_hour}`` — both are counts of
+    request-completion lines since the api container started (lifetime)
+    and in the last 60 minutes (last_hour).
+    """
+    out: dict[str, int] = {"lifetime": 0, "last_hour": 0}
+
+    full = mp.exec_in_vm(cfg.vm.name, "docker", "logs", "firecrawl-api", check=False)
+    if full.returncode == 0:
+        haystack = (full.stdout or "") + (full.stderr or "")
+        out["lifetime"] = haystack.count("request completed")
+
+    recent = mp.exec_in_vm(
+        cfg.vm.name,
+        "docker",
+        "logs",
+        "--since",
+        "1h",
+        "firecrawl-api",
+        check=False,
+    )
+    if recent.returncode == 0:
+        haystack = (recent.stdout or "") + (recent.stderr or "")
+        out["last_hour"] = haystack.count("request completed")
+
+    return out
 
 
 def _queue_stats(cfg: AgentsConfig) -> dict[str, list[dict[str, Any]]]:
