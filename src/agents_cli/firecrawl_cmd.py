@@ -302,35 +302,47 @@ def status(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> dict[str, Any]
     payload["rate_limits"] = _rate_limit_snapshot(cfg) if running else {}
     payload["queues"] = _queue_stats(cfg) if running else {"rabbitmq": [], "bull": []}
     payload["requests"] = _request_counts(cfg) if running else {}
+    payload["saturation"] = _saturation(payload["containers"]) if running else {}
+
+    # One name-column width shared across containers + both queue
+    # blocks. Makes "running", "pending=", "active=" all start at the
+    # same horizontal position — the three sections read as one
+    # logical table.
+    queues = payload["queues"]
+    rmq_qs = queues.get("rabbitmq") or []
+    bull_qs = queues.get("bull") or []
+    name_w = max(
+        (
+            *(len(s) for s in payload["containers"]),
+            *(len(q["name"]) for q in rmq_qs + bull_qs),
+            12,  # floor for short-name-only runs
+        ),
+    )
 
     human_lines = [
         f"firecrawl: {'running' if running else 'stopped'} at {state.get('api_url', '?')}",
         f"  wired agents: {', '.join(wired) or '(none)'}",
         f"  api health:   {payload['api_health']}",
-        "  containers:",
     ]
-    for svc, stats in payload["containers"].items():
-        human_lines.append(
-            f"    {svc:<22} {stats['state']:<10} "
-            f"cpu={stats.get('cpu_pct', '?'):<7} "
-            f"mem={stats.get('mem_usage', '?')}"
-        )
     req = payload.get("requests", {})
     if req:
         human_lines.append(
             f"  requests served: {req.get('lifetime', '?')} lifetime, "
             f"{req.get('last_hour', '?')} in last hour"
         )
+    sat = payload.get("saturation", {})
+    if sat:
+        human_lines.append(f"  saturation:   {sat['message']}")
 
-    queues = payload["queues"]
-    rmq_qs = queues.get("rabbitmq") or []
-    bull_qs = queues.get("bull") or []
+    human_lines.append("  containers:")
+    for svc, stats in payload["containers"].items():
+        human_lines.append(
+            f"    {svc:<{name_w}}  {stats['state']:<8}  "
+            f"cpu={stats.get('cpu_pct', '?'):<7} "
+            f"mem={stats.get('mem_usage', '?')}"
+        )
+
     if rmq_qs or bull_qs:
-        # Shared name-column width across both blocks so the first
-        # value column (RabbitMQ "pending=" / Bull "active=") lines
-        # up vertically across the two sections — visually treats
-        # them as one logical table.
-        name_w = max((len(q["name"]) for q in rmq_qs + bull_qs), default=12)
         if rmq_qs:
             human_lines.append("  queues (RabbitMQ — current depth):")
             for q in rmq_qs:
@@ -369,15 +381,10 @@ def status(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> dict[str, Any]
         # auth middleware before any `consume()` call, so the in-source
         # caps (scrape=100/min etc) never fire either. Effectively
         # unbounded. Verified empirically: 30 parallel scrapes return
-        # 30x 200s with zero 429s. Real saturation manifests as
-        # container resource pressure (CPU% / mem) above, not as 429s.
+        # 30x 200s with zero 429s.
         human_lines.append(
             "  rate-limit counters: not tracked — auth disabled, "
             "in-source caps are not enforced either."
-        )
-        human_lines.append(
-            "  saturation signals: watch the container CPU% + mem above; "
-            "playwright OOM = real ceiling."
         )
     ui.emit(payload, human="\n".join(human_lines))
     return payload
@@ -825,6 +832,68 @@ def _rate_limit_snapshot(cfg: AgentsConfig) -> dict[str, int]:
             continue
         counters[mode] = counters.get(mode, 0) + int(token)
     return counters
+
+
+def _saturation(containers: dict[str, dict[str, str]]) -> dict[str, Any]:
+    """Turn per-container memory % into a single ok/warn/critical signal.
+
+    Memory is the right axis: rate limits aren't enforced in
+    auth-disabled mode (so 429s never fire), and CPU spikes during a
+    scrape are normal and harmless. Sustained memory pressure → OOM
+    kill → broken stack. Playwright is the usual offender (chromium
+    + page contexts).
+
+    Thresholds (against each container's compose ``mem_limit``):
+
+    - **critical** ≥ 95% — OOM imminent, raise the limit NOW.
+    - **warn**     ≥ 80% — headroom is thin; bump the limit or
+      reduce concurrency.
+    - **ok**       < 80% — fine.
+
+    Reports the WORST container, since one bad actor is enough to
+    take the stack down. Returns ``{level, worst_service,
+    worst_pct, message}`` — JSON consumers get the structured form,
+    humans get the message.
+    """
+    worst_pct = 0.0
+    worst_svc = ""
+    for svc, stats in containers.items():
+        mem_pct_str = stats.get("mem_pct", "")
+        if not mem_pct_str:
+            continue
+        try:
+            pct = float(str(mem_pct_str).rstrip("%"))
+        except ValueError:
+            continue
+        if pct > worst_pct:
+            worst_pct = pct
+            worst_svc = svc
+
+    short = worst_svc.removeprefix("firecrawl-") or worst_svc
+    if worst_pct >= 95.0:
+        level, msg = (
+            "critical",
+            f"CRITICAL — {short} at {worst_pct:.0f}% mem; raise its mem_limit now (OOM imminent)",
+        )
+    elif worst_pct >= 80.0:
+        level, msg = (
+            "warn",
+            f"WARN — {short} at {worst_pct:.0f}% mem; thin headroom, consider raising mem_limit",
+        )
+    elif worst_svc:
+        level, msg = (
+            "ok",
+            f"OK (worst: {short} at {worst_pct:.0f}% mem)",
+        )
+    else:
+        level, msg = "unknown", "unknown (no docker stats data)"
+
+    return {
+        "level": level,
+        "worst_service": worst_svc,
+        "worst_mem_pct": worst_pct,
+        "message": msg,
+    }
 
 
 def _request_counts(cfg: AgentsConfig) -> dict[str, int]:

@@ -530,6 +530,41 @@ def test_queue_stats_parses_rabbitmqctl_and_redis(cfg: AgentsConfig, mocker: Any
     assert precrawl["active"] == 0
 
 
+@pytest.mark.parametrize(
+    "worst_mem_pct,expected_level",
+    [
+        (45.0, "ok"),
+        (79.9, "ok"),
+        (80.0, "warn"),
+        (90.0, "warn"),
+        (95.0, "critical"),
+        (99.9, "critical"),
+    ],
+)
+def test_saturation_classifies_worst_container(worst_mem_pct: float, expected_level: str) -> None:
+    """The classifier picks the WORST container's mem_pct as the signal.
+    Fixture: api gets the test value, others are intentionally lower.
+    """
+    containers = {
+        "firecrawl-api": {"state": "running", "mem_pct": f"{worst_mem_pct}%"},
+        "firecrawl-playwright": {"state": "running", "mem_pct": "10%"},
+        "firecrawl-redis": {"state": "running", "mem_pct": "5%"},
+    }
+    sat = firecrawl_cmd._saturation(containers)
+    assert sat["level"] == expected_level
+    assert sat["worst_service"] == "firecrawl-api"
+    assert sat["worst_mem_pct"] == worst_mem_pct
+
+
+def test_saturation_handles_missing_mem_pct() -> None:
+    """Containers with no mem_pct field (e.g. simulator returning bare
+    state) shouldn't crash the classifier — they get treated as 0.
+    """
+    containers = {"firecrawl-api": {"state": "absent"}}
+    sat = firecrawl_cmd._saturation(containers)
+    assert sat["level"] == "unknown"
+
+
 def test_queue_stats_handles_rabbitmq_unavailable(cfg: AgentsConfig, mocker: Any) -> None:
     """If rabbitmqctl can't be exec'd (container down, image lacks the
     tool, etc.), we still return a well-formed dict with empty
