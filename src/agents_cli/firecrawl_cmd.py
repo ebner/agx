@@ -300,6 +300,7 @@ def status(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> dict[str, Any]
     payload["containers"] = _container_stats(cfg, services)
     payload["api_health"] = _api_health(cfg)
     payload["rate_limits"] = _rate_limit_snapshot(cfg) if running else {}
+    payload["queues"] = _queue_stats(cfg) if running else {"rabbitmq": [], "bull": []}
 
     human_lines = [
         f"firecrawl: {'running' if running else 'stopped'} at {state.get('api_url', '?')}",
@@ -313,6 +314,32 @@ def status(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> dict[str, Any]
             f"cpu={stats.get('cpu_pct', '?'):<7} "
             f"mem={stats.get('mem_usage', '?')}"
         )
+    queues = payload["queues"]
+    if queues.get("rabbitmq") or queues.get("bull"):
+        human_lines.append("  queues (RabbitMQ — current depth):")
+        for q in queues.get("rabbitmq", []):
+            human_lines.append(
+                f"    {q['name']:<35} pending={q['pending']:<3}  "
+                f"in-flight={q['in_flight']:<3}  consumers={q['consumers']}"
+            )
+        bull_any = any(
+            any(q.get(k, 0) for k in ("active", "completed", "failed", "wait"))
+            for q in queues.get("bull", [])
+        )
+        if queues.get("bull"):
+            human_lines.append(
+                "  queues (Bull / redis — lifetime totals):"
+                if bull_any
+                else "  queues (Bull / redis — lifetime totals, all idle):"
+            )
+            for q in queues.get("bull", []):
+                human_lines.append(
+                    f"    {q['name']:<22} active={q.get('active', 0):<3}  "
+                    f"completed={q.get('completed', 0):<4}  "
+                    f"failed={q.get('failed', 0):<3}  "
+                    f"waiting={q.get('wait', 0)}"
+                )
+
     rl = payload["rate_limits"]
     if rl:
         human_lines.append("  rate-limit usage (current window):")
@@ -780,6 +807,118 @@ def _rate_limit_snapshot(cfg: AgentsConfig) -> dict[str, int]:
             continue
         counters[mode] = counters.get(mode, 0) + int(token)
     return counters
+
+
+def _queue_stats(cfg: AgentsConfig) -> dict[str, list[dict[str, Any]]]:
+    """Queue-depth + consumer + lifetime-totals snapshot.
+
+    Two sources because firecrawl is mid-migration between queue
+    backends:
+
+    - **RabbitMQ** carries the modern NUQ-based paths
+      (``extract.jobs``, ``extract.dlq``, plus ``nuq.queue_*.prefetch``
+      internal buffers). Returns *current depth* (pending /
+      in-flight / consumers) via ``rabbitmqctl list_queues``.
+      Historical totals aren't reliably populated via mgmt-plugin
+      ``message_stats`` for these queues (NUQ's framing bypasses
+      standard rabbitmq accounting), so we report only what's
+      trustworthy.
+
+    - **Bull (redis)** carries the legacy / less-trafficked paths
+      (``precrawlQueue``, ``billingQueue``, ``generateLlmsTxtQueue``,
+      ``deepResearchQueue``). For these, redis stores per-queue
+      ``:wait`` / ``:active`` / ``:completed`` / ``:failed`` lists
+      and sets — Bull doesn't auto-trim ``:completed`` by default, so
+      LLEN gives a usable "how many jobs have completed since this
+      redis came up" counter.
+
+    Internal NUQ prefetch queues are filtered out — they're transient
+    framing buffers, not user-meaningful work.
+    """
+    out: dict[str, list[dict[str, Any]]] = {"rabbitmq": [], "bull": []}
+
+    rmq = mp.exec_in_vm(
+        cfg.vm.name,
+        "docker",
+        "exec",
+        "firecrawl-rabbitmq",
+        "rabbitmqctl",
+        "list_queues",
+        "--quiet",
+        "name",
+        "messages",
+        "messages_ready",
+        "messages_unacknowledged",
+        "consumers",
+        check=False,
+    )
+    if rmq.returncode == 0:
+        for raw_line in rmq.stdout.splitlines():
+            parts = raw_line.split("\t")
+            if len(parts) < 5 or parts[0] == "name":
+                continue
+            name = parts[0]
+            # `nuq.queue_*.prefetch` are NUQ-internal in-flight buffers
+            # — always 0 with 0 consumers. Skip for human output but
+            # keep them in JSON so anyone debugging can still see them.
+            try:
+                total, ready, unacked, consumers = (int(x or 0) for x in parts[1:5])
+            except ValueError:
+                continue
+            if name.startswith("nuq.") and ".prefetch" in name:
+                continue
+            out["rabbitmq"].append(
+                {
+                    "name": name,
+                    "total": total,
+                    "pending": ready,
+                    "in_flight": unacked,
+                    "consumers": consumers,
+                }
+            )
+
+    bull_queues = (
+        "precrawlQueue",
+        "billingQueue",
+        "generateLlmsTxtQueue",
+        "deepResearchQueue",
+    )
+    for queue in bull_queues:
+        stats: dict[str, Any] = {"name": queue}
+        for state in ("wait", "active", "completed", "failed", "delayed"):
+            # Bull uses lists for some states (wait/completed/failed)
+            # and sets for others (active/delayed) — LLEN returns 0 on
+            # a key that's a set, so try ZCARD as a fallback.
+            r = mp.exec_in_vm(
+                cfg.vm.name,
+                "docker",
+                "exec",
+                "firecrawl-redis",
+                "redis-cli",
+                "LLEN",
+                f"bull:{{{queue}}}:{state}",
+                check=False,
+            )
+            n = 0
+            if r.returncode == 0 and r.stdout.strip().lstrip("-").isdigit():
+                n = int(r.stdout.strip())
+            if n == 0:
+                z = mp.exec_in_vm(
+                    cfg.vm.name,
+                    "docker",
+                    "exec",
+                    "firecrawl-redis",
+                    "redis-cli",
+                    "ZCARD",
+                    f"bull:{{{queue}}}:{state}",
+                    check=False,
+                )
+                if z.returncode == 0 and z.stdout.strip().lstrip("-").isdigit():
+                    n = max(n, int(z.stdout.strip()))
+            stats[state] = n
+        out["bull"].append(stats)
+
+    return out
 
 
 def _firecrawl_services_in_compose(cfg: AgentsConfig) -> list[str]:

@@ -172,6 +172,16 @@ zero 429s. **Real saturation manifests as container resource
 pressure**, not as 429s. Watch CPU% and memory in the `containers`
 section — playwright OOM is the practical ceiling.
 
+The `queues` section gives both **current depth** (RabbitMQ — modern
+NUQ scrape/crawl path) and **lifetime totals** (Bull / redis — legacy
+queues for precrawl, billing, llms-txt, deepresearch). RabbitMQ's
+`pending` + `in-flight` + `consumers` tell you whether work is
+backlogged or actively flowing; Bull's `completed` + `failed` track
+lifetime job counts since the redis instance came up (Bull doesn't
+auto-trim, so these accumulate). NUQ-internal `prefetch` queues are
+filtered out of the human view since they're transient framing
+buffers — included in the `--json` payload for debugging.
+
 ## Self-hosted Firecrawl
 
 One Firecrawl deployment per VM, shared across every Hermes agent the

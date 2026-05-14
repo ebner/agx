@@ -465,3 +465,86 @@ def test_status_includes_containers_and_api_health(
     assert expected_services.issubset(info["containers"].keys())
     assert info["api_health"] in {"healthy", "unhealthy", "unknown"}
     assert "rate_limits" in info
+    assert "queues" in info
+
+
+def test_queue_stats_parses_rabbitmqctl_and_redis(cfg: AgentsConfig, mocker: Any) -> None:
+    """Direct unit test of `_queue_stats` parsing logic — feed it
+    realistic rabbitmqctl + redis-cli outputs and verify the dict
+    shape.
+    """
+
+    # Live `rabbitmqctl list_queues --quiet` is TSV.
+    rmq_output = (
+        "extract.jobs\t0\t0\t0\t1\n"
+        "nuq.queue_scrape.prefetch\t0\t0\t0\t0\n"
+        "extract.dlq\t2\t1\t1\t1\n"
+        "nuq.queue_crawl_finished.prefetch\t0\t0\t0\t0\n"
+    )
+
+    def runner(vm_name: str, *cmd: str, check: bool = True) -> MpResult:
+        # `rabbitmqctl list_queues ...`
+        if "rabbitmqctl" in cmd:
+            return _ok(rmq_output)
+        # `redis-cli LLEN bull:{<queue>}:<state>`
+        if "redis-cli" in cmd and "LLEN" in cmd:
+            key = cmd[-1]
+            # Fixture: precrawlQueue has 5 completed jobs, others empty.
+            if key == "bull:{precrawlQueue}:completed":
+                return _ok("5\n")
+            return _ok("0\n")
+        # `redis-cli ZCARD ...` fallback path
+        if "redis-cli" in cmd and "ZCARD" in cmd:
+            return _ok("0\n")
+        return _ok("")
+
+    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=runner)
+
+    stats = firecrawl_cmd._queue_stats(cfg)
+
+    # RabbitMQ: prefetch queues are filtered out of the human-relevant list.
+    rmq_names = [q["name"] for q in stats["rabbitmq"]]
+    assert "extract.jobs" in rmq_names
+    assert "extract.dlq" in rmq_names
+    assert all("prefetch" not in n for n in rmq_names)
+
+    dlq = next(q for q in stats["rabbitmq"] if q["name"] == "extract.dlq")
+    assert dlq == {
+        "name": "extract.dlq",
+        "total": 2,
+        "pending": 1,
+        "in_flight": 1,
+        "consumers": 1,
+    }
+
+    # Bull: all four queues listed; precrawlQueue has completed=5.
+    bull_names = [q["name"] for q in stats["bull"]]
+    assert bull_names == [
+        "precrawlQueue",
+        "billingQueue",
+        "generateLlmsTxtQueue",
+        "deepResearchQueue",
+    ]
+    precrawl = next(q for q in stats["bull"] if q["name"] == "precrawlQueue")
+    assert precrawl["completed"] == 5
+    assert precrawl["active"] == 0
+
+
+def test_queue_stats_handles_rabbitmq_unavailable(cfg: AgentsConfig, mocker: Any) -> None:
+    """If rabbitmqctl can't be exec'd (container down, image lacks the
+    tool, etc.), we still return a well-formed dict with empty
+    rabbitmq list and best-effort Bull stats.
+    """
+
+    def runner(vm_name: str, *cmd: str, check: bool = True) -> MpResult:
+        if "rabbitmqctl" in cmd:
+            return MpResult(stdout="", stderr="not running", returncode=1)
+        if "redis-cli" in cmd:
+            return _ok("0\n")
+        return _ok("")
+
+    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=runner)
+    stats = firecrawl_cmd._queue_stats(cfg)
+    assert stats["rabbitmq"] == []
+    # Bull still gets a slot per queue even when redis returns 0.
+    assert len(stats["bull"]) == 4
