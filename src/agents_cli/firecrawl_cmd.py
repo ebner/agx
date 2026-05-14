@@ -315,26 +315,36 @@ def status(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> dict[str, Any]
             f"mem={stats.get('mem_usage', '?')}"
         )
     queues = payload["queues"]
-    if queues.get("rabbitmq") or queues.get("bull"):
-        human_lines.append("  queues (RabbitMQ — current depth):")
-        for q in queues.get("rabbitmq", []):
-            human_lines.append(
-                f"    {q['name']:<35} pending={q['pending']:<3}  "
-                f"in-flight={q['in_flight']:<3}  consumers={q['consumers']}"
+    rmq_qs = queues.get("rabbitmq") or []
+    bull_qs = queues.get("bull") or []
+    if rmq_qs or bull_qs:
+        if rmq_qs:
+            # Compute column width from actual data so a short queue
+            # name like "extract.jobs" doesn't sit in 30 chars of
+            # trailing whitespace before the next column.
+            rmq_name_w = max(len(q["name"]) for q in rmq_qs)
+            human_lines.append("  queues (RabbitMQ — current depth):")
+            for q in rmq_qs:
+                human_lines.append(
+                    f"    {q['name']:<{rmq_name_w}}  "
+                    f"pending={q['pending']:<3}  "
+                    f"in-flight={q['in_flight']:<3}  "
+                    f"consumers={q['consumers']}"
+                )
+        if bull_qs:
+            bull_any = any(
+                any(q.get(k, 0) for k in ("active", "completed", "failed", "wait")) for q in bull_qs
             )
-        bull_any = any(
-            any(q.get(k, 0) for k in ("active", "completed", "failed", "wait"))
-            for q in queues.get("bull", [])
-        )
-        if queues.get("bull"):
+            bull_name_w = max(len(q["name"]) for q in bull_qs)
             human_lines.append(
                 "  queues (Bull / redis — lifetime totals):"
                 if bull_any
                 else "  queues (Bull / redis — lifetime totals, all idle):"
             )
-            for q in queues.get("bull", []):
+            for q in bull_qs:
                 human_lines.append(
-                    f"    {q['name']:<22} active={q.get('active', 0):<3}  "
+                    f"    {q['name']:<{bull_name_w}}  "
+                    f"active={q.get('active', 0):<3}  "
                     f"completed={q.get('completed', 0):<4}  "
                     f"failed={q.get('failed', 0):<3}  "
                     f"waiting={q.get('wait', 0)}"
