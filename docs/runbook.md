@@ -131,11 +131,44 @@ This is the one-shot fix:
    can traverse the dir even when the entrypoint failed to align
    hermes (band-aid for the worst case). Per-file modes are untouched
    — secrets at mode 600 (`auth.json`, `auth.lock`) stay private.
+7. `chown` of image-baked paths the runtime user writes into — see
+   below.
 
 When the entrypoint succeeded, output is `ok` and hermes uid = 1000.
 When it didn't, output is `PARTIAL`: traversal works, but the
 underlying image issue persists and you should investigate the
 entrypoint of your pinned Hermes image tag.
+
+### Image-baked paths the runtime user writes into
+
+`/opt/data` is mounted from the host (so its perms persist), but
+Hermes also writes into image-baked paths *inside* the container's
+overlay filesystem — and those get wiped on every recreate.
+
+The two known targets:
+
+- `/opt/hermes/scripts/` — where `hermes setup` installs per-bridge
+  helpers (e.g. the WhatsApp bridge's `npm install` lands at
+  `whatsapp-bridge/node_modules/`). Image-baked root-owned by
+  default. Without a chown to uid 1000, `hermes setup` (or a
+  re-run of one of its install branches) hits `EACCES: permission
+  denied, mkdir '/opt/hermes/scripts/whatsapp-bridge/node_modules'`.
+- `/home/hermes/` — the runtime user's home. npm cache, pip cache,
+  browser cache, dotfiles. The image's `usermod -u 1000 hermes`
+  doesn't migrate the existing home dir, so it stays at the
+  image-baked ownership.
+
+The toolkit auto-chowns both after every container recreate (in
+`fixperms_cmd.chown_hermes_install_paths`) from three code paths:
+`agents create` (service_up phase), `agents fix-perms`, and
+`agents reseat`. The recursive chown prunes the Codex import
+bridge at `/home/hermes/.codex` (which is `:ro` and would otherwise
+emit "Read-only file system" on every entry).
+
+If you ever see an `EACCES` on a path inside `/opt/hermes/` or
+`/home/hermes/` that *isn't* in this list, add it to
+`fixperms_cmd.HERMES_WRITABLE_PATHS` (with prune entries for any
+ro bind-mounts under it) rather than chowning manually.
 
 ## Observability
 

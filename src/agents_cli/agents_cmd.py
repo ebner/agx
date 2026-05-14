@@ -22,7 +22,7 @@ from agents_cli import compose, compose_runner, mp, ui
 from agents_cli import config as cfg_mod
 from agents_cli.compose import HERMES_IMAGE_BASE, OPENCLAW_IMAGE_BASE
 from agents_cli.config import AgentsConfig
-from agents_cli.errors import UserError
+from agents_cli.errors import RuntimeFailure, UserError
 from agents_cli.journal import Journal
 
 AGENT_TYPES = ("hermes", "openclaw")
@@ -209,12 +209,26 @@ def create(
                 _add_service_to_compose(cfg, name, agent_type, svc, port, tag)
             elif phase == "service_up":
                 compose_runner.up(cfg, svc)
-                # If firecrawl is already up project-wide, auto-wire
-                # the new Hermes agent's terminal.env_passthrough so
-                # the LLM's sandboxed shell tool sees the existing
-                # FIRECRAWL_API_KEY / FIRECRAWL_API_URL env vars.
-                # No-op for OpenClaw and when firecrawl isn't installed.
                 if agent_type == "hermes":
+                    # Auto-chown the image-baked paths Hermes' setup
+                    # wizard writes into (e.g. /opt/hermes/scripts/
+                    # for bridge npm-installs, /home/hermes/ for npm
+                    # cache) so first-run `hermes setup` doesn't hit
+                    # EACCES on its install branches. Lost on every
+                    # container recreate — re-applied by fix-perms
+                    # and reseat. See fixperms_cmd.HERMES_WRITABLE_PATHS.
+                    from agents_cli import fixperms_cmd
+
+                    try:
+                        huid = fixperms_cmd.container_hermes_uid(cfg, svc)
+                    except RuntimeFailure:
+                        huid = 1000  # best-effort; entrypoint usually maps to 1000
+                    fixperms_cmd.chown_hermes_install_paths(cfg, svc, huid)
+                    # If firecrawl is already up project-wide, auto-wire
+                    # the new Hermes agent's terminal.env_passthrough so
+                    # the LLM's sandboxed shell tool sees the existing
+                    # FIRECRAWL_API_KEY / FIRECRAWL_API_URL env vars.
+                    # No-op when firecrawl isn't installed.
                     from agents_cli import firecrawl_cmd
 
                     firecrawl_cmd.ensure_agent_wired(cfg, name)
@@ -616,6 +630,7 @@ def reseat(
             huid = fixperms_cmd.container_hermes_uid(cfg, svc)
             fixperms_cmd.chown_data_dir(cfg, svc, huid)
             fixperms_cmd.chmod_data_dir_traversable(cfg, svc)
+            fixperms_cmd.chown_hermes_install_paths(cfg, svc, huid)
 
     payload: dict[str, object] = {
         "name": name,

@@ -78,6 +78,7 @@ def fix_perms(
         huid = container_hermes_uid(cfg, svc)
         chown_data_dir(cfg, svc, huid)
         chmod_data_dir_traversable(cfg, svc)
+        chown_hermes_install_paths(cfg, svc, huid)
 
     aligned = huid == RUNTIME_UID
     payload = {
@@ -157,6 +158,86 @@ def chown_data_dir(cfg: AgentsConfig, svc: str, uid: int) -> None:
     )
     if result.returncode != 0:
         raise RuntimeFailure(f"chown -R {uid}:{uid} /opt/data failed: {result.stderr.strip()}")
+
+
+HERMES_WRITABLE_PATHS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    # (target, paths-to-prune). `find -path <prune> -prune` keeps the
+    # chown from touching read-only bind-mounts the toolkit owns
+    # — notably the Codex import bridge at /home/hermes/.codex,
+    # which is mounted :ro and would emit "Read-only file system"
+    # on every entry without the prune.
+    #
+    # Where Hermes' `setup` wizard installs per-bridge helpers (e.g.
+    # whatsapp-bridge → npm install target). Image-baked at build,
+    # root-owned by default. uid 1000 needs write here to install.
+    ("/opt/hermes/scripts", ()),
+    # Runtime user's home: npm log/cache (`.npm/`), pip cache,
+    # browser cache, etc. The image's `usermod -u 1000 hermes`
+    # doesn't migrate the home dir, so it stays at the image-baked
+    # ownership and uid 1000 can't drop dotfiles here.
+    ("/home/hermes", ("/home/hermes/.codex",)),
+)
+
+
+def chown_hermes_install_paths(cfg: AgentsConfig, svc: str, uid: int) -> None:
+    """Chown the image-baked paths Hermes itself writes into, to the
+    runtime user — so `hermes setup`'s install branches (WhatsApp
+    bridge npm install, future bridges, npm/pip log caches in
+    `/home/hermes/`) can write without EACCES.
+
+    Best-effort: skips any path that doesn't exist (e.g. older
+    Hermes images may not ship ``/opt/hermes/scripts/``). Failures
+    are logged via :func:`ui.warn` rather than raised — getting one
+    install branch wrong shouldn't block the rest of the recreate
+    flow.
+
+    Lives on the container's overlay filesystem, so it's lost on
+    every force-recreate. Every code path that recreates the
+    container (``agents create``'s service_up phase, ``agents
+    fix-perms``, ``agents reseat``) calls this helper after start.
+    """
+    for path, prunes in HERMES_WRITABLE_PATHS:
+        check = mp.exec_in_vm(
+            cfg.vm.name,
+            *_compose_exec_in_vm_argv(cfg, svc, "test", "-e", path, no_tty=True, as_root=True),
+            check=False,
+        )
+        if check.returncode != 0:
+            continue
+        # `find <path> [ -path <prune> -prune -o ]* -exec chown ... +`
+        # walks the tree, short-circuits each pruned subtree (no descent,
+        # no action on the mountpoint dir entry itself), and chowns
+        # everything else. We need the prune rather than just `-xdev`
+        # because `find -xdev` still emits the mountpoint directory's
+        # own entry — and the resulting chown lands on the mounted
+        # read-only fs, not the parent.
+        prune_clause: list[str] = []
+        for prune_path in prunes:
+            prune_clause.extend(["-path", prune_path, "-prune", "-o"])
+        result = mp.exec_in_vm(
+            cfg.vm.name,
+            *_compose_exec_in_vm_argv(
+                cfg,
+                svc,
+                "find",
+                path,
+                *prune_clause,
+                "-exec",
+                "chown",
+                f"{uid}:{uid}",
+                "{}",
+                "+",
+                no_tty=True,
+                as_root=True,
+            ),
+            check=False,
+        )
+        if result.returncode != 0:
+            ui.warn(
+                f"could not chown {path} in {svc!r}: {result.stderr.strip()}. "
+                f"Some `hermes setup` branches that install into this path may "
+                f"fail; rerun with `agents exec --root` as a workaround."
+            )
 
 
 def chmod_data_dir_traversable(cfg: AgentsConfig, svc: str) -> None:
