@@ -125,6 +125,18 @@ def install_vm_fs_simulation(mocker, cfg: AgentsConfig) -> dict:
                 else:
                     p.unlink(missing_ok=True)
             return _ok()
+        if cmd and cmd[0] == "cat" and len(cmd) >= 2:
+            # `docker compose exec <svc> cat /opt/data/config.yaml` — read
+            # the file the runtime-user-inside-container would see.
+            p = resolve(cmd[1])
+            if not p.exists():
+                return MpResult(
+                    stdout="", stderr=f"cat: {cmd[1]}: No such file or directory\n", returncode=1
+                )
+            try:
+                return _ok(p.read_text(encoding="utf-8"))
+            except OSError as e:
+                return MpResult(stdout="", stderr=f"cat: {cmd[1]}: {e}\n", returncode=1)
         # `docker image inspect <hermes-image>`: simulate the image already
         # present so `_ensure_hermes_image_pulled` skips the pull.
         if (

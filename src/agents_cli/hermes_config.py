@@ -35,7 +35,7 @@ from typing import Any
 
 from ruamel.yaml import YAML
 
-from agents_cli import compose, mp
+from agents_cli import mp
 from agents_cli.config import AgentsConfig
 from agents_cli.errors import UserError
 
@@ -85,19 +85,32 @@ def load(path: Path) -> Any:
 
 
 def read_doc(cfg: AgentsConfig, agent_name: str) -> Any:
-    """Read the agent's config.yaml, transparent to ``--data-dir-in-vm``."""
+    """Read the agent's config.yaml, transparent to ``--data-dir-in-vm``.
+
+    In ``--data-dir-in-vm`` mode goes through ``docker compose exec cat``
+    instead of ``multipass transfer``. The VM-host-side
+    ``<vm_agents_root>/<name>/.data/`` is owned by a rootless-Docker
+    subuid (e.g. host uid 100999 for container uid 1000) under
+    mode 700 — SFTP runs as ``ubuntu`` and can't read it. The runtime
+    user inside the container CAN read it.
+
+    Returns an empty doc if the container isn't running (e.g. during
+    ``agents create``'s ``data_dir_created`` phase before
+    ``service_up``) or the file doesn't exist yet — same fallback the
+    old SFTP path had.
+    """
     if cfg.paths.data_dir_in_vm:
-        host_temp = (
-            compose.host_staging_dir(cfg)
-            / f"hermesconf-read-{os.getpid()}-{uuid.uuid4().hex[:8]}.yml"
+        from agents_cli.ops import _compose_exec_in_vm_argv
+
+        svc = f"hermes-{agent_name}"
+        result = mp.exec_in_vm(
+            cfg.vm.name,
+            *_compose_exec_in_vm_argv(cfg, svc, "cat", container_config_path(), no_tty=True),
+            check=False,
         )
-        try:
-            mp.transfer_from_vm(cfg.vm.name, vm_config_path(cfg, agent_name), host_temp)
-            return load(host_temp)
-        except Exception:
+        if result.returncode != 0:
             return _yaml().load("{}\n")
-        finally:
-            host_temp.unlink(missing_ok=True)
+        return _yaml().load(result.stdout)
     return load(config_path(cfg, agent_name))
 
 

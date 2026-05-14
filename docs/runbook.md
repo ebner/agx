@@ -137,6 +137,38 @@ When it didn't, output is `PARTIAL`: traversal works, but the
 underlying image issue persists and you should investigate the
 entrypoint of your pinned Hermes image tag.
 
+## Observability
+
+### VM health — `agents doctor`
+
+The doctor surface is binary (ok / warn / fail) — drop it in cron and
+alert on warn+ exit codes. Currently checks:
+
+- `vm_reachable`, `mount_round_trip`, `user_docker_service`,
+  `port_conflicts`, `data_dir_exists`, `codex_auth`, journals,
+  per-agent container + docker-socket + hermes-doctor + codex-mount +
+  data-dir-access.
+- `disk_space` — warn < 15% free, fail < 5%.
+- `vm_memory` — warn < 1 GiB available, fail < 256 MiB. Reads
+  `MemAvailable` from `/proc/meminfo` (kernel's reclaim-aware
+  accounting, not raw `free -used`).
+- `vm_load` — warn at load1/cpus > 1.0, fail > 2.0.
+
+Exit codes: 0 (all ok), 3 (any fail).
+
+### Firecrawl observability — `agents firecrawl status`
+
+Snapshot of the running stack: per-container state + cpu% + memory
+use, API health probe (via netcat from a sibling container), redis
+rate-limit counters when present, image digests, list of agents
+wired in. No side effects, safe to poll.
+
+Rate-limit counters only exist when Firecrawl runs with DB auth
+enabled. Self-host defaults to `USE_DB_AUTHENTICATION=false` which
+skips the per-token counter setup entirely; the in-source caps
+(scrape=100/min, crawl=15/min, …) still apply but aren't observable
+via the toolkit.
+
 ## Self-hosted Firecrawl
 
 One Firecrawl deployment per VM, shared across every Hermes agent the

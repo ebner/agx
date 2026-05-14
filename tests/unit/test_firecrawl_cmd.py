@@ -437,3 +437,31 @@ def test_status_reports_wired_agents(
     info = firecrawl_cmd.status(config_path=with_coder)
     assert info["installed"] is True
     assert "coder" in info["wired_agents"]
+
+
+def test_status_includes_containers_and_api_health(
+    with_coder: Path, cfg: AgentsConfig, mocker: Any, vm_fs_mocks: dict[str, Any]
+) -> None:
+    """The richer status surface should include per-container state +
+    api health, even when the simulator returns generic ok for
+    docker stats / nc probes.
+    """
+    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agents_cli.compose_runner.ps", return_value=_ok(""))
+    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+
+    firecrawl_cmd.up(config_path=with_coder)
+    info = firecrawl_cmd.status(config_path=with_coder)
+    assert "containers" in info
+    # All five firecrawl services accounted for, even if the simulator
+    # returned no stats per-container (default `state: "absent"`).
+    expected_services = {
+        "firecrawl-api",
+        "firecrawl-playwright",
+        "firecrawl-redis",
+        "firecrawl-rabbitmq",
+        "firecrawl-postgres",
+    }
+    assert expected_services.issubset(info["containers"].keys())
+    assert info["api_health"] in {"healthy", "unhealthy", "unknown"}
+    assert "rate_limits" in info

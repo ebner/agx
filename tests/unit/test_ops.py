@@ -125,6 +125,16 @@ def _stub_minimal_doctor(mocker, vm_state: str = "Running") -> None:
         # "<mode> <uid>" — return a healthy mode/owner.
         if "stat" in cmd and "/opt/data" in cmd:
             return _ok("755 1000\n")
+        # `cat /proc/meminfo` for the vm_memory check — return a healthy
+        # snapshot (8 GiB total, 4 GiB available).
+        if cmd[:2] == ("cat", "/proc/meminfo"):
+            return _ok("MemTotal: 8388608 kB\nMemAvailable: 4194304 kB\n")
+        # `nproc` for the vm_load check.
+        if cmd[:1] == ("nproc",):
+            return _ok("4\n")
+        # `cat /proc/loadavg` for the vm_load check — return idle load.
+        if cmd[:2] == ("cat", "/proc/loadavg"):
+            return _ok("0.42 0.31 0.25 1/123 4567\n")
         return _ok("ok\n")
 
     mocker.patch("agents_cli.mp.exec_in_vm", side_effect=vm_command)
@@ -208,6 +218,126 @@ def test_doctor_passes_on_healthy_setup(with_coder: Path, mocker) -> None:
     assert not report.failed
 
 
+def test_doctor_memory_check_warns_under_1g_available(with_coder: Path, mocker) -> None:
+    mocker.patch(
+        "agents_cli.mp.info_vm",
+        return_value=_ok(json.dumps({"info": {"agents": {"state": "Running"}}})),
+    )
+
+    def runner(vm_name: str, *cmd: str, check: bool = True) -> MpResult:
+        if "is-active" in " ".join(cmd):
+            return _ok("active\n")
+        if "stat" in cmd and "/opt/data" in cmd:
+            return _ok("755 1000\n")
+        if cmd[:2] == ("cat", "/proc/meminfo"):
+            # 8 GiB total, only 700 MiB available → warn (< 1 GiB)
+            return _ok("MemTotal: 8388608 kB\nMemAvailable: 716800 kB\n")
+        if cmd[:1] == ("nproc",):
+            return _ok("4\n")
+        if cmd[:2] == ("cat", "/proc/loadavg"):
+            return _ok("0.5 0.3 0.2 1/100 999\n")
+        return _ok("ok\n")
+
+    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=runner)
+    mocker.patch(
+        "agents_cli.compose_runner.ps",
+        return_value=_ok(json.dumps([{"Service": "hermes-coder", "State": "running"}])),
+    )
+    report = ops.doctor(config_path=with_coder)
+    [check] = [c for c in report.checks if c.name == "vm_memory"]
+    assert check.status == "warn"
+    assert "available" in check.detail
+
+
+def test_doctor_memory_check_fails_under_256m_available(with_coder: Path, mocker) -> None:
+    mocker.patch(
+        "agents_cli.mp.info_vm",
+        return_value=_ok(json.dumps({"info": {"agents": {"state": "Running"}}})),
+    )
+
+    def runner(vm_name: str, *cmd: str, check: bool = True) -> MpResult:
+        if "is-active" in " ".join(cmd):
+            return _ok("active\n")
+        if "stat" in cmd and "/opt/data" in cmd:
+            return _ok("755 1000\n")
+        if cmd[:2] == ("cat", "/proc/meminfo"):
+            # 8 GiB total, 100 MiB available → fail
+            return _ok("MemTotal: 8388608 kB\nMemAvailable: 102400 kB\n")
+        if cmd[:1] == ("nproc",):
+            return _ok("4\n")
+        if cmd[:2] == ("cat", "/proc/loadavg"):
+            return _ok("0.5 0.3 0.2 1/100 999\n")
+        return _ok("ok\n")
+
+    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=runner)
+    mocker.patch(
+        "agents_cli.compose_runner.ps",
+        return_value=_ok(json.dumps([{"Service": "hermes-coder", "State": "running"}])),
+    )
+    with pytest.raises(HealthCheckFailure):
+        ops.doctor(config_path=with_coder)
+
+
+def test_doctor_load_check_warns_on_saturation(with_coder: Path, mocker) -> None:
+    mocker.patch(
+        "agents_cli.mp.info_vm",
+        return_value=_ok(json.dumps({"info": {"agents": {"state": "Running"}}})),
+    )
+
+    def runner(vm_name: str, *cmd: str, check: bool = True) -> MpResult:
+        if "is-active" in " ".join(cmd):
+            return _ok("active\n")
+        if "stat" in cmd and "/opt/data" in cmd:
+            return _ok("755 1000\n")
+        if cmd[:2] == ("cat", "/proc/meminfo"):
+            return _ok("MemTotal: 8388608 kB\nMemAvailable: 4194304 kB\n")
+        if cmd[:1] == ("nproc",):
+            return _ok("4\n")
+        if cmd[:2] == ("cat", "/proc/loadavg"):
+            # load1=5.0 on 4 cpus → ratio 1.25 → warn
+            return _ok("5.00 4.50 3.80 5/200 1234\n")
+        return _ok("ok\n")
+
+    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=runner)
+    mocker.patch(
+        "agents_cli.compose_runner.ps",
+        return_value=_ok(json.dumps([{"Service": "hermes-coder", "State": "running"}])),
+    )
+    report = ops.doctor(config_path=with_coder)
+    [check] = [c for c in report.checks if c.name == "vm_load"]
+    assert check.status == "warn"
+    assert "load ratio" in check.detail
+
+
+def test_doctor_load_check_fails_on_severe_oversub(with_coder: Path, mocker) -> None:
+    mocker.patch(
+        "agents_cli.mp.info_vm",
+        return_value=_ok(json.dumps({"info": {"agents": {"state": "Running"}}})),
+    )
+
+    def runner(vm_name: str, *cmd: str, check: bool = True) -> MpResult:
+        if "is-active" in " ".join(cmd):
+            return _ok("active\n")
+        if "stat" in cmd and "/opt/data" in cmd:
+            return _ok("755 1000\n")
+        if cmd[:2] == ("cat", "/proc/meminfo"):
+            return _ok("MemTotal: 8388608 kB\nMemAvailable: 4194304 kB\n")
+        if cmd[:1] == ("nproc",):
+            return _ok("4\n")
+        if cmd[:2] == ("cat", "/proc/loadavg"):
+            # load1=10 on 4 cpus → ratio 2.5 → fail
+            return _ok("10.00 9.50 8.80 5/200 1234\n")
+        return _ok("ok\n")
+
+    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=runner)
+    mocker.patch(
+        "agents_cli.compose_runner.ps",
+        return_value=_ok(json.dumps([{"Service": "hermes-coder", "State": "running"}])),
+    )
+    with pytest.raises(HealthCheckFailure):
+        ops.doctor(config_path=with_coder)
+
+
 def test_doctor_flags_data_dir_eacces(with_coder: Path, mocker) -> None:
     """Reproduce the canonical `agents exec` permission failure: stat
     /opt/data returns EACCES because the dir is owned by uid 10000 and
@@ -229,6 +359,12 @@ def test_doctor_flags_data_dir_eacces(with_coder: Path, mocker) -> None:
                 stderr="stat: cannot stat '/opt/data': Permission denied\n",
                 returncode=1,
             )
+        if cmd[:2] == ("cat", "/proc/meminfo"):
+            return _ok("MemTotal: 8388608 kB\nMemAvailable: 4194304 kB\n")
+        if cmd[:1] == ("nproc",):
+            return _ok("4\n")
+        if cmd[:2] == ("cat", "/proc/loadavg"):
+            return _ok("0.42 0.31 0.25 1/123 4567\n")
         return _ok("ok\n")
 
     mocker.patch("agents_cli.mp.exec_in_vm", side_effect=runner)
@@ -255,6 +391,12 @@ def test_doctor_warns_on_data_dir_owner_mismatch(with_coder: Path, mocker) -> No
             return _ok("active\n")
         if "stat" in cmd and "/opt/data" in cmd:
             return _ok("700 10000\n")
+        if cmd[:2] == ("cat", "/proc/meminfo"):
+            return _ok("MemTotal: 8388608 kB\nMemAvailable: 4194304 kB\n")
+        if cmd[:1] == ("nproc",):
+            return _ok("4\n")
+        if cmd[:2] == ("cat", "/proc/loadavg"):
+            return _ok("0.42 0.31 0.25 1/123 4567\n")
         return _ok("ok\n")
 
     mocker.patch("agents_cli.mp.exec_in_vm", side_effect=runner)
@@ -279,6 +421,12 @@ def test_doctor_flags_hermes_doctor_failure(with_coder: Path, mocker) -> None:
         joined = " ".join(cmd)
         if "hermes" in joined and "doctor" in joined:
             return _fail("doctor says no")
+        if cmd[:2] == ("cat", "/proc/meminfo"):
+            return _ok("MemTotal: 8388608 kB\nMemAvailable: 4194304 kB\n")
+        if cmd[:1] == ("nproc",):
+            return _ok("4\n")
+        if cmd[:2] == ("cat", "/proc/loadavg"):
+            return _ok("0.42 0.31 0.25 1/123 4567\n")
         return _ok(stdout="ok\n")
 
     mocker.patch("agents_cli.mp.exec_in_vm", side_effect=conditional_runner)

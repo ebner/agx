@@ -148,6 +148,8 @@ def doctor(
         _check_mount_round_trip(cfg, report)
         _check_user_docker_service(cfg, report)
         _check_disk_space(cfg, report)
+        _check_vm_memory(cfg, report)
+        _check_vm_load(cfg, report)
         _check_journals(cfg, report)
         _check_port_conflicts(cfg, report)
         _check_codex_auth(cfg, report)
@@ -352,6 +354,81 @@ def _check_disk_space(cfg: AgentsConfig, report: DoctorReport) -> None:
         report.add("disk_space", "warn", detail)
     else:
         report.add("disk_space", "ok", detail)
+
+
+def _check_vm_memory(cfg: AgentsConfig, report: DoctorReport) -> None:
+    """Probe the VM's available RAM and warn / fail on tight headroom.
+
+    Uses ``MemAvailable`` from ``/proc/meminfo`` — kernel's accounting of
+    "memory that can be allocated without swapping or reclaim from disk".
+    More accurate than ``free - used`` because it accounts for reclaimable
+    page cache. Thresholds:
+
+    - fail when < 256 MiB available (OOM imminent)
+    - warn when < 1 GiB available (squeezed; firecrawl + multiple
+      Hermes agents will start contesting)
+    """
+    result = mp.exec_in_vm(cfg.vm.name, "cat", "/proc/meminfo", check=False)
+    if result.returncode != 0:
+        report.add("vm_memory", "warn", "could not read /proc/meminfo")
+        return
+    info: dict[str, int] = {}
+    for line in result.stdout.splitlines():
+        if ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        parts = v.strip().split()
+        if parts and parts[0].isdigit():
+            info[k.strip()] = int(parts[0])  # kB
+    total_kb = info.get("MemTotal", 0)
+    avail_kb = info.get("MemAvailable", 0)
+    if total_kb == 0:
+        report.add("vm_memory", "warn", "MemTotal=0 in /proc/meminfo")
+        return
+    avail_mib = avail_kb / 1024
+    total_gib = total_kb / 1024 / 1024
+    used_pct = (1 - avail_kb / total_kb) * 100
+    detail = f"{avail_mib / 1024:.1f} GiB available of {total_gib:.1f} GiB ({used_pct:.0f}% used)"
+    if avail_mib < 256:
+        report.add("vm_memory", "fail", detail)
+    elif avail_mib < 1024:
+        report.add("vm_memory", "warn", detail)
+    else:
+        report.add("vm_memory", "ok", detail)
+
+
+def _check_vm_load(cfg: AgentsConfig, report: DoctorReport) -> None:
+    """1-minute load average vs CPU count.
+
+    Load ratio (load1 / nproc):
+
+    - fail when > 2.0 — sustained 2x oversubscription, things will be
+      noticeably slow.
+    - warn when > 1.0 — fully saturated; one extra task and you queue.
+    """
+    nproc = mp.exec_in_vm(cfg.vm.name, "nproc", check=False)
+    cpus = int(nproc.stdout.strip()) if nproc.returncode == 0 and nproc.stdout.strip() else 1
+    loadavg = mp.exec_in_vm(cfg.vm.name, "cat", "/proc/loadavg", check=False)
+    if loadavg.returncode != 0:
+        report.add("vm_load", "warn", "could not read /proc/loadavg")
+        return
+    parts = loadavg.stdout.strip().split()
+    if not parts:
+        report.add("vm_load", "warn", f"unparseable loadavg: {loadavg.stdout!r}")
+        return
+    try:
+        load1 = float(parts[0])
+    except ValueError:
+        report.add("vm_load", "warn", f"unparseable loadavg: {loadavg.stdout!r}")
+        return
+    ratio = load1 / cpus
+    detail = f"{load1:.2f} (1m) on {cpus} CPU{'s' if cpus != 1 else ''}; load ratio {ratio:.2f}"
+    if ratio > 2.0:
+        report.add("vm_load", "fail", detail)
+    elif ratio > 1.0:
+        report.add("vm_load", "warn", detail)
+    else:
+        report.add("vm_load", "ok", detail)
 
 
 def _check_journals(cfg: AgentsConfig, report: DoctorReport) -> None:

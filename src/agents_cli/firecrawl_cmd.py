@@ -275,12 +275,18 @@ def destroy(
 
 
 def status(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> dict[str, Any]:
+    """Snapshot the firecrawl deployment: per-container resource use,
+    api health probe, redis-side rate-limit counters, image digests,
+    wired agents.
+
+    No side effects — safe to run in tight loops / from cron.
+    """
     cfg = cfg_mod.load(config_path)
     state = read_state(cfg)
     services = list(_firecrawl_services_in_compose(cfg))
     running = bool(services) and _service_running(cfg, "firecrawl-api")
     wired = _list_wired_agents(cfg)
-    payload = {
+    payload: dict[str, Any] = {
         "running": running,
         "installed": bool(services),
         "api_url": state.get("api_url"),
@@ -290,14 +296,41 @@ def status(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> dict[str, Any]
     if not services:
         ui.emit(payload, human="firecrawl: not installed (run `agents firecrawl up`)")
         return payload
-    ui.emit(
-        payload,
-        human=(
-            f"firecrawl: {'running' if running else 'stopped'} at "
-            f"{state.get('api_url', '?')}\n"
-            f"  wired agents: {', '.join(wired) or '(none)'}"
-        ),
-    )
+
+    payload["containers"] = _container_stats(cfg, services)
+    payload["api_health"] = _api_health(cfg)
+    payload["rate_limits"] = _rate_limit_snapshot(cfg) if running else {}
+
+    human_lines = [
+        f"firecrawl: {'running' if running else 'stopped'} at {state.get('api_url', '?')}",
+        f"  wired agents: {', '.join(wired) or '(none)'}",
+        f"  api health:   {payload['api_health']}",
+        "  containers:",
+    ]
+    for svc, stats in payload["containers"].items():
+        human_lines.append(
+            f"    {svc:<22} {stats['state']:<10} "
+            f"cpu={stats.get('cpu_pct', '?'):<7} "
+            f"mem={stats.get('mem_usage', '?')}"
+        )
+    rl = payload["rate_limits"]
+    if rl:
+        human_lines.append("  rate-limit usage (current window):")
+        for mode, n in sorted(rl.items()):
+            human_lines.append(f"    {mode:<22} {n} req/min")
+    else:
+        # When `USE_DB_AUTHENTICATION=false` (the toolkit's default for
+        # self-host), Firecrawl's auth middleware skips the per-token
+        # rate-limiter setup entirely — there are no counter keys in
+        # redis to read. Caps in the api source (e.g. scrape=100/min)
+        # apply only in DB-auth mode. Surface the situation so the
+        # absence of numbers isn't read as "rate-limiter broken".
+        human_lines.append(
+            "  rate-limit counters: not tracked "
+            "(USE_DB_AUTHENTICATION=false skips per-token limiting; "
+            "in-source caps still apply: scrape=100/min, crawl=15/min, …)"
+        )
+    ui.emit(payload, human="\n".join(human_lines))
     return payload
 
 
@@ -574,6 +607,175 @@ def _list_wired_agents(cfg: AgentsConfig) -> list[str]:
         if all(k in passthrough for k in AGENT_PASSTHROUGH_KEYS):
             out.append(agent)
     return out
+
+
+def _container_stats(cfg: AgentsConfig, services: list[str]) -> dict[str, dict[str, str]]:
+    """Per-container resource snapshot via ``docker stats --no-stream``.
+
+    Returns a dict keyed by service name, each entry containing
+    ``state`` (running/stopped), ``cpu_pct`` (e.g. ``"0.5%"``),
+    ``mem_usage`` (e.g. ``"380MiB / 3GiB"``), ``mem_pct``.
+    """
+    out: dict[str, dict[str, str]] = {svc: {"state": "absent"} for svc in services}
+
+    ps = mp.exec_in_vm(
+        cfg.vm.name,
+        "docker",
+        "ps",
+        "-a",
+        "--filter",
+        f"name=^{FIRECRAWL_SERVICE_PREFIX}",
+        "--format",
+        "{{.Names}}\t{{.State}}",
+        check=False,
+    )
+    if ps.returncode == 0:
+        for line in ps.stdout.splitlines():
+            parts = line.strip().split("\t", 1)
+            if len(parts) != 2:
+                continue
+            name, state = parts
+            if name in out:
+                out[name]["state"] = state
+
+    stats = mp.exec_in_vm(
+        cfg.vm.name,
+        "docker",
+        "stats",
+        "--no-stream",
+        "--format",
+        "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}",
+        *services,
+        check=False,
+    )
+    if stats.returncode == 0:
+        for line in stats.stdout.splitlines():
+            parts = line.strip().split("\t")
+            if len(parts) < 4:
+                continue
+            name, cpu, mem, memp = parts[:4]
+            if name in out:
+                out[name].update(cpu_pct=cpu, mem_usage=mem, mem_pct=memp)
+    return out
+
+
+def _api_health(cfg: AgentsConfig) -> str:
+    """Probe ``/v1/health`` on the firecrawl-api over the docker network
+    from a sibling container. Returns ``"healthy"`` / ``"unhealthy"`` /
+    ``"unknown"``.
+
+    Why a sibling? The api image is built ``FROM`` a minimal node base
+    that has no curl or wget — ``docker exec firecrawl-api ...`` to
+    probe localhost won't work. Redis' image has the ``timeout`` +
+    raw-socket utilities; we just connect TCP to firecrawl-api:3002
+    via ``nc`` (busybox netcat in the redis:alpine image).
+    """
+    from agents_cli.ops import _compose_exec_in_vm_argv
+
+    # Use redis-cli's host as a netcat-style probe: redis:alpine ships
+    # busybox netcat. `nc -z` is the standard "is the port open" check.
+    probe = _compose_exec_in_vm_argv(
+        cfg,
+        "firecrawl-redis",
+        "nc",
+        "-z",
+        "-w",
+        "3",
+        "firecrawl-api",
+        "3002",
+        no_tty=True,
+        as_root=True,
+    )
+    result = mp.exec_in_vm(cfg.vm.name, *probe, check=False)
+    if result.returncode == 0:
+        return "healthy"
+    err = (result.stderr or "").lower()
+    if "is not running" in err or "no such" in err:
+        return "unknown"
+    return "unhealthy"
+
+
+def _rate_limit_snapshot(cfg: AgentsConfig) -> dict[str, int]:
+    """Read the rate-limit counters firecrawl maintains in redis.
+
+    ``rate-limiter-flexible`` stores one key per (mode, token) pair as
+    ``<keyPrefix>:<token>`` with the current window's consumed-points
+    count as the value. We aggregate across tokens since self-host
+    typically has a single shared bearer (``USE_DB_AUTHENTICATION=false``).
+
+    Returns ``{mode: total_consumed_in_current_window}``. Empty dict
+    on any redis error (status command must not fail noisily).
+    """
+    from agents_cli.ops import _compose_exec_in_vm_argv
+
+    # KEYS is fine on a self-host single-user redis with a small key
+    # count; the rate-limiter creates O(modes * tokens) keys, at most
+    # a few hundred even in heavy use.
+    result = mp.exec_in_vm(
+        cfg.vm.name,
+        *_compose_exec_in_vm_argv(
+            cfg,
+            "firecrawl-redis",
+            "redis-cli",
+            "--no-raw",
+            "KEYS",
+            "*",
+            no_tty=True,
+            as_root=True,
+        ),
+        check=False,
+    )
+    if result.returncode != 0:
+        return {}
+
+    # rate-limiter-flexible keys look like ``scrape:fc-self-hosted-…``
+    # — mode prefix followed by ``:`` then the bearer token. Skip
+    # everything else (firecrawl also writes its own session keys
+    # which we don't care about for rate-limit snapshots).
+    known_modes = {
+        "scrape",
+        "crawl",
+        "search",
+        "map",
+        "extract",
+        "preview",
+        "crawlStatus",
+        "extractStatus",
+        "browser",
+        "browserExecute",
+        "account",
+    }
+    counters: dict[str, int] = {}
+    for raw in result.stdout.splitlines():
+        key = raw.strip().strip('"')
+        if not key or ":" not in key:
+            continue
+        mode = key.split(":", 1)[0]
+        if mode not in known_modes:
+            continue
+        val = mp.exec_in_vm(
+            cfg.vm.name,
+            *_compose_exec_in_vm_argv(
+                cfg,
+                "firecrawl-redis",
+                "redis-cli",
+                "--no-raw",
+                "GET",
+                key,
+                no_tty=True,
+                as_root=True,
+            ),
+            check=False,
+        )
+        if val.returncode != 0:
+            continue
+        # `redis-cli --no-raw GET` returns either a quoted integer string
+        # ("42") or `(nil)`. Parse defensively.
+        token = val.stdout.strip().strip('"')
+        if not token.lstrip("-").isdigit():
+            continue
+        counters[mode] = counters.get(mode, 0) + int(token)
+    return counters
 
 
 def _firecrawl_services_in_compose(cfg: AgentsConfig) -> list[str]:
