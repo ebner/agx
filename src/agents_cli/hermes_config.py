@@ -5,16 +5,20 @@ file the Hermes container sees at ``$HERMES_HOME/config.yaml``). The
 file is hand-editable, so we round-trip with ruamel.yaml to preserve
 the user's comments and key order.
 
-Write pattern (same contract as compose.py):
+Write pattern (different from ``compose.write_compose_atomically`` —
+this one goes THROUGH the container):
 
 1. Mutate in memory.
-2. Dump to host temp via ``compose.host_staging_dir(cfg)``.
-3. ``multipass transfer`` to a VM-side stage at
-   ``<vm_agents_root>/<name>/.data/config.yaml.<pid>.<uuid>.new``.
-4. Validate by exec'ing ``hermes config validate -f <staged>`` inside
-   the running agent's container.
-5. Atomic same-fs rename inside the VM: ``mv <staged> config.yaml``.
-6. Clean up host temp; rm VM-side stage on any error path.
+2. ``docker compose exec -T <svc> sh -c 'cat > <staged>'`` with the
+   YAML content piped via stdin. Running as the container's runtime
+   user (which owns ``/opt/data`` under rootless Docker) is the only
+   way to write here in ``--data-dir-in-vm`` mode, where the dir is
+   subuid-owned and multipass-SFTP runs as ``ubuntu`` (which isn't
+   the owner).
+3. Validate via ``hermes config validate`` exec'd in the same
+   container.
+4. Atomic same-fs rename inside the container: ``mv <staged> config.yaml``.
+5. RM the staged file on any error path.
 
 The CLI refuses any change that would bind the dashboard to anything
 other than ``127.0.0.1`` / ``localhost`` / ``::1`` — one of the locked
@@ -55,10 +59,21 @@ def config_path(cfg: AgentsConfig, agent_name: str) -> Path:
 
 
 def vm_config_path(cfg: AgentsConfig, agent_name: str) -> str:
-    """The VM-side path of a Hermes agent's config.yaml — what the
-    container sees at ``$HERMES_HOME/config.yaml`` after the bind mount.
+    """VM-host-side path of an agent's config.yaml (the bind-mount source).
+
+    Used by ``read_doc`` in ``--data-dir-in-vm`` mode to pull the file
+    out via ``multipass transfer``. Writes don't go through this path
+    anymore — see :func:`write_atomically`.
     """
     return f"{cfg.paths.vm_agents_root}/{agent_name}/.data/config.yaml"
+
+
+def container_config_path() -> str:
+    """In-container path of the agent's config.yaml — what processes
+    inside the container see at ``$HERMES_HOME/config.yaml``. Used by
+    write paths that go through ``docker compose exec``.
+    """
+    return "/opt/data/config.yaml"
 
 
 def load(path: Path) -> Any:
@@ -93,84 +108,123 @@ def dump(doc: Any) -> str:
 
 
 def write_atomically(cfg: AgentsConfig, agent_name: str, doc: Any) -> None:
-    """Plan-correct write: host-temp → ``multipass transfer`` → validate via
-    ``hermes config validate`` inside the agent's container → VM-side ``mv``.
+    """Atomic write via ``docker compose exec`` inside the running container.
 
-    Falls back to a structural-only check if the container isn't running
-    yet (during ``agents create``, the wizard hasn't started it) — the
-    dashboard refusal still applies in that case.
+    Writes the new content to a staged path inside ``/opt/data`` via
+    ``cat > <staged>`` exec'd as the container's runtime user, validates
+    via ``hermes config validate`` (also exec'd), then ``mv`` to
+    ``config.yaml`` — all within the same filesystem, so the rename is
+    atomic.
+
+    Why not ``multipass transfer`` like ``compose.write_compose_atomically``
+    does for the project-level compose file? Because under rootless
+    Docker, ``/opt/data`` is owned by a subuid (e.g. host uid 100999
+    for container uid 1000) — not by ``ubuntu``. Multipass-SFTP runs
+    as the ``ubuntu`` user and silently can't write to subuid-owned
+    paths (the failure surfaces only on first attempt: ``cannot open
+    remote file ...: Permission denied``). Going through
+    ``docker compose exec`` puts the writer inside the container's
+    user namespace where it owns the dir.
+
+    The container MUST be running. ``agents create`` brings it up
+    during the ``service_up`` phase before the wizard runs, and every
+    later caller (``codex skill-enable``, memory plugin enable,
+    ``agents secret set``) runs against an already-running container.
     """
     validate_dashboard_binding(doc)
 
     if not cfg.vm_runtime.is_populated():
         raise UserError("vm_runtime fields not populated; run `agents vm init` first")
 
+    from agents_cli.ops import _compose_exec_in_vm_argv
+
     pid = os.getpid()
     suffix = uuid.uuid4().hex[:8]
-    vm_target = vm_config_path(cfg, agent_name)
-    vm_stage = f"{vm_target}.{pid}.{suffix}.new"
-    host_temp = compose.host_staging_dir(cfg) / f"hermesconf-{pid}-{suffix}.yml"
+    target = container_config_path()
+    stage = f"{target}.{pid}.{suffix}.new"
+    svc = f"hermes-{agent_name}"
+    content = dump(doc).encode("utf-8")
+
+    # Write the staged file from inside the container. `sh -c 'cat > FILE'`
+    # is the simplest way to get arbitrary content onto disk as the runtime
+    # user; the content is piped via stdin so it never appears on the argv
+    # (avoiding both quoting hell and process-listing leaks for sensitive
+    # config like API keys).
+    write_argv = _compose_exec_in_vm_argv(cfg, svc, "sh", "-c", f"cat > {stage}", no_tty=True)
+    write = mp.exec_in_vm_with_stdin(cfg.vm.name, *write_argv, input_bytes=content, check=False)
+    if write.returncode != 0:
+        err = (write.stderr or "").lower()
+        if any(m in err for m in ("not running", "no such service", "no such container")):
+            raise UserError(
+                f"cannot write {agent_name}'s config.yaml — container "
+                f"{svc!r} is not running. Start it with "
+                f"`agents start {agent_name}` first."
+            )
+        raise UserError(
+            f"failed to stage {agent_name}'s config.yaml inside {svc!r}: "
+            f"{(write.stderr or '').strip() or 'rc=' + str(write.returncode)}"
+        )
 
     try:
-        host_temp.write_text(dump(doc), encoding="utf-8")
-        # Ensure the parent directory exists in the VM (in --data-dir-in-vm
-        # mode the per-agent dir may not exist on the host).
-        mp.exec_in_vm(
-            cfg.vm.name,
-            "mkdir",
-            "-p",
-            f"{cfg.paths.vm_agents_root}/{agent_name}/.data",
-            check=False,
-        )
-        mp.transfer_to_vm(host_temp, cfg.vm.name, vm_stage)
-        _validate_in_container(cfg, agent_name, vm_stage)
-        mp.exec_in_vm(cfg.vm.name, "mv", vm_stage, vm_target)
+        _validate_in_container(cfg, agent_name, stage)
+        mv_argv = _compose_exec_in_vm_argv(cfg, svc, "mv", stage, target, no_tty=True)
+        mp.exec_in_vm(cfg.vm.name, *mv_argv)
     except Exception:
-        mp.exec_in_vm(cfg.vm.name, "rm", "-f", vm_stage, check=False)
+        rm_argv = _compose_exec_in_vm_argv(cfg, svc, "rm", "-f", stage, no_tty=True)
+        mp.exec_in_vm(cfg.vm.name, *rm_argv, check=False)
         raise
-    finally:
-        host_temp.unlink(missing_ok=True)
 
 
 def _validate_in_container(cfg: AgentsConfig, agent_name: str, vm_path: str) -> None:
-    """Exec ``hermes config validate`` against the staged file inside the
-    running container. Best-effort: if the container isn't up, we skip
-    (the structural ``validate_dashboard_binding`` already ran).
+    """Best-effort validation of the staged config file inside the container.
+
+    Hermes' CLI evolved here — older versions had ``hermes config
+    validate``, newer ones use ``hermes config check``. We try each;
+    if NEITHER is available the structural ``validate_dashboard_binding``
+    upstream is the only guard, which is acceptable: every writer
+    goes through this module's helpers that produce well-formed YAML.
+
+    Skipped silently when the container isn't running.
     """
     from agents_cli.ops import _compose_exec_in_vm_argv
 
     svc = f"hermes-{agent_name}"
-    # `hermes config validate` reads from $HERMES_HOME/config.yaml by
-    # default; point it at the staged file by setting HERMES_CONFIG.
     container_stage = f"/opt/data/{Path(vm_path).name}"
-    result = mp.exec_in_vm(
-        cfg.vm.name,
-        *_compose_exec_in_vm_argv(
-            cfg,
-            svc,
-            "hermes",
-            "config",
-            "validate",
-            no_tty=True,
-            env={"HERMES_CONFIG": container_stage},
-        ),
-        check=False,
-    )
-    if result.returncode in (0, None):
-        return
-    # Container not running yet (most likely cause): silently skip;
-    # structural validation already ran. Distinguish from real validation
-    # failures by checking stderr for known "no such service" / "not running"
-    # phrases.
-    err = (result.stderr or "").lower()
-    if any(
-        marker in err
-        for marker in ("not running", "no such service", "no such container", "is not running")
-    ):
-        return
-    raise UserError(
-        f"hermes config validate failed for {agent_name!r}: {result.stderr.strip() or result.stdout.strip()}"
-    )
+
+    for sub in ("check", "validate"):
+        result = mp.exec_in_vm(
+            cfg.vm.name,
+            *_compose_exec_in_vm_argv(
+                cfg,
+                svc,
+                "hermes",
+                "config",
+                sub,
+                no_tty=True,
+                env={"HERMES_CONFIG": container_stage},
+            ),
+            check=False,
+        )
+        if result.returncode in (0, None):
+            return
+        err = (result.stderr or "").lower()
+        if any(
+            marker in err
+            for marker in (
+                "not running",
+                "no such service",
+                "no such container",
+                "is not running",
+            )
+        ):
+            return
+        # Subcommand not recognised → try the next one.
+        if "invalid choice" in err or "usage: hermes config" in err:
+            continue
+        raise UserError(
+            f"hermes config {sub} failed for {agent_name!r}: "
+            f"{result.stderr.strip() or result.stdout.strip()}"
+        )
 
 
 def validate_dashboard_binding(doc: Any) -> None:
@@ -220,6 +274,41 @@ def remove_docker_volume(doc: Any, mapping: str) -> None:
     volumes = terminal.get("docker_volumes") or []
     if mapping in volumes:
         volumes.remove(mapping)
+
+
+# ---------- terminal.env_passthrough (used by secrets_cmd) ----------
+
+
+def add_env_passthrough(doc: Any, key: str) -> None:
+    """Append ``key`` to ``terminal.env_passthrough`` so it forwards into
+    sandboxed shell / execute_code calls. Idempotent.
+
+    Hermes' default ``terminal.env_passthrough: []`` is a security feature:
+    env vars present in the Hermes Python process don't leak into the
+    subprocesses it spawns for the ``terminal`` and ``execute_code``
+    tools unless the user explicitly allowlists them. Per-agent secrets
+    written by ``agents secret set`` need this entry too, otherwise the
+    LLM's own shell-based "is this configured?" diagnostics will report
+    "not set" even though Hermes' built-in tools see the var fine.
+    """
+    terminal = doc.setdefault("terminal", {})
+    passthrough = terminal.setdefault("env_passthrough", [])
+    if key not in passthrough:
+        passthrough.append(key)
+
+
+def remove_env_passthrough(doc: Any, key: str) -> None:
+    """Drop ``key`` from ``terminal.env_passthrough`` if present.
+
+    Used by ``agents secret unset``. Leaving a stale entry would be
+    harmless (the var no longer exists in the container env, so nothing
+    propagates), but removing it keeps the config tidy and avoids
+    confusing future reads.
+    """
+    terminal = doc.get("terminal") or {}
+    passthrough = terminal.get("env_passthrough") or []
+    if key in passthrough:
+        passthrough.remove(key)
 
 
 # ---------- general model.provider helper (informational) ----------

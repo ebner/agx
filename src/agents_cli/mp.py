@@ -141,6 +141,20 @@ def exec_bash(
     )
 
 
+def exec_in_vm_with_stdin(vm: str, *cmd: str, input_bytes: bytes, check: bool = True) -> MpResult:
+    """Run a VM-side command with the given bytes piped to its stdin.
+
+    Used for "write a file from inside a container" — we send the file
+    content via ``docker compose exec -T <svc> sh -c 'cat > <path>'``.
+    Going through the container's user namespace is the only way to
+    write to a path whose underlying directory is owned by a
+    rootless-Docker subuid (the common case in ``--data-dir-in-vm``
+    mode, where multipass-SFTP runs as ``ubuntu`` and can't touch
+    subuid-owned dirs).
+    """
+    return mp("exec", vm, "--", *cmd, check=check, input_bytes=input_bytes)
+
+
 def exec_in_vm_interactive(vm: str, *cmd: str) -> int:
     """Run a command in the VM with stdin/stdout/stderr inherited from
     the parent process — necessary for interactive wizards (``hermes

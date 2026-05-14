@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-from agents_cli import compose, secrets_cmd
+from agents_cli import compose, hermes_config, secrets_cmd
 from agents_cli import config as cfg_mod
 from agents_cli.agents_cmd import create
 from agents_cli.config import (
@@ -268,3 +268,95 @@ def test_all_secret_keys_lists_every_agent(
 def test_list_refuses_unknown_agent(saved_config: Path) -> None:
     with pytest.raises(UserError, match="not in compose"):
         secrets_cmd.list_secrets("ghost", config_path=saved_config)
+
+
+# ---------- terminal.env_passthrough auto-wiring ----------
+#
+# Hermes filters env vars before spawning shell / execute_code
+# subprocesses (terminal.env_passthrough defaults to []). Without this,
+# secrets are visible to Hermes' built-in tools (which read os.environ
+# directly) but NOT to the LLM's shell-based diagnostics — leading to
+# false-negative "not configured" reports. agents secret set must
+# allowlist each key so the full execution surface sees it.
+
+
+def test_set_adds_key_to_terminal_env_passthrough(
+    with_coder: Path, cfg: AgentsConfig, mocker: Any
+) -> None:
+    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    secrets_cmd.set_secret("coder", "FIRECRAWL_API_KEY", "fc-test", config_path=with_coder)
+    doc = hermes_config.load(hermes_config.config_path(cfg, "coder"))
+    passthrough = doc["terminal"]["env_passthrough"]
+    assert "FIRECRAWL_API_KEY" in passthrough
+
+
+def test_set_passthrough_is_idempotent(with_coder: Path, cfg: AgentsConfig, mocker: Any) -> None:
+    """Setting the same secret twice must NOT duplicate the passthrough entry."""
+    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    secrets_cmd.set_secret("coder", "KEY", "v1", config_path=with_coder)
+    secrets_cmd.set_secret("coder", "KEY", "v2", config_path=with_coder)
+    doc = hermes_config.load(hermes_config.config_path(cfg, "coder"))
+    passthrough = doc["terminal"]["env_passthrough"]
+    assert passthrough.count("KEY") == 1
+
+
+def test_set_passthrough_appends_to_existing_entries(
+    with_coder: Path, cfg: AgentsConfig, mocker: Any
+) -> None:
+    """User-managed entries (e.g. via `hermes setup`) must survive."""
+    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    # Pre-populate config.yaml with a manually-added passthrough entry.
+    doc = hermes_config.load(hermes_config.config_path(cfg, "coder"))
+    hermes_config.add_env_passthrough(doc, "TAVILY_API_KEY")
+    hermes_config.write_atomically(cfg, "coder", doc)
+
+    secrets_cmd.set_secret("coder", "FIRECRAWL_API_KEY", "fc", config_path=with_coder)
+
+    doc = hermes_config.load(hermes_config.config_path(cfg, "coder"))
+    passthrough = doc["terminal"]["env_passthrough"]
+    assert "TAVILY_API_KEY" in passthrough
+    assert "FIRECRAWL_API_KEY" in passthrough
+
+
+def test_unset_removes_key_from_passthrough(
+    with_coder: Path, cfg: AgentsConfig, mocker: Any
+) -> None:
+    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    secrets_cmd.set_secret("coder", "DROPME", "v", config_path=with_coder)
+    secrets_cmd.unset_secret("coder", "DROPME", config_path=with_coder)
+    doc = hermes_config.load(hermes_config.config_path(cfg, "coder"))
+    passthrough = doc.get("terminal", {}).get("env_passthrough", [])
+    assert "DROPME" not in passthrough
+
+
+def test_unset_leaves_unrelated_passthrough_entries(
+    with_coder: Path, cfg: AgentsConfig, mocker: Any
+) -> None:
+    """Removing one secret must not strip others' passthrough entries."""
+    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    secrets_cmd.set_secret("coder", "KEEPME", "a", config_path=with_coder)
+    secrets_cmd.set_secret("coder", "DROPME", "b", config_path=with_coder)
+    secrets_cmd.unset_secret("coder", "DROPME", config_path=with_coder)
+    doc = hermes_config.load(hermes_config.config_path(cfg, "coder"))
+    passthrough = doc["terminal"]["env_passthrough"]
+    assert "KEEPME" in passthrough
+    assert "DROPME" not in passthrough
+
+
+# ---------- hermes_config helpers ----------
+
+
+def test_add_env_passthrough_creates_terminal_block_if_missing() -> None:
+    from ruamel.yaml import YAML
+
+    doc = YAML().load("{}\n")
+    hermes_config.add_env_passthrough(doc, "K")
+    assert doc["terminal"]["env_passthrough"] == ["K"]
+
+
+def test_remove_env_passthrough_handles_missing_terminal_block() -> None:
+    from ruamel.yaml import YAML
+
+    doc = YAML().load("{}\n")
+    # No-op; just must not raise.
+    hermes_config.remove_env_passthrough(doc, "K")

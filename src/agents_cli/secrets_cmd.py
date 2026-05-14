@@ -31,7 +31,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from agents_cli import compose, compose_runner, mp, ui
+from agents_cli import compose, compose_runner, hermes_config, mp, ui
 from agents_cli import config as cfg_mod
 from agents_cli.agents_cmd import _detect_type_from_compose
 from agents_cli.agents_cmd import service_name as _service_name_for
@@ -76,13 +76,15 @@ def set_secret(
     if "\n" in value or "\r" in value:
         raise UserError("secret value must not contain newlines")
     cfg = cfg_mod.load(config_path)
-    svc, _agent_type = _resolve_service(cfg, agent_name)
+    svc, agent_type = _resolve_service(cfg, agent_name)
 
     with compose.acquire_lock(cfg.paths.host_data_dir):
         env = _read_env(cfg, agent_name)
         env[key] = value
         _write_env(cfg, agent_name, env)
         _ensure_env_file_in_compose(cfg, agent_name, svc)
+        if agent_type == "hermes":
+            _ensure_env_passthrough(cfg, agent_name, key)
 
     compose_runner.up(cfg, svc)
     ui.emit(
@@ -99,7 +101,7 @@ def unset_secret(
 ) -> None:
     _validate_key(key)
     cfg = cfg_mod.load(config_path)
-    svc, _agent_type = _resolve_service(cfg, agent_name)
+    svc, agent_type = _resolve_service(cfg, agent_name)
 
     with compose.acquire_lock(cfg.paths.host_data_dir):
         env = _read_env(cfg, agent_name)
@@ -107,6 +109,8 @@ def unset_secret(
             raise UserError(f"secret {key!r} not set for {agent_name!r}")
         del env[key]
         _write_env(cfg, agent_name, env)
+        if agent_type == "hermes":
+            _drop_env_passthrough(cfg, agent_name, key)
 
     compose_runner.up(cfg, svc)
     ui.emit(
@@ -241,6 +245,26 @@ def _render_env_file(env: dict[str, str]) -> str:
         return ""
     lines = [f"{k}={v}" for k, v in sorted(env.items())]
     return "\n".join(lines) + "\n"
+
+
+def _ensure_env_passthrough(cfg: AgentsConfig, agent_name: str, key: str) -> None:
+    """Add ``key`` to the agent's ``terminal.env_passthrough`` so it
+    actually reaches Hermes' sandboxed shell / execute_code subprocesses.
+
+    Without this, the var lives in the Hermes Python process (visible
+    to built-in tools that read ``os.environ``) but is filtered out of
+    every subprocess Hermes spawns — meaning the LLM's own shell-based
+    diagnostics report "not set" even though the integration works.
+    """
+    doc = hermes_config.read_doc(cfg, agent_name)
+    hermes_config.add_env_passthrough(doc, key)
+    hermes_config.write_atomically(cfg, agent_name, doc)
+
+
+def _drop_env_passthrough(cfg: AgentsConfig, agent_name: str, key: str) -> None:
+    doc = hermes_config.read_doc(cfg, agent_name)
+    hermes_config.remove_env_passthrough(doc, key)
+    hermes_config.write_atomically(cfg, agent_name, doc)
 
 
 def _ensure_env_file_in_compose(cfg: AgentsConfig, agent_name: str, svc_name: str) -> None:

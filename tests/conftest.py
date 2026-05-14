@@ -64,17 +64,62 @@ def install_vm_fs_simulation(mocker, cfg: AgentsConfig) -> dict:
         shutil.copy(str(src), str(host_dst))
         return _ok()
 
+    def _strip_docker_exec_prefix(
+        cmd: tuple[str, ...],
+    ) -> tuple[tuple[str, ...], str] | None:
+        """Recognise ``docker compose ... exec [flags] <svc> <inner...>`` and
+        return ``(<inner...>, <svc>)``. Lets us reuse the bare-mv /
+        bare-rm handlers when the production code routes them through
+        ``docker compose exec`` (necessary in real --data-dir-in-vm mode
+        where ubuntu can't touch subuid-owned dirs directly).
+        """
+        if not cmd or cmd[0] != "docker" or "exec" not in cmd:
+            return None
+        i = cmd.index("exec") + 1
+        while i < len(cmd) and cmd[i].startswith("-"):
+            if cmd[i] in ("--user", "-e"):
+                i += 2
+            else:
+                i += 1
+        if i + 1 >= len(cmd):
+            return None
+        return tuple(cmd[i + 1 :]), cmd[i]
+
+    def _container_path(svc: str, path: str) -> Path:
+        """Translate an in-container path (``/opt/data/...``) to its
+        host-side location for a given service name. Hermes mounts
+        ``./<name>/.data:/opt/data`` so ``/opt/data/X`` → ``<data-dir>/<name>/.data/X``.
+        """
+        for prefix in ("hermes-", "openclaw-"):
+            if svc.startswith(prefix):
+                agent = svc[len(prefix) :]
+                if path.startswith("/opt/data"):
+                    rel = path[len("/opt/data") :].lstrip("/")
+                    return host_root / agent / ".data" / rel
+                if path.startswith("/home/node/.openclaw"):
+                    rel = path[len("/home/node/.openclaw") :].lstrip("/")
+                    return host_root / agent / ".openclaw" / rel
+        return host_path(path)
+
     def in_vm_runner(vm_name: str, *cmd: str, check: bool = True) -> MpResult:
+        svc: str | None = None
+        stripped = _strip_docker_exec_prefix(cmd)
+        if stripped is not None:
+            cmd, svc = stripped
+
+        def resolve(p: str) -> Path:
+            return _container_path(svc, p) if svc else host_path(p)
+
         if cmd and cmd[0] == "mv" and len(cmd) >= 3:
-            src = host_path(cmd[1])
-            dst = host_path(cmd[2])
+            src = resolve(cmd[1])
+            dst = resolve(cmd[2])
             os.replace(src, dst)
             return _ok()
         if cmd and cmd[0] == "rm":
             for arg in cmd[1:]:
                 if arg.startswith("-"):
                     continue
-                p = host_path(arg)
+                p = resolve(arg)
                 if p.is_dir():
                     shutil.rmtree(p, ignore_errors=True)
                 else:
@@ -93,6 +138,32 @@ def install_vm_fs_simulation(mocker, cfg: AgentsConfig) -> dict:
             return _ok()
         return _ok()
 
+    def in_vm_with_stdin_runner(
+        vm_name: str, *cmd: str, input_bytes: bytes, check: bool = True
+    ) -> MpResult:
+        """Simulate `docker compose exec -T <svc> sh -c 'cat > FILE'` —
+        the production write path for hermes_config writes. Pulls FILE
+        out of the shell snippet, maps it to its host path, writes the
+        piped bytes.
+        """
+        svc: str | None = None
+        stripped = _strip_docker_exec_prefix(cmd)
+        inner = cmd
+        if stripped is not None:
+            inner, svc = stripped
+        if (
+            len(inner) >= 3
+            and inner[0] == "sh"
+            and inner[1] == "-c"
+            and inner[2].startswith("cat > ")
+        ):
+            path = inner[2][len("cat > ") :].strip()
+            dst = _container_path(svc, path) if svc else host_path(path)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_bytes(input_bytes)
+            return _ok()
+        return _ok()
+
     def bash_runner(
         vm_name: str, script: str, *, check: bool = True, timeout: float | None = None
     ) -> MpResult:
@@ -107,6 +178,9 @@ def install_vm_fs_simulation(mocker, cfg: AgentsConfig) -> dict:
             "agents_cli.mp.transfer_from_vm", side_effect=transfer_from
         ),
         "exec_in_vm": mocker.patch("agents_cli.mp.exec_in_vm", side_effect=in_vm_runner),
+        "exec_in_vm_with_stdin": mocker.patch(
+            "agents_cli.mp.exec_in_vm_with_stdin", side_effect=in_vm_with_stdin_runner
+        ),
         "exec_bash": mocker.patch("agents_cli.mp.exec_bash", side_effect=bash_runner),
         # `_run_agent_setup` uses the interactive variant so the wizard
         # actually sees stdin. The unit-test stub just reports rc=0.
