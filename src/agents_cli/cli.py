@@ -19,6 +19,7 @@ import click
 from agents_cli import (
     __version__,
     agents_cmd,
+    conversations_cmd,
     export_cmd,
     firecrawl_cmd,
     fixperms_cmd,
@@ -437,6 +438,25 @@ def agent_setup(name: str) -> None:
 def agent_doctor(name: str | None) -> None:
     """Health-check the VM, mount, and agents."""
     _run(ops.doctor, target=name)
+
+
+@main.command("conversations")
+@click.argument("name")
+@click.option(
+    "--limit",
+    type=int,
+    default=20,
+    help="Max active sessions to render in the human table (JSON is unbounded).",
+)
+def agent_conversations(name: str, limit: int) -> None:
+    """Show active/open/total conversation counts for a Hermes agent.
+
+    Reads ``/opt/data/state.db`` inside the container and reports how
+    many sessions are within the gateway's auto-continue freshness
+    window — i.e. still "hot" in the gateway's context cache.
+    Per-platform breakdown plus a top-N active list. Read-only.
+    """
+    _run(conversations_cmd.status, name, limit=limit)
 
 
 @main.command("fix-perms")
