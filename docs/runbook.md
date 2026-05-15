@@ -427,6 +427,61 @@ Phases (each idempotent, journaled at `<data-dir>/.journal/rebuild-<vm>-<utc>.js
 
 If something crashes mid-rebuild, re-running `agents vm rebuild` picks up where the journal left off. The staging dir is left in place after success so you can inspect; safe to `rm -rf <data-dir>/.rebuild-staging/` once `agents doctor` is green.
 
+## Running on arm64 / Raspberry Pi 5
+
+The toolkit works on arm64 Linux hosts (RPi5, Apple Silicon under Multipass, generic arm64 servers), but a few upstream images need awareness.
+
+### What works natively on arm64
+
+- `nousresearch/hermes-agent` — multi-arch manifest. Hermes itself is fully native.
+- The Hermes sandbox image `nikolaik/python-nodejs:python3.11-nodejs20` — multi-arch.
+- `redis:alpine`, `rabbitmq:3-management`, Firecrawl `playwright-service` — multi-arch.
+
+### What runs under qemu-user emulation on arm64
+
+- `ghcr.io/firecrawl/nuq-postgres:latest` — Firecrawl publishes amd64-only for this one. Postgres runs fine under emulation, just slower at init and on heavy queries. `agents doctor` flags this with an `arm64_emulation=warn` check when firecrawl is installed.
+
+The toolkit auto-detects host arch at `agents firecrawl up` time and picks `ghcr.io/firecrawl/firecrawl:linux-arm64` (the api image ships per-arch tags, not a multi-arch manifest). No flag needed.
+
+If `nuq-postgres` performance bites, override it via `docker-compose.override.yml` with a stock `postgres:16` and run Firecrawl's schema migrations against it. Out of scope for the toolkit to automate; document if you do this so the next maintainer knows why the override exists.
+
+### Recommended VM sizing on RPi5
+
+The toolkit defaults (4 CPU, 8 GiB RAM, 25 GiB disk) assume a workstation host. On RPi5 you'll want to scale down — the VM competes with everything else on the host.
+
+| RPi5 board | Recommended `agents vm init` flags |
+|---|---|
+| RPi5 8 GiB | `--cpus 3 --memory 5 --disk 25` (leaves 3 GiB for host) |
+| RPi5 4 GiB | Don't. The VM defaults eat too much of the board; run Hermes directly on the host instead. |
+
+Resize an existing VM with `agents vm resize --cpus N --memory NG --disk NG` rather than reinstalling.
+
+### `--data-dir-in-vm` is strongly recommended on arm64
+
+The default mount layout puts the agent data dir on the host filesystem, shared into the VM via Multipass's 9p mount. This is fine on workstations with NVMe and fast 9p drivers, but on RPi5:
+
+- microSD cards are slow at random I/O (the dominant pattern for SQLite WAL mode).
+- 9p over QEMU on arm64 is measurably slower than on amd64.
+- Hermes' `state.db` (sessions/messages), `kanban.db`, and any memory-backend SQLite use WAL mode, which interacts poorly with 9p.
+
+The opt-out keeps agent state on the VM's ext4 filesystem and exposes it to host backups via the `agents export-cron` archive flow:
+
+```bash
+agents vm init --data-dir /data/agents --data-dir-in-vm
+agents export-cron install --time 02:30,08:30,14:30,20:30
+```
+
+duplicity (or whatever you back up with) picks up the 6-hourly archives natively. You lose direct host-side inspection of the data dir but gain measurably better DB performance.
+
+### What about NVMe-on-RPi5?
+
+If your RPi5 has an NVMe HAT and you're booting from NVMe, microSD considerations don't apply — but the 9p mount perf is still slower on arm64. `--data-dir-in-vm` is still recommended; the gain from native ext4 access to SQLite is independent of the underlying physical disk.
+
+### Limitations
+
+- **OpenViking memory sidecar** — `volcengine/openviking` arm64 status not verified by the toolkit; manifest fetch failed during investigation. If you need OpenViking memory on arm64, check that the image actually ships your arch before enabling the backend. `holographic` and `mem0` memory backends are pure-Python and arch-agnostic.
+- **OpenClaw image registry** — pull access denied at investigation time (the public registry path may differ from what the toolkit's allowlist expects). Verify OpenClaw publishes arm64 builds before relying on it on RPi5; Hermes-only deployments are unaffected.
+
 ## Tearing down
 
 ```bash

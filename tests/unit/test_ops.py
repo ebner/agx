@@ -559,6 +559,64 @@ def test_doctor_flags_hermes_doctor_failure(with_coder: Path, mocker) -> None:
         ops.doctor(config_path=with_coder)
 
 
+def test_doctor_arm64_emulation_warns_when_firecrawl_running_on_arm64(
+    with_coder: Path, mocker, cfg: AgentsConfig
+) -> None:
+    """On arm64 hosts, the firecrawl nuq-postgres image runs under
+    qemu emulation (upstream ships no arm64 tag). The doctor must
+    flag this so users aren't surprised by slow Postgres init.
+    """
+    mocker.patch("agents_cli.firecrawl_cmd._docker_arch", return_value="arm64")
+    mocker.patch("agents_cli.firecrawl_cmd.is_installed", return_value=True)
+    _stub_minimal_doctor(mocker)
+    mocker.patch(
+        "agents_cli.compose_runner.ps",
+        return_value=_ok(json.dumps([{"Service": "hermes-coder", "State": "running"}])),
+    )
+
+    report = ops.doctor(config_path=with_coder)
+    [check] = [c for c in report.checks if c.name == "arm64_emulation"]
+    assert check.status == "warn"
+    assert "nuq-postgres" in check.detail
+
+
+def test_doctor_arm64_emulation_silent_when_firecrawl_absent(
+    with_coder: Path, mocker, cfg: AgentsConfig
+) -> None:
+    """Don't warn on arm64 if firecrawl isn't installed — nothing
+    is being emulated. Stays at ok with a 'not installed' detail.
+    """
+    mocker.patch("agents_cli.firecrawl_cmd._docker_arch", return_value="arm64")
+    mocker.patch("agents_cli.firecrawl_cmd.is_installed", return_value=False)
+    _stub_minimal_doctor(mocker)
+    mocker.patch(
+        "agents_cli.compose_runner.ps",
+        return_value=_ok(json.dumps([{"Service": "hermes-coder", "State": "running"}])),
+    )
+
+    report = ops.doctor(config_path=with_coder)
+    [check] = [c for c in report.checks if c.name == "arm64_emulation"]
+    assert check.status == "ok"
+
+
+def test_doctor_arm64_emulation_silent_on_amd64_host(
+    with_coder: Path, mocker, cfg: AgentsConfig
+) -> None:
+    """Most hosts are amd64 — the probe should be a quiet ok line,
+    not a noisy warn.
+    """
+    mocker.patch("agents_cli.firecrawl_cmd._docker_arch", return_value="amd64")
+    _stub_minimal_doctor(mocker)
+    mocker.patch(
+        "agents_cli.compose_runner.ps",
+        return_value=_ok(json.dumps([{"Service": "hermes-coder", "State": "running"}])),
+    )
+
+    report = ops.doctor(config_path=with_coder)
+    [check] = [c for c in report.checks if c.name == "arm64_emulation"]
+    assert check.status == "ok"
+
+
 def _seed_agent_config(cfg: AgentsConfig, agent: str, model: str) -> None:
     """Write the agent's config.yaml so ``hermes_config.read_doc`` can
     pick it up. Seeds the bare-string form of ``model:`` (Hermes also

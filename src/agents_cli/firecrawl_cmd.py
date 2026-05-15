@@ -47,6 +47,7 @@ resolves them naturally.
 from __future__ import annotations
 
 import json
+import platform
 import secrets
 from pathlib import Path
 from typing import Any
@@ -64,16 +65,50 @@ from agents_cli.compose import (
 from agents_cli.config import AgentsConfig
 from agents_cli.errors import RuntimeFailure, UserError
 
+
+def _docker_arch() -> str:
+    """Map the host's CPU arch to Docker's tag convention.
+
+    Multipass always launches a same-arch guest VM (no cross-arch
+    virtualization), so the host's arch IS the in-VM Docker daemon's
+    arch — which is what tag selection actually needs to match.
+
+    Returns ``"arm64"`` on aarch64 / arm64, ``"amd64"`` everywhere else.
+    Uncommon architectures (riscv64, ppc64le, etc.) fall through to
+    ``"amd64"`` since none of the upstream Firecrawl tags target them
+    — emulation is the only path and the amd64 tag is the safer bet
+    than a guessed mapping.
+    """
+    m = platform.machine().lower()
+    if m in ("aarch64", "arm64"):
+        return "arm64"
+    return "amd64"
+
+
 # Upstream-floating references the toolkit uses ONCE to resolve digests.
 # These get written to the compose file only as ``<repo>@sha256:<digest>``,
 # never as ``<repo>:<tag>`` — see module docstring on pinning policy.
+#
+# Firecrawl's ``api`` image ships per-arch tags (``:linux-amd64`` and
+# ``:linux-arm64`` are separate single-arch images, NOT a multi-arch
+# manifest), so the tag must match the host's arch at digest-resolve
+# time. ``nuq-postgres`` has no arm64 tag — on arm64 hosts it runs
+# under qemu-user emulation (see ``_check_arm64_emulation`` in ``ops``).
+# The other three (playwright / redis / rabbitmq) ship multi-arch
+# manifests, so a single tag suffices.
 FLOATING_REFS: dict[str, str] = {
-    "api": f"{FIRECRAWL_API_IMAGE_BASE}:linux-amd64",
+    "api": f"{FIRECRAWL_API_IMAGE_BASE}:linux-{_docker_arch()}",
     "playwright": f"{FIRECRAWL_PLAYWRIGHT_IMAGE_BASE}:latest",
     "postgres": f"{FIRECRAWL_POSTGRES_IMAGE_BASE}:latest",
     "redis": f"{FIRECRAWL_REDIS_IMAGE_BASE}:alpine",
     "rabbitmq": f"{FIRECRAWL_RABBITMQ_IMAGE_BASE}:3-management",
 }
+
+# Images that are amd64-only at upstream and will run under emulation
+# on arm64 hosts. Surfaced by ``_check_arm64_emulation`` in doctor.
+ARM64_EMULATED_IMAGES: tuple[str, ...] = (
+    f"{FIRECRAWL_POSTGRES_IMAGE_BASE} (Firecrawl publishes no arm64 tag)",
+)
 
 # Env-var names the project-level .env carries when firecrawl is up.
 # Hermes agents see API_KEY + API_URL via compose ``${VAR:-}``

@@ -156,6 +156,7 @@ def doctor(
         _check_journals(cfg, report)
         _check_port_conflicts(cfg, report)
         _check_codex_auth(cfg, report)
+        _check_arm64_emulation(cfg, report)
     else:
         report.add("data_dir_exists", "fail", f"{cfg.paths.host_data_dir} missing")
 
@@ -733,6 +734,38 @@ def _check_hermes_codex_mount(
             f"/opt/data/auth.json — `hermes setup` won't be able to import "
             f"(rc={bridge.returncode})",
         )
+
+
+def _check_arm64_emulation(cfg: AgentsConfig, report: DoctorReport) -> None:
+    """On arm64 hosts, surface which active project-level images will be
+    running under qemu-user emulation because upstream doesn't ship an
+    arm64 variant.
+
+    Currently the only one is Firecrawl's ``nuq-postgres`` — works under
+    emulation, but slower at init time and on heavy queries. The check
+    only fires when firecrawl is actually installed (otherwise there's
+    nothing to emulate).
+
+    Not a failure — just visibility. Users who hit performance issues
+    on RPi5 / arm64 Linux can swap in a stock ``postgres:16`` via
+    ``docker-compose.override.yml`` and run Firecrawl's schema
+    migrations against it.
+    """
+    from agents_cli import firecrawl_cmd
+
+    if firecrawl_cmd._docker_arch() != "arm64":
+        report.add("arm64_emulation", "ok", "host is amd64; no emulation in play")
+        return
+    if not firecrawl_cmd.is_installed(cfg):
+        report.add("arm64_emulation", "ok", "host arm64; firecrawl not installed")
+        return
+    report.add(
+        "arm64_emulation",
+        "warn",
+        "host is arm64. Running under qemu-user emulation: "
+        + "; ".join(firecrawl_cmd.ARM64_EMULATED_IMAGES)
+        + ". Works but is slower; swap via docker-compose.override.yml if it bites.",
+    )
 
 
 def _check_hermes_model_set(

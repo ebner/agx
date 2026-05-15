@@ -104,6 +104,51 @@ def with_coder(
 # ---------- up ----------
 
 
+def test_docker_arch_maps_aarch64_to_arm64(mocker: Any) -> None:
+    """Linux arm64 hosts report ``aarch64`` via ``platform.machine``;
+    that's what RPi5's distro returns. Docker tag convention is
+    ``arm64`` though — verify the mapping.
+    """
+    mocker.patch("platform.machine", return_value="aarch64")
+    assert firecrawl_cmd._docker_arch() == "arm64"
+
+
+def test_docker_arch_maps_arm64_macos_to_arm64(mocker: Any) -> None:
+    """macOS Apple Silicon returns ``arm64`` directly — round-trip clean."""
+    mocker.patch("platform.machine", return_value="arm64")
+    assert firecrawl_cmd._docker_arch() == "arm64"
+
+
+def test_docker_arch_defaults_to_amd64_for_x86_64(mocker: Any) -> None:
+    mocker.patch("platform.machine", return_value="x86_64")
+    assert firecrawl_cmd._docker_arch() == "amd64"
+
+
+def test_docker_arch_falls_back_to_amd64_for_exotic_archs(mocker: Any) -> None:
+    """riscv64, ppc64le, etc. — Firecrawl publishes no tags for these,
+    so picking amd64 is the safer choice than guessing a mapping.
+    Emulation will kick in regardless.
+    """
+    mocker.patch("platform.machine", return_value="riscv64")
+    assert firecrawl_cmd._docker_arch() == "amd64"
+
+
+def test_floating_refs_use_host_arch_for_api_image() -> None:
+    """The api image is single-arch per tag (``:linux-amd64`` and
+    ``:linux-arm64`` are separate). The OTHER firecrawl images are
+    multi-arch manifests, so they keep a single tag.
+    """
+    # Whatever the test host actually is, the FLOATING_REFS api tag
+    # must end in -amd64 or -arm64. (Module-import-time resolution.)
+    assert firecrawl_cmd.FLOATING_REFS["api"].endswith(("-amd64", "-arm64")), (
+        "api tag must encode an arch"
+    )
+    # The other three remain multi-arch — no per-arch suffix.
+    assert "amd64" not in firecrawl_cmd.FLOATING_REFS["playwright"]
+    assert "amd64" not in firecrawl_cmd.FLOATING_REFS["redis"]
+    assert "amd64" not in firecrawl_cmd.FLOATING_REFS["rabbitmq"]
+
+
 def test_up_resolves_digests_and_writes_state(
     with_coder: Path, cfg: AgentsConfig, mocker: Any, vm_fs_mocks: dict[str, Any]
 ) -> None:
