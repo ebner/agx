@@ -231,3 +231,132 @@ def test_conversations_surfaces_unparseable_output_as_runtime_failure(
     mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok("not json at all\n"))
     with pytest.raises(RuntimeFailure, match="could not parse"):
         conversations_cmd.status("coder", config_path=with_coder)
+
+
+# ---------- export ----------
+
+
+def test_export_writes_one_markdown_per_session(
+    with_coder: Path, tmp_path: Path, mocker: Any
+) -> None:
+    """The canonical case: a couple of sessions with a few messages each.
+    Verify file naming (``<session_id>.md``), metadata header, and that
+    each message lands in the output with its role + timestamp.
+    """
+    canned = {
+        "sessions": [
+            {
+                "id": "20260515_120000_abc",
+                "source": "whatsapp",
+                "title": "Birthday plan",
+                "started_at": 1747310400.0,
+                "ended_at": None,
+                "message_count": 2,
+                "input_tokens": 200,
+                "output_tokens": 100,
+                "model": "gpt-5.5",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "Where should we host?",
+                        "timestamp": 1747310401.0,
+                        "tool_name": None,
+                        "tool_call_id": None,
+                    },
+                    {
+                        "role": "assistant",
+                        "content": "Let me think about indoor vs outdoor venues.",
+                        "timestamp": 1747310410.0,
+                        "tool_name": None,
+                        "tool_call_id": None,
+                    },
+                ],
+            },
+            {
+                "id": "20260515_130000_def",
+                "source": "cli",
+                "title": "(no title)",
+                "started_at": 1747314000.0,
+                "ended_at": 1747314600.0,
+                "message_count": 1,
+                "input_tokens": 50,
+                "output_tokens": 20,
+                "model": "gpt-5.5",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "hello",
+                        "timestamp": 1747314001.0,
+                        "tool_name": None,
+                        "tool_call_id": None,
+                    },
+                ],
+            },
+        ]
+    }
+    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok(json.dumps(canned)))
+
+    out_dir = tmp_path / "transcripts"
+    payload = conversations_cmd.export("coder", to_dir=out_dir, config_path=with_coder)
+
+    assert payload["sessions_written"] == 2
+    a = (out_dir / "20260515_120000_abc.md").read_text(encoding="utf-8")
+    b = (out_dir / "20260515_130000_def.md").read_text(encoding="utf-8")
+    assert "# Birthday plan" in a
+    assert "Where should we host?" in a
+    assert "Let me think about indoor vs outdoor" in a
+    assert "Session ID" in a
+    assert "**Model**: gpt-5.5" in a
+    # Second session — ended, single message
+    assert "Ended" in b and "open" not in b.split("Ended")[1].split("\n")[0]
+
+
+def test_export_creates_to_dir_if_missing(with_coder: Path, tmp_path: Path, mocker: Any) -> None:
+    """Don't make users mkdir first — just create the directory."""
+    mocker.patch(
+        "agents_cli.mp.exec_in_vm",
+        return_value=_ok(json.dumps({"sessions": []})),
+    )
+    target = tmp_path / "deep" / "nested" / "transcripts"
+    assert not target.exists()
+    conversations_cmd.export("coder", to_dir=target, config_path=with_coder)
+    assert target.is_dir()
+
+
+def test_export_is_idempotent(with_coder: Path, tmp_path: Path, mocker: Any) -> None:
+    """Running export twice with the same data overwrites the same files
+    rather than erroring or appending — important for cron-driven
+    archival.
+    """
+    canned = {
+        "sessions": [
+            {
+                "id": "s1",
+                "source": "cli",
+                "title": "first",
+                "started_at": 1.0,
+                "ended_at": None,
+                "message_count": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "model": None,
+                "messages": [],
+            },
+        ]
+    }
+    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok(json.dumps(canned)))
+    target = tmp_path / "out"
+    conversations_cmd.export("coder", to_dir=target, config_path=with_coder)
+    first = (target / "s1.md").read_text(encoding="utf-8")
+    conversations_cmd.export("coder", to_dir=target, config_path=with_coder)
+    second = (target / "s1.md").read_text(encoding="utf-8")
+    assert first == second
+
+
+def test_export_rejects_openclaw(with_openclaw_personal: Path, tmp_path: Path, mocker: Any) -> None:
+    exec_spy = mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok())
+    with pytest.raises(UserError, match="Hermes-only"):
+        conversations_cmd.export(
+            "personal", to_dir=tmp_path / "out", config_path=with_openclaw_personal
+        )
+    exec_spy.assert_not_called()

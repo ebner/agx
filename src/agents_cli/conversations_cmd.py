@@ -1,25 +1,25 @@
-"""``agents conversations <name>``: stats about active Hermes conversations.
+"""``agents conversations``: stats + transcript-export for a Hermes agent.
 
-Reads the in-container SQLite session store at ``/opt/data/state.db``
-(populated by Hermes' gateway as messages flow) and reports:
+Two subcommands:
 
-- Total sessions (open + ended)
-- Active context: sessions whose last message timestamp is within
-  ``agent.gateway_auto_continue_freshness`` seconds. The gateway keeps
-  these "hot" — the next message in the same channel resumes the
-  context without recompression. Sessions older than the window are
-  still resumable but cold; they trigger a context recompression /
-  reload on next message.
-- Per-platform breakdown (total / open / active per source).
-- Active session list (id / source / title / msgs / tokens / age).
+- ``status <name>`` — counts active / open / total sessions, per-platform
+  breakdown, top-N active table. "Active" means within the
+  ``agent.gateway_auto_continue_freshness`` window (the gateway keeps
+  these hot; older open sessions are cold and trigger context
+  recompression on next message).
+- ``export <name> --to <dir>`` — writes one Markdown transcript per
+  session under ``<dir>/<session_id>.md``. Used for migration / archival
+  (the OpenClaw side of a Hermes→OpenClaw cutover; see
+  ``docs/migration.md``).
 
-Hermes-only. OpenClaw has its own session storage which doesn't share
-this schema; out of scope unless we ever add an equivalent reader.
+Reads the in-container SQLite session store at ``/opt/data/state.db``.
+Hermes-only. OpenClaw has its own session schema; out of scope unless we
+ever add an equivalent reader.
 
-The query runs as a single ``python3 -c`` inside the agent's container
-(via ``docker compose exec``) — keeps the SQLite client work in-VM and
-returns one JSON blob over stdout that the host parses and renders.
-Read-only: no flock, no mutations.
+Both subcommands run a single ``python3 -c`` inside the agent's
+container (via ``docker compose exec``) and return one JSON blob the
+host parses + renders. Read-only on the container side: no flock, no
+mutations.
 """
 
 from __future__ import annotations
@@ -98,6 +98,28 @@ print(json.dumps(out))
 """
 
 
+_EXPORT_SCRIPT = """\
+import json, sqlite3
+c = sqlite3.connect("/opt/data/state.db")
+c.row_factory = sqlite3.Row
+sessions = []
+for s in c.execute('''
+  select id, source, title, started_at, ended_at, message_count,
+         input_tokens, output_tokens, model
+  from sessions order by started_at
+'''):
+    msgs = []
+    for m in c.execute(
+        "select role, content, timestamp, tool_name, tool_call_id "
+        "from messages where session_id = ? order by id",
+        (s["id"],),
+    ):
+        msgs.append({k: m[k] for k in m.keys()})
+    sessions.append({**{k: s[k] for k in s.keys()}, "messages": msgs})
+print(json.dumps({"sessions": sessions}))
+"""
+
+
 def status(
     name: str,
     *,
@@ -123,11 +145,13 @@ def status(
 
 
 def _query(cfg: AgentsConfig, svc: str) -> dict[str, Any]:
+    return _query_with_script(cfg, svc, _QUERY_SCRIPT)
+
+
+def _query_with_script(cfg: AgentsConfig, svc: str, script: str) -> dict[str, Any]:
     result = mp.exec_in_vm(
         cfg.vm.name,
-        *_compose_exec_in_vm_argv(
-            cfg, svc, "python3", "-c", _QUERY_SCRIPT, no_tty=True, as_root=True
-        ),
+        *_compose_exec_in_vm_argv(cfg, svc, "python3", "-c", script, no_tty=True, as_root=True),
         check=False,
     )
     if result.returncode != 0:
@@ -145,6 +169,107 @@ def _query(cfg: AgentsConfig, svc: str) -> dict[str, Any]:
         raise RuntimeFailure(
             f"could not parse session query output: {e}; got: {result.stdout[:200]!r}"
         ) from e
+
+
+def export(
+    name: str,
+    *,
+    to_dir: Path,
+    config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH,
+) -> dict[str, Any]:
+    """Write one Markdown transcript per session to ``to_dir``.
+
+    Use case: migration to OpenClaw (or any other agent runtime). The
+    Hermes ``state.db`` schema doesn't port, but plain-text transcripts
+    are universally useful for archival and for seeding the destination
+    agent with relevant context manually.
+
+    Idempotent: existing files with the same session_id are overwritten.
+    Creates ``to_dir`` if missing. Open (un-ended) sessions are exported
+    too — their transcripts reflect the state at export time.
+    """
+    cfg = cfg_mod.load(config_path)
+    agent_type = _detect_type_from_compose(cfg, name)
+    if agent_type is None:
+        raise UserError(f"agent {name!r} not in compose")
+    if agent_type != "hermes":
+        raise UserError(
+            f"conversations export is Hermes-only — {name!r} is type "
+            f"{agent_type!r}. OpenClaw uses a different session schema."
+        )
+    svc = _service_name_for(name, agent_type)
+
+    data = _query_with_script(cfg, svc, _EXPORT_SCRIPT)
+    sessions = data.get("sessions") or []
+
+    to_dir.mkdir(parents=True, exist_ok=True)
+    written: list[str] = []
+    for s in sessions:
+        path = to_dir / f"{s['id']}.md"
+        path.write_text(_render_session_md(s), encoding="utf-8")
+        written.append(path.name)
+
+    payload = {
+        "agent": name,
+        "to_dir": str(to_dir),
+        "sessions_written": len(written),
+        "files": written,
+    }
+    ui.emit(
+        payload,
+        human=(
+            f"{name}: exported {len(written)} session transcript(s) to {to_dir}\n"
+            f"  (one Markdown file per session; safe to grep / archive / hand-seed "
+            f"into another agent's context)"
+        ),
+    )
+    return payload
+
+
+def _render_session_md(s: dict[str, Any]) -> str:
+    """Render one session's metadata + messages as Markdown.
+
+    Format: front-matter-style metadata block, then one section per
+    message with role + timestamp header. Tool calls / tool results
+    are surfaced explicitly so they're useful when re-seeding another
+    agent.
+    """
+    import datetime as _dt
+
+    def ts(epoch: float | None) -> str:
+        if not epoch:
+            return "—"
+        return _dt.datetime.fromtimestamp(epoch, tz=_dt.UTC).isoformat()
+
+    title = s.get("title") or "(no title)"
+    lines = [
+        f"# {title}",
+        "",
+        f"- **Session ID**: `{s['id']}`",
+        f"- **Source**: {s.get('source') or '—'}",
+        f"- **Model**: {s.get('model') or '—'}",
+        f"- **Started**: {ts(s.get('started_at'))}",
+        f"- **Ended**: {ts(s.get('ended_at')) if s.get('ended_at') else 'open'}",
+        f"- **Messages**: {s.get('message_count') or len(s.get('messages') or [])}",
+        f"- **Tokens**: in={s.get('input_tokens') or 0}, out={s.get('output_tokens') or 0}",
+        "",
+        "---",
+        "",
+    ]
+    for m in s.get("messages") or []:
+        role = (m.get("role") or "?").lower()
+        tname = m.get("tool_name")
+        header = f"## {role}"
+        if tname:
+            header += f" — tool `{tname}`"
+        header += f"  ·  {ts(m.get('timestamp'))}"
+        lines.append(header)
+        lines.append("")
+        content = m.get("content") or ""
+        if content:
+            lines.append(content if not content.startswith("#") else "\\" + content)
+        lines.append("")
+    return "\n".join(lines)
 
 
 def _emit(payload: dict[str, Any], *, limit: int) -> None:
