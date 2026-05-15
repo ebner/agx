@@ -43,6 +43,20 @@ class VmConfig(BaseModel):
     # given moment (newer LTS releases lag a few months); opt in with
     # `vm init --ubuntu-release 26.04` once that's no longer the case.
     ubuntu_release: str = "24.04"
+    # VM hypervisor backend. ``multipass`` is the cross-platform
+    # default; ``libvirt`` is Linux-only and adds GPU-passthrough
+    # capability (the motivation for the abstraction — see GH #2).
+    # The choice persists at ``agents vm init`` time and dispatches
+    # every host↔VM call in ``mp.py`` to the matching backend module
+    # under ``agents_cli.backends``.
+    backend: str = "multipass"
+
+    @field_validator("backend")
+    @classmethod
+    def _validate_backend(cls, v: str) -> str:
+        if v not in ("multipass", "libvirt"):
+            raise ValueError(f"vm.backend must be 'multipass' or 'libvirt', got {v!r}")
+        return v
 
 
 class PathsConfig(BaseModel):

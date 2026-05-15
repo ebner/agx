@@ -63,11 +63,25 @@ def _run(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> None:
 @click.option("-v", "--verbose", is_flag=True, help="Verbose logging.")
 @click.pass_context
 def main(ctx: click.Context, json_output: bool, assume_yes: bool, verbose: bool) -> None:
-    """Manage AI agents inside a Multipass VM."""
+    """Manage AI agents inside a Multipass or libvirt VM."""
     ctx.ensure_object(dict)
     ctx.obj["json"] = json_output
     ctx.obj["yes"] = assume_yes
     ctx.obj["verbose"] = verbose
+
+    # Wire up the VM-backend dispatcher from config (if a config exists).
+    # `vm init` runs before any config exists — it sets the backend via
+    # its own --backend flag before invoking any backend primitive.
+    try:
+        cfg = cfg_mod.load()
+    except Exception:
+        # No config yet (e.g. first-time `vm init`). Dispatcher defaults
+        # to multipass; `vm init` will override based on --backend flag.
+        return
+    from agents_cli import mp
+    from agents_cli.backends import get_backend_module
+
+    mp.set_backend(get_backend_module(cfg.vm.backend))
 
 
 # ---------- vm lifecycle ----------
