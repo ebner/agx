@@ -25,6 +25,7 @@ from agents_cli import (
     fixperms_cmd,
     ollama_cmd,
     ops,
+    outdated_cmd,
     secrets_cmd,
     ui,
     upgrades,
@@ -440,7 +441,12 @@ def agent_doctor(name: str | None) -> None:
     _run(ops.doctor, target=name)
 
 
-@main.command("conversations")
+@main.group("conversations")
+def conversations_group() -> None:
+    """Inspect a Hermes agent's conversation store (status + export)."""
+
+
+@conversations_group.command("status")
 @click.argument("name")
 @click.option(
     "--limit",
@@ -448,7 +454,7 @@ def agent_doctor(name: str | None) -> None:
     default=20,
     help="Max active sessions to render in the human table (JSON is unbounded).",
 )
-def agent_conversations(name: str, limit: int) -> None:
+def conversations_status(name: str, limit: int) -> None:
     """Show active/open/total conversation counts for a Hermes agent.
 
     Reads ``/opt/data/state.db`` inside the container and reports how
@@ -457,6 +463,26 @@ def agent_conversations(name: str, limit: int) -> None:
     Per-platform breakdown plus a top-N active list. Read-only.
     """
     _run(conversations_cmd.status, name, limit=limit)
+
+
+@conversations_group.command("export")
+@click.argument("name")
+@click.option(
+    "--to",
+    "to_dir",
+    type=click.Path(path_type=Path),
+    required=True,
+    help="Output directory; one Markdown file per session lands here.",
+)
+def conversations_export(name: str, to_dir: Path) -> None:
+    """Export every session as a Markdown transcript.
+
+    One ``<session_id>.md`` per session, with metadata header + per-
+    message sections. Idempotent: existing files overwritten. Used
+    for migration (Hermes→OpenClaw) and long-term archival. See
+    ``docs/migration.md`` for the runbook.
+    """
+    _run(conversations_cmd.export, name, to_dir=to_dir)
 
 
 @main.command("fix-perms")
@@ -486,10 +512,34 @@ def agents_pull(name: str | None) -> None:
     _run(upgrades.pull, name)
 
 
+@main.command("outdated")
+@click.argument("name", required=False)
+@click.option(
+    "--include-prerelease",
+    is_flag=True,
+    help="Include beta/rc/alpha tags when fetching the latest upstream tag.",
+)
+def agents_outdated(name: str | None, include_prerelease: bool) -> None:
+    """Report which agents are behind upstream.
+
+    Compose pinning means agents stay frozen at their captured tag
+    until you run ``agents upgrade <name>``. This command fetches the
+    latest upstream tag from GitHub Releases for each agent type and
+    classifies each agent as current / outdated / unknown.
+    """
+    _run(outdated_cmd.check, name, include_prerelease=include_prerelease)
+
+
 @main.command("upgrade")
 @click.argument("name", required=False)
 @click.option("--all", "all_agents", is_flag=True, help="Upgrade every agent in compose.")
 @click.option("--tag", default=None, help="Target image tag (single-agent upgrade only).")
+@click.option(
+    "--latest",
+    "to_latest",
+    is_flag=True,
+    help="Resolve and pin to the latest upstream tag (single-agent only).",
+)
 @click.option("--no-snapshot", is_flag=True, help="Skip both snapshots.")
 @click.option(
     "--canary",
@@ -500,6 +550,7 @@ def agents_upgrade(
     name: str | None,
     all_agents: bool,
     tag: str | None,
+    to_latest: bool,
     no_snapshot: bool,
     canary: str | None,
 ) -> None:
@@ -509,13 +560,23 @@ def agents_upgrade(
             raise click.UsageError("--all is mutually exclusive with NAME")
         if tag:
             raise click.UsageError("--tag is single-agent only")
+        if to_latest:
+            raise click.UsageError("--latest is single-agent only")
         _run(upgrades.upgrade_all, canary=canary)
         return
     if not name:
         raise click.UsageError("provide NAME or --all")
     if canary:
         raise click.UsageError("--canary is meaningful only with --all")
-    _run(upgrades.upgrade, name, tag=tag, no_snapshot=no_snapshot)
+    if tag and to_latest:
+        raise click.UsageError("--tag and --latest are mutually exclusive")
+    _run(
+        upgrades.upgrade,
+        name,
+        tag=tag,
+        to_latest=to_latest,
+        no_snapshot=no_snapshot,
+    )
 
 
 @main.command("rollback")

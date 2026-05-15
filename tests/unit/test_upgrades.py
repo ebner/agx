@@ -134,6 +134,41 @@ def test_upgrade_with_no_snapshot_skips_both_snapshots(
     mocks["snapshot"].assert_not_called()
 
 
+def test_upgrade_to_latest_resolves_upstream_and_writes_default(
+    with_coder: Path, mocker, cfg: AgentsConfig
+) -> None:
+    """--latest pulls the upstream tag, pins it on the agent, AND
+    refreshes the toolkit-wide default so future `agents create`
+    starts on the latest baseline. Without the default refresh, new
+    agents would silently re-anchor to the (now-stale) `vm init`-time
+    tag.
+    """
+    _stub_happy_upgrade(mocker, cfg)
+    mocker.patch("agents_cli.outdated_cmd.fetch_latest_tag", return_value="v9.9.9")
+
+    upgrades.upgrade("coder", to_latest=True, config_path=with_coder)
+
+    doc = compose.load_compose(cfg.paths.host_data_dir / "docker-compose.yml")
+    assert doc["services"]["hermes-coder"]["image"].endswith(":v9.9.9")
+    reloaded = cfg_mod.load(with_coder)
+    assert reloaded.defaults.hermes_image_tag == "v9.9.9"
+
+
+def test_upgrade_to_latest_refuses_when_github_unreachable(
+    with_coder: Path, mocker, cfg: AgentsConfig
+) -> None:
+    """Network fetch failure must NOT silently fall back to the current
+    pinned tag — that would be a no-op disguised as a successful
+    upgrade. Caller asked for "latest", give them an error if we can't
+    determine what that is.
+    """
+    _stub_happy_upgrade(mocker, cfg)
+    mocker.patch("agents_cli.outdated_cmd.fetch_latest_tag", return_value=None)
+
+    with pytest.raises(UserError, match="could not resolve latest"):
+        upgrades.upgrade("coder", to_latest=True, config_path=with_coder)
+
+
 # ---------- failure paths ----------
 
 

@@ -83,6 +83,7 @@ def upgrade(
     name: str,
     *,
     tag: str | None = None,
+    to_latest: bool = False,
     no_snapshot: bool = False,
     config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH,
 ) -> UpgradeOutcome:
@@ -98,7 +99,30 @@ def upgrade(
     if not old_tag:
         raise UserError(f"current image for {name!r} has no tag: {current_image!r}")
 
-    new_tag = tag or old_tag  # explicit tag wins; otherwise refresh in place
+    if to_latest:
+        # Resolve latest upstream tag via the same /releases/latest path
+        # `outdated` uses. Refuses if the network fetch fails — bumping
+        # to "whatever we had before" silently would defeat the flag.
+        from agents_cli import outdated_cmd
+
+        latest = outdated_cmd.fetch_latest_tag(agent_type, include_prerelease=False)
+        if not latest:
+            raise UserError(
+                f"could not resolve latest upstream tag for {agent_type!r} "
+                f"— GitHub API unreachable? Pass --tag <T> explicitly."
+            )
+        new_tag = latest
+        # Refresh the toolkit-wide default so future `agents create` of
+        # this type starts on the latest baseline rather than the
+        # `vm init`-time snapshot.
+        if agent_type == "hermes" and cfg.defaults.hermes_image_tag != latest:
+            cfg.defaults.hermes_image_tag = latest
+            cfg_mod.save(cfg, config_path)
+        elif agent_type == "openclaw" and cfg.defaults.openclaw_image_tag != latest:
+            cfg.defaults.openclaw_image_tag = latest
+            cfg_mod.save(cfg, config_path)
+    else:
+        new_tag = tag or old_tag  # explicit tag wins; otherwise refresh in place
     base = HERMES_IMAGE_BASE if agent_type == "hermes" else OPENCLAW_IMAGE_BASE
 
     with compose.acquire_lock(cfg.paths.host_data_dir):
