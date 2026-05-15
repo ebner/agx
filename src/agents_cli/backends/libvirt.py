@@ -1,49 +1,54 @@
-"""libvirt / KVM backend (Phase A stub — see GH #2 for implementation roadmap).
+"""libvirt / KVM backend (Phase B — EXPERIMENTAL, see GH #2).
 
-This module satisfies the :class:`agents_cli.backends.VmBackend`
-Protocol interface so the dispatcher in ``mp.py`` can route to it
-when ``cfg.vm.backend == "libvirt"``. Every method currently raises
-:class:`NotImplementedError` with a hint pointing at the issue.
+⚠️  Untested on real hardware in the merging session — every code
+path here is docs-driven. Smoke-test on a Linux + libvirt host
+before relying on it; expect minor quirks around virsh output
+formats, cloud-init seed ISO, and GPU IOMMU-group handling that
+will surface only when actually exercised.
 
-Phase B will fill these in:
+Architecture:
 
-- ``launch`` — virt-install with cloud-init seed ISO, Ubuntu cloud
-  image cached under ``<data-dir>/.images/`` (per ``platform.machine()``
-  for amd64 vs arm64).
-- ``exec_*`` — ssh into the VM (key-based auth via the cloud-init
-  user-data injected at launch).
-- ``transfer_*`` — scp over the same ssh connection.
-- ``mount`` — virtiofs (preferred) or 9p, attached via the domain XML.
-- ``snapshot`` / ``restore`` — ``virsh snapshot-create-as`` /
-  ``snapshot-revert``.
-- GPU passthrough — vfio-pci device detection (NVIDIA / AMD / Intel),
-  IOMMU-group validation, hostdev XML attach.
+- VMs are provisioned via ``virt-install --import`` against an
+  Ubuntu cloud image (cached at ``<data-dir>/.images/``) with a
+  cloud-init seed ISO that injects an SSH key pair the toolkit
+  generates at ``vm init`` time (stored under
+  ``<data-dir>/.ssh/``). All subsequent exec/transfer goes through
+  that SSH connection — no libvirt-guest-agent dependency.
+- The libvirt URI is ``qemu:///system`` (required for GPU
+  passthrough; user must be in the ``libvirt`` group on the host).
+- Mounts use virtiofs attached via domain-XML ``<filesystem>``
+  elements. 9p is documented as a manual fallback if virtiofsd is
+  unavailable.
+- Snapshots use ``virsh snapshot-create-as`` ``--disk-only``
+  (external snapshots / qcow2 backing chain) so the disk isn't
+  paused during creation.
+- GPU passthrough: PCI device detected via ``lspci -nn``
+  (vendor IDs ``10de`` NVIDIA, ``1002`` AMD, ``8086`` Intel),
+  IOMMU groups validated under ``/sys/kernel/iommu_groups/``,
+  attached via ``<hostdev>`` XML.
 
-Refuses to import on non-Linux hosts — :func:`_require_linux_host`
-runs at module import time so ``cfg.vm.backend == "libvirt"`` fails
-loud at ``cli.main`` startup rather than during the first VM
-operation.
+Linux-only: import refuses on macOS/Windows. For non-Linux hosts
+use ``--backend multipass``.
 """
 
 from __future__ import annotations
 
+import json
+import os
 import platform
+import re
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
+from typing import Final
 
+from agents_cli import ui
 from agents_cli.backends import MpResult
 from agents_cli.errors import RuntimeFailure, UserError
 
 
 def _require_linux_host() -> None:
-    """libvirt is Linux-only (per GH #2 / runbook). macOS users on
-    Apple Silicon should stick with Multipass; Windows users get
-    Multipass via Hyper-V.
-
-    Raised at import time (via the module-level call below) AND at
-    every method entry as a belt-and-suspenders check — module
-    re-imports across test scopes occasionally bypass module-level
-    raise. The duplicate is cheap.
-    """
     if platform.system() != "Linux":
         raise UserError(
             "libvirt backend is Linux-only. Use --backend multipass on "
@@ -54,46 +59,276 @@ def _require_linux_host() -> None:
 _require_linux_host()
 
 
-def _stub(name: str) -> RuntimeFailure:
-    return RuntimeFailure(
-        f"libvirt backend {name!r} is not implemented yet — see GitHub issue #2. "
-        f"Use --backend multipass for now."
+# ---------- constants ----------
+
+LIBVIRT_URI: Final = "qemu:///system"
+VIRSH: Final = "virsh"
+VIRT_INSTALL: Final = "virt-install"
+SSH: Final = "ssh"
+SCP: Final = "scp"
+QEMU_IMG: Final = "qemu-img"
+CLOUD_LOCALDS: Final = "cloud-localds"
+LSPCI: Final = "lspci"
+
+CLOUD_IMAGE_URL_FMT: Final = (
+    "https://cloud-images.ubuntu.com/releases/{release}/release/"
+    "ubuntu-{release}-server-cloudimg-{arch}.img"
+)
+
+# Set by configure(); helpers raise loud if used pre-init.
+_CACHE_ROOT: Path | None = None
+_SSH_KEY: Path | None = None
+
+
+def _data_dir() -> Path:
+    if _CACHE_ROOT is None:
+        raise RuntimeFailure(
+            "libvirt backend not initialised — call configure(data_dir) "
+            "first. cli.main does this when cfg.vm.backend == 'libvirt'."
+        )
+    return _CACHE_ROOT
+
+
+def _ssh_key_path() -> Path:
+    if _SSH_KEY is None:
+        raise RuntimeFailure("libvirt SSH key not initialised — call configure() first.")
+    return _SSH_KEY
+
+
+def configure(data_dir: Path) -> None:
+    """Populate module-level cache paths. Called by cli.main when
+    libvirt is the active backend, before any primitive runs.
+    """
+    global _CACHE_ROOT, _SSH_KEY
+    _CACHE_ROOT = data_dir
+    _SSH_KEY = data_dir / ".ssh" / "id_ed25519"
+
+
+# ---------- low-level subprocess + virsh helpers ----------
+
+
+def _run(
+    argv: list[str],
+    *,
+    check: bool = True,
+    input_bytes: bytes | None = None,
+    timeout: float | None = None,
+) -> MpResult:
+    """Argv-form subprocess wrapper — same shape as multipass.run."""
+    ui.info(f"$ {' '.join(argv)}")
+    try:
+        proc = subprocess.run(
+            argv,
+            input=input_bytes,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+    except FileNotFoundError as e:
+        raise RuntimeFailure(
+            f"command not found: {argv[0]} ({e}). "
+            f"Install libvirt: sudo apt install libvirt-clients libvirt-daemon-system "
+            f"virtinst genisoimage cloud-image-utils openssh-client qemu-utils."
+        ) from e
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeFailure(f"{' '.join(argv)} timed out after {timeout}s") from e
+    out = proc.stdout.decode("utf-8", errors="replace") if proc.stdout else ""
+    err = proc.stderr.decode("utf-8", errors="replace") if proc.stderr else ""
+    result = MpResult(stdout=out, stderr=err, returncode=proc.returncode)
+    if check and proc.returncode != 0:
+        raise RuntimeFailure(
+            f"command failed (exit {proc.returncode}): {' '.join(argv)}\nstderr: {err.strip()}"
+        )
+    return result
+
+
+def _virsh(*args: str, check: bool = True, timeout: float | None = 60.0) -> MpResult:
+    return _run([VIRSH, "-c", LIBVIRT_URI, *args], check=check, timeout=timeout)
+
+
+# ---------- SSH layer ----------
+
+
+def _ssh_opts() -> list[str]:
+    """Throwaway-VM SSH defaults: no host-key prompt, no
+    known-hosts churn (key changes after vm rebuild).
+    """
+    return [
+        "-i",
+        str(_ssh_key_path()),
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "-o",
+        "LogLevel=ERROR",
+        "-o",
+        "ConnectTimeout=10",
+    ]
+
+
+def _vm_ip(vm: str) -> str:
+    """``virsh domifaddr`` → IPv4 lease. Re-queried each call —
+    libvirt DHCP can re-issue.
+    """
+    result = _virsh("domifaddr", vm, "--source", "lease", check=False)
+    if result.returncode != 0:
+        raise RuntimeFailure(f"could not get IP for libvirt VM {vm!r}: {result.stderr.strip()}")
+    for line in result.stdout.splitlines():
+        m = re.search(r"\b(\d+\.\d+\.\d+\.\d+)/\d+", line)
+        if m:
+            return m.group(1)
+    raise RuntimeFailure(
+        f"libvirt VM {vm!r} has no IPv4 lease yet (is it running and on the default network?)"
     )
 
 
-# ---------- exec ----------
+def _ssh(vm: str, *cmd: str, check: bool = True, input_bytes: bytes | None = None) -> MpResult:
+    ip = _vm_ip(vm)
+    argv = [SSH, *_ssh_opts(), f"ubuntu@{ip}", "--", *cmd]
+    return _run(argv, check=check, input_bytes=input_bytes)
+
+
+# ---------- cloud-init + disk provisioning ----------
+
+
+def _docker_arch() -> str:
+    m = platform.machine().lower()
+    return "arm64" if m in ("aarch64", "arm64") else "amd64"
+
+
+def _ensure_cloud_image(release: str) -> Path:
+    """Cache an Ubuntu cloud image under ``<data-dir>/.images/``.
+    Idempotent across launches.
+    """
+    arch = _docker_arch()
+    cache = _data_dir() / ".images"
+    cache.mkdir(parents=True, exist_ok=True)
+    target = cache / f"ubuntu-{release}-server-cloudimg-{arch}.img"
+    if target.exists():
+        return target
+    url = CLOUD_IMAGE_URL_FMT.format(release=release, arch=arch)
+    ui.info(f"downloading {url} → {target}")
+    _run(["curl", "-fSL", "-o", str(target), url], timeout=900.0)
+    return target
+
+
+def _ensure_ssh_key() -> Path:
+    """Generate a toolkit-owned ed25519 key on first launch."""
+    key = _ssh_key_path()
+    if key.exists():
+        return key
+    key.parent.mkdir(parents=True, exist_ok=True)
+    _run(
+        [
+            "ssh-keygen",
+            "-t",
+            "ed25519",
+            "-N",
+            "",
+            "-C",
+            "agents-libvirt",
+            "-f",
+            str(key),
+        ]
+    )
+    os.chmod(key, 0o600)
+    return key
+
+
+def _build_cloud_init(vm: str, ssh_pubkey: str) -> tuple[Path, Path]:
+    """Write user-data + meta-data YAML to a tempdir."""
+    tmp = Path(tempfile.mkdtemp(prefix=f"agents-libvirt-{vm}-"))
+    (tmp / "meta-data").write_text(f"instance-id: {vm}\nlocal-hostname: {vm}\n", encoding="utf-8")
+    (tmp / "user-data").write_text(
+        "#cloud-config\n"
+        "users:\n"
+        "  - name: ubuntu\n"
+        "    sudo: ALL=(ALL) NOPASSWD:ALL\n"
+        "    shell: /bin/bash\n"
+        "    ssh_authorized_keys:\n"
+        f"      - {ssh_pubkey.strip()}\n"
+        "package_update: true\n"
+        "packages:\n"
+        "  - openssh-server\n"
+        "  - qemu-guest-agent\n"
+        "runcmd:\n"
+        "  - systemctl enable --now qemu-guest-agent\n",
+        encoding="utf-8",
+    )
+    return tmp / "user-data", tmp / "meta-data"
+
+
+def _make_seed_iso(vm: str, user_data: Path, meta_data: Path) -> Path:
+    """cloud-localds packs user-data + meta-data into the NoCloud
+    ISO9660 format cloud-init looks for on first boot.
+    """
+    iso = _data_dir() / ".seeds" / f"{vm}-seed.iso"
+    iso.parent.mkdir(parents=True, exist_ok=True)
+    _run([CLOUD_LOCALDS, str(iso), str(user_data), str(meta_data)])
+    return iso
+
+
+def wait_for_ssh(vm: str, timeout_s: int = 180) -> None:
+    """Block until SSH responds (cloud-init typically takes 30-90s).
+    Exposed for ``vm.init``'s post-launch handshake step.
+    """
+    import time
+
+    start = time.time()
+    while time.time() - start < timeout_s:
+        result = _ssh(vm, "true", check=False)
+        if result.returncode == 0:
+            return
+        time.sleep(5)
+    raise RuntimeFailure(f"libvirt VM {vm!r} did not become SSH-reachable within {timeout_s}s")
+
+
+# ---------- VmBackend Protocol implementation ----------
 
 
 def exec_in_vm(vm: str, *cmd: str, check: bool = True) -> MpResult:
-    raise _stub("exec_in_vm")
+    _require_linux_host()
+    return _ssh(vm, *cmd, check=check)
 
 
 def exec_bash(
     vm: str, script: str, *, check: bool = True, timeout: float | None = None
 ) -> MpResult:
-    raise _stub("exec_bash")
+    _require_linux_host()
+    ip = _vm_ip(vm)
+    argv = [SSH, *_ssh_opts(), f"ubuntu@{ip}", "bash", "-s"]
+    return _run(argv, check=check, input_bytes=script.encode(), timeout=timeout)
 
 
 def exec_in_vm_with_stdin(vm: str, *cmd: str, input_bytes: bytes, check: bool = True) -> MpResult:
-    raise _stub("exec_in_vm_with_stdin")
+    _require_linux_host()
+    return _ssh(vm, *cmd, check=check, input_bytes=input_bytes)
 
 
 def exec_in_vm_interactive(vm: str, *cmd: str) -> int:
-    raise _stub("exec_in_vm_interactive")
-
-
-# ---------- file transfer ----------
+    """Interactive SSH — inherits terminal so wizards can prompt."""
+    _require_linux_host()
+    ip = _vm_ip(vm)
+    argv = [SSH, "-t", *_ssh_opts(), f"ubuntu@{ip}", "--", *cmd]
+    ui.info(f"$ {' '.join(argv)}")
+    try:
+        result = subprocess.run(argv, check=False)
+    except FileNotFoundError as e:
+        raise RuntimeFailure(f"command not found: {argv[0]} ({e})") from e
+    return result.returncode
 
 
 def transfer_to_vm(host_path: Path, vm: str, vm_path: str) -> MpResult:
-    raise _stub("transfer_to_vm")
+    _require_linux_host()
+    ip = _vm_ip(vm)
+    return _run([SCP, *_ssh_opts(), str(host_path), f"ubuntu@{ip}:{vm_path}"])
 
 
 def transfer_from_vm(vm: str, vm_path: str, host_path: Path) -> MpResult:
-    raise _stub("transfer_from_vm")
-
-
-# ---------- mounts ----------
+    _require_linux_host()
+    ip = _vm_ip(vm)
+    return _run([SCP, *_ssh_opts(), f"ubuntu@{ip}:{vm_path}", str(host_path)])
 
 
 def mount(
@@ -107,60 +342,364 @@ def mount(
     vm_gid: int = 1000,
     mount_type: str = "native",
 ) -> MpResult:
-    raise _stub("mount")
+    """Attach a virtiofs share via domain XML.
+
+    Persistent (``--config``) attach; takes effect on next VM start.
+    Caller (``vm._ensure_mount``) does the stop/mount/start dance.
+    In-guest fstab line is added by ``exec_bash`` if the VM is up.
+
+    9p fallback isn't implemented — virtiofsd is the supported path.
+    If virtiofs setup fails on your host, the workaround is to add
+    the 9p ``<filesystem>`` block manually via ``virsh edit <vm>``.
+    """
+    _require_linux_host()
+    tag = vm_path.replace("/", "_").strip("_") or "share"
+    xml = (
+        "<filesystem type='mount' accessmode='passthrough'>"
+        "  <driver type='virtiofs'/>"
+        f"  <source dir='{host_path}'/>"
+        f"  <target dir='{tag}'/>"
+        "</filesystem>"
+    )
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".xml", delete=False, encoding="utf-8") as f:
+        f.write(xml)
+        xml_path = f.name
+    try:
+        result = _virsh("attach-device", vm, xml_path, "--config", check=False)
+    finally:
+        os.unlink(xml_path)
+    if result.returncode != 0:
+        return result
+    # Best-effort in-guest mount setup. If VM isn't up yet, this is a
+    # no-op; vm.start re-runs the mount probe and the bootstrap script
+    # can pick up the fstab entry on next boot.
+    import contextlib
+
+    fstab_line = f"{tag} {vm_path} virtiofs rw,_netdev 0 0"
+    with contextlib.suppress(RuntimeFailure):
+        exec_bash(
+            vm,
+            f"sudo mkdir -p {vm_path} && "
+            f"grep -qF {fstab_line!r} /etc/fstab || "
+            f"echo {fstab_line!r} | sudo tee -a /etc/fstab && "
+            f"sudo mount -a",
+            check=False,
+        )
+    return result
 
 
 def umount(vm: str, vm_path: str) -> MpResult:
-    raise _stub("umount")
-
-
-# ---------- lifecycle ----------
+    """Detach the virtiofs share via domain XML, located by target tag."""
+    _require_linux_host()
+    tag = vm_path.replace("/", "_").strip("_") or "share"
+    xml = (
+        "<filesystem type='mount' accessmode='passthrough'>"
+        "  <driver type='virtiofs'/>"
+        f"  <target dir='{tag}'/>"
+        "</filesystem>"
+    )
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".xml", delete=False, encoding="utf-8") as f:
+        f.write(xml)
+        xml_path = f.name
+    try:
+        return _virsh("detach-device", vm, xml_path, "--config", check=False)
+    finally:
+        os.unlink(xml_path)
 
 
 def launch(vm: str, *, image: str, cpus: int, memory_gb: int, disk_gb: int) -> MpResult:
-    raise _stub("launch")
+    """Provision a libvirt VM via ``virt-install --import``.
+
+    ``image`` is the Ubuntu release version (e.g. ``"24.04"``); the
+    multipass-style short form maps directly to a cloud-image
+    filename. Anything else is rejected up-front to avoid silent
+    wrong-image guesses.
+    """
+    _require_linux_host()
+    if not re.fullmatch(r"\d+\.\d+", image):
+        raise UserError(f"libvirt backend expects an Ubuntu release (e.g. '24.04'), got {image!r}")
+
+    base_image = _ensure_cloud_image(image)
+    pub_key = _ensure_ssh_key().with_suffix(".pub").read_text(encoding="utf-8")
+    user_data, meta_data = _build_cloud_init(vm, pub_key)
+    seed_iso = _make_seed_iso(vm, user_data, meta_data)
+
+    disk = _data_dir() / ".disks" / f"{vm}.qcow2"
+    disk.parent.mkdir(parents=True, exist_ok=True)
+    _run(
+        [
+            QEMU_IMG,
+            "create",
+            "-f",
+            "qcow2",
+            "-b",
+            str(base_image),
+            "-F",
+            "qcow2",
+            str(disk),
+            f"{disk_gb}G",
+        ]
+    )
+
+    osvariant = "ubuntu" + image.replace(".", "")
+    return _run(
+        [
+            VIRT_INSTALL,
+            "--connect",
+            LIBVIRT_URI,
+            "--name",
+            vm,
+            "--memory",
+            str(memory_gb * 1024),
+            "--vcpus",
+            str(cpus),
+            "--disk",
+            f"path={disk},format=qcow2,bus=virtio",
+            "--disk",
+            f"path={seed_iso},device=cdrom",
+            "--os-variant",
+            osvariant,
+            "--virt-type",
+            "kvm",
+            "--graphics",
+            "none",
+            "--network",
+            "network=default,model=virtio",
+            "--import",
+            "--noautoconsole",
+            "--wait",
+            "0",
+        ],
+        timeout=300.0,
+    )
 
 
 def info_vm(vm: str, *, fmt: str = "json") -> MpResult:
-    raise _stub("info_vm")
+    """``virsh dominfo`` raw text — callers parsing this are
+    backend-aware (vm.status / vm._is_running).
+    """
+    _require_linux_host()
+    return _virsh("dominfo", vm, check=False)
 
 
 def list_vms(*, fmt: str = "json") -> MpResult:
-    raise _stub("list_vms")
+    """Best-effort multipass-list-compatible JSON payload."""
+    _require_linux_host()
+    result = _virsh("list", "--all", "--name", check=False)
+    if result.returncode != 0:
+        return result
+    names = [n for n in result.stdout.splitlines() if n.strip()]
+    payload = {"list": [{"name": n} for n in names]}
+    return MpResult(stdout=json.dumps(payload), stderr="", returncode=0)
 
 
 def find(*, fmt: str = "json", show_unsupported: bool = False) -> MpResult:
-    """libvirt has no equivalent of ``multipass find`` — Ubuntu cloud
-    images live at https://cloud-images.ubuntu.com/<release>/current/.
-    The libvirt backend's ``launch`` will pull them directly when
-    implemented; until then this just refuses.
+    """Return what's in the local cache. libvirt has no ``multipass
+    find`` equivalent; cloud images are fetched directly from
+    cloud-images.ubuntu.com on first launch.
     """
-    raise _stub("find")
+    _require_linux_host()
+    cache = _data_dir() / ".images"
+    items: list[dict[str, str]] = []
+    if cache.exists():
+        for p in cache.glob("ubuntu-*-server-cloudimg-*.img"):
+            items.append({"name": p.name, "path": str(p)})
+    return MpResult(stdout=json.dumps({"cached_images": items}), stderr="", returncode=0)
 
 
 def start_vm(vm: str) -> MpResult:
-    raise _stub("start_vm")
+    _require_linux_host()
+    return _virsh("start", vm, check=False)
 
 
 def stop_vm(vm: str) -> MpResult:
-    raise _stub("stop_vm")
+    """ACPI shutdown. libvirt waits ~30s for graceful exit; caller
+    should retry with destroy if it hangs.
+    """
+    _require_linux_host()
+    return _virsh("shutdown", vm, check=False)
 
 
 def set_config(key: str, value: str | int) -> MpResult:
-    """No direct equivalent — libvirt resizing goes through
-    ``virsh setmaxmem`` / ``setvcpus`` / ``qemu-img resize``. ``agents
-    vm resize`` will dispatch to a libvirt-specific helper in Phase B.
+    """Translate multipass-style ``local.<vm>.<knob>`` keys into
+    virsh / qemu-img equivalents. ``agents vm resize`` is the only
+    known caller.
     """
-    raise _stub("set_config")
+    _require_linux_host()
+    m = re.match(r"local\.(?P<vm>[^.]+)\.(?P<knob>cpus|memory|disk)", key)
+    if not m:
+        return MpResult(
+            stdout="", stderr=f"unsupported libvirt set_config key: {key}", returncode=1
+        )
+    vm = m.group("vm")
+    knob = m.group("knob")
+    if knob == "cpus":
+        return _virsh("setvcpus", vm, str(value), "--config", check=False)
+    if knob == "memory":
+        gb_match = re.match(r"(\d+)", str(value))
+        if not gb_match:
+            return MpResult(stdout="", stderr=f"unparseable memory value {value!r}", returncode=1)
+        kib = int(gb_match.group(1)) * 1024 * 1024
+        out = _virsh("setmaxmem", vm, str(kib), "--config", check=False)
+        if out.returncode != 0:
+            return out
+        return _virsh("setmem", vm, str(kib), "--config", check=False)
+    # disk
+    gb_match = re.match(r"(\d+)", str(value))
+    if not gb_match:
+        return MpResult(stdout="", stderr=f"unparseable disk value {value!r}", returncode=1)
+    disk = _data_dir() / ".disks" / f"{vm}.qcow2"
+    return _run([QEMU_IMG, "resize", str(disk), f"{gb_match.group(1)}G"], check=False)
 
 
 def delete_vm(vm: str, *, purge: bool = False) -> MpResult:
-    raise _stub("delete_vm")
+    """destroy + undefine. With ``purge``, also removes the qcow2
+    disk and seed ISO under ``<data-dir>/.disks/`` and ``.seeds/``.
+    """
+    _require_linux_host()
+    _virsh("destroy", vm, check=False)
+    args = ["undefine", vm, "--nvram"]
+    if purge:
+        args.append("--remove-all-storage")
+    result = _virsh(*args, check=False)
+    if purge:
+        disk = _data_dir() / ".disks" / f"{vm}.qcow2"
+        if disk.exists():
+            disk.unlink()
+        seed = _data_dir() / ".seeds" / f"{vm}-seed.iso"
+        if seed.exists():
+            seed.unlink()
+    return result
 
 
 def snapshot(vm: str, name: str, *, comment: str | None = None) -> MpResult:
-    raise _stub("snapshot")
+    _require_linux_host()
+    args = ["snapshot-create-as", vm, name]
+    if comment:
+        args.extend(["--description", comment])
+    # External / qcow2-backing-chain snapshots — disk not paused
+    # during creation.
+    args.append("--disk-only")
+    return _virsh(*args, check=False)
 
 
 def restore(snapshot_id: str, *, destructive: bool = False) -> MpResult:
-    raise _stub("restore")
+    """``snapshot_id`` form ``<vm>.<name>`` (same as multipass)."""
+    _require_linux_host()
+    if "." not in snapshot_id:
+        return MpResult(
+            stdout="",
+            stderr=f"libvirt snapshot id must be '<vm>.<name>', got {snapshot_id!r}",
+            returncode=1,
+        )
+    vm, name = snapshot_id.split(".", 1)
+    args = ["snapshot-revert", vm, name]
+    if destructive:
+        args.append("--force")
+    return _virsh(*args, check=False)
+
+
+# ---------- GPU passthrough ----------
+
+GPU_VENDORS: Final = {
+    "10de": "NVIDIA",
+    "1002": "AMD",
+    "8086": "Intel",
+}
+
+
+def detect_gpus() -> list[dict[str, str]]:
+    """Enumerate PCI VGA/3D/Display controllers from supported
+    vendors via ``lspci -nn -D``. Returns ``[]`` when lspci is
+    missing — callers decide whether that's a hard failure.
+
+    Each entry: ``{pci_id, vendor, vendor_name, device, description,
+    iommu_group, vfio_bound}``. The ``iommu_group`` and ``vfio_bound``
+    fields drive doctor + GPU-attach validation.
+    """
+    if not shutil.which(LSPCI):
+        return []
+    result = _run([LSPCI, "-nn", "-D"], check=False)
+    if result.returncode != 0:
+        return []
+    gpus: list[dict[str, str]] = []
+    for line in result.stdout.splitlines():
+        m = re.match(
+            r"(?P<pci>\S+)\s+(?:VGA compatible|3D|Display)\s+controller\s+\[\w+\]:\s+(?P<desc>.+?)\s+\[(?P<vid>[0-9a-f]{4}):(?P<did>[0-9a-f]{4})\]",
+            line,
+        )
+        if not m:
+            continue
+        vid = m.group("vid").lower()
+        if vid not in GPU_VENDORS:
+            continue
+        pci = m.group("pci")
+        gpus.append(
+            {
+                "pci_id": pci,
+                "vendor": vid,
+                "vendor_name": GPU_VENDORS[vid],
+                "device": m.group("did"),
+                "description": m.group("desc"),
+                "iommu_group": _iommu_group_for(pci),
+                "vfio_bound": "true" if _is_vfio_bound(pci) else "false",
+            }
+        )
+    return gpus
+
+
+def _iommu_group_for(pci: str) -> str:
+    """Read ``/sys/bus/pci/devices/<pci>/iommu_group/``. Returns empty
+    string when IOMMU isn't enabled or the device isn't in a group.
+    """
+    link = Path(f"/sys/bus/pci/devices/{pci}/iommu_group")
+    if not link.exists():
+        return ""
+    try:
+        return Path(os.readlink(link)).name
+    except OSError:
+        return ""
+
+
+def _is_vfio_bound(pci: str) -> bool:
+    driver_link = Path(f"/sys/bus/pci/devices/{pci}/driver")
+    if not driver_link.exists():
+        return False
+    try:
+        return Path(os.readlink(driver_link)).name == "vfio-pci"
+    except OSError:
+        return False
+
+
+def attach_gpu_xml(vm: str, pci_id: str) -> MpResult:
+    """Build and attach the ``<hostdev>`` XML for a PCI passthrough
+    device. Requires the device bound to vfio-pci and the VM stopped.
+
+    ``pci_id`` form ``0000:01:00.0`` (full domain:bus:slot.function).
+    """
+    _require_linux_host()
+    m = re.match(
+        r"(?P<dom>[0-9a-f]{4}):(?P<bus>[0-9a-f]{2}):(?P<slot>[0-9a-f]{2})\.(?P<func>[0-7])",
+        pci_id,
+    )
+    if not m:
+        return MpResult(
+            stdout="",
+            stderr=f"invalid PCI id {pci_id!r}; expected DDDD:BB:SS.F",
+            returncode=1,
+        )
+    xml = (
+        "<hostdev mode='subsystem' type='pci' managed='yes'>"
+        "  <source>"
+        f"    <address domain='0x{m.group('dom')}' bus='0x{m.group('bus')}'"
+        f"     slot='0x{m.group('slot')}' function='0x{m.group('func')}'/>"
+        "  </source>"
+        "</hostdev>"
+    )
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".xml", delete=False, encoding="utf-8") as f:
+        f.write(xml)
+        xml_path = f.name
+    try:
+        return _virsh("attach-device", vm, xml_path, "--config", check=False)
+    finally:
+        os.unlink(xml_path)

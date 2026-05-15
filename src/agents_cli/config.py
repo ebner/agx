@@ -50,12 +50,29 @@ class VmConfig(BaseModel):
     # every host↔VM call in ``mp.py`` to the matching backend module
     # under ``agents_cli.backends``.
     backend: str = "multipass"
+    # GPU PCI IDs to pass through (libvirt backend only). Form:
+    # ``["0000:01:00.0", "0000:01:00.1"]``. Populated by
+    # ``agents vm init --backend libvirt --gpu`` (auto-detect) or
+    # ``--gpu <pci-id>`` (explicit). Empty list = no passthrough.
+    gpu_passthrough: list[str] = Field(default_factory=list)
 
     @field_validator("backend")
     @classmethod
     def _validate_backend(cls, v: str) -> str:
         if v not in ("multipass", "libvirt"):
             raise ValueError(f"vm.backend must be 'multipass' or 'libvirt', got {v!r}")
+        return v
+
+    @field_validator("gpu_passthrough")
+    @classmethod
+    def _validate_gpu_ids(cls, v: list[str]) -> list[str]:
+        import re
+
+        for pci in v:
+            if not re.fullmatch(r"[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]", pci):
+                raise ValueError(
+                    f"gpu_passthrough id {pci!r} must be DDDD:BB:SS.F (e.g. 0000:01:00.0)"
+                )
         return v
 
 

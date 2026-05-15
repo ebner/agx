@@ -573,6 +573,88 @@ If your RPi5 has an NVMe HAT and you're booting from NVMe, microSD consideration
 - **OpenViking memory sidecar** — `volcengine/openviking` arm64 status not verified by the toolkit; manifest fetch failed during investigation. If you need OpenViking memory on arm64, check that the image actually ships your arch before enabling the backend. `holographic` and `mem0` memory backends are pure-Python and arch-agnostic.
 - **OpenClaw image registry** — pull access denied at investigation time (the public registry path may differ from what the toolkit's allowlist expects). Verify OpenClaw publishes arm64 builds before relying on it on RPi5; Hermes-only deployments are unaffected.
 
+## Using the libvirt backend (experimental — Linux + GPU passthrough)
+
+The default `multipass` backend works everywhere and is the right choice for 95% of deployments. The `libvirt` backend exists for one reason: **GPU passthrough**, which Multipass doesn't support and which is required for vLLM (and helpful for accelerated Ollama/llama.cpp inference on workstations with discrete GPUs). See [GH #2](https://github.com/ebner/agents/issues/2) for the design rationale.
+
+⚠️  **Experimental — not smoke-tested on real hardware in the toolkit's CI.** Tests verify argv shapes and value types; full end-to-end correctness needs validation on a Linux + libvirt host with a real GPU. Expect minor quirks around virsh output formats, cloud-init seed ISO, and IOMMU-group handling that will surface only when actually exercised.
+
+### Prerequisites
+
+- **Linux host** (Ubuntu 22.04+ or equivalent). macOS and Windows hosts are explicitly refused — use Multipass there.
+- **libvirt + KVM stack**:
+  ```bash
+  sudo apt install libvirt-clients libvirt-daemon-system virtinst \
+                   genisoimage cloud-image-utils openssh-client qemu-utils
+  sudo usermod -aG libvirt $USER     # log out + back in for group to take effect
+  ```
+- **For GPU passthrough**: IOMMU enabled in BIOS, vfio-pci kernel module, and the target GPU bound to vfio-pci at boot. The Arch wiki's [PCI passthrough via OVMF](https://wiki.archlinux.org/title/PCI_passthrough_via_OVMF) is the canonical setup guide; the toolkit doesn't automate the kernel-cmdline / modprobe configuration because that's a host-level change with reboot consequences.
+- **For arm64 (RPi5 etc.)**: KVM works on arm64 Linux; the cloud image arch is auto-detected from `platform.machine()`. No GPU passthrough on RPi5 (no discrete GPU).
+
+### Provisioning
+
+```bash
+# CPU-only (no GPU passthrough)
+agents vm init --backend libvirt --data-dir /data/agents
+
+# With autodetect (picks every vfio-pci-bound GPU it finds via lspci)
+agents vm init --backend libvirt --gpu auto --data-dir /data/agents
+
+# With explicit PCI ID(s); repeat --gpu to pass multiple devices
+agents vm init --backend libvirt --gpu 0000:01:00.0 --gpu 0000:01:00.1 \
+    --data-dir /data/agents
+```
+
+`vm init` with `--backend libvirt`:
+
+1. Downloads the Ubuntu cloud image (~600 MB) into `<data-dir>/.images/<release>-<arch>.img` on first run; cached for subsequent rebuilds.
+2. Generates an ed25519 SSH keypair at `<data-dir>/.ssh/id_ed25519`. The pubkey is injected via cloud-init user-data so the toolkit can `ssh ubuntu@<vm-ip>` for every subsequent exec.
+3. Builds a NoCloud seed ISO via `cloud-localds` and feeds it to `virt-install --import` alongside a copy-on-write qcow2 backed by the cached image.
+4. After the VM is reachable via SSH, attaches any configured GPUs (stops VM → `virsh attach-device <hostdev-xml>` per GPU → starts VM → re-waits).
+5. Runs the same `vm-bootstrap.sh` script as the multipass path. The script knows nothing about the hypervisor.
+
+### Verifying GPU passthrough
+
+```bash
+agents vm shell                              # ssh into the VM
+nvidia-smi                                   # NVIDIA: should list the GPU
+lspci | grep -E "VGA|3D"                     # AMD/Intel: card visible
+```
+
+If the card isn't there: the device isn't bound to vfio-pci. `lspci -k -d <vendor>:` on the **host** shows the driver — if it's `nvidia` / `amdgpu` / `i915`, you need to unbind the host driver and bind vfio-pci first (kernel cmdline `vfio-pci.ids=<vid>:<did>` is the usual approach).
+
+### What's the same vs different vs Multipass
+
+| Behavior | Multipass | libvirt |
+|---|---|---|
+| Cross-platform | Linux/macOS/Windows | Linux only |
+| GPU passthrough | Not supported | Auto-detect NVIDIA/AMD/Intel |
+| VM provisioning | `multipass launch` (one shot) | virt-install + cloud-init seed ISO + ssh wait |
+| Exec into VM | `multipass exec` | `ssh ubuntu@<ip>` (key auth) |
+| File transfer | `multipass transfer` (SFTP) | `scp` |
+| Host-mount | `multipass mount --type native` | virtiofs via `<filesystem>` domain XML |
+| Snapshots | `multipass snapshot` | `virsh snapshot-create-as --disk-only` (qcow2 backing chain) |
+| `vm resize` | `multipass set local.<vm>.<knob>` | `virsh setvcpus` / `setmaxmem` / `qemu-img resize` |
+| Image catalog | `multipass find` | Cloud images at `cloud-images.ubuntu.com` (no catalog) |
+
+### Migration between backends
+
+Not automated. If you want to switch backends on an existing deployment:
+
+1. `agents export --all` to capture every agent's data dir into `<data-dir>/backups/`.
+2. `agents vm destroy --yes`.
+3. `agents vm init --backend <new-backend> --data-dir <same-path>`.
+4. `agents import <name> <archive>` for each archived agent.
+
+The host data dir is backend-agnostic; only the VM provisioning changes.
+
+### Known limitations (Phase B)
+
+- **9p mount fallback is documented, not coded.** If `virtiofsd` isn't available, edit the domain XML manually via `virsh edit <vm>` to use 9p.
+- **Snapshot/restore semantics differ from Multipass.** Multipass's `vm snapshot` creates a full point-in-time image; the libvirt implementation uses external (qcow2 backing chain) snapshots which are cheaper to create but accumulate disk usage over time. Long-term hosts with frequent snapshots may need periodic `virsh blockcommit`.
+- **`agents vm list` only shows VMs created by the toolkit** — both backends now return JSON with a `list` key containing one entry per VM name, but the schema isn't as rich as multipass's full `multipass list` output.
+- **Doctor checks don't yet probe libvirt-daemon health.** Follow-up needed; for now check `systemctl status libvirtd` manually if a VM seems wedged.
+
 ## Tearing down
 
 ```bash

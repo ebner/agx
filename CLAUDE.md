@@ -6,6 +6,7 @@
 
 ## Locked architecture rules (do not relitigate)
 
+0. **VM backend is pluggable.** `cfg.vm.backend` selects `multipass` (cross-platform default) or `libvirt` (Linux-only, experimental — enables GPU passthrough; see GH #2). `mp.py` is a dispatcher; the real implementations live in `agents_cli/backends/multipass.py` and `agents_cli/backends/libvirt.py`. Backend modules are duck-typed (free functions matching `VmBackend` Protocol). `cli.main` calls `mp.set_backend(get_backend_module(cfg.vm.backend))` once at startup; everything else uses `mp.foo(...)` and stays backend-agnostic. **Never add new VM-host primitives directly to `mp.py`** — add them to BOTH backend modules + the dispatcher in `mp.py`.
 1. **Rootless Docker inside the VM.** Daemon runs as `ubuntu`, socket at `<docker_socket_path>` (read from `[vm_runtime]` in config — set by BOOTSTRAP_OK). Never hardcode the path or the UID.
 2. **One mount, one source of truth.** Host `<data-dir>` is mounted at VM `/home/ubuntu/agents` with explicit `multipass mount -u <host-uid>:1000 -g <host-gid>:1000`. All per-agent data, the compose file, the `.env`, exports, and the toolkit-scoped Codex auth live under this path. The VM disk only holds OS + Docker engine + image cache. Opt-out is `vm init --data-dir-in-vm` — **recommended for SQLite-heavy workloads** (Hermes' kanban/sessions/insights stores use WAL, which doesn't work over the 9p share; in-VM ext4 fixes that). Under `--data-dir-in-vm` agent state is host-visible only via `agents export` archives; `agents export-cron install --time 02:30,08:30,14:30,20:30` gives you 6-hourly archives that duplicity picks up natively.
 3. **Toolkit-scoped Codex auth** at `<data-dir>/.codex/` — NEVER the user's personal `~/.codex/`. `agents codex login` sets `CODEX_HOME=<data-dir>/.codex`.
@@ -100,7 +101,11 @@ src/agents_cli/
   config.py       # pydantic v2 schema + tomlkit round-trip of ~/.config/agents/config.toml
   ui.py           # human/JSON output, confirmation prompts, --yes bypass
   errors.py       # exit-code mapping (0 success, 1 user error, 2 runtime, 3 health)
-  mp.py           # multipass primitives: launch/exec/transfer/mount/snapshot/list/info; BOOTSTRAP_OK parser
+  mp.py           # VM-backend DISPATCHER (was multipass primitives). Thin wrappers over `cfg.vm.backend`'s module. Re-exports value types (MpResult, BootstrapStatus, parse_bootstrap_ok) for backward compat.
+  backends/       # VM-backend implementations
+    __init__.py   # VmBackend Protocol, MpResult/BootstrapStatus, parse_bootstrap_ok, get_backend_module
+    multipass.py  # Multipass impl (cross-platform default; was mp.py before the abstraction)
+    libvirt.py    # libvirt/KVM impl, Linux-only, EXPERIMENTAL. Cloud-init seed ISO + virt-install + ssh/scp. GPU passthrough auto-detect (NVIDIA/AMD/Intel) + IOMMU validation + hostdev XML attach. configure(data_dir) MUST be called before any primitive — cli.main does this when libvirt is active.
   compose_runner.py  # docker compose verbs via multipass exec
   compose.py      # ruamel round-trip, Hermes/OpenClaw service fragments, port allocator
   hermes_config.py   # round-trip edit of each agent's config.yaml; refuses 0.0.0.0

@@ -81,7 +81,13 @@ def main(ctx: click.Context, json_output: bool, assume_yes: bool, verbose: bool)
     from agents_cli import mp
     from agents_cli.backends import get_backend_module
 
-    mp.set_backend(get_backend_module(cfg.vm.backend))
+    backend_mod = get_backend_module(cfg.vm.backend)
+    mp.set_backend(backend_mod)
+    # libvirt needs the data dir for image / ssh-key caching.
+    if cfg.vm.backend == "libvirt":
+        from agents_cli.backends import libvirt as libvirt_mod
+
+        libvirt_mod.configure(cfg.paths.host_data_dir)
 
 
 # ---------- vm lifecycle ----------
@@ -109,6 +115,19 @@ def vm() -> None:
     metavar="VERSION",
     help="Override Ubuntu LTS for the VM (default 24.04). Use 26.04 once Docker CE's repos include it.",
 )
+@click.option(
+    "--backend",
+    type=click.Choice(["multipass", "libvirt"]),
+    default="multipass",
+    help="VM hypervisor backend. libvirt is Linux-only + experimental; enables GPU passthrough.",
+)
+@click.option(
+    "--gpu",
+    "gpu",
+    multiple=True,
+    metavar="PCI",
+    help="GPU PCI passthrough (libvirt only). 'auto' for autodetect, or DDDD:BB:SS.F. Repeatable.",
+)
 def vm_init(
     data_dir: str,
     data_dir_in_vm: bool,
@@ -116,8 +135,12 @@ def vm_init(
     memory_gb: int | None,
     disk_gb: int | None,
     ubuntu_release: str | None,
+    backend: str,
+    gpu: tuple[str, ...],
 ) -> None:
-    """Provision the Multipass VM and mount the host data dir."""
+    """Provision the VM (Multipass or libvirt) and mount the host data dir."""
+    if gpu and backend != "libvirt":
+        raise click.UsageError("--gpu requires --backend libvirt")
     _run(
         vm_mod.init,
         data_dir=Path(data_dir).expanduser(),
@@ -126,6 +149,8 @@ def vm_init(
         memory_gb=memory_gb,
         disk_gb=disk_gb,
         ubuntu_release=ubuntu_release,
+        backend=backend,
+        gpu=list(gpu),
     )
 
 

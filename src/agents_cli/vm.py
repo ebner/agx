@@ -38,6 +38,8 @@ def init(
     memory_gb: int | None = None,
     disk_gb: int | None = None,
     ubuntu_release: str | None = None,
+    backend: str = "multipass",
+    gpu: list[str] | None = None,
     config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH,
 ) -> None:
     """Idempotently provision the agents VM.
@@ -51,6 +53,12 @@ def init(
       6. Pipe the bootstrap script in, parse the BOOTSTRAP_OK handshake.
       7. Populate `[vm_runtime]` and pinned image tags.
       8. Seed an empty docker-compose.yml and .env on the data-dir.
+
+    ``backend`` selects the hypervisor (``"multipass"`` default,
+    ``"libvirt"`` experimental Linux-only). ``gpu`` is a list of PCI
+    IDs to pass through on libvirt — ``["auto"]`` triggers vendor-
+    aware autodetect (NVIDIA / AMD / Intel) and fills the config with
+    every GPU bound to vfio-pci.
     """
     cfg = _load_or_default_config(config_path)
 
@@ -69,18 +77,41 @@ def init(
         cfg.vm.disk_gb = disk_gb
     if ubuntu_release is not None:
         cfg.vm.ubuntu_release = ubuntu_release
+    cfg.vm.backend = backend
+    if backend == "libvirt":
+        cfg.vm.gpu_passthrough = _resolve_gpu_list(gpu or [])
+    elif gpu:
+        raise UserError("--gpu requires --backend libvirt")
+
+    # Switch the dispatcher to the chosen backend BEFORE any of the
+    # mp.* primitives below run, otherwise we'd talk to multipass
+    # when the user asked for libvirt.
+    from agents_cli import mp
+    from agents_cli.backends import get_backend_module
+
+    mp.set_backend(get_backend_module(backend))
+    if backend == "libvirt":
+        from agents_cli.backends import libvirt as libvirt_mod
+
+        libvirt_mod.configure(cfg.paths.host_data_dir)
 
     cfg.host = HostConfig(uid=os.getuid(), gid=os.getgid())
 
     _prepare_host_data_dir(cfg.paths.host_data_dir)
 
-    image = _select_ubuntu_image(cfg.vm.ubuntu_release)
-    if image != cfg.vm.ubuntu_release:
-        ui.warn(
-            f"Ubuntu {cfg.vm.ubuntu_release} not listed by `multipass find`; "
-            f"falling back to {image}."
-        )
-        cfg.vm.ubuntu_release = image
+    if backend == "multipass":
+        image = _select_ubuntu_image(cfg.vm.ubuntu_release)
+        if image != cfg.vm.ubuntu_release:
+            ui.warn(
+                f"Ubuntu {cfg.vm.ubuntu_release} not listed by `multipass find`; "
+                f"falling back to {image}."
+            )
+            cfg.vm.ubuntu_release = image
+    else:
+        # libvirt backend interprets `image` as the Ubuntu release
+        # version (e.g. "24.04") and downloads the matching cloud
+        # image directly — no catalog probe needed.
+        image = cfg.vm.ubuntu_release
 
     cfg_mod.save(cfg, config_path)
 
@@ -96,6 +127,19 @@ def init(
             memory_gb=cfg.vm.memory_gb,
             disk_gb=cfg.vm.disk_gb,
         )
+        # libvirt: wait for SSH (cloud-init) before bootstrap; attach
+        # any configured GPUs while the VM is stopped, then restart.
+        if backend == "libvirt":
+            from agents_cli.backends import libvirt as libvirt_mod
+
+            libvirt_mod.wait_for_ssh(cfg.vm.name)
+            if cfg.vm.gpu_passthrough:
+                mp.stop_vm(cfg.vm.name)
+                for pci in cfg.vm.gpu_passthrough:
+                    ui.info(f"attaching GPU {pci} to {cfg.vm.name}")
+                    libvirt_mod.attach_gpu_xml(cfg.vm.name, pci)
+                mp.start_vm(cfg.vm.name)
+                libvirt_mod.wait_for_ssh(cfg.vm.name)
 
     if not data_dir_in_vm:
         _ensure_mount(cfg)
@@ -712,6 +756,38 @@ def _fetch_latest_tag(repo_key: str) -> str | None:
             return str(tag) if tag else None
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
         return None
+
+
+def _resolve_gpu_list(requested: list[str]) -> list[str]:
+    """Map the ``--gpu`` CLI input to a concrete list of PCI IDs.
+
+    ``["auto"]`` triggers vendor-aware detection (NVIDIA / AMD / Intel)
+    via :func:`agents_cli.backends.libvirt.detect_gpus`. Anything else
+    is treated as a literal PCI-ID list and validated against the
+    DDDD:BB:SS.F regex. Empty list returns empty.
+
+    Detected GPUs are filtered to those bound to vfio-pci — silently
+    skipping host-driver-bound devices (which would fail to attach
+    anyway). If autodetect finds zero vfio-bound GPUs, raises
+    UserError with a setup hint rather than silently succeeding with
+    no passthrough.
+    """
+    if not requested:
+        return []
+    if requested == ["auto"]:
+        from agents_cli.backends import libvirt as libvirt_mod
+
+        gpus = libvirt_mod.detect_gpus()
+        vfio = [g["pci_id"] for g in gpus if g["vfio_bound"] == "true"]
+        if not vfio:
+            raise UserError(
+                "no vfio-pci-bound GPUs found. Bind the GPU to vfio-pci first: "
+                "see https://wiki.archlinux.org/title/PCI_passthrough_via_OVMF"
+                " for the standard kernel-cmdline + vfio-pci.ids setup."
+            )
+        return vfio
+    # Explicit list; pydantic validator catches malformed entries.
+    return list(requested)
 
 
 def _fallback_tag(repo_key: str) -> str:
