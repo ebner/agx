@@ -162,6 +162,38 @@ class OllamaConfig(BaseModel):
         return v
 
 
+class InferenceConfig(BaseModel):
+    """Local inference engines running INSIDE the VM as sibling Docker
+    services. Distinct from :class:`OllamaConfig` which describes an
+    EXTERNAL Ollama instance reachable over the network — both can
+    coexist (e.g. external GPU box for the heavy model, in-VM CPU
+    Ollama for a small embedding model).
+
+    The toolkit owns the lifecycle of in-VM engines (``agents inference
+    up/down``), pins their images by digest on first up, and writes
+    the compose entries. Memory backends + agent wiring prefer this
+    block over the external ``[ollama]`` when both are populated AND
+    the in-VM engine is healthy — see ``agents model use`` for the
+    explicit per-agent wiring command.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    # True after `agents inference up ollama` has succeeded at least
+    # once. Read by doctor / models commands to decide whether to
+    # probe the in-VM engine at all.
+    ollama_enabled: bool = False
+    ollama_port: int = 11434
+    # Digest-pinned image refs, written on first `agents inference up`
+    # and reused thereafter (same model as firecrawl-state). Empty
+    # until first up.
+    ollama_image: str = ""
+    # llama.cpp doesn't have a single "enabled" — each loaded model is
+    # a separate service. Just tracks the pinned image used to spawn
+    # them.
+    llamacpp_image: str = ""
+
+
 class ExportCronConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -205,6 +237,7 @@ class AgentsConfig(BaseModel):
     vm_runtime: VmRuntimeConfig = Field(default_factory=VmRuntimeConfig)
     defaults: DefaultsConfig = Field(default_factory=DefaultsConfig)
     ollama: OllamaConfig = Field(default_factory=OllamaConfig)
+    inference: InferenceConfig = Field(default_factory=InferenceConfig)
     export_cron: ExportCronConfig = Field(default_factory=ExportCronConfig)
 
 

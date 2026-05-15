@@ -15,6 +15,8 @@ from agents_cli.compose import (
     FIRECRAWL_RABBITMQ_IMAGE_BASE,
     FIRECRAWL_REDIS_IMAGE_BASE,
     HERMES_IMAGE_BASE,
+    LLAMACPP_IMAGE_BASE,
+    OLLAMA_IMAGE_BASE,
     OPENCLAW_IMAGE_BASE,
     OPENVIKING_IMAGE_BASE,
     add_service,
@@ -189,6 +191,8 @@ def test_allowlist_set_is_what_we_advertise() -> None:
                 FIRECRAWL_POSTGRES_IMAGE_BASE,
                 FIRECRAWL_REDIS_IMAGE_BASE,
                 FIRECRAWL_RABBITMQ_IMAGE_BASE,
+                OLLAMA_IMAGE_BASE,
+                LLAMACPP_IMAGE_BASE,
             }
         )
         == ALLOWED_IMAGE_BASES

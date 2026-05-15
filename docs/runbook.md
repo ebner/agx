@@ -427,6 +427,97 @@ Phases (each idempotent, journaled at `<data-dir>/.journal/rebuild-<vm>-<utc>.js
 
 If something crashes mid-rebuild, re-running `agents vm rebuild` picks up where the journal left off. The staging dir is left in place after success so you can inspect; safe to `rm -rf <data-dir>/.rebuild-staging/` once `agents doctor` is green.
 
+## Local inference (Ollama, llama.cpp)
+
+The toolkit can run local LLMs inside the VM as sibling Docker services. Hermes agents (and OpenClaw, with manual configuration) reach them over the project Docker network — no external API calls, no per-token billing.
+
+### Phase 1: Ollama (simplest path)
+
+```bash
+# Start the Ollama service (auto-resolves and pins the image digest)
+agents inference up ollama
+
+# Pull a model — accepts both Ollama Hub refs and HuggingFace
+agents model pull ollama llama3.2:3b
+agents model pull ollama hf.co/bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M
+
+# Wire it into an agent (writes the model: block in config.yaml)
+agents model use coder --engine ollama --model llama3.2:3b
+
+# Or route compression + vision through it too (free, no cloud cost)
+agents model use coder --engine ollama --model llama3.2:3b --aux all
+
+# Restart so the gateway picks up the new config
+agents restart coder
+```
+
+Status + introspection:
+
+```bash
+agents inference status            # what's running, models loaded
+agents model list                  # disk inventory (both engines)
+agents doctor coder               # includes inference_ollama check
+```
+
+### Phase 2: llama.cpp (HF GGUFs, per-model serving)
+
+llama.cpp is one-model-per-process by design, so each loaded model becomes its own compose service:
+
+```bash
+# Pin the llama.cpp image (no service started yet)
+agents inference up llama-cpp
+
+# Download a GGUF from HuggingFace into <data-dir>/models/llama-cpp/
+agents model pull llama-cpp bartowski/Llama-3.2-3B-Instruct-GGUF:Llama-3.2-3B-Instruct-Q4_K_M.gguf
+
+# Spawn a llama-server bound to that file
+agents inference load llama-cpp llama-3-2-3b --gguf Llama-3.2-3B-Instruct-Q4_K_M.gguf --port 8080
+
+# Wire an agent
+agents model use coder --engine llama-cpp --model llama-3-2-3b
+
+# Unload when done (frees RAM)
+agents inference unload llama-cpp llama-3-2-3b
+```
+
+### vLLM
+
+Not supported inside the toolkit's Multipass VM. vLLM is GPU-only in practice, and Multipass doesn't support GPU passthrough on stable releases (see [GH issue #2](https://github.com/ebner/agents/issues/2) for the libvirt-backend investigation). If you have an externally-hosted vLLM, point Hermes at it via:
+
+```yaml
+model:
+  default: meta-llama/Llama-3-8B-Instruct
+  provider: custom
+  base_url: http://your-vllm-host:8000/v1
+  api_key: <your-token>
+```
+
+This works today with no toolkit changes — the `custom` provider in Hermes bypasses its provider registry.
+
+### Storage and sizing
+
+Models live under `<data-dir>/models/{ollama,llama-cpp}/`. Rough RAM budget per quantized model:
+
+| Model | Disk | RAM | Notes |
+|---|---|---|---|
+| 1.5B Q4 | ~1 GB | ~2 GB | Fine on RPi5 8 GiB |
+| 3B Q4 | ~2 GB | ~3-4 GB | Tight on RPi5 8 GiB |
+| 7B Q4_K_M | ~4 GB | ~6 GB | Workstation only |
+| 13B Q4_K_M | ~8 GB | ~10 GB | Workstation only |
+
+Disk caveat: download multiple 7B variants and you'll burn 20+ GB fast. Default VM disk is 25 GB total. Run `agents vm resize --disk 80` (or higher) before going model-shopping.
+
+### OpenClaw
+
+The toolkit doesn't write OpenClaw's config. `agents model use` refuses on OpenClaw agents but prints the exact `base_url` to paste into `openclaw configure` manually.
+
+### Two `[ollama]` blocks aren't a typo
+
+- `[ollama]` (and `agents ollama configure/status`) — points the toolkit at an **external** Ollama (separate GPU box, hosted, etc.). Localhost is refused because it would resolve to the VM itself, not where you actually run Ollama.
+- `[inference]` (managed by `agents inference up/down`) — **in-VM** Ollama. Lives inside the Multipass guest, served at the Docker DNS name `ollama:11434`.
+
+Both can coexist — e.g. heavy LLM on the external GPU box, lightweight embedding model on the in-VM Ollama.
+
 ## Running on arm64 / Raspberry Pi 5
 
 The toolkit works on arm64 Linux hosts (RPi5, Apple Silicon under Multipass, generic arm64 servers), but a few upstream images need awareness.

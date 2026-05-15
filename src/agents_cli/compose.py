@@ -65,6 +65,14 @@ FIRECRAWL_PLAYWRIGHT_IMAGE_BASE: Final = "ghcr.io/firecrawl/playwright-service"
 FIRECRAWL_POSTGRES_IMAGE_BASE: Final = "ghcr.io/firecrawl/nuq-postgres"
 FIRECRAWL_REDIS_IMAGE_BASE: Final = "redis"
 FIRECRAWL_RABBITMQ_IMAGE_BASE: Final = "rabbitmq"
+# Local-inference backends (Phase 1: Ollama, Phase 2: llama.cpp).
+# Project-scoped sibling services like Firecrawl; one Ollama service
+# serves every agent via Docker DNS. vLLM intentionally not in the
+# allowlist — see GitHub issue #2 (libvirt + GPU passthrough); use
+# `provider: custom + base_url` to point at an externally-hosted vLLM
+# instead.
+OLLAMA_IMAGE_BASE: Final = "ollama/ollama"
+LLAMACPP_IMAGE_BASE: Final = "ghcr.io/ggml-org/llama.cpp"
 ALLOWED_IMAGE_BASES: Final = frozenset(
     {
         HERMES_IMAGE_BASE,
@@ -75,6 +83,8 @@ ALLOWED_IMAGE_BASES: Final = frozenset(
         FIRECRAWL_POSTGRES_IMAGE_BASE,
         FIRECRAWL_REDIS_IMAGE_BASE,
         FIRECRAWL_RABBITMQ_IMAGE_BASE,
+        OLLAMA_IMAGE_BASE,
+        LLAMACPP_IMAGE_BASE,
     }
 )
 
@@ -417,6 +427,116 @@ def openclaw_service_fragment(
 
 
 FIRECRAWL_SERVICE_PREFIX: Final = "firecrawl-"
+
+# ---------- local inference (Phase 1: Ollama, Phase 2: llama.cpp) ----------
+
+OLLAMA_SERVICE_NAME: Final = "ollama"
+OLLAMA_DEFAULT_PORT: Final = 11434
+LLAMACPP_SERVICE_PREFIX: Final = "llama-cpp-"
+
+
+def ollama_service_fragment(*, image: str, port: int = OLLAMA_DEFAULT_PORT) -> dict[str, Any]:
+    """Compose block for the project-scoped Ollama inference server.
+
+    One Ollama instance serves every Hermes agent over the project's
+    default docker network as ``http://ollama:11434/v1``. The host port
+    is bound to ``127.0.0.1`` so a host-side ``ollama`` CLI invocation
+    works (useful for debugging), but it is NEVER exposed to the
+    network — Ollama has no auth, so a bind to 0.0.0.0 would expose
+    every loaded model to the LAN.
+
+    Models live on a bind mount at ``./models/ollama/`` (relative to
+    the project compose dir, i.e. ``<data-dir>/models/ollama/``) so
+    they're host-visible for inspection and survive ``agents inference
+    down``. The full Ollama blob store layout is under that path
+    (manifests + blobs subdirs).
+
+    ``OLLAMA_KEEP_ALIVE: -1m`` keeps loaded models in RAM until
+    explicitly evicted; the default 5-minute idle timeout would
+    constantly unload-and-reload the agent's chosen model between
+    requests on a low-traffic agent setup, defeating the cache.
+
+    ``mem_limit`` deliberately not set: model weights + KV cache size
+    varies wildly across models (~2 GB for 1.5B Q4, ~6 GB for 7B Q4,
+    ~10 GB for 13B Q4), and a hard cap would kill loads. Users on
+    constrained VMs (RPi5) pick smaller models; doctor's
+    ``inference_model_memory_fit`` warns if the chosen model exceeds
+    75% of VM RAM.
+    """
+    return {
+        "image": image,
+        "container_name": OLLAMA_SERVICE_NAME,
+        "restart": "unless-stopped",
+        "ports": [f"127.0.0.1:{port}:11434"],
+        "volumes": ["./models/ollama:/root/.ollama"],
+        "environment": {
+            "OLLAMA_HOST": "0.0.0.0:11434",
+            "OLLAMA_KEEP_ALIVE": "-1m",
+        },
+        "expose": ["11434"],
+        # Healthcheck via Ollama's own /api/tags. Doctor reuses the
+        # same path for its `inference_health` probe.
+        "healthcheck": {
+            "test": [
+                "CMD-SHELL",
+                "ollama list >/dev/null 2>&1 || exit 1",
+            ],
+            "interval": "30s",
+            "timeout": "5s",
+            "retries": 3,
+            "start_period": "20s",
+        },
+    }
+
+
+def llamacpp_service_fragment(
+    *,
+    model_slug: str,
+    image: str,
+    gguf_relative_path: str,
+    port: int,
+    ctx_size: int = 4096,
+    n_gpu_layers: int = 0,
+) -> dict[str, Any]:
+    """Compose block for ONE llama.cpp server bound to ONE GGUF file.
+
+    Unlike Ollama, llama.cpp's server is single-model — each loaded
+    model is a separate `llama-server` process. We model this as one
+    compose service per model, named ``llama-cpp-<slug>``. The slug is
+    a sanitized form of the model name (lowercase, ``[a-z0-9-]+``).
+
+    ``gguf_relative_path`` is relative to the shared models dir
+    (``<data-dir>/models/llama-cpp/``); the container mounts that dir
+    read-only at ``/models``.
+
+    ``ctx_size`` and ``n_gpu_layers`` are exposed because they're the
+    two knobs that materially affect a llama-server's resource budget;
+    other tuning belongs in ``docker-compose.override.yml``.
+
+    The host port is bound to ``127.0.0.1`` for the same reason as
+    Ollama (no auth on the server).
+    """
+    return {
+        "image": image,
+        "container_name": f"{LLAMACPP_SERVICE_PREFIX}{model_slug}",
+        "restart": "unless-stopped",
+        "ports": [f"127.0.0.1:{port}:8080"],
+        "volumes": ["./models/llama-cpp:/models:ro"],
+        "command": [
+            "--server",
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "8080",
+            "-m",
+            f"/models/{gguf_relative_path}",
+            "-c",
+            str(ctx_size),
+            "-ngl",
+            str(n_gpu_layers),
+        ],
+        "expose": ["8080"],
+    }
 
 
 def firecrawl_service_fragments(

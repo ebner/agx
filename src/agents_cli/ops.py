@@ -157,6 +157,7 @@ def doctor(
         _check_port_conflicts(cfg, report)
         _check_codex_auth(cfg, report)
         _check_arm64_emulation(cfg, report)
+        _check_inference_health(cfg, report)
     else:
         report.add("data_dir_exists", "fail", f"{cfg.paths.host_data_dir} missing")
 
@@ -733,6 +734,51 @@ def _check_hermes_codex_mount(
             f"/home/hermes/.codex/auth.json unreadable AND no persistent "
             f"/opt/data/auth.json — `hermes setup` won't be able to import "
             f"(rc={bridge.returncode})",
+        )
+
+
+def _check_inference_health(cfg: AgentsConfig, report: DoctorReport) -> None:
+    """Probe in-VM inference engines that the toolkit owns.
+
+    Ollama: hits ``/api/tags`` via ``docker exec`` (no network probe
+    needed since we're already in the daemon's domain). llama-cpp's
+    per-model services are checked individually when present.
+
+    Skips silently when no engine is enabled — most users won't have
+    local inference up.
+    """
+    if not cfg.inference.ollama_enabled:
+        report.add(
+            "inference_ollama",
+            "ok",
+            "skipped (not enabled; `agents inference up ollama` to start)",
+        )
+        return
+    from agents_cli.compose import OLLAMA_SERVICE_NAME
+
+    result = mp.exec_in_vm(
+        cfg.vm.name,
+        "docker",
+        "exec",
+        OLLAMA_SERVICE_NAME,
+        "ollama",
+        "list",
+        check=False,
+    )
+    if result.returncode == 0:
+        model_count = max(0, len(result.stdout.strip().splitlines()) - 1)
+        report.add(
+            "inference_ollama",
+            "ok",
+            f"healthy at http://{OLLAMA_SERVICE_NAME}:11434/v1 ({model_count} model(s) loaded)",
+        )
+    else:
+        err = (result.stderr or "").strip()
+        report.add(
+            "inference_ollama",
+            "fail",
+            f"`ollama list` failed inside container: {err or 'rc=' + str(result.returncode)}. "
+            f"Try `agents restart-service ollama` or `agents inference down ollama && agents inference up ollama`.",
         )
 
 

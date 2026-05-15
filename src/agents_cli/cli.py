@@ -23,6 +23,8 @@ from agents_cli import (
     export_cmd,
     firecrawl_cmd,
     fixperms_cmd,
+    inference_cmd,
+    models_cmd,
     ollama_cmd,
     ops,
     outdated_cmd,
@@ -910,6 +912,134 @@ def firecrawl_status() -> None:
 def firecrawl_logs(service: str | None, follow: bool, since: str | None) -> None:
     """Tail logs from a firecrawl service (default: api)."""
     _run(firecrawl_cmd.logs, service=service, follow=follow, since=since)
+
+
+# ---------- local inference engines ----------
+
+
+@main.group("inference")
+def inference_group() -> None:
+    """Local inference engines (Ollama, llama.cpp) running inside the VM."""
+
+
+@inference_group.command("up")
+@click.argument("engine", type=click.Choice(["ollama", "llama-cpp"]))
+@click.option("--upgrade", is_flag=True, help="Re-resolve the upstream image digest.")
+def inference_up(engine: str, upgrade: bool) -> None:
+    """Start the named engine (or pin its image for llama-cpp)."""
+    _run(inference_cmd.up, engine, upgrade=upgrade)
+
+
+@inference_group.command("down")
+@click.argument("engine", type=click.Choice(["ollama", "llama-cpp"]))
+def inference_down(engine: str) -> None:
+    """Stop and remove the engine's compose service(s). Model weights preserved."""
+    _run(inference_cmd.down, engine)
+
+
+@inference_group.command("status")
+def inference_status() -> None:
+    """Snapshot every in-VM inference engine."""
+    _run(inference_cmd.status)
+
+
+@inference_group.command("load")
+@click.argument("engine", type=click.Choice(["llama-cpp"]))
+@click.argument("slug")
+@click.option("--gguf", required=True, help="GGUF filename under <data-dir>/models/llama-cpp/.")
+@click.option("--port", type=int, default=8080, help="Host port (bound to 127.0.0.1).")
+@click.option("--ctx-size", type=int, default=4096, help="Context window in tokens.")
+@click.option("--n-gpu-layers", type=int, default=0, help="Layers to offload to GPU (CPU-only: 0).")
+def inference_load(
+    engine: str, slug: str, gguf: str, port: int, ctx_size: int, n_gpu_layers: int
+) -> None:
+    """Spawn a llama-server for one GGUF model.
+
+    Ollama doesn't need this — it loads models on demand. llama-cpp's
+    server is one-model-per-process, so each loaded model becomes its
+    own compose service named ``llama-cpp-<slug>``.
+    """
+    if engine != "llama-cpp":
+        raise click.UsageError("`inference load` is llama-cpp-only")
+    _run(
+        inference_cmd.up_llamacpp_model,
+        slug,
+        gguf_relative_path=gguf,
+        port=port,
+        ctx_size=ctx_size,
+        n_gpu_layers=n_gpu_layers,
+    )
+
+
+@inference_group.command("unload")
+@click.argument("engine", type=click.Choice(["llama-cpp"]))
+@click.argument("slug")
+def inference_unload(engine: str, slug: str) -> None:
+    """Stop and remove one llama-cpp per-model service."""
+    if engine != "llama-cpp":
+        raise click.UsageError("`inference unload` is llama-cpp-only")
+    _run(inference_cmd.down_llamacpp_model, slug)
+
+
+# ---------- models ----------
+
+
+@main.group("model")
+def model_group() -> None:
+    """Pull / list / remove local models; wire an agent to one."""
+
+
+@model_group.command("pull")
+@click.argument("engine", type=click.Choice(["ollama", "llama-cpp"]))
+@click.argument("model")
+def model_pull(engine: str, model: str) -> None:
+    """Pull a model.
+
+    For ollama: ``<name>:<tag>`` (Ollama Hub) or
+    ``hf.co/<repo>:<quant>`` (HuggingFace via Ollama's native support).
+
+    For llama-cpp: ``<hf-repo>:<filename>`` — downloads the GGUF
+    into <data-dir>/models/llama-cpp/.
+    """
+    _run(models_cmd.pull, engine, model)
+
+
+@model_group.command("list")
+@click.argument("engine", required=False, type=click.Choice(["ollama", "llama-cpp"]))
+def model_list(engine: str | None) -> None:
+    """List downloaded models. Omits the engine arg to list both."""
+    _run(models_cmd.list_models, engine)
+
+
+@model_group.command("rm")
+@click.argument("engine", type=click.Choice(["ollama", "llama-cpp"]))
+@click.argument("model")
+@click.option("-y", "--yes", "yes_local", is_flag=True, help="Skip confirmation.")
+@click.pass_context
+def model_rm(ctx: click.Context, engine: str, model: str, yes_local: bool) -> None:
+    """Remove a downloaded model."""
+    _run(models_cmd.rm, engine, model, yes=yes_local or ctx.obj.get("yes", False))
+
+
+@model_group.command("use")
+@click.argument("agent")
+@click.option("--engine", required=True, type=click.Choice(["ollama", "llama-cpp"]))
+@click.option("--model", required=True, help="Model name as known by the engine.")
+@click.option(
+    "--aux",
+    default=None,
+    type=click.Choice(["compression", "vision", "all"]),
+    help="Also route the named auxiliary task(s) to this engine.",
+)
+def model_use(agent: str, engine: str, model: str, aux: str | None) -> None:
+    """Wire a Hermes agent's main model to a local inference engine.
+
+    Writes the structured ``model:`` block in the agent's config.yaml
+    (provider=custom + base_url + api_key), pointing at the in-VM
+    DNS name of the engine. With ``--aux``, also reroutes auxiliary
+    tasks (compression/vision/all) to the same endpoint.
+    """
+    _run(models_cmd.use, agent, engine=engine, model=model, aux=aux)
 
 
 # ---------- secrets ----------
