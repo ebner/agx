@@ -165,6 +165,7 @@ def doctor(
             _check_hermes_data_dir_accessible(cfg, svc, agent_name, report)
             _check_hermes_doctor(cfg, svc, agent_name, report)
             _check_hermes_codex_mount(cfg, svc, agent_name, report)
+            _check_hermes_model_set(cfg, svc, agent_name, report)
 
     _emit_doctor_table(report)
     if report.failed:
@@ -732,6 +733,91 @@ def _check_hermes_codex_mount(
             f"/opt/data/auth.json — `hermes setup` won't be able to import "
             f"(rc={bridge.returncode})",
         )
+
+
+def _check_hermes_model_set(
+    cfg: AgentsConfig, svc: str, agent_name: str, report: DoctorReport
+) -> None:
+    """Warn when an active provider is configured in ``auth.json`` but
+    the top-level ``model:`` in ``config.yaml`` is empty.
+
+    Symptom of this misconfiguration: headless aux calls (compression,
+    cron jobs, vision in ``provider: auto`` mode) silently fail with
+    ``RuntimeError: <Provider> Responses request 'model' must be a
+    non-empty string``. Interactive chat keeps working because the
+    gateway resolves a per-session model default at session-create
+    time, but that fallback isn't applied to aux code paths.
+
+    Often masked downstream as ``Compression summary failed: [Errno 9]
+    Bad file descriptor`` — when the empty-model ``RuntimeError`` fires
+    mid-stream, the compression cleanup tries to close an already-broken
+    HTTP stream and the EBADF wrapper hides the real cause.
+    """
+    from agents_cli import hermes_config
+
+    try:
+        doc = hermes_config.read_doc(cfg, agent_name)
+    except (RuntimeFailure, UserError) as e:
+        report.add(f"{agent_name}.model_set", "warn", f"config.yaml unreadable: {e}")
+        return
+
+    # Hermes accepts ``model:`` in two shapes:
+    #   - bare string:  model: gpt-5.5
+    #   - structured:   model: {default: gpt-5.5, provider: ..., base_url: ...}
+    # The wizard (`hermes model`) writes the structured form; older
+    # configs and `hermes config set model X` write the bare form.
+    # Both are valid; "is set" means the resolved name is non-empty.
+    raw_model = doc.get("model")
+    if isinstance(raw_model, dict):
+        model_name = raw_model.get("default") or raw_model.get("name") or ""
+    elif isinstance(raw_model, str):
+        model_name = raw_model
+    else:
+        model_name = ""
+
+    cat = mp.exec_in_vm(
+        cfg.vm.name,
+        *_compose_exec_in_vm_argv(
+            cfg, svc, "cat", "/opt/data/auth.json", no_tty=True, as_root=True
+        ),
+        check=False,
+    )
+    if cat.returncode != 0:
+        # Container down or no auth.json yet — nothing to compare against.
+        err = (cat.stderr or "").lower()
+        if "is not running" in err or "no such" in err:
+            report.add(f"{agent_name}.model_set", "warn", "container not up")
+        else:
+            report.add(f"{agent_name}.model_set", "ok", "skipped (no auth.json yet)")
+        return
+    try:
+        auth = json.loads(cat.stdout)
+    except json.JSONDecodeError:
+        report.add(f"{agent_name}.model_set", "warn", "auth.json unparseable")
+        return
+    active = auth.get("active_provider") if isinstance(auth, dict) else None
+    if not active:
+        report.add(f"{agent_name}.model_set", "ok", "skipped (no active provider)")
+        return
+
+    if model_name.strip():
+        report.add(
+            f"{agent_name}.model_set",
+            "ok",
+            f"model={model_name!r}, provider={active!r}",
+        )
+        return
+
+    report.add(
+        f"{agent_name}.model_set",
+        "warn",
+        f"config.yaml `model:` is empty but auth.json active_provider={active!r}. "
+        f"Headless aux calls (compression, cron, vision auto-fallback) will silently "
+        f"fail with \"<provider> request 'model' must be a non-empty string\" — "
+        f"interactive chat works only because the gateway resolves a per-session "
+        f"runtime default. Fix: `agents exec {agent_name} -- hermes model` "
+        f"(interactive wizard).",
+    )
 
 
 def _emit_doctor_table(report: DoctorReport) -> None:

@@ -136,6 +136,11 @@ def _stub_minimal_doctor(mocker, vm_state: str = "Running") -> None:
         # `cat /proc/loadavg` for the vm_load check — return idle load.
         if cmd[:2] == ("cat", "/proc/loadavg"):
             return _ok("0.42 0.31 0.25 1/123 4567\n")
+        # Default for the model_set probe: pretend auth.json doesn't
+        # exist yet → check skips at "no auth.json yet". Tests that
+        # exercise model_set replace this stub with a custom runner.
+        if "cat" in cmd and "/opt/data/auth.json" in cmd:
+            return MpResult(stdout="", stderr="No such file", returncode=1)
         return _ok("ok\n")
 
     mocker.patch("agents_cli.mp.exec_in_vm", side_effect=vm_command)
@@ -552,6 +557,181 @@ def test_doctor_flags_hermes_doctor_failure(with_coder: Path, mocker) -> None:
     )
     with pytest.raises(HealthCheckFailure):
         ops.doctor(config_path=with_coder)
+
+
+def _seed_agent_config(cfg: AgentsConfig, agent: str, model: str) -> None:
+    """Write the agent's config.yaml so ``hermes_config.read_doc`` can
+    pick it up. Seeds the bare-string form of ``model:`` (Hermes also
+    accepts a dict — covered by ``_seed_agent_config_dict_model``).
+    """
+    from agents_cli import hermes_config
+
+    p = hermes_config.config_path(cfg, agent)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(f"model: {model!r}\nproviders: {{}}\n", encoding="utf-8")
+
+
+def _seed_agent_config_dict_model(cfg: AgentsConfig, agent: str, default: str) -> None:
+    """Write the agent's config.yaml with the structured ``model:`` form
+    the ``hermes model`` wizard produces:
+    ``model: {default: <name>, provider: ..., base_url: ...}``.
+    """
+    from agents_cli import hermes_config
+
+    p = hermes_config.config_path(cfg, agent)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(
+        f"model:\n  default: {default}\n  provider: openai-codex\n"
+        f"  base_url: https://chatgpt.com/backend-api/codex\nproviders: {{}}\n",
+        encoding="utf-8",
+    )
+
+
+def _doctor_runner_with_auth(auth_json: str | None):
+    """Build a doctor exec_in_vm side_effect that returns ``auth_json``
+    for ``cat /opt/data/auth.json`` (or rc=1 when None) and the usual
+    healthy responses for everything else.
+    """
+
+    def runner(vm_name: str, *cmd: str, check: bool = True) -> MpResult:
+        joined = " ".join(cmd)
+        if "is-active" in joined:
+            return _ok("active\n")
+        if "stat" in cmd and "/opt/data" in cmd:
+            return _ok("755 1000\n")
+        if cmd[:2] == ("cat", "/proc/meminfo"):
+            return _ok("MemTotal: 8388608 kB\nMemAvailable: 4194304 kB\n")
+        if cmd[:1] == ("nproc",):
+            return _ok("4\n")
+        if cmd[:2] == ("cat", "/proc/loadavg"):
+            return _ok("0.42 0.31 0.25 1/123 4567\n")
+        # The exec_in_vm argv passes through `docker compose ... exec <svc>
+        # cat /opt/data/auth.json` — `cat` and the path sit at the tail,
+        # not in cmd[:2]. Mirror the membership-check pattern used by
+        # the codex_mount test.
+        if "cat" in cmd and "/opt/data/auth.json" in cmd:
+            if auth_json is None:
+                return MpResult(stdout="", stderr="No such file", returncode=1)
+            return _ok(auth_json)
+        return _ok("ok\n")
+
+    return runner
+
+
+def test_doctor_model_set_warns_when_provider_set_but_model_empty(
+    with_coder: Path, cfg: AgentsConfig, mocker
+) -> None:
+    """Canonical misconfiguration: an active LLM provider is configured
+    in auth.json but ``model:`` is empty in config.yaml. Interactive
+    chat keeps working via the gateway's per-session runtime default,
+    but headless aux calls (compression, cron, vision auto-fallback)
+    silently fail with "<provider> request 'model' must be a non-empty
+    string" — often masked downstream as "Bad file descriptor" when
+    the stream cleanup hits an already-closed fd.
+    """
+    _seed_agent_config(cfg, "coder", "")
+
+    mocker.patch(
+        "agents_cli.mp.info_vm",
+        return_value=_ok(json.dumps({"info": {"agents": {"state": "Running"}}})),
+    )
+    mocker.patch(
+        "agents_cli.mp.exec_in_vm",
+        side_effect=_doctor_runner_with_auth('{"active_provider": "openai-codex"}'),
+    )
+    mocker.patch(
+        "agents_cli.compose_runner.ps",
+        return_value=_ok(json.dumps([{"Service": "hermes-coder", "State": "running"}])),
+    )
+
+    report = ops.doctor(config_path=with_coder)
+    [check] = [c for c in report.checks if c.name == "coder.model_set"]
+    assert check.status == "warn"
+    assert "openai-codex" in check.detail
+    assert "hermes model" in check.detail  # remediation hint
+
+
+def test_doctor_model_set_ok_when_model_and_provider_both_set(
+    with_coder: Path, cfg: AgentsConfig, mocker
+) -> None:
+    _seed_agent_config(cfg, "coder", "gpt-5.5")
+
+    mocker.patch(
+        "agents_cli.mp.info_vm",
+        return_value=_ok(json.dumps({"info": {"agents": {"state": "Running"}}})),
+    )
+    mocker.patch(
+        "agents_cli.mp.exec_in_vm",
+        side_effect=_doctor_runner_with_auth('{"active_provider": "openai-codex"}'),
+    )
+    mocker.patch(
+        "agents_cli.compose_runner.ps",
+        return_value=_ok(json.dumps([{"Service": "hermes-coder", "State": "running"}])),
+    )
+
+    report = ops.doctor(config_path=with_coder)
+    [check] = [c for c in report.checks if c.name == "coder.model_set"]
+    assert check.status == "ok"
+    assert "gpt-5.5" in check.detail
+    assert "openai-codex" in check.detail
+
+
+def test_doctor_model_set_ok_when_model_is_dict_form(
+    with_coder: Path, cfg: AgentsConfig, mocker
+) -> None:
+    """The ``hermes model`` interactive wizard writes ``model:`` as a
+    dict (``{default, provider, base_url}``), not a bare string. The
+    check must treat ``model.default`` as the resolved name; otherwise
+    we'd false-positive warn on the post-wizard happy path.
+    """
+    _seed_agent_config_dict_model(cfg, "coder", "gpt-5.5")
+
+    mocker.patch(
+        "agents_cli.mp.info_vm",
+        return_value=_ok(json.dumps({"info": {"agents": {"state": "Running"}}})),
+    )
+    mocker.patch(
+        "agents_cli.mp.exec_in_vm",
+        side_effect=_doctor_runner_with_auth('{"active_provider": "openai-codex"}'),
+    )
+    mocker.patch(
+        "agents_cli.compose_runner.ps",
+        return_value=_ok(json.dumps([{"Service": "hermes-coder", "State": "running"}])),
+    )
+
+    report = ops.doctor(config_path=with_coder)
+    [check] = [c for c in report.checks if c.name == "coder.model_set"]
+    assert check.status == "ok"
+    assert "gpt-5.5" in check.detail
+
+
+def test_doctor_model_set_skipped_when_no_active_provider(
+    with_coder: Path, cfg: AgentsConfig, mocker
+) -> None:
+    """A fresh agent with no LLM provider configured yet shouldn't trip
+    the model_set warn — no provider means no aux call would fire
+    anyway. Skip silently so the doctor stays quiet during onboarding.
+    """
+    _seed_agent_config(cfg, "coder", "")
+
+    mocker.patch(
+        "agents_cli.mp.info_vm",
+        return_value=_ok(json.dumps({"info": {"agents": {"state": "Running"}}})),
+    )
+    mocker.patch(
+        "agents_cli.mp.exec_in_vm",
+        # auth.json present but empty (no active_provider)
+        side_effect=_doctor_runner_with_auth("{}"),
+    )
+    mocker.patch(
+        "agents_cli.compose_runner.ps",
+        return_value=_ok(json.dumps([{"Service": "hermes-coder", "State": "running"}])),
+    )
+
+    report = ops.doctor(config_path=with_coder)
+    [check] = [c for c in report.checks if c.name == "coder.model_set"]
+    assert check.status == "ok"
+    assert "no active provider" in check.detail
 
 
 # ---------- runtime-user default for `docker compose exec` ----------
