@@ -120,26 +120,42 @@ def init(
             {"action": "vm_launch", "vm": cfg.vm.name, "image": image},
             human=f"launching VM {cfg.vm.name!r} ({image}) — this can take a few minutes...",
         )
-        mp.launch(
-            cfg.vm.name,
-            image=image,
-            cpus=cfg.vm.cpus,
-            memory_gb=cfg.vm.memory_gb,
-            disk_gb=cfg.vm.disk_gb,
-        )
-        # libvirt: wait for SSH (cloud-init) before bootstrap; attach
-        # any configured GPUs while the VM is stopped, then restart.
-        if backend == "libvirt":
-            from agents_cli.backends import libvirt as libvirt_mod
+        try:
+            mp.launch(
+                cfg.vm.name,
+                image=image,
+                cpus=cfg.vm.cpus,
+                memory_gb=cfg.vm.memory_gb,
+                disk_gb=cfg.vm.disk_gb,
+            )
+            # libvirt: wait for SSH (cloud-init) before bootstrap; attach
+            # any configured GPUs while the VM is stopped, then restart.
+            if backend == "libvirt":
+                from agents_cli.backends import libvirt as libvirt_mod
 
-            libvirt_mod.wait_for_ssh(cfg.vm.name)
-            if cfg.vm.gpu_passthrough:
-                mp.stop_vm(cfg.vm.name)
-                for pci in cfg.vm.gpu_passthrough:
-                    ui.info(f"attaching GPU {pci} to {cfg.vm.name}")
-                    libvirt_mod.attach_gpu_xml(cfg.vm.name, pci)
-                mp.start_vm(cfg.vm.name)
                 libvirt_mod.wait_for_ssh(cfg.vm.name)
+                if cfg.vm.gpu_passthrough:
+                    mp.stop_vm(cfg.vm.name)
+                    for pci in cfg.vm.gpu_passthrough:
+                        ui.info(f"attaching GPU {pci} to {cfg.vm.name}")
+                        libvirt_mod.attach_gpu_xml(cfg.vm.name, pci)
+                    mp.start_vm(cfg.vm.name)
+                    libvirt_mod.wait_for_ssh(cfg.vm.name)
+        except BaseException:
+            # Transactional cleanup (libvirt only). Multipass's `launch`
+            # is atomic — either the VM exists fully or not at all —
+            # but libvirt can leave a partially-created domain that
+            # references missing disk files, blocking retries until
+            # `virsh undefine --remove-all-storage`. See GH #3.
+            if backend == "libvirt":
+                ui.warn(
+                    "vm init failed after launch — cleaning up partial libvirt domain "
+                    "so retry isn't blocked..."
+                )
+                from agents_cli.backends import libvirt as libvirt_mod
+
+                libvirt_mod._cleanup_partial_domain(cfg.vm.name)
+            raise
 
     if not data_dir_in_vm:
         _ensure_mount(cfg)
@@ -312,7 +328,11 @@ def take_snapshot(
 ) -> str:
     cfg = cfg_mod.load(config_path)
     full_name = _unique_snapshot_name(cfg.vm.name, name)
-    mp.snapshot(cfg.vm.name, full_name, comment=comment)
+    result = mp.snapshot(cfg.vm.name, full_name, comment=comment)
+    if result.returncode != 0:
+        raise RuntimeFailure(
+            f"snapshot failed: {(result.stderr or 'unknown error').strip()}"
+        )
     ui.emit({"vm": cfg.vm.name, "snapshot": full_name}, human=f"snapshot: {full_name}")
     return full_name
 
@@ -588,18 +608,23 @@ def _vm_exists(name: str) -> bool:
 def _ensure_mount(cfg: AgentsConfig) -> None:
     """Mount the host data-dir into the VM if it isn't already.
 
-    Multipass ``--type native`` requires the VM stopped. If the VM is
-    running we stop, mount, and restart — accepting the ~30s cost in
-    exchange for a mount type that supports rootless Docker bind mounts
-    (the default ``classic`` / fuse.sshfs does not — see ``mp.mount``).
-    Mounts persist across reboots, so this only triggers when the mount
-    is genuinely absent (fresh ``vm init`` or after an external umount).
+    Multipass ``--type native`` requires the VM stopped. The libvirt
+    backend's virtiofs mount works ``--live --config`` (no stop
+    needed). To avoid an unnecessary stop/start cycle (which loses
+    DHCP lease + briefly wedges the host's ARP cache, then breaks
+    bootstrap with "no route to host" — observed during the
+    2026-05-16 smoke test), only stop+start on multipass.
+
+    Mounts persist across reboots, so this only triggers when the
+    mount is genuinely absent (fresh ``vm init`` or after an external
+    umount).
     """
     if _has_mount(cfg):
         return
 
+    requires_stop = cfg.vm.backend == "multipass"
     was_running = _vm_running(cfg.vm.name)
-    if was_running:
+    if was_running and requires_stop:
         mp.stop_vm(cfg.vm.name)
     mp.mount(
         cfg.paths.host_data_dir,
@@ -608,8 +633,12 @@ def _ensure_mount(cfg: AgentsConfig) -> None:
         host_uid=cfg.host.uid,
         host_gid=cfg.host.gid,
     )
-    if was_running:
+    if was_running and requires_stop:
         mp.start_vm(cfg.vm.name)
+        if cfg.vm.backend == "libvirt":
+            from agents_cli.backends import libvirt as libvirt_mod
+
+            libvirt_mod.wait_for_ssh(cfg.vm.name)
 
 
 def _has_mount(cfg: AgentsConfig) -> bool:

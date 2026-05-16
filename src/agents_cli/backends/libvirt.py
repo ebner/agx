@@ -269,25 +269,52 @@ def _make_seed_iso(vm: str, user_data: Path, meta_data: Path) -> Path:
     return iso
 
 
-def wait_for_ssh(vm: str, timeout_s: int = 180) -> None:
-    """Block until SSH responds (cloud-init typically takes 30-90s).
-    Exposed for ``vm.init``'s post-launch handshake step.
+def wait_for_ssh(vm: str, timeout_s: int = 180, *, wait_cloud_init: bool = True) -> None:
+    """Block until SSH responds AND (by default) cloud-init has
+    finished. Cloud-init takes 60-180s on a fresh boot and holds the
+    apt dpkg lock the whole time; running the toolkit's bootstrap
+    apt-install during that window silently no-ops because of the
+    lock.
 
-    Suppresses :class:`RuntimeFailure` from ``_vm_ip`` (which raises
-    until libvirt's DHCP issues a lease) and from ``_ssh`` (which
-    fails with "Connection refused" while sshd is still coming up).
-    Both are expected during the cloud-init bring-up window; only
-    timeout-expiry is a hard failure.
+    Two-phase wait:
+
+    1. Poll ``ssh ubuntu@<vm> true`` until two successive probes
+       succeed (single success can race sshd startup and the next
+       SSH call hits ``kex_exchange_identification: Connection reset``).
+    2. Run ``cloud-init status --wait`` inside the VM, which blocks
+       until first-boot is done (apt lock released, packages
+       installed).
+
+    Set ``wait_cloud_init=False`` for follow-up reboots where
+    cloud-init has long since finished — saves the 2-second status
+    check round-trip.
     """
     import contextlib
     import time
 
     start = time.time()
+    successes = 0
     while time.time() - start < timeout_s:
         with contextlib.suppress(RuntimeFailure):
             result = _ssh(vm, "true", check=False)
             if result.returncode == 0:
-                return
+                successes += 1
+                if successes >= 2:
+                    time.sleep(2)
+                    if wait_cloud_init:
+                        # `cloud-init status --wait` blocks until
+                        # first-boot completes; check=False because
+                        # rc=2 means "completed with errors" which
+                        # we'd rather surface via the bootstrap
+                        # output than mask here.
+                        _ssh(vm, "cloud-init", "status", "--wait", check=False)
+                        # Brief settle so the dpkg lock is fully
+                        # released before bootstrap fires.
+                        time.sleep(2)
+                    return
+                time.sleep(3)
+                continue
+        successes = 0
         time.sleep(5)
     raise RuntimeFailure(f"libvirt VM {vm!r} did not become SSH-reachable within {timeout_s}s")
 
@@ -306,7 +333,30 @@ def exec_bash(
     _require_linux_host()
     ip = _vm_ip(vm)
     argv = [SSH, *_ssh_opts(), f"ubuntu@{ip}", "bash", "-s"]
-    return _run(argv, check=check, input_bytes=script.encode(), timeout=timeout)
+    # One automatic retry on "kex_exchange" / "Connection reset by
+    # peer" — sshd post-cloud-init can briefly drop connections
+    # while it reconfigures. ``wait_for_ssh`` already cushions this
+    # with a double-probe + settle delay, but heavy bootstrap
+    # scripts (the toolkit's is ~500 lines) sometimes still race.
+    import time
+
+    for attempt in range(2):
+        result = _run(argv, check=False, input_bytes=script.encode(), timeout=timeout)
+        if result.returncode == 0:
+            return result
+        err = (result.stderr or "").lower()
+        transient = (
+            "kex_exchange" in err or "connection reset" in err or "connection refused" in err
+        )
+        if not transient or attempt == 1:
+            if check and result.returncode != 0:
+                raise RuntimeFailure(
+                    f"command failed (exit {result.returncode}): {' '.join(argv)}\n"
+                    f"stderr: {(result.stderr or '').strip()}"
+                )
+            return result
+        time.sleep(5)
+    return result
 
 
 def exec_in_vm_with_stdin(vm: str, *cmd: str, input_bytes: bytes, check: bool = True) -> MpResult:
@@ -350,18 +400,32 @@ def mount(
     vm_gid: int = 1000,
     mount_type: str = "native",
 ) -> MpResult:
-    """Attach a virtiofs share via domain XML.
+    """Attach a virtiofs share + mount it in-guest.
 
-    Persistent (``--config``) attach; takes effect on next VM start.
-    Caller (``vm._ensure_mount``) does the stop/mount/start dance.
-    In-guest fstab line is added by ``exec_bash`` if the VM is up.
+    Three things have to be true for virtiofs to work:
+
+    1. Domain XML has ``<memoryBacking source.type='memfd'
+       access.mode='shared'/>`` — set at ``launch`` time.
+    2. ``<filesystem type='mount'><driver type='virtiofs'/>...``
+       attached. We use ``--live --config`` so it takes effect
+       both immediately on a running VM and persists across reboots.
+    3. In-guest: ``mount -t virtiofs <tag> <vm_path>`` plus an
+       fstab entry for boot.
+
+    Host-side prereq: libvirt-qemu must traverse ``host_path``'s
+    parent dirs. Falls back gracefully on perm errors.
 
     9p fallback isn't implemented — virtiofsd is the supported path.
-    If virtiofs setup fails on your host, the workaround is to add
-    the 9p ``<filesystem>`` block manually via ``virsh edit <vm>``.
+    If virtiofs is wedged, edit the domain XML manually via
+    ``virsh edit <vm>``.
     """
     _require_linux_host()
+    import contextlib
+
     tag = vm_path.replace("/", "_").strip("_") or "share"
+    # Make sure libvirt-qemu can traverse the host path.
+    with contextlib.suppress(OSError):
+        os.chmod(host_path, 0o755)
     xml = (
         "<filesystem type='mount' accessmode='passthrough'>"
         "  <driver type='virtiofs'/>"
@@ -373,24 +437,27 @@ def mount(
         f.write(xml)
         xml_path = f.name
     try:
-        result = _virsh("attach-device", vm, xml_path, "--config", check=False)
+        # --live attaches now; --config persists across reboots.
+        # Falls back to --config-only if the VM is stopped.
+        result = _virsh("attach-device", vm, xml_path, "--live", "--config", check=False)
+        if result.returncode != 0 and "not running" in (result.stderr or "").lower():
+            result = _virsh("attach-device", vm, xml_path, "--config", check=False)
     finally:
         os.unlink(xml_path)
     if result.returncode != 0:
         return result
-    # Best-effort in-guest mount setup. If VM isn't up yet, this is a
-    # no-op; vm.start re-runs the mount probe and the bootstrap script
-    # can pick up the fstab entry on next boot.
+    # In-guest mount + fstab entry. Best-effort: if VM is stopped,
+    # this is skipped and the fstab will be picked up at next boot.
     import contextlib
 
     fstab_line = f"{tag} {vm_path} virtiofs rw,_netdev 0 0"
     with contextlib.suppress(RuntimeFailure):
         exec_bash(
             vm,
-            f"sudo mkdir -p {vm_path} && "
-            f"grep -qF {fstab_line!r} /etc/fstab || "
-            f"echo {fstab_line!r} | sudo tee -a /etc/fstab && "
-            f"sudo mount -a",
+            f"sudo mkdir -p {vm_path}\n"
+            f"grep -qF '{fstab_line}' /etc/fstab || "
+            f"echo '{fstab_line}' | sudo tee -a /etc/fstab >/dev/null\n"
+            f"mountpoint -q {vm_path} || sudo mount -t virtiofs {tag} {vm_path}\n",
             check=False,
         )
     return result
@@ -448,6 +515,16 @@ def launch(vm: str, *, image: str, cpus: int, memory_gb: int, disk_gb: int) -> M
             f"{disk_gb}G",
         ]
     )
+    # libvirt-qemu must be able to traverse the data-dir to reach
+    # disk + seed. Default mkdir mode on /tmp is 700, which blocks
+    # libvirt-qemu. Make all relevant parent dirs world-traversable.
+    # Disk + seed files themselves stay at default mode 600 (libvirt
+    # opens them via the QEMU helper which has the right caps).
+    import contextlib
+
+    for d in (disk.parent, base_image.parent, seed_iso.parent, _data_dir()):
+        with contextlib.suppress(OSError):
+            os.chmod(d, 0o755)
 
     # virt-install accepts `ubuntu<MAJOR>.<MINOR>` (with the dot) per
     # `--osinfo list`. The toolkit's `image` arg is already that shape
@@ -462,6 +539,12 @@ def launch(vm: str, *, image: str, cpus: int, memory_gb: int, disk_gb: int) -> M
             vm,
             "--memory",
             str(memory_gb * 1024),
+            # Required for virtiofs mounts to work later. Without
+            # shared memfd backing, attach_device of a <filesystem
+            # type=virtiofs> block succeeds but the guest mount hits
+            # "Transport endpoint is not connected". See GH #4.
+            "--memorybacking",
+            "source.type=memfd,access.mode=shared",
             "--vcpus",
             str(cpus),
             "--disk",
@@ -482,6 +565,34 @@ def launch(vm: str, *, image: str, cpus: int, memory_gb: int, disk_gb: int) -> M
             "0",
         ],
         timeout=300.0,
+    )
+
+
+def _cleanup_partial_domain(vm: str) -> None:
+    """Tear down a half-provisioned libvirt domain so a retry of
+    ``vm init`` doesn't trip over the orphan. Safe to call when the
+    domain doesn't exist; each step is best-effort.
+
+    GH #3: virt-install can leave a defined-but-unstartable domain
+    if e.g. ``wait_for_ssh`` times out after the domain is
+    registered. Caller (``vm.init``'s libvirt branch) wraps the
+    launch+wait+gpu sequence and invokes this on failure.
+    """
+    _virsh("destroy", vm, check=False)
+    # Snapshot metadata blocks undefine — wipe it first.
+    snap_list = _virsh("snapshot-list", vm, "--name", check=False)
+    if snap_list.returncode == 0:
+        for snap_name in snap_list.stdout.splitlines():
+            snap_name = snap_name.strip()
+            if snap_name:
+                _virsh("snapshot-delete", vm, snap_name, "--metadata", check=False)
+    _virsh(
+        "undefine",
+        vm,
+        "--nvram",
+        "--managed-save",
+        "--remove-all-storage",
+        check=False,
     )
 
 
@@ -639,12 +750,34 @@ def snapshot(vm: str, name: str, *, comment: str | None = None) -> MpResult:
     Internal snapshots accumulate inside the qcow2; periodic
     ``virsh snapshot-delete`` cleanup may be needed on long-running
     VMs that snapshot frequently.
+
+    **Incompatible with virtiofs mounts**. libvirt refuses
+    ``snapshot-create-as`` on a domain with active virtiofs (vhost-
+    user) filesystems because the backend lacks ``VHOST_USER_PROTOCOL
+    _F_LOG_SHMFD``. We detect this and return a result with a
+    user-actionable error: stop the VM + detach the mount + snapshot
+    + reattach. Phase-B follow-up should automate the
+    detach/reattach dance.
     """
     _require_linux_host()
     args = ["snapshot-create-as", vm, name]
     if comment:
         args.extend(["--description", comment])
-    return _virsh(*args, check=False)
+    result = _virsh(*args, check=False)
+    if result.returncode != 0 and "vhost-user" in (result.stderr or "").lower():
+        return MpResult(
+            stdout="",
+            stderr=(
+                f"libvirt snapshot failed: VM has an active virtiofs (vhost-user) mount, "
+                f"which blocks internal snapshots. Detach the filesystem first:\n"
+                f"  virsh -c qemu:///system shutdown {vm} && "
+                f"virsh -c qemu:///system snapshot-create-as {vm} {name} && "
+                f"virsh -c qemu:///system start {vm}\n"
+                f"(toolkit auto-detach is pending — see follow-up issue)"
+            ),
+            returncode=result.returncode,
+        )
+    return result
 
 
 def restore(snapshot_id: str, *, destructive: bool = False) -> MpResult:
