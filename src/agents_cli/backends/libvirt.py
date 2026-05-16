@@ -751,33 +751,19 @@ def snapshot(vm: str, name: str, *, comment: str | None = None) -> MpResult:
     ``virsh snapshot-delete`` cleanup may be needed on long-running
     VMs that snapshot frequently.
 
-    **Incompatible with virtiofs mounts**. libvirt refuses
+    **Incompatible with virtiofs on a running VM**. libvirt refuses
     ``snapshot-create-as`` on a domain with active virtiofs (vhost-
     user) filesystems because the backend lacks ``VHOST_USER_PROTOCOL
-    _F_LOG_SHMFD``. We detect this and return a result with a
-    user-actionable error: stop the VM + detach the mount + snapshot
-    + reattach. Phase-B follow-up should automate the
-    detach/reattach dance.
+    _F_LOG_SHMFD``. The high-level ``vm.take_snapshot`` prompts the
+    user and stops the VM around the snapshot to avoid this. Direct
+    callers of this primitive that hit the error get the virsh error
+    message verbatim — the workaround is to stop the VM first.
     """
     _require_linux_host()
     args = ["snapshot-create-as", vm, name]
     if comment:
         args.extend(["--description", comment])
-    result = _virsh(*args, check=False)
-    if result.returncode != 0 and "vhost-user" in (result.stderr or "").lower():
-        return MpResult(
-            stdout="",
-            stderr=(
-                f"libvirt snapshot failed: VM has an active virtiofs (vhost-user) mount, "
-                f"which blocks internal snapshots. Detach the filesystem first:\n"
-                f"  virsh -c qemu:///system shutdown {vm} && "
-                f"virsh -c qemu:///system snapshot-create-as {vm} {name} && "
-                f"virsh -c qemu:///system start {vm}\n"
-                f"(toolkit auto-detach is pending — see follow-up issue)"
-            ),
-            returncode=result.returncode,
-        )
-    return result
+    return _virsh(*args, check=False)
 
 
 def restore(snapshot_id: str, *, destructive: bool = False) -> MpResult:

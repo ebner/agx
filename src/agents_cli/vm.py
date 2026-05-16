@@ -324,28 +324,152 @@ def shell(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> None:
 
 
 def take_snapshot(
-    name: str, *, comment: str | None = None, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH
+    name: str,
+    *,
+    comment: str | None = None,
+    yes: bool = False,
+    config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH,
 ) -> str:
+    """Take a VM snapshot.
+
+    Multipass snapshots can take a running VM directly. libvirt with
+    an active virtiofs mount cannot (vhost-user backend lacks
+    ``VHOST_USER_PROTOCOL_F_LOG_SHMFD``), so on that backend we
+    prompt for confirmation and run a transactional stop → snapshot
+    → start cycle. The VM is briefly down (~30s); any containers
+    inside get a clean shutdown via the libvirt ACPI signal +
+    restart afterwards.
+
+    ``yes=True`` skips the confirmation prompt.
+    """
     cfg = cfg_mod.load(config_path)
     full_name = _unique_snapshot_name(cfg.vm.name, name)
-    result = mp.snapshot(cfg.vm.name, full_name, comment=comment)
-    if result.returncode != 0:
-        raise RuntimeFailure(
-            f"snapshot failed: {(result.stderr or 'unknown error').strip()}"
+
+    # libvirt + virtiofs needs the VM stopped for snapshot. Other
+    # combinations (multipass, libvirt with --data-dir-in-vm) work
+    # directly on a running VM.
+    requires_downtime = cfg.vm.backend == "libvirt" and not cfg.paths.data_dir_in_vm
+    was_running = requires_downtime and _vm_running(cfg.vm.name)
+
+    if (
+        was_running
+        and not yes
+        and not ui.confirm(
+            (
+                "Snapshotting a libvirt VM with an active virtiofs mount "
+                "requires briefly stopping the VM (~30s downtime). Any "
+                "running Docker containers (Hermes agents, Firecrawl, "
+                "Ollama, etc.) will be cleanly stopped by libvirt's ACPI "
+                "shutdown and restarted afterwards.\n"
+                "Proceed?"
+            ),
+            default=False,
         )
+    ):
+        raise UserError("aborted by user")
+
+    if was_running:
+        ui.info(f"stopping {cfg.vm.name!r} for snapshot...")
+        mp.stop_vm(cfg.vm.name)
+        # Wait for shutdown to complete (ACPI can take ~20s on a
+        # busy Ubuntu cloud image).
+        _wait_for_vm_stopped(cfg.vm.name, timeout_s=60)
+
+    try:
+        result = mp.snapshot(cfg.vm.name, full_name, comment=comment)
+        if result.returncode != 0:
+            raise RuntimeFailure(f"snapshot failed: {(result.stderr or 'unknown error').strip()}")
+    finally:
+        if was_running:
+            ui.info(f"restarting {cfg.vm.name!r}...")
+            mp.start_vm(cfg.vm.name)
+            if cfg.vm.backend == "libvirt":
+                from agents_cli.backends import libvirt as libvirt_mod
+
+                libvirt_mod.wait_for_ssh(cfg.vm.name, wait_cloud_init=False)
+
     ui.emit({"vm": cfg.vm.name, "snapshot": full_name}, human=f"snapshot: {full_name}")
     return full_name
+
+
+def _wait_for_vm_stopped(vm_name: str, *, timeout_s: int = 60) -> None:
+    """Poll info_vm until the VM reports a non-running state.
+
+    libvirt's ``shutdown`` is asynchronous (sends ACPI then returns);
+    calling snapshot-create-as immediately after may race against
+    qemu still flushing. Multipass's ``stop`` blocks until done so
+    this is a libvirt-shaped helper, but harmless on multipass.
+    """
+    import time
+
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if not _vm_running(vm_name):
+            return
+        time.sleep(2)
+    raise RuntimeFailure(
+        f"VM {vm_name!r} did not shut down within {timeout_s}s — "
+        f"force with `virsh destroy {vm_name}` and retry."
+    )
 
 
 def restore_snapshot(
     snapshot_name: str,
     *,
     destructive: bool = False,
+    yes: bool = False,
     config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH,
 ) -> None:
+    """Revert the VM to a prior snapshot.
+
+    Same downtime trade-off as :func:`take_snapshot`: libvirt with
+    an active virtiofs mount can't snapshot-revert a running VM,
+    so we prompt for confirmation and stop the VM first. After
+    revert the VM is restarted so the user lands on a running VM
+    again (matching multipass-restore semantics).
+
+    ``yes=True`` skips the confirmation prompt. ``destructive=True``
+    bypasses multipass's safety check (no-op on libvirt).
+    """
     cfg = cfg_mod.load(config_path)
     snapshot_id = f"{cfg.vm.name}.{snapshot_name}"
-    mp.restore(snapshot_id, destructive=destructive)
+
+    requires_downtime = cfg.vm.backend == "libvirt" and not cfg.paths.data_dir_in_vm
+    was_running = requires_downtime and _vm_running(cfg.vm.name)
+
+    if (
+        was_running
+        and not yes
+        and not ui.confirm(
+            (
+                f"Restoring snapshot {snapshot_name!r} on a libvirt VM with "
+                f"an active virtiofs mount requires briefly stopping the "
+                f"VM (~30s). Any running Docker containers will be cleanly "
+                f"stopped and restarted afterwards. The restore itself is "
+                f"destructive — state since the snapshot will be lost.\n"
+                f"Proceed?"
+            ),
+            default=False,
+        )
+    ):
+        raise UserError("aborted by user")
+
+    if was_running:
+        ui.info(f"stopping {cfg.vm.name!r} for restore...")
+        mp.stop_vm(cfg.vm.name)
+        _wait_for_vm_stopped(cfg.vm.name, timeout_s=60)
+
+    try:
+        mp.restore(snapshot_id, destructive=destructive)
+    finally:
+        if was_running:
+            ui.info(f"restarting {cfg.vm.name!r}...")
+            mp.start_vm(cfg.vm.name)
+            if cfg.vm.backend == "libvirt":
+                from agents_cli.backends import libvirt as libvirt_mod
+
+                libvirt_mod.wait_for_ssh(cfg.vm.name, wait_cloud_init=False)
+
     ui.emit({"vm": cfg.vm.name, "restored": snapshot_id}, human=f"restored: {snapshot_id}")
 
 

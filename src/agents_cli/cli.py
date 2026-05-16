@@ -259,17 +259,33 @@ def vm_status() -> None:
 @vm.command("snapshot")
 @click.argument("name")
 @click.option("--comment", default=None)
-def vm_snapshot(name: str, comment: str | None) -> None:
-    """Take a multipass snapshot."""
-    _run(vm_mod.take_snapshot, name, comment=comment)
+@click.option("-y", "--yes", "yes_local", is_flag=True, help="Skip the downtime confirmation.")
+@click.pass_context
+def vm_snapshot(ctx: click.Context, name: str, comment: str | None, yes_local: bool) -> None:
+    """Take a VM snapshot.
+
+    On libvirt with an active virtiofs mount, prompts to confirm a
+    brief VM stop (~30s) because the vhost-user backend can't be
+    snapshotted while running. ``-y`` / global ``--yes`` skip the
+    prompt.
+    """
+    yes = bool(ctx.obj.get("yes")) or yes_local
+    _run(vm_mod.take_snapshot, name, comment=comment, yes=yes)
 
 
 @vm.command("restore")
 @click.argument("name")
 @click.option("--destructive", is_flag=True, help="Skip multipass's safety check.")
-def vm_restore(name: str, destructive: bool) -> None:
-    """Restore a multipass snapshot by name."""
-    _run(vm_mod.restore_snapshot, name, destructive=destructive)
+@click.option("-y", "--yes", "yes_local", is_flag=True, help="Skip the downtime confirmation.")
+@click.pass_context
+def vm_restore(ctx: click.Context, name: str, destructive: bool, yes_local: bool) -> None:
+    """Restore a snapshot by name.
+
+    On libvirt with an active virtiofs mount, prompts to confirm a
+    brief VM stop. ``-y`` / global ``--yes`` skip the prompt.
+    """
+    yes = bool(ctx.obj.get("yes")) or yes_local
+    _run(vm_mod.restore_snapshot, name, destructive=destructive, yes=yes)
 
 
 @vm.group("snapshots")
