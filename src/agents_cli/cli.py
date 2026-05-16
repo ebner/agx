@@ -18,6 +18,7 @@ import click
 
 from agents_cli import (
     __version__,
+    access_cmd,
     agents_cmd,
     conversations_cmd,
     export_cmd,
@@ -25,6 +26,7 @@ from agents_cli import (
     fixperms_cmd,
     inference_cmd,
     models_cmd,
+    mounts_cmd,
     ollama_cmd,
     ops,
     outdated_cmd,
@@ -100,7 +102,14 @@ def vm() -> None:
 
 @vm.command("init")
 @click.option(
-    "--data-dir", required=True, type=click.Path(), help="Host directory where agent state lives."
+    "--data-dir",
+    required=False,
+    default=None,
+    type=click.Path(),
+    help=(
+        "Host directory where agent state lives. Required for multipass/libvirt; "
+        "defaults to ~/.local/share/agents/ for bare_metal."
+    ),
 )
 @click.option(
     "--data-dir-in-vm", is_flag=True, help="Keep data on the VM disk instead of host-mounting."
@@ -117,9 +126,12 @@ def vm() -> None:
 )
 @click.option(
     "--backend",
-    type=click.Choice(["multipass", "libvirt"]),
+    type=click.Choice(["multipass", "libvirt", "bare_metal"]),
     default="multipass",
-    help="VM hypervisor backend. libvirt is Linux-only + experimental; enables GPU passthrough.",
+    help=(
+        "VM hypervisor backend. libvirt is Linux-only + experimental; enables GPU passthrough. "
+        "bare_metal runs containers directly on the host (Linux-only, opt-in trust trade-off)."
+    ),
 )
 @click.option(
     "--gpu",
@@ -129,7 +141,7 @@ def vm() -> None:
     help="GPU PCI passthrough (libvirt only). 'auto' for autodetect, or DDDD:BB:SS.F. Repeatable.",
 )
 def vm_init(
-    data_dir: str,
+    data_dir: str | None,
     data_dir_in_vm: bool,
     cpus: int | None,
     memory_gb: int | None,
@@ -138,9 +150,26 @@ def vm_init(
     backend: str,
     gpu: tuple[str, ...],
 ) -> None:
-    """Provision the VM (Multipass or libvirt) and mount the host data dir."""
+    """Provision the VM (Multipass or libvirt) and mount the host data dir.
+
+    With ``--backend bare_metal`` no VM is provisioned: the toolkit
+    verifies that rootless Docker is installed on the host and treats the
+    host as the runtime. The VM trust boundary is forfeited; only use
+    bare_metal on single-user dev workstations.
+    """
     if gpu and backend != "libvirt":
         raise click.UsageError("--gpu requires --backend libvirt")
+    if backend == "bare_metal":
+        if data_dir_in_vm:
+            raise click.UsageError("--data-dir-in-vm is meaningless with --backend bare_metal")
+        if data_dir is None:
+            data_dir = str(Path.home() / ".local" / "share" / "agents")
+    else:
+        if data_dir is None:
+            raise click.UsageError(
+                "--data-dir is required for multipass/libvirt backends "
+                "(use --backend bare_metal to omit it)"
+            )
     _run(
         vm_mod.init,
         data_dir=Path(data_dir).expanduser(),
@@ -1151,6 +1180,171 @@ def secret_clear(ctx: click.Context, agent: str, yes_local: bool) -> None:
     """Wipe ALL secrets for an agent."""
     yes = yes_local or ctx.obj.get("yes", False)
     _run(secrets_cmd.clear_secrets, agent, yes=yes)
+
+
+# ---------- mounts ----------
+
+
+@main.group("mount")
+def mount_group() -> None:
+    """Give an agent access to specific host folders.
+
+    Adds a per-agent host→VM→container mount chain. Read-only by
+    default. ``--target sandbox`` (Hermes only) also exposes the
+    folder to the LLM's shell tools via ``terminal.docker_volumes``;
+    ``--target both`` does both runtime + sandbox. The default per
+    agent type is ``both`` for Hermes, ``runtime`` for OpenClaw.
+    """
+
+
+@mount_group.command("add")
+@click.argument("agent")
+@click.option("--host", "host_path", required=True, type=click.Path(), help="Host path to share.")
+@click.option(
+    "--container",
+    "container_path",
+    required=True,
+    metavar="PATH",
+    help="Path inside the container (e.g. /workspace/x).",
+)
+@click.option(
+    "--rw",
+    "writable",
+    is_flag=True,
+    help="Allow the agent to write. Default is read-only; --rw warns explicitly.",
+)
+@click.option(
+    "--target",
+    type=click.Choice(["runtime", "sandbox", "both"]),
+    default=None,
+    help=(
+        "Where to expose the mount: runtime container, Hermes sandbox container, "
+        "or both. Defaults to 'both' for Hermes, 'runtime' for OpenClaw."
+    ),
+)
+@click.option("--restart", is_flag=True, help="Restart the agent after adding to apply the mount.")
+@click.option("-y", "--yes", "yes_local", is_flag=True, help="Skip the --rw safety prompt.")
+@click.pass_context
+def mount_add(
+    ctx: click.Context,
+    agent: str,
+    host_path: str,
+    container_path: str,
+    writable: bool,
+    target: str | None,
+    restart: bool,
+    yes_local: bool,
+) -> None:
+    """Add a host folder to ``agent``'s container."""
+    yes = yes_local or ctx.obj.get("yes", False)
+    if (
+        writable
+        and not yes
+        and not click.confirm(
+            f"--rw lets the agent (and any prompt-injected commands) modify files at "
+            f"{host_path}. A compromised agent could overwrite or exfiltrate them. "
+            f"Continue?",
+            default=False,
+        )
+    ):
+        raise click.Abort()
+    _run(
+        mounts_cmd.add,
+        agent=agent,
+        host=host_path,
+        container=container_path,
+        readonly=not writable,
+        target=target,
+        restart=restart,
+        config_path=cfg_mod.DEFAULT_CONFIG_PATH,
+    )
+
+
+@mount_group.command("remove")
+@click.argument("agent")
+@click.option(
+    "--container",
+    "container_path",
+    required=True,
+    metavar="PATH",
+    help="Container path of the mount to remove.",
+)
+@click.option("--restart", is_flag=True, help="Restart the agent after removal to drop the mount.")
+def mount_remove(agent: str, container_path: str, restart: bool) -> None:
+    """Remove a previously-added mount from ``agent``."""
+    _run(
+        mounts_cmd.remove,
+        agent=agent,
+        container=container_path,
+        restart=restart,
+        config_path=cfg_mod.DEFAULT_CONFIG_PATH,
+    )
+
+
+@mount_group.command("list")
+@click.argument("agent", required=False)
+def mount_list(agent: str | None) -> None:
+    """List mounts for an agent (or all agents if omitted)."""
+    _run(mounts_cmd.list_mounts, agent=agent, config_path=cfg_mod.DEFAULT_CONFIG_PATH)
+
+
+# ---------- access (host-user ACL on agent data dirs) ----------
+
+
+@main.group("access")
+def access_group() -> None:
+    """Grant the host user access to an agent's data dir.
+
+    Rootless Docker writes the agent's files at a subuid (e.g. host
+    uid 100999 for container uid 1000), so the host user can't read
+    or edit them without sudo. ``agents access grant`` adds a POSIX
+    ACL granting the host user access; the default-ACL bit makes the
+    grant survive container recreates.
+
+    New agents (created with this version of the toolkit) get this
+    automatically at ``agents create`` time — only pre-existing
+    agents need an explicit ``grant``.
+
+    No-op on the bare_metal backend (container uid maps to the host
+    user; files are already accessible).
+    """
+
+
+@access_group.command("grant")
+@click.argument("agent")
+@click.option(
+    "--rw",
+    "writable",
+    is_flag=True,
+    help="Grant read-write (default: read-only).",
+)
+@click.option("-y", "--yes", "yes_local", is_flag=True, help="Skip the sudo confirmation.")
+@click.pass_context
+def access_grant(ctx: click.Context, agent: str, writable: bool, yes_local: bool) -> None:
+    """Grant the host user access to ``agent``'s data dir.
+
+    Requires sudo (the dir is owned by a rootless-Docker subuid).
+    The exact ``setfacl`` commands are printed before sudo runs.
+    """
+    yes = yes_local or ctx.obj.get("yes", False)
+    _run(access_cmd.grant, agent=agent, writable=writable, yes=yes)
+
+
+@access_group.command("revoke")
+@click.argument("agent")
+@click.option("-y", "--yes", "yes_local", is_flag=True, help="Skip the sudo confirmation.")
+@click.pass_context
+def access_revoke(ctx: click.Context, agent: str, yes_local: bool) -> None:
+    """Drop the host-user ACL from ``agent``'s data dir."""
+    yes = yes_local or ctx.obj.get("yes", False)
+    _run(access_cmd.revoke, agent=agent, yes=yes)
+
+
+@access_group.command("list")
+@click.argument("agent", required=False)
+def access_list(agent: str | None) -> None:
+    """Show per-agent ACL status (ok / missing)."""
+    _run(access_cmd.list_access, agent=agent)
 
 
 # ---------- config (read-only convenience) ----------

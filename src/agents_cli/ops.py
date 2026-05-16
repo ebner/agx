@@ -168,6 +168,7 @@ def doctor(
 
     for svc, agent_type, agent_name in _services_to_check(cfg, target):
         _check_service_container(cfg, svc, agent_name, agent_type, report)
+        _check_host_access(cfg, agent_name, agent_type, report)
         if agent_type == "hermes":
             _check_hermes_data_dir_accessible(cfg, svc, agent_name, report)
             _check_hermes_doctor(cfg, svc, agent_name, report)
@@ -309,6 +310,9 @@ def _check_vm_reachable(cfg: AgentsConfig, report: DoctorReport) -> None:
 
 
 def _check_mount_round_trip(cfg: AgentsConfig, report: DoctorReport) -> None:
+    if cfg.vm.backend == "bare_metal":
+        report.add("mount_round_trip", "ok", "skipped (bare_metal — data-dir is host-native)")
+        return
     if cfg.paths.data_dir_in_vm:
         report.add("mount_round_trip", "ok", "skipped (data_dir_in_vm)")
         return
@@ -565,6 +569,50 @@ def _container_state_for(ps_json: str, service: str) -> str:
         if entry.get("Service") == service or entry.get("Name", "").endswith(f"-{service}"):
             return str(entry.get("State", "?"))
     return "absent"
+
+
+def _check_host_access(
+    cfg: AgentsConfig, agent_name: str, agent_type: str, report: DoctorReport
+) -> None:
+    """Warn if the host user can't reach the agent's data dir via the
+    filesystem (i.e. no POSIX ACL granting access, and the dir is
+    owned by a foreign uid — typically the rootless-Docker subuid).
+
+    Emits ``warn`` not ``fail`` because the toolkit itself works fine
+    without host access — it's a user-ergonomics check. The hint
+    points at ``agents access grant`` for the fix.
+
+    Skipped on bare-metal (container uid maps to host user; files are
+    already accessible) and in ``--data-dir-in-vm`` mode (the dirs
+    aren't on the host at all).
+    """
+    if cfg.vm.backend == "bare_metal" or cfg.paths.data_dir_in_vm:
+        return
+    from agents_cli import access_cmd, permissions
+
+    try:
+        dirs = access_cmd._agent_dirs(cfg, agent_name, agent_type)
+    except (UserError, Exception):
+        return
+    for d in dirs:
+        status = permissions.assess_host_access(d, cfg.host.uid)
+        if status == "missing":
+            report.add(
+                f"{agent_name}.host_access",
+                "warn",
+                f"{d} is owned by a foreign uid with no ACL for host user "
+                f"{cfg.host.uid} — run `agents access grant {agent_name}` to fix.",
+            )
+            return
+        if status == "masked":
+            report.add(
+                f"{agent_name}.host_access",
+                "warn",
+                f"{d} has an ACL entry for host user {cfg.host.uid} but it's "
+                f"masked to ---. Re-run `agents access grant {agent_name}` to "
+                f"apply the mask reset and unblock reads.",
+            )
+            return
 
 
 def _check_hermes_data_dir_accessible(

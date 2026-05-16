@@ -279,6 +279,15 @@ def _create_data_dirs(cfg: AgentsConfig, name: str, agent_type: str) -> None:
     env_path = cfg.paths.host_data_dir / name / ".env"
     if not env_path.exists():
         env_path.write_text("", encoding="utf-8")
+    # Default ACL so files the container will create (at rootless
+    # subuid) inherit a `u:<host-uid>:rwx` entry — the host user can
+    # read/edit the agent's files without sudo from day one. No-op
+    # on bare-metal / data-dir-in-vm; warn-only if the fs lacks ACL
+    # support. See agents_cli.access_cmd for the post-hoc grant
+    # variant pre-existing agents need.
+    from agents_cli import access_cmd
+
+    access_cmd.auto_grant_on_create(cfg, name, agent_type)
 
 
 def _delete_data_dir(cfg: AgentsConfig, name: str) -> None:
@@ -393,7 +402,7 @@ def list_agents(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> list[dict
 # ---------- remove ----------
 
 
-REMOVE_PHASES = ["container_stopped", "compose_updated", "data_dir_deleted"]
+REMOVE_PHASES = ["mounts_torn_down", "container_stopped", "compose_updated", "data_dir_deleted"]
 
 
 def remove(
@@ -425,7 +434,17 @@ def remove(
         )
 
         for phase in _phases_to_run(journal):
-            if phase == "container_stopped":
+            if phase == "mounts_torn_down":
+                # Wipe any host-folder mounts the user added via
+                # `agents mount add` BEFORE stopping the container — the
+                # container holds the bind mounts open, but the VM-side
+                # mount needs the agent's compose-override entry gone
+                # first to avoid `compose down`'s implicit re-up.
+                from agents_cli import mounts_cmd
+
+                mounts_cmd.remove_all_for_agent(cfg, name)
+                journal.advance(phase)
+            elif phase == "container_stopped":
                 if _service_in_compose(cfg, svc):
                     # `compose stop` + `compose rm -fs <svc>` is service-scoped;
                     # `compose down <svc>` is version-dependent and historically

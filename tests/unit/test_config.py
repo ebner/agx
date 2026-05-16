@@ -75,6 +75,21 @@ def test_data_dir_normal_absolute_path_ok(tmp_path: Path) -> None:
     assert p.host_data_dir == tmp_path / "data"
 
 
+def test_vm_backend_accepts_three_backends() -> None:
+    from agents_cli.config import VmConfig
+
+    for backend in ("multipass", "libvirt", "bare_metal"):
+        cfg = VmConfig(backend=backend)
+        assert cfg.backend == backend
+
+
+def test_vm_backend_rejects_unknown() -> None:
+    from agents_cli.config import VmConfig
+
+    with pytest.raises(ValueError, match="bare_metal"):
+        VmConfig(backend="podman")
+
+
 def test_export_cron_time_validation() -> None:
     from agents_cli.config import ExportCronConfig
 

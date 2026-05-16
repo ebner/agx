@@ -488,9 +488,31 @@ def mount(
 
 
 def umount(vm: str, vm_path: str) -> MpResult:
-    """Detach the virtiofs share via domain XML, located by target tag."""
+    """Detach the virtiofs share via domain XML, located by target tag.
+
+    Mirrors :func:`mount`'s ``--live --config`` semantics: detach
+    immediately on a running VM, fall back to ``--config`` only when
+    the VM is stopped. Also unmounts in-guest and strips the fstab
+    entry so a later reboot doesn't try to remount a now-absent share.
+    """
     _require_linux_host()
     tag = vm_path.replace("/", "_").strip("_") or "share"
+
+    # In-guest cleanup first (best effort). Doing this before detach
+    # avoids the kernel logging spurious "transport endpoint not
+    # connected" errors when the virtiofsd vanishes under an active
+    # mount.
+    import contextlib
+
+    fstab_line = f"{tag} {vm_path} virtiofs rw,_netdev 0 0"
+    with contextlib.suppress(RuntimeFailure):
+        exec_bash(
+            vm,
+            f"mountpoint -q {vm_path} && sudo umount {vm_path} || true\n"
+            f"sudo sed -i '\\|^{fstab_line}$|d' /etc/fstab\n",
+            check=False,
+        )
+
     xml = (
         "<filesystem type='mount' accessmode='passthrough'>"
         "  <driver type='virtiofs'/>"
@@ -501,7 +523,10 @@ def umount(vm: str, vm_path: str) -> MpResult:
         f.write(xml)
         xml_path = f.name
     try:
-        return _virsh("detach-device", vm, xml_path, "--config", check=False)
+        result = _virsh("detach-device", vm, xml_path, "--live", "--config", check=False)
+        if result.returncode != 0 and "not running" in (result.stderr or "").lower():
+            result = _virsh("detach-device", vm, xml_path, "--config", check=False)
+        return result
     finally:
         os.unlink(xml_path)
 

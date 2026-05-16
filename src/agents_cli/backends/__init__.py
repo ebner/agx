@@ -205,6 +205,11 @@ def get_backend_module(backend_name: str) -> object:
         from agents_cli.backends import libvirt
 
         return libvirt
+    if backend_name == "bare_metal":
+        from agents_cli.backends import bare_metal
+
+        return bare_metal
     raise UserError(
-        f"unknown vm backend {backend_name!r}; supported: multipass, libvirt (Linux only)"
+        f"unknown vm backend {backend_name!r}; supported: multipass, libvirt (Linux), "
+        "bare_metal (Linux)"
     )

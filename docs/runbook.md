@@ -270,6 +270,136 @@ Networking: only `firecrawl-api` is reachable, and only over the
 docker network as `http://firecrawl-api:3002`. No host port is
 published; debug via `agents firecrawl logs` or `agents vm shell`.
 
+## Reading agent files from the host (`agents access`)
+
+The agent's runtime container writes files into the bind-mounted data dir as a rootless-Docker subuid (typically host uid `100999`, mapped from container uid `1000`). The host user owns the *directory* but not the files inside; without intervention, `ls /home/$USER/agents/coder/.data` fails with permission denied.
+
+`agents access` grants the host user a POSIX ACL entry so the files become readable (or editable) without changing ownership — the container keeps writing as `100999`, the host user gets an ACL row granting access, and the default ACL on the directory means new files the agent writes inherit the grant.
+
+```bash
+# Read-only access (safe; the agent owns the files, you can just look)
+agents access grant coder
+
+# Read-write (lets you edit skills/SOUL.md/etc.)
+agents access grant coder --rw
+
+# Drop the ACL
+agents access revoke coder
+
+# Per-agent ACL state
+agents access list           # all agents
+agents access list coder    # just coder
+```
+
+### Defaults + automation
+
+- **New agents get this automatically.** `agents create` sets a default ACL on the agent's `.data/` (or `.openclaw/` + `workspace/` for OpenClaw) *before* the container starts; files the agent then writes inherit `u:<host-uid>:rwx`. Pre-existing agents created before this feature need an explicit `agents access grant` once.
+- **Sudo is required** for `grant` / `revoke` (the target is owned by a subuid). The toolkit prints the exact `setfacl` commands first and confirms — `-y` (or global `--yes`) skips the prompt.
+- **OpenClaw grants both** `.openclaw/` and `workspace/`. State and workspace are usually both interesting; carving sub-scopes adds CLI surface for no clear win.
+- **Read-only is the default.** Use `--rw` only if you intend to edit. A prompt-injected agent on a writable mount is the same risk class as a writable `agents mount add --rw`.
+
+### Backend differences
+
+| Backend | Behavior |
+|---|---|
+| multipass / libvirt | The grant runs setfacl on the host filesystem (under the multipass/virtiofs mount). 9p and virtiofs both honor ACLs — verified on Linux + ext4. |
+| bare_metal | No-op + informational message: the container uid maps 1:1 to the host user, so files are already host-owned. |
+| `--data-dir-in-vm` | Refused with a hint — the data isn't on the host filesystem; host ACLs can't reach it. Use `agents export` for host-side reads. |
+
+### Doctor integration
+
+`agents doctor` warns (does NOT fail) when an agent's data dir is owned by a foreign uid with no ACL for the host user:
+
+```
+WARN  coder.host_access  /home/user/agents/coder/.data is owned by a foreign uid
+                          with no ACL for host user 1000 — run `agents access grant coder` to fix.
+```
+
+The warning is the right severity: the toolkit itself works fine without host access; this is a user-ergonomics check.
+
+### Filesystem requirements
+
+Needs POSIX ACL support (`getfacl`/`setfacl` work + the underlying FS carries the xattrs). ext4 + btrfs + zfs all qualify out of the box; FAT/exFAT and most network mounts do not. The toolkit probes before granting and refuses with a clear message rather than silently leaving a partial ACL.
+
+## Sharing host folders with an agent (`agents mount`)
+
+Give an agent access to a specific folder on the host. The toolkit handles the two hops the folder needs to traverse before the agent container sees it: host → VM mount → docker bind volume.
+
+```bash
+# Default: ro, target both runtime + sandbox on Hermes
+agents mount add coder --host ~/projects/x --container /workspace/x
+
+# Read-write (will prompt; --yes to skip the warning)
+agents mount add coder --host ~/data --container /workspace/data --rw
+
+# Sandbox-only (visible to the LLM's shell tools, NOT the runtime container)
+agents mount add coder --host ~/scripts --container /workspace/scripts --target sandbox
+
+# OpenClaw — runtime only (sandbox concept is Hermes-specific)
+agents mount add bob --host ~/projects --container /workspace/projects
+
+# List, then remove
+agents mount list coder
+agents mount remove coder --container /workspace/x
+
+# Apply immediately rather than reminding you to restart
+agents mount add coder --host ~/projects/x --container /workspace/x --restart
+```
+
+### Defaults
+
+- **Read-only** unless `--rw`. The CLAUDE.md threat model is explicit: a prompt-injected agent can be persuaded into destructive ops on any writable mount.
+- **`--target`** defaults per agent type: **Hermes → `both`** (runtime container + Hermes sandbox via `terminal.docker_volumes`), **OpenClaw → `runtime`** (sandbox is Hermes-only).
+- **Per-agent isolation.** Each agent gets its own VM-side mount target at `/home/ubuntu/host-extras/<agent>/<hash>-<basename>` — no cross-agent sharing. Two agents wanting the same host folder both run `agents mount add`.
+
+### What lives where
+
+| File | Owner | Purpose |
+|---|---|---|
+| `<data-dir>/<agent>/.mounts.json` | toolkit | Source of truth for that agent's extra mounts. |
+| `<data-dir>/docker-compose.override.yml` | toolkit + user | Toolkit appends `volumes:` entries here; the main `docker-compose.yml` is left alone so `agents reseat` / `agents upgrade` don't clobber the additions. |
+| `<data-dir>/<agent>/.data/config.yaml` (`terminal.docker_volumes`) | toolkit | Hermes sandbox mount list. |
+
+### Backend differences
+
+| Backend | Add | Remove |
+|---|---|---|
+| multipass | Stops the VM, runs `multipass mount --type native`, restarts (~30s downtime). The toolkit prompts; `--yes` skips. | Live `multipass umount` (no stop needed). |
+| libvirt | Hot-attaches a virtiofs `<filesystem>` block via `virsh attach-device --live --config` + `mount -t virtiofs` + `_netdev` fstab entry inside the guest. No downtime. | Hot-detach via `virsh detach-device --live --config` + in-guest umount + fstab cleanup. |
+| bare_metal | No-op VM step (the folder is already addressable to the rootless Docker daemon). | No-op VM step. |
+
+### Reserved container paths
+
+The toolkit refuses container paths that would shadow its own bind mounts: `/opt/data`, `/home/hermes`, `/home/hermes/.codex`, `/home/node`, `/home/node/.openclaw`, `/run`, `/proc`, `/sys`, `/dev`, `/etc`, `/usr`, `/var`, `/`. Pick something under `/workspace/`.
+
+### Restart required
+
+Both add and remove leave the running container with stale state until the next restart. The output reminds you:
+```
+agent restart required: agents restart coder
+```
+…or pass `--restart` to apply immediately.
+
+### Export / import semantics
+
+`agents export <agent>` includes the agent's `.mounts.json` in the tarball as metadata. `agents import <agent>` deliberately does NOT re-apply those mounts (host paths likely differ on the destination machine) — instead, it surfaces them as `agents mount add ...` commands you can copy-paste and edit.
+
+### Safety knobs
+
+- `--rw` prompts unless `--yes`/global `--yes`. Pick narrow read-only mounts wherever possible.
+- The `target sandbox`/`both` choice on Hermes exposes the folder to the LLM's `terminal` and `execute_code` skills. If you only want it visible to your own scripts that you exec into the runtime, use `--target runtime`.
+
+### Auto-ACL: how the user and the agent both see the folder
+
+The agent (uid 1000 inside the container, which maps to host subuid 100999) and you (uid 1000 on the host) are *different uids* under rootless Docker. Without intervention, files would land owned by 100999 with the agent's umask — you wouldn't be able to read what the agent wrote, and the agent wouldn't be able to read your mode-600 files. `agents mount add` solves this automatically:
+
+- **Read-only mount** (default): grants the agent's subuid `rX` on existing files + sets a default ACL so future files you add inherit the grant.
+- **`--rw` mount**: grants the agent's subuid `rwX` for both directions, AND adds a default ACL granting your uid `rwx` so files the agent writes back are readable by you.
+
+No sudo needed (you own the host folder). Probed first — if the filesystem doesn't support ACLs (FAT/exFAT/network mount), the mount still works but you'll see a warning about likely permission errors on mode-restrictive files.
+
+`agents mount remove` strips the toolkit-added ACL entries; any unrelated entries you added by hand are left in place.
+
 ## Per-agent secrets
 
 API keys for skills (Firecrawl, GitHub, etc.) go in a per-agent .env
@@ -737,6 +867,91 @@ agents vm destroy --export-first  # always export before destroying
 ```
 
 `vm destroy` does not touch `<data-dir>` or `~/.codex`. To reset completely, manually `rm -rf <data-dir>` afterward (irreversible).
+
+## Using the bare_metal backend (no VM, Linux-only)
+
+Bare-metal runs agent containers directly on the host with rootless Docker — no Multipass, no libvirt, no VM at all. It's the right answer when:
+
+- You're on a **single-user dev workstation** where the VM trust boundary is overkill — the same human runs the editor, browser, and shell anyway.
+- You want **native GPU access** for local LLMs (Strix Halo / Ryzen AI MAX, dedicated AMD/NVIDIA cards) without the libvirt vfio-pci passthrough dance.
+- You want **fast init**: no cloud-image download, no cloud-init bring-up, no virtio overhead.
+
+### What you trade away
+
+- **The VM trust boundary.** A compromised agent that escapes a container is on your host, period. CLAUDE.md's defense-in-depth rationale leans on the VM to absorb skill-marketplace malware; bare-metal forfeits that. Only use bare-metal where the host is *already* trusted.
+- **Full-state rollback during upgrades.** `agents upgrade` still snapshots the host data-dir via tarball (so agent state can be reverted), but there's no VM snapshot of the rootless-Docker engine or OS state.
+- **Snapshots in general.** `agents vm snapshot` / `restore` refuse on bare-metal — use `agents export` for data archives, and host-level tools (duplicity, restic, btrfs/zfs) for full-host snapshots.
+
+### Prerequisites
+
+The toolkit's bare-metal bootstrap is **verify-only**: it probes for rootless Docker and refuses if anything's missing rather than running `sudo apt` on your behalf. Install these yourself first:
+
+```bash
+# 1. Apt packages
+sudo apt install uidmap dbus-user-session docker-compose-plugin
+
+# 2. Enable lingering so systemd --user services survive logout
+sudo loginctl enable-linger "$USER"
+
+# 3. Install rootless Docker
+curl -fsSL https://get.docker.com/rootless | sh
+
+# 4. Start it + enable autostart
+systemctl --user enable --now docker.service
+
+# 5. Sanity check
+docker version
+```
+
+If `/var/run/docker.sock` already exists (rootful Docker), the toolkit will refuse to run on top of it — uninstall rootful first or migrate via `dockerd-rootless-setuptool.sh install`. The toolkit's security model assumes the rootless user namespace; running on rootful would put compromised containers' processes as effective root on the host.
+
+### Init
+
+```bash
+# Bare-metal defaults the data-dir to ~/.local/share/agents
+agents vm init --backend bare_metal
+
+# Or pick your own path
+agents vm init --backend bare_metal --data-dir /data/agents
+
+# init re-runs are safe — the verify loop is idempotent
+```
+
+The init step does not provision a VM. It:
+
+1. Probes every rootless-Docker prerequisite, surfaces the exact missing-package commands if any fail
+2. Captures `[vm_runtime]` (socket path, host uid/gid) into `~/.config/agents/config.toml`
+3. Pins Hermes / OpenClaw image tags from GitHub releases
+4. Seeds the data-dir with `docker-compose.yml` + `.env`
+
+Output ends with a `bare_metal runtime ready (no VM)` line plus the standard trust-boundary warning.
+
+### Lifecycle differences
+
+| Command | Bare-metal behavior |
+|---|---|
+| `agents vm start` / `vm stop` | No-op (informational message). The host is always 'on'; stop individual agents via `agents stop <name>`. |
+| `agents vm shell` | Spawns a subshell with `CWD=<data-dir>` and `DOCKER_HOST=unix://<rootless socket>` already exported — `docker compose ...` and `agents exec ...` work immediately. |
+| `agents vm status` | Reports the host kernel and a synthesized "Running" state (consistent with VM-mode output for scripting). |
+| `agents vm snapshot` / `restore` | Refuse. Use `agents export` archives + a host snapshot tool. |
+| `agents vm resize` / `rebuild` | Refuse — host sizing is real hardware. |
+| `agents vm destroy` | Stops and removes all toolkit-managed containers (`docker compose down --remove-orphans`). Host data-dir is preserved; `rm -rf <data-dir>` manually for a complete reset. |
+| `agents create/start/stop/restart/logs/exec/setup/doctor/upgrade/rollback` | Work transparently — every host↔runtime call goes through the same backend dispatcher. |
+
+### Host reboot recovery
+
+`restart: unless-stopped` on every agent container, plus the rootless `docker.service` running as a `systemctl --user` unit (with `enable-linger` set in the prereqs above), brings the whole stack back without manual intervention.
+
+If `docker.service` isn't coming up on its own, check:
+
+```bash
+loginctl show-user "$USER" --property=Linger     # should print Linger=yes
+systemctl --user status docker.service            # should be active
+```
+
+### Local inference on bare-metal
+
+`agents inference up ollama` works the same on bare-metal — Ollama runs as a sibling Docker service. The win is GPU access: Ollama in a bare-metal container can use `--device /dev/kfd --device /dev/dri/renderD128` (ROCm/AMD) or `--gpus all` (NVIDIA Container Toolkit) to talk to the host GPU directly, while the host's X session keeps sharing the same GPU. No vfio-pci, no libvirt vGPU. The toolkit's `inference up` doesn't yet auto-wire those flags — add them via `docker-compose.override.yml` for now (tracked as a Phase 2 follow-up to issue #5).
 
 ## Troubleshooting
 

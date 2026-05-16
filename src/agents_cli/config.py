@@ -59,8 +59,10 @@ class VmConfig(BaseModel):
     @field_validator("backend")
     @classmethod
     def _validate_backend(cls, v: str) -> str:
-        if v not in ("multipass", "libvirt"):
-            raise ValueError(f"vm.backend must be 'multipass' or 'libvirt', got {v!r}")
+        if v not in ("multipass", "libvirt", "bare_metal"):
+            raise ValueError(
+                f"vm.backend must be 'multipass', 'libvirt', or 'bare_metal', got {v!r}"
+            )
         return v
 
     @field_validator("gpu_passthrough")

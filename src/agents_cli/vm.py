@@ -83,6 +83,27 @@ def init(
     elif gpu:
         raise UserError("--gpu requires --backend libvirt")
 
+    # Bare-metal aligns vm_agents_root with the real host data-dir so
+    # compose_runner's `--project-directory` / `-f` / `--env-file` flags
+    # produce correct host paths without per-call special-casing.
+    if backend == "bare_metal":
+        import platform as _platform
+
+        if _platform.system() != "Linux":
+            raise UserError(
+                f"--backend bare_metal is Linux-only (host: {_platform.system()}). "
+                "Use --backend multipass on macOS/Windows."
+            )
+        if data_dir_in_vm:
+            raise UserError("--data-dir-in-vm is meaningless with --backend bare_metal")
+        cfg.paths = PathsConfig.model_validate(
+            {
+                "host_data_dir": str(cfg.paths.host_data_dir),
+                "vm_agents_root": str(cfg.paths.host_data_dir),
+                "data_dir_in_vm": False,
+            }
+        )
+
     # Switch the dispatcher to the chosen backend BEFORE any of the
     # mp.* primitives below run, otherwise we'd talk to multipass
     # when the user asked for libvirt.
@@ -107,15 +128,19 @@ def init(
                 f"falling back to {image}."
             )
             cfg.vm.ubuntu_release = image
-    else:
+    elif backend == "libvirt":
         # libvirt backend interprets `image` as the Ubuntu release
         # version (e.g. "24.04") and downloads the matching cloud
         # image directly — no catalog probe needed.
         image = cfg.vm.ubuntu_release
+    else:
+        # bare_metal: no VM, no image. Keep the string so the journal
+        # event below has something printable.
+        image = "(host)"
 
     cfg_mod.save(cfg, config_path)
 
-    if not _vm_exists(cfg.vm.name):
+    if backend != "bare_metal" and not _vm_exists(cfg.vm.name):
         ui.emit(
             {"action": "vm_launch", "vm": cfg.vm.name, "image": image},
             human=f"launching VM {cfg.vm.name!r} ({image}) — this can take a few minutes...",
@@ -157,10 +182,15 @@ def init(
                 libvirt_mod._cleanup_partial_domain(cfg.vm.name)
             raise
 
-    if not data_dir_in_vm:
+    if backend != "bare_metal" and not data_dir_in_vm:
         _ensure_mount(cfg)
 
-    status, boot_stdout, boot_stderr = _run_bootstrap(cfg.vm.name)
+    if backend == "bare_metal":
+        from agents_cli.backends import bare_metal as bm
+
+        status, boot_stdout, boot_stderr = bm.verify_bootstrap(cfg.paths.host_data_dir)
+    else:
+        status, boot_stdout, boot_stderr = _run_bootstrap(cfg.vm.name)
     if not status.is_ok():
         # Dump the captured streams so the user sees what actually failed.
         # The per-field flags ("net=fail", "daemon=fail") rarely tell the
@@ -191,34 +221,52 @@ def init(
     # Make the VM auto-resume on host boot so the chain Docker →
     # containers → agents recovers without manual intervention.
     # No-op on multipass (snap daemon auto-resumes everything),
-    # essential on libvirt (defaults to Autostart=disable).
-    autostart_result = mp.set_autostart(cfg.vm.name, enabled=True)
-    if autostart_result.returncode != 0:
-        ui.warn(
-            f"could not enable autostart for {cfg.vm.name!r}: "
-            f"{(autostart_result.stderr or '').strip() or 'unknown error'}. "
-            f"VM won't auto-start on host reboot; enable manually via the "
-            f"backend's native tool if needed."
-        )
+    # essential on libvirt (defaults to Autostart=disable), no-op on
+    # bare_metal (no VM; container `restart: unless-stopped` covers it).
+    if backend != "bare_metal":
+        autostart_result = mp.set_autostart(cfg.vm.name, enabled=True)
+        if autostart_result.returncode != 0:
+            ui.warn(
+                f"could not enable autostart for {cfg.vm.name!r}: "
+                f"{(autostart_result.stderr or '').strip() or 'unknown error'}. "
+                f"VM won't auto-start on host reboot; enable manually via the "
+                f"backend's native tool if needed."
+            )
 
     cfg_mod.save(cfg, config_path)
     _seed_data_dir(cfg)
 
-    ui.emit(
-        {
-            "vm": cfg.vm.name,
-            "data_dir": str(cfg.paths.host_data_dir),
-            "docker_socket": cfg.vm_runtime.docker_socket_path,
-            "hermes_image_tag": cfg.defaults.hermes_image_tag,
-            "openclaw_image_tag": cfg.defaults.openclaw_image_tag,
-        },
-        human=(
+    if backend == "bare_metal":
+        ui.warn(
+            "bare_metal backend: the VM trust boundary is forfeited. A compromised "
+            "agent that escapes its container reaches the host directly. Only use this "
+            "on single-user dev workstations where the host is already trusted."
+        )
+        human_ready = (
+            f"bare_metal runtime ready (no VM).\n"
+            f"  data-dir: {cfg.paths.host_data_dir}\n"
+            f"  docker socket: {cfg.vm_runtime.docker_socket_path}\n"
+            f"  hermes image: nousresearch/hermes-agent:{cfg.defaults.hermes_image_tag}\n"
+            f"  openclaw image: openclaw/openclaw:{cfg.defaults.openclaw_image_tag}"
+        )
+    else:
+        human_ready = (
             f"VM {cfg.vm.name!r} ready.\n"
             f"  data-dir: {cfg.paths.host_data_dir}\n"
             f"  docker socket: {cfg.vm_runtime.docker_socket_path}\n"
             f"  hermes image: nousresearch/hermes-agent:{cfg.defaults.hermes_image_tag}\n"
             f"  openclaw image: openclaw/openclaw:{cfg.defaults.openclaw_image_tag}"
-        ),
+        )
+    ui.emit(
+        {
+            "vm": cfg.vm.name,
+            "backend": backend,
+            "data_dir": str(cfg.paths.host_data_dir),
+            "docker_socket": cfg.vm_runtime.docker_socket_path,
+            "hermes_image_tag": cfg.defaults.hermes_image_tag,
+            "openclaw_image_tag": cfg.defaults.openclaw_image_tag,
+        },
+        human=human_ready,
     )
 
 
@@ -229,6 +277,16 @@ def start(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> None:
     from agents_cli import compose
 
     cfg = cfg_mod.load(config_path)
+    if cfg.vm.backend == "bare_metal":
+        # No VM lifecycle on bare-metal; nothing to wait for. Still sweep
+        # stale staging files so the next mutation isn't tripped up by
+        # a prior crashed write.
+        compose.cleanup_stale_temps(cfg)
+        ui.emit(
+            {"vm": cfg.vm.name, "status": "running", "backend": "bare_metal"},
+            human=f"{cfg.vm.name}: running (bare_metal — host is always 'on')",
+        )
+        return
     mp.start_vm(cfg.vm.name)
     if not cfg.paths.data_dir_in_vm:
         _ensure_mount(cfg)
@@ -241,6 +299,15 @@ def start(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> None:
 
 def stop(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> None:
     cfg = cfg_mod.load(config_path)
+    if cfg.vm.backend == "bare_metal":
+        ui.emit(
+            {"vm": cfg.vm.name, "status": "running", "backend": "bare_metal"},
+            human=(
+                f"{cfg.vm.name}: no-op (bare_metal — host doesn't stop). "
+                f"Use `agents stop <name>` to stop individual agents."
+            ),
+        )
+        return
     mp.stop_vm(cfg.vm.name)
     ui.emit({"vm": cfg.vm.name, "status": "stopped"}, human=f"{cfg.vm.name}: stopped")
 
@@ -263,6 +330,11 @@ def resize(
         raise UserError("provide at least one of --cpus, --memory, --disk")
 
     cfg = cfg_mod.load(config_path)
+    if cfg.vm.backend == "bare_metal":
+        raise UserError(
+            "vm resize doesn't apply on the bare_metal backend (host sizing is "
+            "real hardware). Adjust host resources directly."
+        )
 
     if disk_gb is not None and disk_gb < cfg.vm.disk_gb:
         raise UserError(
@@ -328,8 +400,28 @@ def status(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> None:
 
 
 def shell(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> None:
-    """Drop into a multipass shell. Replaces the process so click can't wrap."""
+    """Drop into a shell with the toolkit's env pre-applied.
+
+    Multipass / libvirt: hand off to the backend's native shell tool.
+    Bare-metal: spawn a subshell on the host with ``CWD=<data-dir>`` and
+    ``DOCKER_HOST=unix://<rootless socket>`` exported, so ``docker
+    compose ...`` and ``agents exec ...`` just work.
+    """
     cfg = cfg_mod.load(config_path)
+    if cfg.vm.backend == "bare_metal":
+        from agents_cli.backends import bare_metal as bm
+
+        rc = bm.open_shell(cfg.paths.host_data_dir, cfg.vm_runtime.docker_socket_path)
+        if rc != 0:
+            raise RuntimeFailure(f"subshell exited with status {rc}")
+        return
+    if cfg.vm.backend == "libvirt":
+        from agents_cli.backends import libvirt as libvirt_mod
+
+        rc = libvirt_mod.exec_in_vm_interactive(cfg.vm.name, "bash", "-l")
+        if rc != 0:
+            raise RuntimeFailure(f"shell exited with status {rc}")
+        return
     os.execvp("multipass", ["multipass", "shell", cfg.vm.name])
 
 
@@ -356,6 +448,13 @@ def take_snapshot(
     ``yes=True`` skips the confirmation prompt.
     """
     cfg = cfg_mod.load(config_path)
+    if cfg.vm.backend == "bare_metal":
+        raise UserError(
+            "VM snapshots are unavailable on the bare_metal backend (no VM disk to "
+            "snapshot). Use `agents export <name>` for data-dir backups, and a host-"
+            "level snapshot tool (duplicity, restic, btrfs/zfs snapshots) for the "
+            "rest."
+        )
     full_name = _unique_snapshot_name(cfg.vm.name, name)
 
     # libvirt + virtiofs needs the VM stopped for snapshot. Other
@@ -445,6 +544,11 @@ def restore_snapshot(
     bypasses multipass's safety check (no-op on libvirt).
     """
     cfg = cfg_mod.load(config_path)
+    if cfg.vm.backend == "bare_metal":
+        raise UserError(
+            "snapshot restore is unavailable on the bare_metal backend. Use "
+            "`agents import <name> <archive>` to restore an `agents export` archive."
+        )
     snapshot_id = f"{cfg.vm.name}.{snapshot_name}"
 
     requires_downtime = cfg.vm.backend == "libvirt" and not cfg.paths.data_dir_in_vm
@@ -553,6 +657,12 @@ def rebuild(
     from agents_cli.journal import Journal
 
     cfg = cfg_mod.load(config_path)
+    if cfg.vm.backend == "bare_metal":
+        raise UserError(
+            "vm rebuild doesn't apply on the bare_metal backend (there's no VM to "
+            "rebuild). For data restore: `agents import`; for full reset: `agents "
+            "vm destroy --yes` then `agents vm init --backend bare_metal`."
+        )
 
     target_cpus = cpus if cpus is not None else cfg.vm.cpus
     target_memory = memory_gb if memory_gb is not None else cfg.vm.memory_gb
@@ -668,6 +778,26 @@ def rebuild(
 
 def destroy(*, yes: bool = False, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> None:
     cfg = cfg_mod.load(config_path)
+    if cfg.vm.backend == "bare_metal":
+        # On bare-metal there's no VM to delete; instead, bring the
+        # compose stack down. Host data-dir is untouched (matches the
+        # multipass/libvirt invariant).
+        from agents_cli import compose_runner
+
+        if not yes and not ui.confirm(
+            (
+                f"bare_metal: stop and remove all toolkit-managed containers? "
+                f"Host data-dir at {cfg.paths.host_data_dir} stays untouched."
+            ),
+            default=False,
+        ):
+            raise UserError("aborted by user")
+        compose_runner.down(cfg, remove_orphans=True)
+        ui.emit(
+            {"vm": cfg.vm.name, "status": "destroyed", "backend": "bare_metal"},
+            human=f"{cfg.vm.name}: compose stack down (bare_metal — no VM to delete)",
+        )
+        return
     if not yes and not ui.confirm(
         f"destroy VM {cfg.vm.name!r}? Host data-dir at {cfg.paths.host_data_dir} stays untouched.",
         default=False,

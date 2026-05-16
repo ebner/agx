@@ -136,6 +136,50 @@ def dump_compose(doc: Any) -> str:
     return buf.getvalue()
 
 
+OVERRIDE_FILENAME = "docker-compose.override.yml"
+
+
+def override_path(cfg: AgentsConfig) -> Path:
+    """Host-side location of the user/toolkit-extra compose override.
+
+    ``docker compose`` auto-merges this file alongside ``docker-compose.yml``
+    when it sits next to it. The toolkit's main compose file is owned by
+    the CLI (``agents reseat`` / ``upgrade`` rewrite blocks in it), so any
+    user customization or `agents mount`-style additions live here instead.
+    """
+    return cfg.paths.host_data_dir / OVERRIDE_FILENAME
+
+
+def read_override_doc(cfg: AgentsConfig) -> Any:
+    """Round-trip read of the override file. Returns an empty
+    ``services: {}`` doc if it doesn't exist yet — callers can build up
+    additions and then write atomically.
+    """
+    return load_compose(override_path(cfg))
+
+
+def write_override_atomically(cfg: AgentsConfig, doc: Any) -> None:
+    """Write the override file via host-temp → rename (same-filesystem).
+
+    Unlike the main compose, the override file lives only on the host
+    side — `docker compose` reads it from the project directory it
+    auto-detects, which is the same dir whether the project lives on
+    a host mount (multipass/libvirt) or directly on the host (bare-
+    metal). No ``multipass transfer`` step needed.
+
+    Atomic via ``os.replace`` on the same filesystem (host data-dir).
+    """
+    content = dump_compose(doc)
+    target = override_path(cfg)
+    tmp = host_staging_dir(cfg) / f"override-{os.getpid()}-{uuid.uuid4().hex[:8]}.yml"
+    try:
+        tmp.write_text(content, encoding="utf-8")
+        os.replace(tmp, target)
+        ui.info(f"compose: wrote {target}")
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
 def host_staging_dir(cfg: AgentsConfig) -> Path:
     """Host-side scratch dir for anything that's about to be
     ``multipass transfer``\\ -ed into the VM (compose files, Hermes

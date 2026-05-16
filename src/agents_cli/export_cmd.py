@@ -188,10 +188,41 @@ def import_archive(
         # Legacy .tar.gz path (archives from pre-G6 versions).
         with tarfile.open(archive_path, "r:gz") as tf:
             tf.extractall(cfg.paths.host_data_dir, filter="data")
+    _surface_imported_mounts_metadata(cfg, name)
     ui.emit(
         {"name": name, "archive": str(archive_path)},
         human=f"imported {archive_path} into {target}",
     )
+
+
+def _surface_imported_mounts_metadata(cfg: AgentsConfig, name: str) -> None:
+    """The archive may carry the source's ``.mounts.json``. Per the
+    design decision (issue #5 follow-up): we keep the file as metadata
+    but DO NOT re-mount on this host — host paths are likely different
+    here, and re-running ``multipass mount`` for stale paths would
+    fail mid-import. Just surface the list so the user knows what to
+    re-add manually.
+    """
+    from agents_cli import mounts_cmd
+
+    entries = mounts_cmd.load_manifest(cfg, name)
+    if not entries:
+        return
+    lines = ["the imported archive declares these host mounts (NOT re-applied here):"]
+    for e in entries:
+        lines.append(
+            f"  agents mount add {name} --host {e.host_path} "
+            f"--container {e.container_path}"
+            + ("" if e.readonly else " --rw")
+            + (f" --target {e.target}" if e.target != "both" else "")
+        )
+    lines.append("Re-add the ones that still apply on this host.")
+    ui.warn("\n".join(lines))
+    # Drop the manifest so the surfaced commands above are the
+    # source of truth — keeping a stale .mounts.json that doesn't
+    # match the actual compose-override state would mislead
+    # subsequent `agents mount list` / `agents remove`.
+    mounts_cmd.manifest_path(cfg, name).unlink(missing_ok=True)
 
 
 # ---------- host-cron integration ----------
