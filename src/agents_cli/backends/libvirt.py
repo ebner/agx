@@ -272,14 +272,22 @@ def _make_seed_iso(vm: str, user_data: Path, meta_data: Path) -> Path:
 def wait_for_ssh(vm: str, timeout_s: int = 180) -> None:
     """Block until SSH responds (cloud-init typically takes 30-90s).
     Exposed for ``vm.init``'s post-launch handshake step.
+
+    Suppresses :class:`RuntimeFailure` from ``_vm_ip`` (which raises
+    until libvirt's DHCP issues a lease) and from ``_ssh`` (which
+    fails with "Connection refused" while sshd is still coming up).
+    Both are expected during the cloud-init bring-up window; only
+    timeout-expiry is a hard failure.
     """
+    import contextlib
     import time
 
     start = time.time()
     while time.time() - start < timeout_s:
-        result = _ssh(vm, "true", check=False)
-        if result.returncode == 0:
-            return
+        with contextlib.suppress(RuntimeFailure):
+            result = _ssh(vm, "true", check=False)
+            if result.returncode == 0:
+                return
         time.sleep(5)
     raise RuntimeFailure(f"libvirt VM {vm!r} did not become SSH-reachable within {timeout_s}s")
 
@@ -441,7 +449,10 @@ def launch(vm: str, *, image: str, cpus: int, memory_gb: int, disk_gb: int) -> M
         ]
     )
 
-    osvariant = "ubuntu" + image.replace(".", "")
+    # virt-install accepts `ubuntu<MAJOR>.<MINOR>` (with the dot) per
+    # `--osinfo list`. The toolkit's `image` arg is already that shape
+    # (e.g. "24.04") so we just prepend the vendor prefix.
+    osvariant = f"ubuntu{image}"
     return _run(
         [
             VIRT_INSTALL,
@@ -475,11 +486,43 @@ def launch(vm: str, *, image: str, cpus: int, memory_gb: int, disk_gb: int) -> M
 
 
 def info_vm(vm: str, *, fmt: str = "json") -> MpResult:
-    """``virsh dominfo`` raw text — callers parsing this are
-    backend-aware (vm.status / vm._is_running).
+    """Run ``virsh dominfo`` and reshape the output to the JSON form
+    multipass produces, so callers (``vm.status``, ``vm._vm_running``)
+    don't need to branch on backend.
+
+    multipass returns ``{"errors": [], "info": {"<vm>": {"state": ...,
+    "release": ..., ...}}}``; we fill in the same outer shape with the
+    fields virsh actually surfaces (state, OS type, CPU count, memory).
     """
     _require_linux_host()
-    return _virsh("dominfo", vm, check=False)
+    raw = _virsh("dominfo", vm, check=False)
+    if raw.returncode != 0:
+        return raw
+    fields: dict[str, str] = {}
+    for line in raw.stdout.splitlines():
+        if ":" not in line:
+            continue
+        key, _, val = line.partition(":")
+        fields[key.strip()] = val.strip()
+    # Map virsh "State" values to multipass-compatible labels for the
+    # vm.status / _vm_running consumers.
+    state_map = {
+        "running": "Running",
+        "shut off": "Stopped",
+        "paused": "Suspended",
+        "in shutdown": "Stopping",
+    }
+    state = state_map.get(fields.get("State", "").lower(), fields.get("State", "Unknown"))
+    info = {
+        "state": state,
+        "release": fields.get("OS Type", "kvm"),
+        "cpu_count": fields.get("CPU(s)", ""),
+        "memory": fields.get("Max memory", ""),
+        "id": fields.get("Id", ""),
+        "uuid": fields.get("UUID", ""),
+    }
+    payload = {"errors": [], "info": {vm: info}}
+    return MpResult(stdout=json.dumps(payload), stderr="", returncode=0)
 
 
 def list_vms(*, fmt: str = "json") -> MpResult:
