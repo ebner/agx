@@ -577,7 +577,7 @@ If your RPi5 has an NVMe HAT and you're booting from NVMe, microSD consideration
 
 The default `multipass` backend works everywhere and is the right choice for 95% of deployments. The `libvirt` backend exists for one reason: **GPU passthrough**, which Multipass doesn't support and which is required for vLLM (and helpful for accelerated Ollama/llama.cpp inference on workstations with discrete GPUs). See [GH #2](https://github.com/ebner/agents/issues/2) for the design rationale.
 
-⚠️  **Experimental — not smoke-tested on real hardware in the toolkit's CI.** Tests verify argv shapes and value types; full end-to-end correctness needs validation on a Linux + libvirt host with a real GPU. Expect minor quirks around virsh output formats, cloud-init seed ISO, and IOMMU-group handling that will surface only when actually exercised.
+⚠️  **Experimental status**: lifecycle + mount + snapshot + restore validated on a real Linux + libvirt host (Ubuntu 24.04, kernel 6.17, AMD Strix Halo, 2026-05-16). GPU attach validated only via XML dry-run — actual hostdev attach has not been exercised yet because the test machine has no discrete GPU separable from the host display. Expect the GPU path may surface minor quirks on first use.
 
 ### Prerequisites
 
@@ -585,11 +585,59 @@ The default `multipass` backend works everywhere and is the right choice for 95%
 - **libvirt + KVM stack**:
   ```bash
   sudo apt install libvirt-clients libvirt-daemon-system virtinst \
-                   genisoimage cloud-image-utils openssh-client qemu-utils
-  sudo usermod -aG libvirt $USER     # log out + back in for group to take effect
+                   genisoimage cloud-image-utils openssh-client \
+                   qemu-utils qemu-system-x86 ovmf virtiofsd
+  sudo usermod -aG libvirt,kvm $USER     # log out + back in for groups to take effect
   ```
-- **For GPU passthrough**: IOMMU enabled in BIOS, vfio-pci kernel module, and the target GPU bound to vfio-pci at boot. The Arch wiki's [PCI passthrough via OVMF](https://wiki.archlinux.org/title/PCI_passthrough_via_OVMF) is the canonical setup guide; the toolkit doesn't automate the kernel-cmdline / modprobe configuration because that's a host-level change with reboot consequences.
+- **For GPU passthrough**: IOMMU enabled in BIOS AND on the kernel cmdline (`amd_iommu=on iommu=pt` or `intel_iommu=on iommu=pt`), vfio-pci kernel module, and the target GPU bound to vfio-pci at boot. The Arch wiki's [PCI passthrough via OVMF](https://wiki.archlinux.org/title/PCI_passthrough_via_OVMF) is the canonical setup guide; the toolkit doesn't automate the kernel-cmdline / modprobe configuration because that's a host-level change with reboot consequences.
 - **For arm64 (RPi5 etc.)**: KVM works on arm64 Linux; the cloud image arch is auto-detected from `platform.machine()`. No GPU passthrough on RPi5 (no discrete GPU).
+
+### Two host-level gotchas worth fixing once
+
+These don't block the toolkit from working but tripped up the first real-hardware run and will trip up other users on similar systems.
+
+**(1) Snap-Multipass hijacks `/dev/kvm` group**
+
+If both snap-Multipass and libvirt are installed on the same host, snap's udev rule (`/etc/udev/rules.d/70-snap.multipass.rules`) tags `/dev/kvm` with `snap_multipass_multipassd`, which triggers `snap-device-helper` to reassign the device's group to snapd's sandboxed namespace (often `systemd-resolve`). libvirt-qemu (in group `kvm`) then can't open the device and every libvirt VM start fails with `Could not access KVM kernel module: Permission denied`.
+
+Symptom in the wild:
+
+```
+$ ls -la /dev/kvm
+crw-rw----+ 1 root systemd-resolve 10, 232 May 16 10:29 /dev/kvm
+                     ^^^^^^^^^^^^^^^ should be 'kvm'
+```
+
+Persistent fix — drop `/etc/udev/rules.d/99-fix-kvm-group.rules` that runs *after* snap's rule (99- sorts after 70-) and re-asserts the right group:
+
+```bash
+sudo tee /etc/udev/rules.d/99-fix-kvm-group.rules >/dev/null <<'EOF'
+KERNEL=="kvm", RUN+="/bin/sh -c 'chgrp kvm /dev/kvm && chmod 0660 /dev/kvm'"
+EOF
+sudo udevadm control --reload-rules
+sudo udevadm trigger /dev/kvm
+```
+
+Alternative: `sudo snap remove --purge multipass` if you've committed to libvirt as your only backend.
+
+**(2) AMD systems often ship with `amd_iommu=off`**
+
+Several AMD platforms (notably Strix Halo / Ryzen AI MAX, but also various Ryzen laptops) default-disable IOMMU because early-firmware BIOS revisions had stability issues with it. Check:
+
+```bash
+cat /proc/cmdline | tr ' ' '\n' | grep -i iommu
+```
+
+If you see `amd_iommu=off`, GPU passthrough is impossible regardless of vfio setup. To enable:
+
+1. **Update BIOS first** — AMD AI-platform IOMMU stability fixes landed in mid-2025 firmware. Boards still on launch firmware may genuinely have IOMMU bugs.
+2. Edit `/etc/default/grub` to change `amd_iommu=off` → `amd_iommu=on iommu=pt` in `GRUB_CMDLINE_LINUX_DEFAULT`.
+3. `sudo update-grub && sudo reboot`.
+4. Verify with `dmesg | grep -i AMD-Vi` (should show initialization, no errors).
+
+`iommu=pt` (passthrough mode) is critical: with it, host-attached devices skip IOMMU translation entirely so bare-metal performance (LLM inference, NVMe I/O) is unaffected. Without it, you pay 1-5% on I/O-heavy workloads for nothing.
+
+Memory capacity for LLMs is **not** affected by IOMMU — only your BIOS GPU-carveout setting (UMA Frame Buffer Size / Variable Graphics Memory) limits how much of system RAM the iGPU can use.
 
 ### Provisioning
 
@@ -632,10 +680,33 @@ If the card isn't there: the device isn't bound to vfio-pci. `lspci -k -d <vendo
 | VM provisioning | `multipass launch` (one shot) | virt-install + cloud-init seed ISO + ssh wait |
 | Exec into VM | `multipass exec` | `ssh ubuntu@<ip>` (key auth) |
 | File transfer | `multipass transfer` (SFTP) | `scp` |
-| Host-mount | `multipass mount --type native` | virtiofs via `<filesystem>` domain XML |
-| Snapshots | `multipass snapshot` | `virsh snapshot-create-as --disk-only` (qcow2 backing chain) |
+| Host-mount | `multipass mount --type native` | virtiofs via `<filesystem>` domain XML (needs `memoryBacking source.type='memfd' access.mode='shared'`, which the toolkit auto-emits) |
+| Snapshots | `multipass snapshot` (running VM ok) | `virsh snapshot-create-as` — internal qcow2 snapshot; **requires VM stopped if a virtiofs mount is active** (vhost-user backend incompatibility). Toolkit auto-stops, prompts for confirmation, restarts afterwards |
 | `vm resize` | `multipass set local.<vm>.<knob>` | `virsh setvcpus` / `setmaxmem` / `qemu-img resize` |
 | Image catalog | `multipass find` | Cloud images at `cloud-images.ubuntu.com` (no catalog) |
+
+### Snapshot semantics on libvirt + virtiofs
+
+A virtiofs mount on a libvirt domain blocks `snapshot-create-as` on a running VM (vhost-user backend lacks `VHOST_USER_PROTOCOL_F_LOG_SHMFD`). The toolkit handles this transparently:
+
+```
+$ agents vm snapshot pre-upgrade
+Snapshotting a libvirt VM with an active virtiofs mount requires
+briefly stopping the VM (~30s downtime). Any running Docker
+containers (Hermes agents, Firecrawl, Ollama, etc.) will be
+cleanly stopped by libvirt's ACPI shutdown and restarted
+afterwards.
+Proceed? [y/N]:
+```
+
+Confirm → toolkit stops the VM via ACPI, snapshots, restarts, re-waits for SSH. Mount auto-remounts via the fstab `_netdev` entry. Same logic applies to `agents vm restore`. `-y` / global `--yes` skips the prompt (used by `agents upgrade`'s pre-upgrade snapshot path).
+
+Why this over the alternatives:
+
+- *Detach virtiofs, snapshot, reattach*: would let containers keep running, but the underlying `umount /home/ubuntu/agents` is either refused (`device is busy` due to Docker bind mounts) or, with `umount -l`, leaves running containers with stale fd handles to deleted mount points — high risk of SQLite-WAL corruption for Hermes' state.db / kanban.db.
+- *External (`--disk-only`) snapshots*: work with virtiofs but **aren't revertible** via `snapshot-revert`. The earlier toolkit version used them and silently broke restore.
+
+The ~30s downtime is the right trade-off: same lifecycle as a normal `agents vm stop`, no container-state risk.
 
 ### Migration between backends
 
@@ -648,12 +719,13 @@ Not automated. If you want to switch backends on an existing deployment:
 
 The host data dir is backend-agnostic; only the VM provisioning changes.
 
-### Known limitations (Phase B)
+### Known limitations
 
-- **9p mount fallback is documented, not coded.** If `virtiofsd` isn't available, edit the domain XML manually via `virsh edit <vm>` to use 9p.
-- **Snapshot/restore semantics differ from Multipass.** Multipass's `vm snapshot` creates a full point-in-time image; the libvirt implementation uses external (qcow2 backing chain) snapshots which are cheaper to create but accumulate disk usage over time. Long-term hosts with frequent snapshots may need periodic `virsh blockcommit`.
-- **`agents vm list` only shows VMs created by the toolkit** — both backends now return JSON with a `list` key containing one entry per VM name, but the schema isn't as rich as multipass's full `multipass list` output.
-- **Doctor checks don't yet probe libvirt-daemon health.** Follow-up needed; for now check `systemctl status libvirtd` manually if a VM seems wedged.
+- **GPU attach not yet end-to-end validated.** XML emission verified via dry-run (matches libvirt's hostdev schema). Actual `virsh attach-device` + guest-driver visibility hasn't been exercised — needs a discrete GPU separable from the host display (typical workstation: integrated graphics for host, discrete card on vfio-pci).
+- **9p mount fallback is documented, not coded.** If `virtiofsd` is unavailable, edit the domain XML manually via `virsh edit <vm>` to use 9p instead of virtiofs.
+- **Internal snapshots accumulate inside the qcow2.** No automated pruning. Periodic `virsh snapshot-delete <vm> <name>` keeps the disk file lean on long-running hosts.
+- **`agents vm list` schema isn't as rich as `multipass list`** — both return `{"list": [{"name": ...}]}` but multipass also surfaces IPs, mounts, release info that the libvirt path doesn't (yet) emit.
+- **Doctor checks don't probe libvirt-daemon health.** Check `systemctl status libvirtd` manually if a VM seems wedged.
 
 ## Tearing down
 
