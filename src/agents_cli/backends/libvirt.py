@@ -513,6 +513,16 @@ def info_vm(vm: str, *, fmt: str = "json") -> MpResult:
         "in shutdown": "Stopping",
     }
     state = state_map.get(fields.get("State", "").lower(), fields.get("State", "Unknown"))
+    # Enumerate snapshots so ``vm.list_snapshots`` (which reads
+    # ``info[vm]["snapshots"]``) finds them. virsh snapshot-list emits
+    # a tabular form; --name shrinks it to one snapshot-name per line.
+    snap_result = _virsh("snapshot-list", vm, "--name", check=False)
+    snapshots: dict[str, dict[str, str]] = {}
+    if snap_result.returncode == 0:
+        for snap_name in snap_result.stdout.splitlines():
+            snap_name = snap_name.strip()
+            if snap_name:
+                snapshots[snap_name] = {}
     info = {
         "state": state,
         "release": fields.get("OS Type", "kvm"),
@@ -520,6 +530,7 @@ def info_vm(vm: str, *, fmt: str = "json") -> MpResult:
         "memory": fields.get("Max memory", ""),
         "id": fields.get("Id", ""),
         "uuid": fields.get("UUID", ""),
+        "snapshots": snapshots,
     }
     payload = {"errors": [], "info": {vm: info}}
     return MpResult(stdout=json.dumps(payload), stderr="", returncode=0)
@@ -616,13 +627,23 @@ def delete_vm(vm: str, *, purge: bool = False) -> MpResult:
 
 
 def snapshot(vm: str, name: str, *, comment: str | None = None) -> MpResult:
+    """Create an internal qcow2 snapshot (revertible).
+
+    Earlier versions used ``--disk-only`` for external (backing-chain)
+    snapshots, but those CAN'T be reverted with ``snapshot-revert``
+    — they're backup points only. Worse, they modify the disk chain
+    so future VM starts may hit perm errors on the base image. The
+    revertible-by-default semantics match Multipass's snapshot
+    behaviour and what ``vm.upgrade``'s rollback flow assumes.
+
+    Internal snapshots accumulate inside the qcow2; periodic
+    ``virsh snapshot-delete`` cleanup may be needed on long-running
+    VMs that snapshot frequently.
+    """
     _require_linux_host()
     args = ["snapshot-create-as", vm, name]
     if comment:
         args.extend(["--description", comment])
-    # External / qcow2-backing-chain snapshots — disk not paused
-    # during creation.
-    args.append("--disk-only")
     return _virsh(*args, check=False)
 
 

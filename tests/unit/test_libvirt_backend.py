@@ -149,16 +149,21 @@ def test_transfer_to_vm_uses_scp(libvirt: Any, mocker: Any, tmp_path: Path) -> N
 # ---------- snapshot ----------
 
 
-def test_snapshot_uses_disk_only_external(libvirt: Any, mocker: Any) -> None:
-    """External snapshots (qcow2 backing chain) don't pause the VM
-    — important for long-running services. Verify --disk-only is
-    in the snapshot-create-as argv.
+def test_snapshot_creates_internal_revertible_snapshot(libvirt: Any, mocker: Any) -> None:
+    """Internal (qcow2-internal) snapshots, NOT --disk-only.
+
+    Earlier versions used --disk-only for external snapshots,
+    but those CAN'T be reverted via snapshot-revert — they're
+    backup points only. Worse, they mutate the disk backing chain
+    and break VM restart afterwards (real-world smoke test on
+    2026-05-16 found this). Revertible semantics match what
+    vm.upgrade's rollback flow assumes.
     """
     run_mock = _mock_subprocess(mocker)
     libvirt.snapshot("agents", "pre-upgrade-2026-05-15", comment="auto")
     argv = run_mock.call_args.args[0]
     assert "snapshot-create-as" in argv
-    assert "--disk-only" in argv
+    assert "--disk-only" not in argv  # explicitly NOT --disk-only
     assert "--description" in argv
 
 
