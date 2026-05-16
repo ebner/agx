@@ -188,6 +188,19 @@ def init(
     cfg.defaults.hermes_image_tag = _fetch_latest_tag("hermes") or _fallback_tag("hermes")
     cfg.defaults.openclaw_image_tag = _fetch_latest_tag("openclaw") or _fallback_tag("openclaw")
 
+    # Make the VM auto-resume on host boot so the chain Docker →
+    # containers → agents recovers without manual intervention.
+    # No-op on multipass (snap daemon auto-resumes everything),
+    # essential on libvirt (defaults to Autostart=disable).
+    autostart_result = mp.set_autostart(cfg.vm.name, enabled=True)
+    if autostart_result.returncode != 0:
+        ui.warn(
+            f"could not enable autostart for {cfg.vm.name!r}: "
+            f"{(autostart_result.stderr or '').strip() or 'unknown error'}. "
+            f"VM won't auto-start on host reboot; enable manually via the "
+            f"backend's native tool if needed."
+        )
+
     cfg_mod.save(cfg, config_path)
     _seed_data_dir(cfg)
 

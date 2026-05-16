@@ -709,6 +709,23 @@ def stop_vm(vm: str) -> MpResult:
     return _virsh("shutdown", vm, check=False)
 
 
+def set_autostart(vm: str, enabled: bool) -> MpResult:
+    """Toggle whether libvirtd starts this VM on host boot.
+
+    Creates / removes a symlink in
+    ``/etc/libvirt/qemu/autostart/<vm>.xml``. Unlike Multipass (where
+    the snap daemon auto-resumes everything), libvirt requires
+    explicit per-domain opt-in — without it the VM stays off across
+    reboots and the entire chain (Docker, containers, agents) never
+    gets a chance to come up.
+    """
+    _require_linux_host()
+    args = ["autostart", vm]
+    if not enabled:
+        args.append("--disable")
+    return _virsh(*args, check=False)
+
+
 def set_config(key: str, value: str | int) -> MpResult:
     """Translate multipass-style ``local.<vm>.<knob>`` keys into
     virsh / qemu-img equivalents. ``agents vm resize`` is the only

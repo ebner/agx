@@ -51,6 +51,7 @@ __all__ = [
     "parse_bootstrap_ok",
     "restore",
     "run",
+    "set_autostart",
     "set_backend",
     "set_config",
     "snapshot",
@@ -188,6 +189,15 @@ def start_vm(vm: str) -> MpResult:
 
 def stop_vm(vm: str) -> MpResult:
     return _b().stop_vm(vm)
+
+
+def set_autostart(vm: str, enabled: bool) -> MpResult:
+    """Toggle whether the VM auto-starts on host boot. No-op on
+    multipass (snap daemon auto-resumes everything by default);
+    libvirt requires explicit opt-in (creates a symlink under
+    ``/etc/libvirt/qemu/autostart/``).
+    """
+    return _b().set_autostart(vm, enabled)
 
 
 def set_config(key: str, value: str | int) -> MpResult:

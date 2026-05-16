@@ -216,6 +216,15 @@ def stop_vm(vm: str) -> MpResult:
     return mp("stop", vm)
 
 
+def set_autostart(vm: str, enabled: bool) -> MpResult:
+    """No-op on Multipass: snap-confined multipassd auto-resumes all
+    defined VMs on host boot by default, so explicit autostart wiring
+    isn't needed. Returns a synthetic ok result so callers don't need
+    to branch.
+    """
+    return MpResult(stdout="", stderr="", returncode=0)
+
+
 def set_config(key: str, value: str | int) -> MpResult:
     """Multipass-specific: ``multipass set <key>=<value>``. Used by
     ``agents vm resize`` to reallocate per-VM cpus/memory/disk on a
