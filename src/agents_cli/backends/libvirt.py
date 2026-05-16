@@ -184,8 +184,23 @@ def _vm_ip(vm: str) -> str:
 
 
 def _ssh(vm: str, *cmd: str, check: bool = True, input_bytes: bytes | None = None) -> MpResult:
+    """Run ``cmd`` argv on the libvirt VM via SSH.
+
+    ssh concatenates all args after the destination with spaces and
+    passes that string to the remote login shell, which re-parses it.
+    That means embedded spaces or shell metacharacters in any ``cmd``
+    element get lost — ``sh -c "docker ps -a"`` ends up running
+    ``docker`` with three positional args and confused docker.
+
+    Fix: shell-quote each argv element with :func:`shlex.quote`
+    before passing to ssh. Joined back together by ssh, the remote
+    shell parses it as the original argv shape.
+    """
+    import shlex
+
     ip = _vm_ip(vm)
-    argv = [SSH, *_ssh_opts(), f"ubuntu@{ip}", "--", *cmd]
+    quoted = [shlex.quote(c) for c in cmd]
+    argv = [SSH, *_ssh_opts(), f"ubuntu@{ip}", "--", *quoted]
     return _run(argv, check=check, input_bytes=input_bytes)
 
 
@@ -365,10 +380,19 @@ def exec_in_vm_with_stdin(vm: str, *cmd: str, input_bytes: bytes, check: bool = 
 
 
 def exec_in_vm_interactive(vm: str, *cmd: str) -> int:
-    """Interactive SSH — inherits terminal so wizards can prompt."""
+    """Interactive SSH — inherits terminal so wizards can prompt.
+
+    Same shlex.quote treatment as :func:`_ssh`: ssh joins post-`--`
+    argv with spaces and the remote shell re-parses, so embedded
+    spaces / shell metacharacters in any element need to round-trip
+    via shell-quoting.
+    """
+    import shlex
+
     _require_linux_host()
     ip = _vm_ip(vm)
-    argv = [SSH, "-t", *_ssh_opts(), f"ubuntu@{ip}", "--", *cmd]
+    quoted = [shlex.quote(c) for c in cmd]
+    argv = [SSH, "-t", *_ssh_opts(), f"ubuntu@{ip}", "--", *quoted]
     ui.info(f"$ {' '.join(argv)}")
     try:
         result = subprocess.run(argv, check=False)

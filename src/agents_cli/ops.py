@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sys
 import textwrap
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -100,8 +101,12 @@ def run_in_agent(
     """
     cfg = cfg_mod.load(config_path)
     svc, _ = _resolve_service(cfg, name)
-    argv = compose_exec_argv(cfg, svc, *(cmd or ("bash",)), as_root=as_root)
-    os.execvp("multipass", argv)
+    # Dispatch via the backend so interactive exec works under
+    # libvirt (SSH-based) as well as multipass. Previously did
+    # os.execvp("multipass", ...) which bypassed the dispatcher and
+    # broke under any non-multipass backend.
+    in_vm = _compose_exec_in_vm_argv(cfg, svc, *(cmd or ("bash",)), as_root=as_root)
+    sys.exit(mp.exec_in_vm_interactive(cfg.vm.name, *in_vm))
 
 
 # ---------- setup wizard ----------
@@ -112,8 +117,8 @@ def setup(name: str, *, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> None
     svc, agent_type = _resolve_service(cfg, name)
     binary = "hermes" if agent_type == "hermes" else "openclaw"
     sub = "setup" if agent_type == "hermes" else "onboard"
-    argv = compose_exec_argv(cfg, svc, binary, sub)
-    os.execvp("multipass", argv)
+    in_vm = _compose_exec_in_vm_argv(cfg, svc, binary, sub)
+    sys.exit(mp.exec_in_vm_interactive(cfg.vm.name, *in_vm))
 
 
 # ---------- doctor ----------
