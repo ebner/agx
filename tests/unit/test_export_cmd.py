@@ -85,6 +85,109 @@ def test_export_refuses_unknown_agent(saved_config: Path) -> None:
         export_cmd.export("ghost", config_path=saved_config)
 
 
+def test_prune_keeps_newest_n_and_deletes_rest(tmp_path: Path) -> None:
+    """Auto-prune sorts on the ``<agent>-<utc>.tar.zst`` filename
+    (ISO timestamps sort chronologically) and deletes everything
+    older than the newest N. Anything not matching the pattern is
+    left alone — user files, other agents' archives, the cron log.
+    """
+    d = tmp_path / "backups"
+    d.mkdir()
+    # Mixed bag of files: coder archives across many days, one bob
+    # archive (different agent), plus untouchable user content.
+    coder_stamps = [
+        "20260518T003001Z",
+        "20260518T063001Z",
+        "20260519T003001Z",
+        "20260519T063001Z",
+        "20260520T003001Z",
+        "20260520T063001Z",
+    ]
+    for s in coder_stamps:
+        (d / f"coder-{s}.tar.zst").write_bytes(b"x")
+    (d / "bob-20260518T003001Z.tar.zst").write_bytes(b"x")
+    (d / ".export-cron.log").write_text("log", encoding="utf-8")
+    (d / "user-manual-archive.tar.zst").write_bytes(b"x")
+
+    deleted = export_cmd._prune_old_archives("coder", d, keep_last=3)
+
+    # Newest 3 coder archives kept; older 3 deleted.
+    kept = sorted(p.name for p in d.iterdir())
+    assert "coder-20260520T063001Z.tar.zst" in kept
+    assert "coder-20260520T003001Z.tar.zst" in kept
+    assert "coder-20260519T063001Z.tar.zst" in kept
+    assert "coder-20260518T003001Z.tar.zst" not in kept
+    # Bob's archive untouched (per-agent isolation).
+    assert "bob-20260518T003001Z.tar.zst" in kept
+    # User files untouched (only the toolkit naming pattern is pruned).
+    assert ".export-cron.log" in kept
+    assert "user-manual-archive.tar.zst" in kept
+    assert len(deleted) == 3
+
+
+def test_prune_disabled_when_keep_last_is_zero(tmp_path: Path) -> None:
+    """``keep_last = 0`` opts out of auto-prune. Useful for users who
+    want unbounded history (e.g. relying on filesystem snapshots
+    instead of duplicity for long history)."""
+    d = tmp_path / "backups"
+    d.mkdir()
+    for s in ("20260518T003001Z", "20260519T003001Z", "20260520T003001Z"):
+        (d / f"coder-{s}.tar.zst").write_bytes(b"x")
+    deleted = export_cmd._prune_old_archives("coder", d, keep_last=0)
+    assert deleted == []
+    assert len(list(d.iterdir())) == 3
+
+
+def test_prune_no_op_when_under_threshold(tmp_path: Path) -> None:
+    """Fewer-or-equal-than-N archives → nothing to delete."""
+    d = tmp_path / "backups"
+    d.mkdir()
+    for s in ("20260520T003001Z", "20260520T063001Z"):
+        (d / f"coder-{s}.tar.zst").write_bytes(b"x")
+    deleted = export_cmd._prune_old_archives("coder", d, keep_last=14)
+    assert deleted == []
+    assert len(list(d.iterdir())) == 2
+
+
+def test_prune_handles_legacy_tar_gz_archives(tmp_path: Path) -> None:
+    """Pre-G6 archives are .tar.gz, not .tar.zst. Auto-prune must
+    treat both as toolkit-owned so users migrating from older
+    versions don't end up with an unbounded old-format pile."""
+    d = tmp_path / "backups"
+    d.mkdir()
+    (d / "coder-20260518T003001Z.tar.gz").write_bytes(b"x")  # legacy
+    (d / "coder-20260519T003001Z.tar.zst").write_bytes(b"x")
+    (d / "coder-20260520T003001Z.tar.zst").write_bytes(b"x")
+    deleted = export_cmd._prune_old_archives("coder", d, keep_last=2)
+    # The legacy .tar.gz is the oldest → gets deleted.
+    assert len(deleted) == 1
+    assert deleted[0].name == "coder-20260518T003001Z.tar.gz"
+
+
+def test_export_skips_prune_when_to_is_custom(
+    with_coder: Path, cfg: AgentsConfig, tmp_path: Path
+) -> None:
+    """User-provided ``--to <path>`` is treated as a destination the
+    user manages themselves — never auto-pruned. Otherwise a user
+    pointing ``--to`` at a shared dir (a NAS mount, a different
+    project's backup folder) would have their other files deleted
+    surprise-style.
+    """
+    elsewhere = tmp_path / "elsewhere"
+    # Pre-seed older archives at the custom location.
+    elsewhere.mkdir()
+    for s in ("20260518T003001Z", "20260519T003001Z", "20260520T003001Z"):
+        (elsewhere / f"coder-{s}.tar.zst").write_bytes(b"x")
+    cfg.export_cron.keep_last = 1  # would prune to 1 if not custom-dir
+    cfg_mod.save(cfg, with_coder)
+
+    export_cmd.export("coder", to=elsewhere, config_path=with_coder)
+
+    # All 3 pre-existing archives still there + 1 new one = 4 total.
+    matching = sorted(p.name for p in elsewhere.glob("coder-*.tar.zst"))
+    assert len(matching) == 4
+
+
 def test_archive_dir_defaults_to_backups_in_both_modes(cfg: AgentsConfig, tmp_path: Path) -> None:
     """``--to`` was previously required under ``--data-dir-in-vm`` —
     forcing the user to type a path on every invocation. The default

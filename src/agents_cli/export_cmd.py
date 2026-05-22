@@ -152,11 +152,65 @@ def export(
         mp.transfer_from_vm(cfg.vm.name, vm_archive, out)
         mp.exec_in_vm(cfg.vm.name, "rm", "-f", vm_archive, check=False)
 
+    # Auto-prune old archives in the default backups dir. Only fires
+    # when the user didn't pass a custom ``--to`` location (custom
+    # destinations are user-managed; we never delete from paths the
+    # user explicitly named).
+    pruned: list[Path] = []
+    if to is None:
+        pruned = _prune_old_archives(name, out.parent, cfg.export_cron.keep_last)
+
+    payload: dict[str, object] = {
+        "name": name,
+        "archive": str(out),
+        "size_bytes": out.stat().st_size,
+    }
+    if pruned:
+        payload["pruned"] = [str(p) for p in pruned]
     ui.emit(
-        {"name": name, "archive": str(out), "size_bytes": out.stat().st_size},
-        human=f"exported {name!r} -> {out}",
+        payload,
+        human=(
+            f"exported {name!r} -> {out}"
+            + (f"\n  pruned {len(pruned)} older archive(s)" if pruned else "")
+        ),
     )
     return out
+
+
+def _prune_old_archives(agent_name: str, archive_dir: Path, keep_last: int) -> list[Path]:
+    """Delete this agent's oldest archives in ``archive_dir``, keeping
+    only the newest ``keep_last``. Returns the deleted paths.
+
+    Only files matching the toolkit's own naming pattern
+    (``<agent>-<utc>.tar.zst``, plus the legacy ``.tar.gz`` form) are
+    candidates — anything else in the dir is left alone (user files,
+    other agents' archives, the ``.export-cron.log``).
+
+    Sort is on filename: ISO-8601 UTC timestamps in the format
+    ``YYYYMMDDTHHMMSSZ`` sort lexicographically the same as
+    chronologically, so we don't need to stat each file.
+
+    ``keep_last == 0`` disables pruning entirely — useful for users
+    who want unbounded history and will clean up by hand.
+    """
+    if keep_last <= 0 or not archive_dir.is_dir():
+        return []
+    candidates = sorted(
+        list(archive_dir.glob(f"{agent_name}-*.tar.zst"))
+        + list(archive_dir.glob(f"{agent_name}-*.tar.gz")),
+        key=lambda p: p.name,
+    )
+    if len(candidates) <= keep_last:
+        return []
+    to_delete = candidates[:-keep_last]
+    deleted: list[Path] = []
+    for p in to_delete:
+        try:
+            p.unlink()
+            deleted.append(p)
+        except OSError as e:
+            ui.warn(f"could not delete old archive {p}: {e}")
+    return deleted
 
 
 def export_all(

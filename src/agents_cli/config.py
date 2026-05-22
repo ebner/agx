@@ -236,6 +236,20 @@ class ExportCronConfig(BaseModel):
     # 20:30") for SQLite-heavy workloads where 24h granularity is too
     # coarse.
     time: str = "02:30"
+    # Per-agent retention of toolkit-written tarballs in the default
+    # ``<data-dir>/backups/`` directory. After every successful
+    # ``agents export`` the toolkit deletes the agent's oldest
+    # archives, keeping only the newest ``keep_last``. Duplicity (or
+    # the user's chosen host-backup tool) is the long-history layer;
+    # this rolling window is just in-flight protection between
+    # nightly off-host runs.
+    #
+    # Default 14 = ~3.5 days at the example 4x/day schedule, or 14
+    # days at a single nightly run. Set to 0 to disable pruning
+    # (full history accumulates; user responsible for cleanup).
+    # Archives the user wrote to a custom ``--to <path>`` location
+    # are NEVER pruned by the toolkit.
+    keep_last: int = Field(default=14, ge=0)
 
     @field_validator("time")
     @classmethod
