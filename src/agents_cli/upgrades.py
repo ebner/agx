@@ -125,6 +125,34 @@ def upgrade(
         new_tag = tag or old_tag  # explicit tag wins; otherwise refresh in place
     base = HERMES_IMAGE_BASE if agent_type == "hermes" else OPENCLAW_IMAGE_BASE
 
+    # No-op short-circuit when the target tag is what we're already on
+    # AND the caller named the target (``--latest`` or ``--tag X``).
+    # Bare ``agents upgrade <name>`` (no flags) intentionally falls
+    # through as a "force-refresh in place" — useful for picking up
+    # env-file changes or recovering from a wedged container without
+    # actually bumping versions.
+    #
+    # Skipping here saves ~30-60s of avoidable agent downtime:
+    # ``vm.take_snapshot`` on libvirt+virtiofs stops the VM, snapshots,
+    # then restarts. Doing that for a no-op upgrade is just penalty.
+    if (to_latest or tag is not None) and new_tag == old_tag:
+        ui.emit(
+            {
+                "name": name,
+                "old_tag": old_tag,
+                "new_tag": new_tag,
+                "noop": True,
+            },
+            human=f"{name!r}: already at {new_tag} — nothing to do",
+        )
+        return UpgradeOutcome(
+            name=name,
+            old_tag=old_tag,
+            new_tag=new_tag,
+            host_snapshot=None,
+            vm_snapshot=None,
+        )
+
     with compose.acquire_lock(cfg.paths.host_data_dir):
         journal = Journal.find_resumable(cfg.paths.host_data_dir, "upgrade", name) or Journal.begin(
             cfg.paths.host_data_dir, "upgrade", name, UPGRADE_PHASES

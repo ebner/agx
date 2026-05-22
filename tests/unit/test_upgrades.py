@@ -316,6 +316,61 @@ def test_vm_snapshot_uses_monotonic_suffix_on_collision(
     snap_spy.assert_called_once()
 
 
+def test_upgrade_to_latest_is_noop_when_already_at_latest(
+    with_coder: Path, mocker, cfg: AgentsConfig
+) -> None:
+    """``agents upgrade --latest`` while already at the latest tag must
+    short-circuit BEFORE touching the VM. ``vm.take_snapshot`` on
+    libvirt+virtiofs stops the VM for ~30-60s; doing that for a no-op
+    is pure penalty and would make periodic ``upgrade --latest`` calls
+    (e.g. from cron) unusable.
+    """
+    mocker.patch("agents_cli.outdated_cmd.fetch_latest_tag", return_value="v1.0.0")
+    mocks = _stub_happy_upgrade(mocker, cfg)
+    outcome = upgrades.upgrade("coder", to_latest=True, config_path=with_coder)
+
+    assert outcome.old_tag == outcome.new_tag == "v1.0.0"
+    assert outcome.host_snapshot is None
+    assert outcome.vm_snapshot is None
+    # The expensive phases must not have run.
+    mocks["stop"].assert_not_called()
+    mocks["snapshot"].assert_not_called()
+    mocks["pull"].assert_not_called()
+    mocks["compose_up"].assert_not_called()
+
+
+def test_upgrade_explicit_tag_matching_current_is_noop(
+    with_coder: Path, mocker, cfg: AgentsConfig
+) -> None:
+    """``--tag X`` when the agent is already at X is also a no-op —
+    the user named the target and we're there. Differs from bare
+    ``agents upgrade <name>`` (no flags) which IS a force-refresh.
+    """
+    mocks = _stub_happy_upgrade(mocker, cfg)
+    outcome = upgrades.upgrade("coder", tag="v1.0.0", config_path=with_coder)
+    assert outcome.old_tag == outcome.new_tag == "v1.0.0"
+    mocks["stop"].assert_not_called()
+    mocks["pull"].assert_not_called()
+
+
+def test_upgrade_bare_call_force_refreshes_in_place(
+    with_coder: Path, mocker, cfg: AgentsConfig
+) -> None:
+    """Bare ``agents upgrade <name>`` (no flags) is the documented
+    refresh-in-place — useful for picking up env-file changes or
+    recovering from a wedged container without changing versions.
+    It must run the full pipeline even though new_tag == old_tag,
+    distinguishing it from the noop short-circuit above.
+    """
+    mocks = _stub_happy_upgrade(mocker, cfg)
+    outcome = upgrades.upgrade("coder", config_path=with_coder)
+    assert outcome.old_tag == outcome.new_tag == "v1.0.0"
+    # Snapshots, pull, recreate all ran.
+    mocks["snapshot"].assert_called_once()
+    mocks["pull"].assert_called_once()
+    mocks["compose_up"].assert_called_once()
+
+
 def test_upgrade_rollback_clears_journal_to_force_clean_retry(
     with_coder: Path, mocker, cfg: AgentsConfig
 ) -> None:
