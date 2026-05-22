@@ -398,15 +398,26 @@ def _latest_host_snapshot(cfg: AgentsConfig, name: str) -> Path | None:
 
 
 def _vm_snapshot(cfg: AgentsConfig, name: str) -> str:
-    """Take a pre-upgrade VM snapshot. Stops/starts the VM to sidestep
-    per-multipass-version snapshot-on-running quirks.
+    """Take a pre-upgrade VM snapshot.
+
+    Delegates to :func:`vm_mod.take_snapshot` so we inherit its full
+    orchestration: ACPI-shutdown-then-wait-for-stopped (libvirt's
+    ``virsh shutdown`` returns before the domain actually halts —
+    racing the snapshot against an active virtiofs vhost-user
+    backend, which fails with VHOST_USER_PROTOCOL_F_LOG_SHMFD), the
+    returncode check on the snapshot itself (libvirt's ``-virsh
+    snapshot-create-as`` is called with check=False so a failure
+    would otherwise be silently swallowed and the journal would
+    advance past a snapshot that doesn't actually exist), and
+    wait_for_ssh after start_vm so the next phase's compose-write-
+    via-scp doesn't race DHCP.
+
+    ``yes=True`` because ``agents upgrade`` is the caller — the
+    user already opted in to downtime by running ``upgrade``; an
+    additional snapshot-stop confirmation here would be redundant.
     """
     base_name = f"pre-upgrade-{name}-{_utc_stamp()}"
-    final_name = vm_mod._unique_snapshot_name(cfg.vm.name, base_name)
-    mp.stop_vm(cfg.vm.name)
-    mp.snapshot(cfg.vm.name, final_name, comment=f"agents upgrade {name}")
-    mp.start_vm(cfg.vm.name)
-    return final_name
+    return vm_mod.take_snapshot(base_name, comment=f"agents upgrade {name}", yes=True)
 
 
 def _latest_vm_snapshot(vm_name: str, agent_name: str) -> str | None:

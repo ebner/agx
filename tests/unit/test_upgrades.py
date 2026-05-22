@@ -297,6 +297,43 @@ def test_vm_snapshot_uses_monotonic_suffix_on_collision(
     snap_spy.assert_called_once()
 
 
+def test_vm_snapshot_waits_for_ssh_on_libvirt_after_start(
+    with_coder: Path, mocker, cfg: AgentsConfig
+) -> None:
+    """Regression for the 2026-05-22 upgrade-on-libvirt failure:
+    ``_vm_snapshot`` must NOT return until the VM is back online
+    after the snapshot stop/start cycle. The next phase (``tag_pinned``)
+    does compose-write-via-scp which races DHCP otherwise — error
+    surfaces as "could not get IP for libvirt VM".
+
+    Routing through ``vm_mod.take_snapshot`` gets us:
+    wait_for_stopped after stop (so the snapshot doesn't race a
+    still-shutting-down VM with active virtiofs), rc check on the
+    snapshot itself (libvirt's snapshot-create-as is invoked with
+    check=False so silent failures would otherwise let the journal
+    advance past a snapshot that doesn't actually exist), and
+    wait_for_ssh after start.
+    """
+    cfg.vm.backend = "libvirt"
+    cfg_mod.save(cfg, with_coder)
+    mocker.patch(
+        "agents_cli.mp.info_vm",
+        return_value=_ok(json.dumps({"info": {"agents": {"state": "Running", "snapshots": {}}}})),
+    )
+    mocker.patch("agents_cli.mp.stop_vm", return_value=_ok())
+    mocker.patch("agents_cli.mp.start_vm", return_value=_ok())
+    mocker.patch("agents_cli.mp.snapshot", return_value=_ok())
+    wait_ssh = mocker.patch("agents_cli.backends.libvirt.wait_for_ssh")
+    # `_vm_running` polling inside take_snapshot's wait_for_stopped
+    # would loop forever on a non-mocked info_vm — short-circuit it.
+    mocker.patch("agents_cli.vm._wait_for_vm_stopped")
+
+    upgrades._vm_snapshot(cfg, "coder")
+
+    wait_ssh.assert_called()
+    assert wait_ssh.call_args.args[0] == cfg.vm.name
+
+
 # ---------- pull ----------
 
 
