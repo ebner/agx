@@ -182,6 +182,72 @@ def install_vm_fs_simulation(mocker, cfg: AgentsConfig) -> dict:
         if ".compose.*.new" in script and "rm -f" in script:
             for p in host_root.glob(".compose.*.new"):
                 p.unlink(missing_ok=True)
+        # Mirror the production behaviour of the in-VM tar paths
+        # (``upgrades._host_data_snapshot`` and ``export_cmd.export``
+        # in host-mount mode): the bash script does
+        # ``cd <vm_root> && [sudo] tar --zstd -cf <vm_archive>
+        # <files...>`` and the toolkit then calls
+        # ``mp.transfer_from_vm`` on ``<vm_archive>``. To keep the
+        # end-to-end export/upgrade tests honest (they assert on
+        # archive contents after round-trip), translate the cd target
+        # to the host data-dir and run a real tar locally. Strips
+        # ``sudo`` since we're already in the test runner's user
+        # namespace and the seeded files are user-owned.
+        import re as _re
+        import subprocess as _subprocess
+
+        # Tar EXTRACT (used by `agents import` + `agents rollback`)
+        # — matches ``cd <vm_root> && [sudo] tar -xf <archive>``. Run
+        # locally with the VM-path translation; ``sudo`` is stripped
+        # because the test runner is already the file owner.
+        mx = _re.search(
+            r"cd\s+(\S+)\s*\n[^\n]*?tar\s+-xf\s+(\S+)",
+            script,
+        )
+        if mx:
+            vm_cwd_x, vm_archive_x = mx.groups()
+            try:
+                relx = Path(vm_cwd_x).relative_to(vm_root)
+                host_cwd_x = host_root / relx
+            except ValueError:
+                host_cwd_x = host_root
+            archive_host = Path(vm_archive_x)
+            if archive_host.exists():
+                _subprocess.run(
+                    ["tar", "-xf", str(archive_host)],
+                    cwd=str(host_cwd_x),
+                    check=False,
+                )
+
+        m = _re.search(
+            r"cd\s+(\S+)\s*\n[^\n]*?tar\s+--zstd\s+-cf\s+(\S+)\s+([^\n]+)",
+            script,
+        )
+        if m:
+            vm_cwd, vm_archive, files_blob = m.groups()
+            try:
+                rel = Path(vm_cwd).relative_to(vm_root)
+                host_cwd = host_root / rel
+            except ValueError:
+                host_cwd = host_root
+            # The export-cmd path emits literal ``<name>`` tokens; the
+            # upgrade-snapshot path emits a shell ``$([ -d X ] && ...)``
+            # form. Both reduce to space-separated tokens after the
+            # shell evaluates them in production. For the simulator
+            # just include every token that's an existing file/dir
+            # under host_cwd.
+            tokens = [t.strip() for t in files_blob.split() if t.strip()]
+            existing = [t for t in tokens if (host_cwd / t).exists()]
+            if existing:
+                _subprocess.run(
+                    ["tar", "--zstd", "-cf", vm_archive, *existing],
+                    cwd=str(host_cwd),
+                    check=False,
+                )
+            else:
+                # No matching files — still produce a valid empty archive
+                # so transfer_from_vm doesn't FileNotFoundError.
+                Path(vm_archive).write_bytes(b"")
         return _ok()
 
     mocks = {

@@ -28,7 +28,6 @@ import datetime
 import shutil
 import subprocess
 import sys
-import tarfile
 from pathlib import Path
 
 from agents_cli import archive as archive_mod
@@ -106,8 +105,38 @@ def export(
         agent_dir = cfg.paths.host_data_dir / name
         if not agent_dir.exists():
             raise UserError(f"agent data dir for {name!r} not found at {agent_dir}")
+        # Host-mount mode: the agent's ``.data/`` subtree is owned by
+        # a rootless-Docker subuid (host uid 100999) under mode 700.
+        # A host-side ``write_tar_zst([(agent_dir, name)])`` walks the
+        # tree as the toolkit user (uid 1000), which can't even ``opendir``
+        # ``.data``. Worse, Python's tarfile suppresses per-file errors
+        # and writes an archive containing JUST the readable directory
+        # stubs — silently produces ~200-byte "successful" tarballs
+        # missing every actual file. ``agents export-cron`` has been
+        # running 4x/day, faithfully producing useless archives that
+        # duplicity then backs up — silent data loss disguised as
+        # working backups.
+        #
+        # Fix: same pattern as ``upgrades._host_data_snapshot`` —
+        # tar inside the VM as root (virtiofs passes file ownership
+        # through; root can read any uid), chown the archive back to
+        # ubuntu so SFTP can transfer it, then transfer out and clean
+        # up the VM-side temp.
+        from agents_cli import mp
+
         out = _archive_dir(cfg, to) / archive_name
-        archive_mod.write_tar_zst(out, [(agent_dir, name)])
+        vm_archive = f"/tmp/agents-export-{name}-{_utc_stamp()}{archive_mod.ARCHIVE_SUFFIX}"
+        mp.exec_bash(
+            cfg.vm.name,
+            (
+                f"set -eu\n"
+                f"cd {cfg.paths.vm_agents_root}\n"
+                f"sudo tar --zstd -cf {vm_archive} {name}\n"
+                f"sudo chown ubuntu:ubuntu {vm_archive}\n"
+            ),
+        )
+        mp.transfer_from_vm(cfg.vm.name, vm_archive, out)
+        mp.exec_in_vm(cfg.vm.name, "rm", "-f", vm_archive, check=False)
 
     ui.emit(
         {"name": name, "archive": str(out), "size_bytes": out.stat().st_size},
@@ -182,12 +211,30 @@ def import_archive(
         and not ui.confirm(f"overwrite existing data dir at {target}?", default=False)
     ):
         raise UserError("aborted by user")
-    if archive_path.suffix == ".zst":
-        archive_mod.extract_tar_zst(archive_path, cfg.paths.host_data_dir)
-    else:
-        # Legacy .tar.gz path (archives from pre-G6 versions).
-        with tarfile.open(archive_path, "r:gz") as tf:
-            tf.extractall(cfg.paths.host_data_dir, filter="data")
+    # Extract inside the VM as root for the symmetric reason export
+    # tars there: the archive members carry their original
+    # ownership (rootless-Docker subuid 100999, mode 700). The host
+    # user can't chown to that uid (out of its subuid range without
+    # CAP_SETUID) and a host-side ``tarfile.extractall`` either
+    # silently strips ownership (landing files as uid 1000, which
+    # the container would then EACCES on read) or fails outright on
+    # symlinks pointing inside the subuid-owned subtree. Root
+    # inside the VM has none of these problems — virtiofs passes
+    # the ownership back through to the host, and the container
+    # sees its own files unchanged.
+    from agents_cli import mp
+
+    vm_archive = f"/tmp/agents-import-{name}-{archive_path.name}"
+    mp.transfer_to_vm(archive_path, cfg.vm.name, vm_archive)
+    mp.exec_bash(
+        cfg.vm.name,
+        (
+            f"set -eu\n"
+            f"cd {cfg.paths.vm_agents_root}\n"
+            f"sudo tar -xf {vm_archive}\n"
+            f"rm -f {vm_archive}\n"
+        ),
+    )
     _surface_imported_mounts_metadata(cfg, name)
     ui.emit(
         {"name": name, "archive": str(archive_path)},
