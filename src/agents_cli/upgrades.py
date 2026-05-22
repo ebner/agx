@@ -170,6 +170,17 @@ def upgrade(
                 compose_runner.up(cfg, svc)
             except Exception as recreate_err:
                 ui.warn(f"could not recreate with old tag: {recreate_err}")
+            # The rollback just undid the new-tag side of every
+            # phase the state machine had advanced past (tag, pull,
+            # recreate). Leaving the journal with those phases marked
+            # "done" would cause the next retry to skip them — doctor
+            # would then run against the old tag and report success,
+            # making the upgrade look like it landed when it didn't.
+            # Erase the journal so retry starts from a clean slate.
+            try:
+                journal.path.unlink(missing_ok=True)
+            except OSError as journal_err:
+                ui.warn(f"could not clear journal {journal.path}: {journal_err}")
             ui.warn(
                 f"snapshots preserved: host={host_snap}, vm={vm_snap} — "
                 f"run `agents rollback {name}` if the live state is broken"
@@ -332,9 +343,27 @@ def _utc_stamp() -> str:
 def _host_data_snapshot(cfg: AgentsConfig, name: str) -> Path:
     """Tar+zstd the agent's data dir + compose + .env.
 
-    Host-mount mode: stream through zstandard on the host.
-    --data-dir-in-vm mode: ``tar --zstd`` inside the VM (tar 1.34+,
-    bundled with Ubuntu 24.04+), then ``multipass transfer`` out.
+    The naïve "stream through zstandard on the host" path doesn't
+    work in general: rootless-Docker writes the agent's files at a
+    subuid (e.g. host uid 100999 for container uid 1000), mode 0700.
+    The host user owns the *directory layout* but cannot read the
+    contents — every ``walk`` into the agent's ``.data/`` hits
+    EACCES. The toolkit's ``agents access grant`` lifts the mask via
+    POSIX ACLs, but the grant gets clobbered every time the Hermes
+    entrypoint chmods ``/opt/data`` on container restart (the chmod
+    resets the mask back to ``---``), so even a freshly-granted
+    agent goes back to unreadable after the next ``compose up``.
+
+    Tarring inside the VM with sudo sidesteps the whole problem:
+    virtiofs passes file ownership through to the guest, and root
+    in the guest can read everything regardless of subuid. Same
+    pattern as the existing ``--data-dir-in-vm`` branch — just
+    works on the host-mount layout too.
+
+    Bare-metal: no VM, runs sudo on the host directly. Best to
+    `agents access grant` first so sudo isn't needed at all; we
+    still attempt sudo as a fallback so a one-shot upgrade isn't
+    blocked by a fresh-but-clobbered ACL.
     """
     upgrades_dir = cfg.paths.host_data_dir / ".upgrades"
     upgrades_dir.mkdir(parents=True, exist_ok=True)
@@ -357,12 +386,29 @@ def _host_data_snapshot(cfg: AgentsConfig, name: str) -> Path:
         mp.exec_in_vm(cfg.vm.name, "rm", "-f", vm_archive, check=False)
         return archive_path
 
-    members = [
-        (cfg.paths.host_data_dir / name, name),
-        (cfg.paths.host_data_dir / "docker-compose.yml", "docker-compose.yml"),
-        (cfg.paths.host_data_dir / ".env", ".env"),
-    ]
-    archive_mod.write_tar_zst(archive_path, members)
+    # Host-mount mode: tar inside the VM as root so subuid-owned
+    # files are readable. The archive's owner inside the VM is root
+    # after the tar runs; chown to ``ubuntu`` so the SFTP/SCP
+    # transfer back to the host (which runs as ``ubuntu``) doesn't
+    # hit EACCES. After transfer the archive lands at
+    # ``<host_data_dir>/.upgrades/`` owned by the toolkit user
+    # (host-side default — ``shutil.copy`` semantics), which is what
+    # the rollback path expects.
+    vm_archive = f"/tmp/agents-upgrade-snap-{name}-{_utc_stamp()}{archive_mod.ARCHIVE_SUFFIX}"
+    mp.exec_bash(
+        cfg.vm.name,
+        (
+            f"set -eu\n"
+            f"cd {cfg.paths.vm_agents_root}\n"
+            f"sudo tar --zstd -cf {vm_archive} "
+            f"$([ -d {name} ] && echo {name} || true) "
+            f"$([ -f docker-compose.yml ] && echo docker-compose.yml || true) "
+            f"$([ -f .env ] && echo .env || true)\n"
+            f"sudo chown ubuntu:ubuntu {vm_archive}\n"
+        ),
+    )
+    mp.transfer_from_vm(cfg.vm.name, vm_archive, archive_path)
+    mp.exec_in_vm(cfg.vm.name, "rm", "-f", vm_archive, check=False)
     return archive_path
 
 

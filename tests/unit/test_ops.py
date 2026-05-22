@@ -645,10 +645,16 @@ def _seed_agent_config_dict_model(cfg: AgentsConfig, agent: str, default: str) -
     )
 
 
-def _doctor_runner_with_auth(auth_json: str | None):
+def _doctor_runner_with_auth(auth_json: str | None, *, host_data_dir: Path | None = None):
     """Build a doctor exec_in_vm side_effect that returns ``auth_json``
     for ``cat /opt/data/auth.json`` (or rc=1 when None) and the usual
     healthy responses for everything else.
+
+    If ``host_data_dir`` is given, ``cat /opt/data/config.yaml`` reads
+    the host-side file at ``<host_data_dir>/<agent>/.data/config.yaml``
+    so tests that seed config.yaml via the host filesystem continue to
+    work after read_doc started routing through ``docker compose
+    exec cat`` (2026-05-22 subuid-readability fix).
     """
 
     def runner(vm_name: str, *cmd: str, check: bool = True) -> MpResult:
@@ -671,6 +677,21 @@ def _doctor_runner_with_auth(auth_json: str | None):
             if auth_json is None:
                 return MpResult(stdout="", stderr="No such file", returncode=1)
             return _ok(auth_json)
+        # Route config.yaml reads to the host-side seed when caller
+        # provided host_data_dir. The container path /opt/data maps
+        # to <data-dir>/<agent>/.data; we recover the agent name from
+        # the service flag in the docker compose exec argv.
+        if "cat" in cmd and "/opt/data/config.yaml" in cmd and host_data_dir is not None:
+            agent: str | None = None
+            for token in cmd:
+                if token.startswith("hermes-"):
+                    agent = token[len("hermes-") :]
+                    break
+            if agent:
+                host_file = host_data_dir / agent / ".data" / "config.yaml"
+                if host_file.exists():
+                    return _ok(host_file.read_text(encoding="utf-8"))
+            return MpResult(stdout="", stderr="No such file", returncode=1)
         return _ok("ok\n")
 
     return runner
@@ -695,7 +716,7 @@ def test_doctor_model_set_warns_when_provider_set_but_model_empty(
     )
     mocker.patch(
         "agents_cli.mp.exec_in_vm",
-        side_effect=_doctor_runner_with_auth('{"active_provider": "openai-codex"}'),
+        side_effect=_doctor_runner_with_auth('{"active_provider": "openai-codex"}', host_data_dir=cfg.paths.host_data_dir),
     )
     mocker.patch(
         "agents_cli.compose_runner.ps",
@@ -720,7 +741,7 @@ def test_doctor_model_set_ok_when_model_and_provider_both_set(
     )
     mocker.patch(
         "agents_cli.mp.exec_in_vm",
-        side_effect=_doctor_runner_with_auth('{"active_provider": "openai-codex"}'),
+        side_effect=_doctor_runner_with_auth('{"active_provider": "openai-codex"}', host_data_dir=cfg.paths.host_data_dir),
     )
     mocker.patch(
         "agents_cli.compose_runner.ps",
@@ -750,7 +771,7 @@ def test_doctor_model_set_ok_when_model_is_dict_form(
     )
     mocker.patch(
         "agents_cli.mp.exec_in_vm",
-        side_effect=_doctor_runner_with_auth('{"active_provider": "openai-codex"}'),
+        side_effect=_doctor_runner_with_auth('{"active_provider": "openai-codex"}', host_data_dir=cfg.paths.host_data_dir),
     )
     mocker.patch(
         "agents_cli.compose_runner.ps",
@@ -779,7 +800,7 @@ def test_doctor_model_set_skipped_when_no_active_provider(
     mocker.patch(
         "agents_cli.mp.exec_in_vm",
         # auth.json present but empty (no active_provider)
-        side_effect=_doctor_runner_with_auth("{}"),
+        side_effect=_doctor_runner_with_auth("{}", host_data_dir=cfg.paths.host_data_dir),
     )
     mocker.patch(
         "agents_cli.compose_runner.ps",

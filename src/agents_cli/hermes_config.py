@@ -85,33 +85,49 @@ def load(path: Path) -> Any:
 
 
 def read_doc(cfg: AgentsConfig, agent_name: str) -> Any:
-    """Read the agent's config.yaml, transparent to ``--data-dir-in-vm``.
+    """Read the agent's config.yaml via ``docker compose exec cat``.
 
-    In ``--data-dir-in-vm`` mode goes through ``docker compose exec cat``
-    instead of ``multipass transfer``. The VM-host-side
-    ``<vm_agents_root>/<name>/.data/`` is owned by a rootless-Docker
-    subuid (e.g. host uid 100999 for container uid 1000) under
-    mode 700 — SFTP runs as ``ubuntu`` and can't read it. The runtime
-    user inside the container CAN read it.
+    Routed through the container regardless of ``data_dir_in_vm``
+    setting. Three reasons:
+
+    1. ``data_dir_in_vm`` mode: ``<vm_agents_root>/<name>/.data/`` is
+       inside the VM, the toolkit runs on the host — direct read is
+       impossible.
+    2. Host-mount mode: the dir is on the host but owned by a
+       rootless-Docker subuid (e.g. host uid 100999 for container uid
+       1000) under mode 700. A host-side ``load(config_path(...))``
+       call hits EACCES on every Hermes agent that hasn't been
+       ``agents access grant``-ed. Even after a grant, the Hermes
+       entrypoint's chmod on container restart can re-mask the ACL.
+       The runtime user inside the container always owns and can
+       read these files.
+    3. Routing through one code path keeps the test simulator (which
+       already maps ``docker compose exec ... cat /opt/data/X`` to
+       the host-side file) consistent across modes.
 
     Returns an empty doc if the container isn't running (e.g. during
     ``agents create``'s ``data_dir_created`` phase before
     ``service_up``) or the file doesn't exist yet — same fallback the
     old SFTP path had.
     """
-    if cfg.paths.data_dir_in_vm:
-        from agents_cli.ops import _compose_exec_in_vm_argv
+    from agents_cli.ops import _compose_exec_in_vm_argv
 
-        svc = f"hermes-{agent_name}"
-        result = mp.exec_in_vm(
-            cfg.vm.name,
-            *_compose_exec_in_vm_argv(cfg, svc, "cat", container_config_path(), no_tty=True),
-            check=False,
-        )
-        if result.returncode != 0:
-            return _yaml().load("{}\n")
-        return _yaml().load(result.stdout)
-    return load(config_path(cfg, agent_name))
+    svc = f"hermes-{agent_name}"
+    result = mp.exec_in_vm(
+        cfg.vm.name,
+        *_compose_exec_in_vm_argv(cfg, svc, "cat", container_config_path(), no_tty=True),
+        check=False,
+    )
+    if result.returncode != 0:
+        return _yaml().load("{}\n")
+    parsed = _yaml().load(result.stdout)
+    # Defensive: ``cat`` may return non-YAML output if the file is
+    # empty or the stub in tests returns a generic OK. Callers index
+    # ``doc.get("model")`` etc. which would AttributeError on a str.
+    # Match the rc != 0 fallback shape.
+    if not isinstance(parsed, dict):
+        return _yaml().load("{}\n")
+    return parsed
 
 
 def dump(doc: Any) -> str:

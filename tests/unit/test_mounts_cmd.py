@@ -78,7 +78,7 @@ def saved_config(cfg_with_agent: AgentsConfig, tmp_path: Path) -> Path:
 
 
 @pytest.fixture
-def mounts_mocked(mocker):
+def mounts_mocked(mocker, cfg_with_agent: AgentsConfig):
     """Stub the VM-mount + hermes_config.write + auto-ACL paths so
     add/remove exercise only the orchestration + on-disk side effects.
 
@@ -86,7 +86,16 @@ def mounts_mocked(mocker):
     because (a) we don't want tests touching real ACL state and (b)
     most failure paths in mounts_cmd are independent of the ACL
     plumbing. There are dedicated tests for the ACL wiring below.
+
+    ``install_vm_fs_simulation`` is installed so ``read_doc`` (which
+    routes through ``docker compose exec cat`` in both modes since
+    the 2026-05-22 subuid-readability fix) finds the host-side
+    config.yaml. The simulator translates ``cat /opt/data/X`` to a
+    host read at ``<data-dir>/<agent>/.data/X``.
     """
+    from tests.conftest import install_vm_fs_simulation
+
+    install_vm_fs_simulation(mocker, cfg_with_agent)
     mounts = {
         "mp_mount": mocker.patch("agents_cli.mp.mount", return_value=_ok()),
         "mp_umount": mocker.patch("agents_cli.mp.umount", return_value=_ok()),

@@ -75,6 +75,22 @@ def _stub_happy_upgrade(mocker, cfg: AgentsConfig | None = None) -> dict:
 
     if cfg is not None:
         install_vm_fs_simulation(mocker, cfg)
+    # ``_host_data_snapshot`` does a sudo-tar inside the VM and then
+    # transfers the archive out (see the long comment in upgrades.py).
+    # The simulator doesn't model that file motion — the upgrade-
+    # state-machine tests below only care that the phase ran, so stub
+    # the helper to write an empty placeholder archive at the expected
+    # host path. Dedicated tests below exercise the real tar+transfer
+    # argv shape against the multipass + libvirt backends.
+    from pathlib import Path as _Path
+
+    def _fake_snap(_cfg, _name):
+        archives = _cfg.paths.host_data_dir / ".upgrades"
+        archives.mkdir(parents=True, exist_ok=True)
+        out = archives / f"{_name}-stub.tar.zst"
+        out.write_bytes(b"")
+        return out
+
     return {
         "stop": mocker.patch("agents_cli.mp.stop_vm", return_value=_ok()),
         "start": mocker.patch("agents_cli.mp.start_vm", return_value=_ok()),
@@ -90,6 +106,9 @@ def _stub_happy_upgrade(mocker, cfg: AgentsConfig | None = None) -> dict:
         "compose_up": mocker.patch("agents_cli.compose_runner.up", return_value=_ok()),
         "doctor": mocker.patch(
             "agents_cli.ops.doctor", return_value=type("R", (), {"failed": False})()
+        ),
+        "host_snap": mocker.patch(
+            "agents_cli.upgrades._host_data_snapshot", side_effect=_fake_snap
         ),
     }
 
@@ -295,6 +314,85 @@ def test_vm_snapshot_uses_monotonic_suffix_on_collision(
     name = upgrades._vm_snapshot(cfg, "coder")
     assert name == f"{base_existing}-2"
     snap_spy.assert_called_once()
+
+
+def test_upgrade_rollback_clears_journal_to_force_clean_retry(
+    with_coder: Path, mocker, cfg: AgentsConfig
+) -> None:
+    """Regression for the 2026-05-22 silent-no-op-on-retry bug:
+    when the upgrade except handler reverts the compose tag, the
+    journal must be cleared too. Without this, the next retry sees
+    completed_phases = [host_data_snapshot, vm_snapshot, tag_pinned,
+    pulled, recreated] and skips them — so the live container stays
+    on the OLD tag while the doctor phase (which IS re-run) reports
+    success, making the upgrade look like it landed when it didn't.
+    """
+    _stub_happy_upgrade(mocker, cfg)
+    # Force doctor to fail so the except handler runs.
+    mocker.patch(
+        "agents_cli.ops.doctor",
+        side_effect=RuntimeFailure("doctor probe blew up"),
+    )
+
+    with pytest.raises(RuntimeFailure, match="doctor probe"):
+        upgrades.upgrade("coder", tag="v1.0.1", config_path=with_coder)
+
+    # The journal MUST be gone so the next retry doesn't think the
+    # tag/pull/recreate phases already succeeded at the new tag.
+    journals = list((cfg.paths.host_data_dir / ".journal").glob("upgrade-coder-*.json"))
+    assert journals == [], (
+        f"journal was not cleared after rollback: {journals} — "
+        f"a retry would skip tag_pinned/pulled/recreated and report success "
+        f"against the OLD tag."
+    )
+
+
+def test_host_data_snapshot_runs_sudo_tar_inside_vm_in_host_mount_mode(
+    with_coder: Path, mocker, cfg: AgentsConfig
+) -> None:
+    """Regression for the 2026-05-22 EACCES on coder's .data: the
+    naïve "stream through zstandard on the host" path doesn't work
+    when the agent's data is owned by a rootless-Docker subuid the
+    host user can't read (mode 700 + foreign uid). The host-mount
+    branch must run ``sudo tar`` inside the VM (where root reads
+    everything via virtiofs passthrough) and transfer the archive out.
+    """
+    exec_bash = mocker.patch("agents_cli.mp.exec_bash", return_value=_ok())
+    transfer = mocker.patch("agents_cli.mp.transfer_from_vm", return_value=_ok())
+    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok())
+
+    upgrades._host_data_snapshot(cfg, "coder")
+
+    exec_bash.assert_called_once()
+    script = exec_bash.call_args.args[1]
+    # The tar MUST run as root via sudo — without it, the host user
+    # can't read subuid-owned files inside the VM either.
+    assert "sudo tar" in script
+    # And the archive MUST get chowned back to ubuntu before SFTP
+    # tries to read it — otherwise the transfer hits EACCES.
+    assert "sudo chown ubuntu:ubuntu" in script
+    transfer.assert_called_once()
+
+
+def test_host_data_snapshot_data_dir_in_vm_branch_unchanged(
+    with_coder: Path, mocker, cfg: AgentsConfig
+) -> None:
+    """In ``--data-dir-in-vm`` mode the data already lives in the VM
+    as the ubuntu user — no sudo needed. Make sure the fix to the
+    host-mount branch didn't accidentally tighten this one too.
+    """
+    cfg.paths = cfg.paths.model_copy(update={"data_dir_in_vm": True})
+    cfg_mod.save(cfg, with_coder)
+    cfg = cfg_mod.load(with_coder)
+    exec_bash = mocker.patch("agents_cli.mp.exec_bash", return_value=_ok())
+    mocker.patch("agents_cli.mp.transfer_from_vm", return_value=_ok())
+    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok())
+
+    upgrades._host_data_snapshot(cfg, "coder")
+
+    script = exec_bash.call_args.args[1]
+    assert "tar --zstd" in script
+    assert "sudo tar" not in script  # not needed in this mode
 
 
 def test_vm_snapshot_waits_for_ssh_on_libvirt_after_start(

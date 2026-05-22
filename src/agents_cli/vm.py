@@ -288,6 +288,16 @@ def start(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> None:
         )
         return
     mp.start_vm(cfg.vm.name)
+    # libvirt's ``virsh start`` returns as soon as QEMU is up; SSH is
+    # only reachable after cloud-init runs the network bringup. The
+    # mount probe below uses exec_in_vm (= SSH on libvirt) and would
+    # race DHCP with rc=255 (ssh: connection refused). Wait_for_ssh
+    # cushions this. Same pattern as vm.init's libvirt branch.
+    # Multipass doesn't need it (mp.start_vm blocks until SSH-able).
+    if cfg.vm.backend == "libvirt":
+        from agents_cli.backends import libvirt as libvirt_mod
+
+        libvirt_mod.wait_for_ssh(cfg.vm.name, wait_cloud_init=False)
     if not cfg.paths.data_dir_in_vm:
         _ensure_mount(cfg)
         _mount_probe(cfg)
