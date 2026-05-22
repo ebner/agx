@@ -716,7 +716,9 @@ def test_doctor_model_set_warns_when_provider_set_but_model_empty(
     )
     mocker.patch(
         "agents_cli.mp.exec_in_vm",
-        side_effect=_doctor_runner_with_auth('{"active_provider": "openai-codex"}', host_data_dir=cfg.paths.host_data_dir),
+        side_effect=_doctor_runner_with_auth(
+            '{"active_provider": "openai-codex"}', host_data_dir=cfg.paths.host_data_dir
+        ),
     )
     mocker.patch(
         "agents_cli.compose_runner.ps",
@@ -741,7 +743,9 @@ def test_doctor_model_set_ok_when_model_and_provider_both_set(
     )
     mocker.patch(
         "agents_cli.mp.exec_in_vm",
-        side_effect=_doctor_runner_with_auth('{"active_provider": "openai-codex"}', host_data_dir=cfg.paths.host_data_dir),
+        side_effect=_doctor_runner_with_auth(
+            '{"active_provider": "openai-codex"}', host_data_dir=cfg.paths.host_data_dir
+        ),
     )
     mocker.patch(
         "agents_cli.compose_runner.ps",
@@ -771,7 +775,9 @@ def test_doctor_model_set_ok_when_model_is_dict_form(
     )
     mocker.patch(
         "agents_cli.mp.exec_in_vm",
-        side_effect=_doctor_runner_with_auth('{"active_provider": "openai-codex"}', host_data_dir=cfg.paths.host_data_dir),
+        side_effect=_doctor_runner_with_auth(
+            '{"active_provider": "openai-codex"}', host_data_dir=cfg.paths.host_data_dir
+        ),
     )
     mocker.patch(
         "agents_cli.compose_runner.ps",
