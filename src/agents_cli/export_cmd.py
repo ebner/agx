@@ -95,7 +95,11 @@ def export(
         vm_archive = f"/tmp/agents-export-{name}-{_utc_stamp()}{archive_mod.ARCHIVE_SUFFIX}"
         mp.exec_bash(
             cfg.vm.name,
-            f"cd {cfg.paths.vm_agents_root} && tar --zstd -cf {vm_archive} {name}",
+            (
+                f"cd {cfg.paths.vm_agents_root} && tar --zstd "
+                f"--warning=no-file-changed --ignore-failed-read "
+                f"-cf {vm_archive} {name}"
+            ),
         )
         target_dir = _archive_dir(cfg, to)
         out = target_dir / archive_name
@@ -126,12 +130,22 @@ def export(
 
         out = _archive_dir(cfg, to) / archive_name
         vm_archive = f"/tmp/agents-export-{name}-{_utc_stamp()}{archive_mod.ARCHIVE_SUFFIX}"
+        # ``--warning=no-file-changed`` demotes GNU tar's rc=1 exit on
+        # "file changed as we read it" (the running agent rewriting
+        # state.db / kanban.db / WAL files during the walk) to a
+        # silent ok — without this, ``set -eu`` aborts before the
+        # chown and we get a root-owned archive that SFTP can't read
+        # back. ``--ignore-failed-read`` similarly handles files that
+        # vanish mid-walk. For crash-consistent backups (duplicity-
+        # style) this is the right trade-off; for point-in-time
+        # SQLite snapshots use ``sqlite3 .backup`` instead.
         mp.exec_bash(
             cfg.vm.name,
             (
                 f"set -eu\n"
                 f"cd {cfg.paths.vm_agents_root}\n"
-                f"sudo tar --zstd -cf {vm_archive} {name}\n"
+                f"sudo tar --zstd --warning=no-file-changed --ignore-failed-read "
+                f"-cf {vm_archive} {name}\n"
                 f"sudo chown ubuntu:ubuntu {vm_archive}\n"
             ),
         )

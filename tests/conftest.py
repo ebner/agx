@@ -219,8 +219,15 @@ def install_vm_fs_simulation(mocker, cfg: AgentsConfig) -> dict:
                     check=False,
                 )
 
+        # Match ``cd <root>`` then ``tar [--zstd] [extra flags] -cf
+        # <archive> <files...>``. Production currently passes
+        # ``--warning=no-file-changed`` and ``--ignore-failed-read``
+        # between ``--zstd`` and ``-cf`` to tolerate live-write
+        # rewrites of state.db/kanban.db; the regex permits arbitrary
+        # tar flags before ``-cf`` so future flag additions don't
+        # silently break the test simulator.
         m = _re.search(
-            r"cd\s+(\S+)\s*\n[^\n]*?tar\s+--zstd\s+-cf\s+(\S+)\s+([^\n]+)",
+            r"cd\s+(\S+)\s*\n[^\n]*?tar\s+(?:[^\n]*?\s)?-cf\s+(\S+)\s+([^\n]+)",
             script,
         )
         if m:

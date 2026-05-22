@@ -412,7 +412,8 @@ def _host_data_snapshot(cfg: AgentsConfig, name: str) -> Path:
             (
                 f"set -eu\n"
                 f"cd {cfg.paths.vm_agents_root}\n"
-                f"tar --zstd -cf {vm_archive} "
+                f"tar --zstd --warning=no-file-changed --ignore-failed-read "
+                f"-cf {vm_archive} "
                 f"$([ -d {name} ] && echo {name} || true) "
                 f"$([ -f docker-compose.yml ] && echo docker-compose.yml || true) "
                 f"$([ -f .env ] && echo .env || true)\n"
@@ -431,12 +432,18 @@ def _host_data_snapshot(cfg: AgentsConfig, name: str) -> Path:
     # (host-side default — ``shutil.copy`` semantics), which is what
     # the rollback path expects.
     vm_archive = f"/tmp/agents-upgrade-snap-{name}-{_utc_stamp()}{archive_mod.ARCHIVE_SUFFIX}"
+    # ``--warning=no-file-changed`` + ``--ignore-failed-read`` so a
+    # live agent rewriting state.db / kanban.db / WAL files mid-walk
+    # doesn't trip ``set -eu`` (GNU tar exits rc=1 on "file changed
+    # as we read it" otherwise). See export_cmd.py for the longer
+    # rationale.
     mp.exec_bash(
         cfg.vm.name,
         (
             f"set -eu\n"
             f"cd {cfg.paths.vm_agents_root}\n"
-            f"sudo tar --zstd -cf {vm_archive} "
+            f"sudo tar --zstd --warning=no-file-changed --ignore-failed-read "
+            f"-cf {vm_archive} "
             f"$([ -d {name} ] && echo {name} || true) "
             f"$([ -f docker-compose.yml ] && echo docker-compose.yml || true) "
             f"$([ -f .env ] && echo .env || true)\n"
