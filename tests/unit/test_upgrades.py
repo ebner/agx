@@ -82,7 +82,6 @@ def _stub_happy_upgrade(mocker, cfg: AgentsConfig | None = None) -> dict:
     # the helper to write an empty placeholder archive at the expected
     # host path. Dedicated tests below exercise the real tar+transfer
     # argv shape against the multipass + libvirt backends.
-    from pathlib import Path as _Path
 
     def _fake_snap(_cfg, _name):
         archives = _cfg.paths.host_data_dir / ".upgrades"
@@ -314,6 +313,81 @@ def test_vm_snapshot_uses_monotonic_suffix_on_collision(
     name = upgrades._vm_snapshot(cfg, "coder")
     assert name == f"{base_existing}-2"
     snap_spy.assert_called_once()
+
+
+def test_upgrade_runs_hermes_config_migrate_after_recreate(
+    with_coder: Path, mocker, cfg: AgentsConfig
+) -> None:
+    """After the container is recreated on the new image, the upgrade
+    must call ``hermes config migrate`` so any schema bumps in the
+    new version take effect. Without this, gateway features that
+    depend on new config fields stay dormant and `hermes config check`
+    reports drift the user has to chase manually.
+    """
+    _stub_happy_upgrade(mocker, cfg)
+    # Capture the exec_in_vm calls — config migrate runs through
+    # docker compose exec, which goes through mp.exec_in_vm.
+    exec_spy = mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok())
+
+    upgrades.upgrade("coder", tag="v1.0.1", config_path=with_coder)
+
+    migrate_calls = [
+        call
+        for call in exec_spy.call_args_list
+        if "hermes" in call.args and "config" in call.args and "migrate" in call.args
+    ]
+    assert migrate_calls, (
+        "expected `hermes config migrate` to be exec'd after recreate; "
+        f"observed exec_in_vm calls: {[c.args for c in exec_spy.call_args_list]}"
+    )
+
+
+def test_upgrade_skips_config_migrate_for_openclaw(
+    cfg: AgentsConfig, saved_config: Path, mocker
+) -> None:
+    """OpenClaw owns its own plugin/config lifecycle (CLAUDE.md
+    Hermes-vs-OpenClaw matrix); the toolkit must not call
+    ``hermes config migrate`` on an OpenClaw agent — that would be
+    invoking the wrong binary entirely.
+    """
+    from tests.conftest import install_vm_fs_simulation
+
+    install_vm_fs_simulation(mocker, cfg)
+    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    create(name="bob", agent_type="openclaw", config_path=saved_config)
+    _stub_happy_upgrade(mocker, cfg)
+    exec_spy = mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok())
+
+    upgrades.upgrade("bob", tag="0.1.1", config_path=saved_config)
+
+    migrate_calls = [
+        call
+        for call in exec_spy.call_args_list
+        if "hermes" in call.args and "config" in call.args and "migrate" in call.args
+    ]
+    assert not migrate_calls
+
+
+def test_upgrade_config_migrate_failure_warns_but_continues(
+    with_coder: Path, mocker, cfg: AgentsConfig
+) -> None:
+    """Older Hermes images may not have the ``migrate`` subcommand,
+    or the container may be slow to accept exec right after restart.
+    Non-zero exit must NOT abort the upgrade — emit a warning and let
+    doctor catch any real misconfiguration.
+    """
+    _stub_happy_upgrade(mocker, cfg)
+
+    def runner(vm_name: str, *cmd: str, check: bool = True):
+        if "hermes" in cmd and "migrate" in cmd:
+            return MpResult(stdout="", stderr="unknown subcommand: migrate", returncode=2)
+        return _ok()
+
+    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=runner)
+
+    # No exception expected.
+    outcome = upgrades.upgrade("coder", tag="v1.0.1", config_path=with_coder)
+    assert outcome.new_tag == "v1.0.1"
 
 
 def test_upgrade_to_latest_is_noop_when_already_at_latest(

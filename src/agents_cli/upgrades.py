@@ -36,12 +36,16 @@ from agents_cli.config import AgentsConfig
 from agents_cli.errors import RuntimeFailure, UserError
 from agents_cli.journal import Journal
 
+CONFIG_MIGRATE_PHASE = "config_migrated"
+
+
 UPGRADE_PHASES = [
     "host_data_snapshot",
     "vm_snapshot",
     "tag_pinned",
     "pulled",
     "recreated",
+    CONFIG_MIGRATE_PHASE,
     "doctor_passed",
 ]
 
@@ -185,6 +189,10 @@ def upgrade(
             if not journal.is_phase_done("recreated"):
                 compose_runner.up(cfg, svc)
                 journal.advance("recreated")
+
+            if not journal.is_phase_done(CONFIG_MIGRATE_PHASE):
+                _run_config_migrate(cfg, svc, agent_type)
+                journal.advance(CONFIG_MIGRATE_PHASE)
 
             if not journal.is_phase_done("doctor_passed"):
                 ops.doctor(target=name, config_path=config_path)
@@ -469,6 +477,51 @@ def _latest_host_snapshot(cfg: AgentsConfig, name: str) -> Path | None:
         + list(upgrades_dir.glob(f"{name}-*.tar.gz"))
     )
     return candidates[-1] if candidates else None
+
+
+def _run_config_migrate(cfg: AgentsConfig, svc: str, agent_type: str) -> None:
+    """Run the in-container config-schema migration after recreate.
+
+    Hermes: ``hermes config migrate``. Newer Hermes versions sometimes
+    bump the ``config.yaml`` schema (add fields, rename keys, deprecate
+    sections). Without this hook, an upgraded container would run with
+    the previous schema — some new gateway features stay dormant, and
+    a future ``config check`` would surface drift the user has to fix
+    manually. Idempotent: when no changes are needed the command just
+    prints "Config version: N ✓" and returns 0.
+
+    OpenClaw: skipped. OpenClaw owns its own plugin lifecycle and the
+    toolkit deliberately stays out of its config surface (see
+    CLAUDE.md's Hermes-vs-OpenClaw matrix). Any config migration on
+    that side is the user's responsibility via ``openclaw configure``.
+
+    Best-effort: a non-zero exit (e.g. older Hermes builds that lack
+    the ``migrate`` subcommand, or the container not being healthy
+    enough to exec into yet) emits a warning and lets the upgrade
+    proceed. Doctor runs next and will catch any leftover
+    misconfiguration. Caveat: this command operates on
+    ``config.yaml`` only — it does NOT migrate data-directory
+    layouts (e.g. the v2026.5.7 → v2026.5.16 ``platforms/pairing/``
+    → ``pairing/`` move that ``agents upgrade coder`` famously hit
+    on 2026-05-22). Such migrations remain the user's responsibility
+    until Hermes adds them upstream.
+    """
+    if agent_type != "hermes":
+        return
+    from agents_cli.ops import _compose_exec_in_vm_argv
+
+    result = mp.exec_in_vm(
+        cfg.vm.name,
+        *_compose_exec_in_vm_argv(cfg, svc, "hermes", "config", "migrate", no_tty=True),
+        check=False,
+    )
+    if result.returncode != 0:
+        ui.warn(
+            f"hermes config migrate failed (rc={result.returncode}); upgrade continues. "
+            f"stderr tail: {(result.stderr or '').strip().splitlines()[-3:] if result.stderr else '(empty)'}. "
+            "Run `agents exec <name> -- hermes config check` after the upgrade "
+            "completes to inspect any drift."
+        )
 
 
 def _vm_snapshot(cfg: AgentsConfig, name: str) -> str:
