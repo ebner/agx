@@ -617,6 +617,133 @@ def test_doctor_arm64_emulation_silent_on_amd64_host(
     assert check.status == "ok"
 
 
+def test_doctor_version_check_reports_tag_when_running(
+    with_coder: Path, cfg: AgentsConfig, mocker
+) -> None:
+    """``<agent>.version`` MUST show the tag the container is
+    actually running — the most useful "what version am I on?" answer
+    in the doctor output. Works for both Hermes and OpenClaw because
+    the compose ``image:`` field is universal."""
+    _stub_minimal_doctor(mocker)
+    mocker.patch(
+        "agents_cli.compose_runner.ps",
+        return_value=_ok(json.dumps([{"Service": "hermes-coder", "State": "running"}])),
+    )
+    # Override the default exec_in_vm to serve `docker inspect` with
+    # an image that matches the compose pin (cfg fixture pins v1.0.0).
+    def runner(vm_name: str, *cmd: str, check: bool = True):
+        joined = " ".join(cmd)
+        if "is-active" in joined:
+            return _ok("active\n")
+        if "stat" in cmd and "/opt/data" in cmd:
+            return _ok("755 1000\n")
+        if cmd[:2] == ("cat", "/proc/meminfo"):
+            return _ok("MemTotal: 8388608 kB\nMemAvailable: 4194304 kB\n")
+        if cmd[:1] == ("nproc",):
+            return _ok("4\n")
+        if cmd[:2] == ("cat", "/proc/loadavg"):
+            return _ok("0.42 0.31 0.25 1/123 4567\n")
+        if (
+            cmd[:3] == ("docker", "inspect", "hermes-coder")
+            and "{{.Config.Image}}" in cmd
+        ):
+            return _ok("nousresearch/hermes-agent:v1.0.0\n")
+        return _ok("ok\n")
+
+    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=runner)
+
+    report = ops.doctor(config_path=with_coder)
+    [check] = [c for c in report.checks if c.name == "coder.version"]
+    assert check.status == "ok"
+    assert check.detail == "v1.0.0"
+
+
+def test_doctor_version_check_warns_on_pin_vs_runtime_drift(
+    with_coder: Path, cfg: AgentsConfig, mocker
+) -> None:
+    """Hand-edited compose with no follow-up restart leaves the
+    container running an older tag than what's pinned. Surface as
+    ``warn`` with the exact ``agents restart <name>`` hint — without
+    this the user only sees the new pin in ``agents list`` and assumes
+    the upgrade took.
+    """
+    _stub_minimal_doctor(mocker)
+    mocker.patch(
+        "agents_cli.compose_runner.ps",
+        return_value=_ok(json.dumps([{"Service": "hermes-coder", "State": "running"}])),
+    )
+
+    def runner(vm_name: str, *cmd: str, check: bool = True):
+        joined = " ".join(cmd)
+        if "is-active" in joined:
+            return _ok("active\n")
+        if "stat" in cmd and "/opt/data" in cmd:
+            return _ok("755 1000\n")
+        if cmd[:2] == ("cat", "/proc/meminfo"):
+            return _ok("MemTotal: 8388608 kB\nMemAvailable: 4194304 kB\n")
+        if cmd[:1] == ("nproc",):
+            return _ok("4\n")
+        if cmd[:2] == ("cat", "/proc/loadavg"):
+            return _ok("0.42 0.31 0.25 1/123 4567\n")
+        if (
+            cmd[:3] == ("docker", "inspect", "hermes-coder")
+            and "{{.Config.Image}}" in cmd
+        ):
+            # Container running v0.9.0; compose fixture pins v1.0.0.
+            return _ok("nousresearch/hermes-agent:v0.9.0\n")
+        return _ok("ok\n")
+
+    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=runner)
+
+    report = ops.doctor(config_path=with_coder)
+    [check] = [c for c in report.checks if c.name == "coder.version"]
+    assert check.status == "warn"
+    assert "v0.9.0" in check.detail
+    assert "v1.0.0" in check.detail
+    assert "agents restart coder" in check.detail
+
+
+def test_doctor_version_check_falls_back_when_container_down(
+    with_coder: Path, cfg: AgentsConfig, mocker
+) -> None:
+    """If the container isn't running, ``docker inspect`` errors —
+    the version check should still surface the compose pin (the
+    user wants "what version am I on?" even when the container is
+    down) and defer the actual "container down" complaint to the
+    parallel ``<agent>.container`` check (avoid duplicate noise).
+    """
+    _stub_minimal_doctor(mocker)
+    mocker.patch(
+        "agents_cli.compose_runner.ps",
+        return_value=_ok(json.dumps([{"Service": "hermes-coder", "State": "exited"}])),
+    )
+
+    base = _doctor_runner_with_auth(None, host_data_dir=cfg.paths.host_data_dir)
+
+    def runner(vm_name: str, *cmd: str, check: bool = True):
+        if cmd[:3] == ("docker", "inspect", "hermes-coder"):
+            return MpResult(stdout="", stderr="No such container", returncode=1)
+        return base(vm_name, *cmd, check=check)
+
+    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=runner)
+
+    # The container-state failure makes doctor raise HealthCheckFailure
+    # after emitting the full report. We exercise the version-check
+    # helper directly so we don't have to also placate every other
+    # check just to read one row.
+    from agents_cli.ops import DoctorReport, _check_agent_version
+
+    report = DoctorReport()
+    _check_agent_version(cfg, "hermes-coder", "coder", "hermes", report)
+    version_checks = [c for c in report.checks if c.name == "coder.version"]
+    assert version_checks
+    # Pin still reported; status ok (the parallel .container check owns
+    # the "container down" complaint).
+    assert version_checks[0].status == "ok"
+    assert "v1.0.0" in version_checks[0].detail
+    assert "container not running" in version_checks[0].detail
+
+
 def _seed_agent_config(cfg: AgentsConfig, agent: str, model: str) -> None:
     """Write the agent's config.yaml so ``hermes_config.read_doc`` can
     pick it up. Seeds the bare-string form of ``model:`` (Hermes also

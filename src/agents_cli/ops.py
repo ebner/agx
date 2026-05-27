@@ -168,6 +168,7 @@ def doctor(
 
     for svc, agent_type, agent_name in _services_to_check(cfg, target):
         _check_service_container(cfg, svc, agent_name, agent_type, report)
+        _check_agent_version(cfg, svc, agent_name, agent_type, report)
         _check_host_access(cfg, agent_name, agent_type, report)
         if agent_type == "hermes":
             _check_hermes_data_dir_accessible(cfg, svc, agent_name, report)
@@ -569,6 +570,78 @@ def _container_state_for(ps_json: str, service: str) -> str:
         if entry.get("Service") == service or entry.get("Name", "").endswith(f"-{service}"):
             return str(entry.get("State", "?"))
     return "absent"
+
+
+def _check_agent_version(
+    cfg: AgentsConfig,
+    svc: str,
+    agent_name: str,
+    agent_type: str,
+    report: DoctorReport,
+) -> None:
+    """Report the agent's current image tag + flag pin/runtime drift.
+
+    Two sources of truth, both interesting:
+    - **Compose pin** (``services.<svc>.image`` in docker-compose.yml) —
+      the version that would be used on the next ``compose up``.
+    - **Live container image** (``docker inspect``'s ``Config.Image``) —
+      what the running container is actually executing right now.
+
+    Normally identical. They diverge when somebody hand-edits the
+    compose file without restarting the container — the user sees the
+    new pin in ``agents list`` but the agent is still on the old code.
+    Surface that as a ``warn`` so the user knows to ``agents restart``.
+
+    Universal across agent types: both Hermes and OpenClaw record their
+    image tag in the same compose field; no agent-specific code path.
+
+    Skipped (``ok``) if the container isn't running — the
+    ``<agent>.container`` check above already fails in that case, and
+    reporting "pinned at X, container down" twice is noise.
+    """
+    try:
+        doc = compose.read_compose_doc(cfg)
+    except (RuntimeFailure, UserError):
+        return
+    pinned_image = (doc.get("services") or {}).get(svc, {}).get("image", "")
+    pinned_tag = pinned_image.split(":", 1)[1] if ":" in pinned_image else ""
+    if not pinned_tag:
+        report.add(f"{agent_name}.version", "warn", "no image tag in compose")
+        return
+
+    container_name = svc  # toolkit sets container_name = svc in the compose fragment
+    inspect = mp.exec_in_vm(
+        cfg.vm.name,
+        "docker",
+        "inspect",
+        container_name,
+        "--format",
+        "{{.Config.Image}}",
+        check=False,
+    )
+    if inspect.returncode != 0:
+        # Container isn't running (or doesn't exist yet). _check_service_container
+        # already surfaced that; skip the drift comparison and just report the pin.
+        report.add(
+            f"{agent_name}.version",
+            "ok",
+            f"pinned at {pinned_tag} (container not running; container check has the details)",
+        )
+        return
+    running_image = inspect.stdout.strip()
+    running_tag = running_image.split(":", 1)[1] if ":" in running_image else "?"
+
+    if running_tag == pinned_tag:
+        report.add(f"{agent_name}.version", "ok", running_tag)
+    else:
+        report.add(
+            f"{agent_name}.version",
+            "warn",
+            (
+                f"container running {running_tag} but compose pins {pinned_tag} — "
+                f"run `agents restart {agent_name}` to apply the pinned version"
+            ),
+        )
 
 
 def _check_host_access(
