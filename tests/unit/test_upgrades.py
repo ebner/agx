@@ -109,6 +109,14 @@ def _stub_happy_upgrade(mocker, cfg: AgentsConfig | None = None) -> dict:
         "host_snap": mocker.patch(
             "agents_cli.upgrades._host_data_snapshot", side_effect=_fake_snap
         ),
+        # Bare ``agents upgrade`` now implicitly fetches the latest
+        # upstream tag. Default to returning the current pin (v1.0.0
+        # in the cfg fixture) so tests that exercise the bare form
+        # without specifying their own intent get a clean no-op rather
+        # than hitting the real GitHub API.
+        "fetch_latest_tag": mocker.patch(
+            "agents_cli.outdated_cmd.fetch_latest_tag", return_value="v1.0.0"
+        ),
     }
 
 
@@ -427,21 +435,34 @@ def test_upgrade_explicit_tag_matching_current_is_noop(
     mocks["pull"].assert_not_called()
 
 
-def test_upgrade_bare_call_noops_when_tag_unchanged(
+def test_upgrade_bare_call_implicitly_fetches_latest(
     with_coder: Path, mocker, cfg: AgentsConfig
 ) -> None:
-    """Bare ``agents upgrade <name>`` (no flags) must no-op when the
-    current pin matches the resolved target tag — without this,
-    typing the command with no flags surprise-stops the agent for
-    ~30-60s with a snapshot dance, prints a misleading
-    ``vX.Y.Z -> vX.Y.Z`` summary, and looks like nothing happened
-    anyway. ``--recreate`` is the explicit opt-in for the legitimate
-    force-refresh use case (env-file changes, wedged container).
-    Previously this test pinned the OPPOSITE behavior — the design
-    flipped after a user hit exactly the misleading-output footgun
-    described above on coder.
+    """Bare ``agents upgrade <name>`` MUST hit the upstream API to
+    discover newer versions — matches ``apt upgrade`` / ``brew upgrade``
+    convention. Without this, a user typing the bare form would see
+    "nothing to do" forever even when newer versions exist upstream,
+    silently freezing them on whatever was current at ``vm init``
+    time.
     """
     mocks = _stub_happy_upgrade(mocker, cfg)
+    upgrades.upgrade("coder", config_path=with_coder)
+    mocks["fetch_latest_tag"].assert_called_once()
+    args = mocks["fetch_latest_tag"].call_args
+    assert args.args[0] == "hermes"
+
+
+def test_upgrade_bare_call_noops_when_at_latest(
+    with_coder: Path, mocker, cfg: AgentsConfig
+) -> None:
+    """Bare ``upgrade`` fetches latest, finds it matches current pin,
+    no-ops cleanly — no snapshot dance, no misleading ``vX -> vX``
+    output. Caught a user-facing regression today where a user typed
+    ``agents upgrade coder`` expecting either a real upgrade or a
+    quick "you're current" message, got ~30-60s of avoidable downtime
+    instead.
+    """
+    mocks = _stub_happy_upgrade(mocker, cfg)  # fetch returns "v1.0.0" = current
     outcome = upgrades.upgrade("coder", config_path=with_coder)
     assert outcome.old_tag == outcome.new_tag == "v1.0.0"
     # Nothing expensive ran.
@@ -449,6 +470,23 @@ def test_upgrade_bare_call_noops_when_tag_unchanged(
     mocks["snapshot"].assert_not_called()
     mocks["pull"].assert_not_called()
     mocks["compose_up"].assert_not_called()
+
+
+def test_upgrade_bare_call_runs_pipeline_when_newer_upstream(
+    with_coder: Path, mocker, cfg: AgentsConfig
+) -> None:
+    """Bare form discovers a newer upstream → runs the full upgrade
+    pipeline. Differs from the noop-at-latest case only in the
+    upstream resolution; same code path as ``--latest``.
+    """
+    mocks = _stub_happy_upgrade(mocker, cfg)
+    mocks["fetch_latest_tag"].return_value = "v9.9.9"  # newer than v1.0.0
+    outcome = upgrades.upgrade("coder", config_path=with_coder)
+    assert outcome.old_tag == "v1.0.0"
+    assert outcome.new_tag == "v9.9.9"
+    mocks["snapshot"].assert_called_once()
+    mocks["pull"].assert_called_once()
+    mocks["compose_up"].assert_called_once()
 
 
 def test_upgrade_with_recreate_flag_runs_full_pipeline_even_with_same_tag(
@@ -459,6 +497,8 @@ def test_upgrade_with_recreate_flag_runs_full_pipeline_even_with_same_tag(
     the image tag doesn't change. Useful for picking up env-file
     changes (per-agent .env modifications) or recovering from a
     wedged container without manually destroying + recreating it.
+    Crucially, ``--recreate`` does NOT trigger the implicit-latest
+    fetch — the user said "refresh in place", not "upgrade".
     """
     mocks = _stub_happy_upgrade(mocker, cfg)
     outcome = upgrades.upgrade("coder", recreate=True, config_path=with_coder)
@@ -466,6 +506,8 @@ def test_upgrade_with_recreate_flag_runs_full_pipeline_even_with_same_tag(
     mocks["snapshot"].assert_called_once()
     mocks["pull"].assert_called_once()
     mocks["compose_up"].assert_called_once()
+    # No upstream fetch with --recreate.
+    mocks["fetch_latest_tag"].assert_not_called()
 
 
 def test_upgrade_recreate_with_explicit_tag_match_still_runs_pipeline(

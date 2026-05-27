@@ -104,17 +104,27 @@ def upgrade(
     if not old_tag:
         raise UserError(f"current image for {name!r} has no tag: {current_image!r}")
 
-    if to_latest:
+    # Bare ``agents upgrade <name>`` (no ``--tag``, no ``--latest``,
+    # no ``--recreate``) implicitly fetches the latest upstream tag —
+    # matches the convention from ``apt upgrade`` / ``brew upgrade`` /
+    # ``npm update``: if the user types ``upgrade`` without a version
+    # selector, they want to be brought to the newest available. The
+    # explicit ``--latest`` flag becomes documentation rather than
+    # behavior-changing. ``--recreate`` is the opt-out — it signals
+    # "refresh in place at the current tag", so we skip the fetch.
+    implicit_latest = tag is None and not to_latest and not recreate
+    if to_latest or implicit_latest:
         # Resolve latest upstream tag via the same /releases/latest path
         # `outdated` uses. Refuses if the network fetch fails — bumping
-        # to "whatever we had before" silently would defeat the flag.
+        # to "whatever we had before" silently would defeat the intent.
         from agents_cli import outdated_cmd
 
         latest = outdated_cmd.fetch_latest_tag(agent_type, include_prerelease=False)
         if not latest:
             raise UserError(
                 f"could not resolve latest upstream tag for {agent_type!r} "
-                f"— GitHub API unreachable? Pass --tag <T> explicitly."
+                f"— GitHub API unreachable? Pass --tag <T> to pin explicitly, "
+                f"or --recreate to force-refresh at the current pin."
             )
         new_tag = latest
         # Refresh the toolkit-wide default so future `agents create` of
@@ -131,18 +141,17 @@ def upgrade(
     base = HERMES_IMAGE_BASE if agent_type == "hermes" else OPENCLAW_IMAGE_BASE
 
     # No-op short-circuit when the target tag matches the current pin.
-    # The bare ``agents upgrade <name>`` form (no ``--tag``, no
-    # ``--latest``) ALSO no-ops here because ``new_tag = old_tag`` —
-    # otherwise typing the command with no flags would surprise-stop
-    # the agent for ~30-60s of avoidable downtime (``vm.take_snapshot``
-    # on libvirt+virtiofs needs the VM stopped), print a misleading
-    # ``v2026.5.16 -> v2026.5.16`` summary, and look like a no-op
-    # anyway. Worst of both worlds.
-    #
-    # ``--recreate`` is the explicit opt-in for the legitimate
-    # force-refresh use cases: picking up env-file changes, recovering
-    # from a wedged container, re-running the doctor with the snapshot
-    # safety net intact.
+    # Covers both:
+    # - bare ``agents upgrade <name>`` after the implicit-latest fetch
+    #   resolved to the same tag the agent is already on
+    # - ``--tag X`` where X happens to equal the current pin
+    # Without this, the upgrade would do ~30-60s of avoidable agent
+    # downtime (``vm.take_snapshot`` on libvirt+virtiofs needs the
+    # VM stopped), print a misleading ``vX.Y.Z -> vX.Y.Z`` summary,
+    # and look like a no-op anyway. ``--recreate`` is the explicit
+    # opt-in for the legitimate force-refresh use cases (env-file
+    # changes, wedged container, re-running doctor with the snapshot
+    # safety net intact).
     if new_tag == old_tag and not recreate:
         ui.emit(
             {

@@ -619,12 +619,22 @@ def agents_outdated(name: str | None, include_prerelease: bool) -> None:
 @main.command("upgrade")
 @click.argument("name", required=False)
 @click.option("--all", "all_agents", is_flag=True, help="Upgrade every agent in compose.")
-@click.option("--tag", default=None, help="Target image tag (single-agent upgrade only).")
+@click.option(
+    "--tag",
+    default=None,
+    help=(
+        "Pin to a specific image tag (single-agent only). Skips the upstream "
+        "check that bare ``upgrade`` does."
+    ),
+)
 @click.option(
     "--latest",
     "to_latest",
     is_flag=True,
-    help="Resolve and pin to the latest upstream tag (single-agent only).",
+    help=(
+        "Resolve and pin to the latest upstream tag (single-agent only). "
+        "Equivalent to bare ``upgrade`` — kept for explicit documentation."
+    ),
 )
 @click.option("--no-snapshot", is_flag=True, help="Skip both snapshots.")
 @click.option(
@@ -653,9 +663,15 @@ def agents_upgrade(
 ) -> None:
     """Upgrade an agent (or every agent with ``--all``).
 
-    Bare ``agents upgrade <name>`` is a no-op when the agent is already
-    at the resolved target tag — pass ``--recreate`` to force a snapshot
-    + recreate + doctor cycle anyway.
+    Bare ``agents upgrade <name>`` fetches the latest upstream tag and
+    upgrades if newer — mirrors the convention from ``apt upgrade`` /
+    ``brew upgrade``. No-ops with an informational message if the agent
+    is already at the latest. Network required (GitHub releases API).
+
+    Pass ``--tag X`` to pin to a specific tag (skips the upstream
+    check). Pass ``--recreate`` to force a snapshot+recreate+doctor
+    cycle even when there's no version change — useful for picking up
+    env-file edits or recovering from a wedged container.
     """
     if all_agents:
         if name:
