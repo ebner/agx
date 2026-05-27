@@ -628,6 +628,16 @@ def agents_outdated(name: str | None, include_prerelease: bool) -> None:
 )
 @click.option("--no-snapshot", is_flag=True, help="Skip both snapshots.")
 @click.option(
+    "--recreate",
+    is_flag=True,
+    help=(
+        "Force-refresh in place even when the target tag matches the current "
+        "pin. Useful for picking up env-file changes or recovering from a "
+        "wedged container. Without this, ``upgrade`` no-ops when there's no "
+        "version change."
+    ),
+)
+@click.option(
     "--canary",
     default=None,
     help="With --all: roll this agent first; halt on failure.",
@@ -638,9 +648,15 @@ def agents_upgrade(
     tag: str | None,
     to_latest: bool,
     no_snapshot: bool,
+    recreate: bool,
     canary: str | None,
 ) -> None:
-    """Upgrade an agent (or every agent with ``--all``)."""
+    """Upgrade an agent (or every agent with ``--all``).
+
+    Bare ``agents upgrade <name>`` is a no-op when the agent is already
+    at the resolved target tag — pass ``--recreate`` to force a snapshot
+    + recreate + doctor cycle anyway.
+    """
     if all_agents:
         if name:
             raise click.UsageError("--all is mutually exclusive with NAME")
@@ -648,6 +664,8 @@ def agents_upgrade(
             raise click.UsageError("--tag is single-agent only")
         if to_latest:
             raise click.UsageError("--latest is single-agent only")
+        if recreate:
+            raise click.UsageError("--recreate is single-agent only")
         _run(upgrades.upgrade_all, canary=canary)
         return
     if not name:
@@ -662,6 +680,7 @@ def agents_upgrade(
         tag=tag,
         to_latest=to_latest,
         no_snapshot=no_snapshot,
+        recreate=recreate,
     )
 
 

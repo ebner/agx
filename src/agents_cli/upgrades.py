@@ -89,6 +89,7 @@ def upgrade(
     tag: str | None = None,
     to_latest: bool = False,
     no_snapshot: bool = False,
+    recreate: bool = False,
     config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH,
 ) -> UpgradeOutcome:
     cfg = cfg_mod.load(config_path)
@@ -129,17 +130,20 @@ def upgrade(
         new_tag = tag or old_tag  # explicit tag wins; otherwise refresh in place
     base = HERMES_IMAGE_BASE if agent_type == "hermes" else OPENCLAW_IMAGE_BASE
 
-    # No-op short-circuit when the target tag is what we're already on
-    # AND the caller named the target (``--latest`` or ``--tag X``).
-    # Bare ``agents upgrade <name>`` (no flags) intentionally falls
-    # through as a "force-refresh in place" — useful for picking up
-    # env-file changes or recovering from a wedged container without
-    # actually bumping versions.
+    # No-op short-circuit when the target tag matches the current pin.
+    # The bare ``agents upgrade <name>`` form (no ``--tag``, no
+    # ``--latest``) ALSO no-ops here because ``new_tag = old_tag`` —
+    # otherwise typing the command with no flags would surprise-stop
+    # the agent for ~30-60s of avoidable downtime (``vm.take_snapshot``
+    # on libvirt+virtiofs needs the VM stopped), print a misleading
+    # ``v2026.5.16 -> v2026.5.16`` summary, and look like a no-op
+    # anyway. Worst of both worlds.
     #
-    # Skipping here saves ~30-60s of avoidable agent downtime:
-    # ``vm.take_snapshot`` on libvirt+virtiofs stops the VM, snapshots,
-    # then restarts. Doing that for a no-op upgrade is just penalty.
-    if (to_latest or tag is not None) and new_tag == old_tag:
+    # ``--recreate`` is the explicit opt-in for the legitimate
+    # force-refresh use cases: picking up env-file changes, recovering
+    # from a wedged container, re-running the doctor with the snapshot
+    # safety net intact.
+    if new_tag == old_tag and not recreate:
         ui.emit(
             {
                 "name": name,
@@ -147,7 +151,10 @@ def upgrade(
                 "new_tag": new_tag,
                 "noop": True,
             },
-            human=f"{name!r}: already at {new_tag} — nothing to do",
+            human=(
+                f"{name!r}: already at {new_tag} — nothing to do "
+                f"(pass --recreate to force-refresh anyway)"
+            ),
         )
         return UpgradeOutcome(
             name=name,

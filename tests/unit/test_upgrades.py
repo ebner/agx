@@ -427,21 +427,57 @@ def test_upgrade_explicit_tag_matching_current_is_noop(
     mocks["pull"].assert_not_called()
 
 
-def test_upgrade_bare_call_force_refreshes_in_place(
+def test_upgrade_bare_call_noops_when_tag_unchanged(
     with_coder: Path, mocker, cfg: AgentsConfig
 ) -> None:
-    """Bare ``agents upgrade <name>`` (no flags) is the documented
-    refresh-in-place — useful for picking up env-file changes or
-    recovering from a wedged container without changing versions.
-    It must run the full pipeline even though new_tag == old_tag,
-    distinguishing it from the noop short-circuit above.
+    """Bare ``agents upgrade <name>`` (no flags) must no-op when the
+    current pin matches the resolved target tag — without this,
+    typing the command with no flags surprise-stops the agent for
+    ~30-60s with a snapshot dance, prints a misleading
+    ``vX.Y.Z -> vX.Y.Z`` summary, and looks like nothing happened
+    anyway. ``--recreate`` is the explicit opt-in for the legitimate
+    force-refresh use case (env-file changes, wedged container).
+    Previously this test pinned the OPPOSITE behavior — the design
+    flipped after a user hit exactly the misleading-output footgun
+    described above on coder.
     """
     mocks = _stub_happy_upgrade(mocker, cfg)
     outcome = upgrades.upgrade("coder", config_path=with_coder)
     assert outcome.old_tag == outcome.new_tag == "v1.0.0"
-    # Snapshots, pull, recreate all ran.
+    # Nothing expensive ran.
+    mocks["stop"].assert_not_called()
+    mocks["snapshot"].assert_not_called()
+    mocks["pull"].assert_not_called()
+    mocks["compose_up"].assert_not_called()
+
+
+def test_upgrade_with_recreate_flag_runs_full_pipeline_even_with_same_tag(
+    with_coder: Path, mocker, cfg: AgentsConfig
+) -> None:
+    """``--recreate`` is the explicit opt-in for the force-refresh
+    use case: snapshot + recreate container + run doctor even though
+    the image tag doesn't change. Useful for picking up env-file
+    changes (per-agent .env modifications) or recovering from a
+    wedged container without manually destroying + recreating it.
+    """
+    mocks = _stub_happy_upgrade(mocker, cfg)
+    outcome = upgrades.upgrade("coder", recreate=True, config_path=with_coder)
+    assert outcome.old_tag == outcome.new_tag == "v1.0.0"
     mocks["snapshot"].assert_called_once()
     mocks["pull"].assert_called_once()
+    mocks["compose_up"].assert_called_once()
+
+
+def test_upgrade_recreate_with_explicit_tag_match_still_runs_pipeline(
+    with_coder: Path, mocker, cfg: AgentsConfig
+) -> None:
+    """``--recreate`` overrides the same-tag short-circuit regardless
+    of whether the tag came in via ``--tag`` or was inferred. A user
+    saying ``--tag v1.0.0 --recreate`` knows what they want.
+    """
+    mocks = _stub_happy_upgrade(mocker, cfg)
+    upgrades.upgrade("coder", tag="v1.0.0", recreate=True, config_path=with_coder)
+    mocks["snapshot"].assert_called_once()
     mocks["compose_up"].assert_called_once()
 
 
