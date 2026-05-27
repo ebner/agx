@@ -629,6 +629,7 @@ def test_doctor_version_check_reports_tag_when_running(
         "agents_cli.compose_runner.ps",
         return_value=_ok(json.dumps([{"Service": "hermes-coder", "State": "running"}])),
     )
+
     # Override the default exec_in_vm to serve `docker inspect` with
     # an image that matches the compose pin (cfg fixture pins v1.0.0).
     def runner(vm_name: str, *cmd: str, check: bool = True):
@@ -643,10 +644,7 @@ def test_doctor_version_check_reports_tag_when_running(
             return _ok("4\n")
         if cmd[:2] == ("cat", "/proc/loadavg"):
             return _ok("0.42 0.31 0.25 1/123 4567\n")
-        if (
-            cmd[:3] == ("docker", "inspect", "hermes-coder")
-            and "{{.Config.Image}}" in cmd
-        ):
+        if cmd[:3] == ("docker", "inspect", "hermes-coder") and "{{.Config.Image}}" in cmd:
             return _ok("nousresearch/hermes-agent:v1.0.0\n")
         return _ok("ok\n")
 
@@ -685,10 +683,7 @@ def test_doctor_version_check_warns_on_pin_vs_runtime_drift(
             return _ok("4\n")
         if cmd[:2] == ("cat", "/proc/loadavg"):
             return _ok("0.42 0.31 0.25 1/123 4567\n")
-        if (
-            cmd[:3] == ("docker", "inspect", "hermes-coder")
-            and "{{.Config.Image}}" in cmd
-        ):
+        if cmd[:3] == ("docker", "inspect", "hermes-coder") and "{{.Config.Image}}" in cmd:
             # Container running v0.9.0; compose fixture pins v1.0.0.
             return _ok("nousresearch/hermes-agent:v0.9.0\n")
         return _ok("ok\n")
