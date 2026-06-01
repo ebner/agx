@@ -206,6 +206,14 @@ def create(
             if phase == "data_dir_created":
                 _create_data_dirs(cfg, name, agent_type)
             elif phase == "compose_updated":
+                if agent_type == "hermes":
+                    # Materialize the cont-init.d perms hook BEFORE writing the
+                    # fragment that bind-mounts it, so the source always exists
+                    # before any `compose up` — otherwise an interrupted/raced
+                    # start lets Docker auto-create a directory at the mount
+                    # path. The hook then re-applies the install-path chown on
+                    # EVERY boot, not just toolkit-driven recreates.
+                    compose.ensure_cont_init_script(cfg)
                 _add_service_to_compose(cfg, name, agent_type, svc, port, tag)
             elif phase == "service_up":
                 compose_runner.up(cfg, svc)
@@ -644,6 +652,11 @@ def reseat(
         # gets the chown/chmod dance — adding HERMES_UID to env will fix newly
         # created files, but stale files from the previous container are still
         # at the old uid.
+        if agent_type == "hermes":
+            # The regenerated fragment now bind-mounts the cont-init.d perms
+            # hook; materialize its source before recreating so the mount
+            # resolves to a file (not an auto-created dir).
+            compose.ensure_cont_init_script(cfg)
         fixperms_cmd.force_recreate(cfg, svc)
         if agent_type == "hermes":
             huid = fixperms_cmd.container_hermes_uid(cfg, svc)

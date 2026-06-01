@@ -203,7 +203,25 @@ def upgrade(
                 journal.advance("pulled")
 
             if not journal.is_phase_done("recreated"):
+                if agent_type == "hermes":
+                    # Materialize the cont-init.d perms hook so a reseated
+                    # agent's bind mount has its source. AND re-apply the
+                    # install-path chown directly: agents whose fragment
+                    # predates the hook (not yet reseated) get recreated here
+                    # with the overlay fs reset to the image-baked uid, and
+                    # upgrade was historically the one recreate path that never
+                    # called the fixer — the exact "re-breaks after every
+                    # upgrade" treadmill. Belt-and-suspenders for reseated ones.
+                    compose.ensure_cont_init_script(cfg)
                 compose_runner.up(cfg, svc)
+                if agent_type == "hermes":
+                    from agents_cli import fixperms_cmd
+
+                    try:
+                        huid = fixperms_cmd.container_hermes_uid(cfg, svc)
+                    except RuntimeFailure:
+                        huid = 1000  # best-effort; entrypoint usually maps to 1000
+                    fixperms_cmd.chown_hermes_install_paths(cfg, svc, huid)
                 journal.advance("recreated")
 
             if not journal.is_phase_done(CONFIG_MIGRATE_PHASE):

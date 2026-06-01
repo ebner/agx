@@ -74,6 +74,10 @@ def fix_perms(
         raise UserError("aborted by user")
 
     with compose.acquire_lock(cfg.paths.host_data_dir):
+        # Materialize the cont-init.d perms hook before recreating so its
+        # bind-mount source exists; going forward the hook re-applies the
+        # install-path chown on every boot without a manual fix-perms.
+        compose.ensure_cont_init_script(cfg)
         force_recreate(cfg, svc)
         huid = container_hermes_uid(cfg, svc)
         chown_data_dir(cfg, svc, huid)

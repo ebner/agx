@@ -193,6 +193,62 @@ echo "BOOTSTRAP_OK uidmap=${UIDMAP_OK} dbus=${DBUS_OK} lingering=${LINGERING_OK}
 """
 
 
+# s6-overlay cont-init.d script, bind-mounted read-only into every Hermes
+# container by the compose fragment. Runs as root on EVERY boot — after the
+# image's own ``01-hermes-setup`` usermod, before any service starts — so the
+# toolkit no longer has to chase rootless-Docker permission drift with
+# ``agents fix-perms`` after each upgrade/recreate. See
+# ``compose.ensure_cont_init_script`` and the "durable in-container perms
+# hook" pitfall in CLAUDE.md.
+HERMES_CONT_INIT_FIXPERMS: Final = r"""#!/command/with-contenv sh
+# 99-toolkit-fixperms — MANAGED BY THE `agents` HOST CLI. DO NOT EDIT.
+#
+# Runs as root on every container boot (s6-overlay cont-init.d), after the
+# image's 01-hermes-setup usermod and before any service starts. Repairs two
+# rootless-Docker permission problems the toolkit otherwise has to chase with
+# `agents fix-perms` after every upgrade/recreate:
+#
+#   1. Image-baked install paths (/opt/hermes/scripts, /home/hermes) live on
+#      the container overlay fs owned by the image build-time uid; a recreate
+#      resets them, so the runtime `hermes` user can't `npm install` bridge
+#      deps etc. Chown them AS ROOT — the overlay fs honors the container's
+#      CAP_CHOWN. We chown to the NUMERIC uid:gid of the live `hermes` user
+#      (resolved via `id`), not the name `hermes:hermes`: a name target would
+#      silently no-op (with the trailing `exit 0`) if the group were ever
+#      renamed, whereas the numeric form mirrors fixperms_cmd and can't drift.
+#      Prune the :ro Codex import bridge so chown never touches a read-only
+#      mount.
+#
+#   2. The gateway log dir. The image's gateway log run script does a root
+#      `mkdir -p` under /opt/data, but /opt/data is a 9p-backed bind mount
+#      that ignores the container's root caps — only the hermes uid can write
+#      there. Pre-create the tree AS hermes (via s6-setuidgid, called by
+#      absolute path so it resolves regardless of the cont-init PATH) so the
+#      root-side mkdir no-ops and s6-log (which runs as hermes) can write.
+#      (The upstream run script's own later `chown -R "$log_dir"` is `|| true`,
+#      so it stays non-fatal once the leaf already exists hermes-owned.)
+#
+# Idempotent. Ends with `exit 0`: a non-zero cont-init.d exit can abort
+# container init depending on S6_BEHAVIOUR_IF_STAGE2_FAILS, so the hook must
+# never let a best-effort chown/mkdir failure surface.
+
+HUID="$(id -u hermes 2>/dev/null || true)"
+HGID="$(id -g hermes 2>/dev/null || true)"
+if [ -n "$HUID" ] && [ -n "$HGID" ]; then
+    if [ -e /opt/hermes/scripts ]; then
+        find /opt/hermes/scripts -exec chown "$HUID:$HGID" {} + 2>/dev/null
+    fi
+    if [ -e /home/hermes ]; then
+        find /home/hermes -path /home/hermes/.codex -prune -o -exec chown "$HUID:$HGID" {} + 2>/dev/null
+    fi
+fi
+
+/command/s6-setuidgid hermes mkdir -p /opt/data/logs/gateways/default 2>/dev/null
+
+exit 0
+"""
+
+
 def render_codex_sandbox_dockerfile(base_image: str) -> str:
     """Render the Dockerfile for `agents codex skill-enable`.
 

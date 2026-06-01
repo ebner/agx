@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
 
 from agents_cli.compose import (
     ALLOWED_IMAGE_BASES,
+    CONT_INIT_CONTAINER_PATH,
+    CONT_INIT_REL,
     FIRECRAWL_API_IMAGE_BASE,
     FIRECRAWL_PLAYWRIGHT_IMAGE_BASE,
     FIRECRAWL_POSTGRES_IMAGE_BASE,
@@ -22,6 +25,7 @@ from agents_cli.compose import (
     add_service,
     cleanup_stale_temps,
     dump_compose,
+    ensure_cont_init_script,
     hermes_service_fragment,
     list_services,
     load_compose,
@@ -86,6 +90,11 @@ def test_hermes_fragment_has_required_mounts(cfg: AgentsConfig) -> None:
     assert "/run/user/1000/docker.sock:/run/user/1000/docker.sock" in s["volumes"]
     assert "./.codex:/home/hermes/.codex:ro" in s["volumes"]
 
+    # The toolkit-managed cont-init.d perms hook is bind-mounted read-only
+    # so it re-applies the install-path chown + gateway-logdir pre-create on
+    # every boot — the durable fix for rootless-Docker perm drift.
+    assert f"./{CONT_INIT_REL}:{CONT_INIT_CONTAINER_PATH}:ro" in s["volumes"]
+
     # DOCKER_HOST env must be set so the Hermes-bundled docker CLI finds
     # the rootless socket.
     assert s["environment"]["DOCKER_HOST"] == "unix:///run/user/1000/docker.sock"
@@ -108,6 +117,94 @@ def test_hermes_fragment_never_binds_zero_address(cfg: AgentsConfig) -> None:
     s = hermes_service_fragment(name="coder", cfg=cfg, port=8642, image_tag="v1.0.0")
     for p in s["ports"]:
         assert p.startswith("127.0.0.1:"), f"insecure binding: {p!r}"
+
+
+def test_ensure_cont_init_script_writes_executable_hook(cfg: AgentsConfig) -> None:
+    # Host-mounted mode (data_dir_in_vm=False): the hook is written straight
+    # into the project dir with the exec bit set, so the read-only bind mount
+    # resolves to an executable file s6-overlay will actually run.
+    ensure_cont_init_script(cfg)
+
+    target = cfg.paths.host_data_dir / CONT_INIT_REL
+    assert target.is_file()
+    assert os.access(target, os.X_OK)
+    assert (target.stat().st_mode & 0o777) == 0o755
+
+    body = target.read_text(encoding="utf-8")
+    # Split-privilege contract: chown the overlay-fs install paths AS ROOT,
+    # but pre-create the 9p-backed gateway logdir AS hermes (root can't write
+    # the 9p mount). Both are load-bearing — see the script's own comments.
+    # The overlay chown targets the NUMERIC uid/gid (resolved via `id`), not
+    # the name `hermes:hermes` — a name target would silently no-op if the
+    # group were renamed, with the trailing `exit 0` hiding it.
+    assert "id -u hermes" in body and "id -g hermes" in body
+    assert 'chown "$HUID:$HGID"' in body
+    assert "/opt/hermes/scripts" in body
+    assert "/command/s6-setuidgid hermes mkdir -p /opt/data/logs/gateways" in body
+    # A non-zero cont-init.d exit can abort container init (depending on
+    # S6_BEHAVIOUR_IF_STAGE2_FAILS), so the hook must always end by succeeding.
+    assert body.rstrip().endswith("exit 0")
+
+
+def test_ensure_cont_init_script_is_idempotent(cfg: AgentsConfig) -> None:
+    ensure_cont_init_script(cfg)
+    first = (cfg.paths.host_data_dir / CONT_INIT_REL).read_text(encoding="utf-8")
+    ensure_cont_init_script(cfg)
+    second = (cfg.paths.host_data_dir / CONT_INIT_REL).read_text(encoding="utf-8")
+    assert first == second
+    # No stray staging temps left behind by the atomic write.
+    assert not list((cfg.paths.host_data_dir / ".staging").glob("continit-*"))
+
+
+def test_ensure_cont_init_script_repairs_docker_created_directory(cfg: AgentsConfig) -> None:
+    # If a `compose up` raced ahead of materialization, Docker creates an
+    # (empty) directory at the bind-mount source. ensure_cont_init_script must
+    # remove it and land a real executable file rather than raise EISDIR.
+    target = cfg.paths.host_data_dir / CONT_INIT_REL
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.mkdir()
+    assert target.is_dir()
+
+    ensure_cont_init_script(cfg)
+
+    assert target.is_file()
+    assert os.access(target, os.X_OK)
+
+
+def test_ensure_cont_init_script_vm_mode_is_atomic(cfg: AgentsConfig, mocker) -> None:
+    # --data-dir-in-vm: transfer to a VM-side temp, chmod the temp, then `mv`
+    # into place — never transfer straight to the final path (a crash mid-way
+    # would otherwise leave a partial/non-executable hook the container mounts).
+    cfg.paths.data_dir_in_vm = True
+    vm_path = f"{cfg.paths.vm_agents_root}/{CONT_INIT_REL}"
+    calls: list[tuple[str, tuple[str, ...]]] = []
+
+    def rec_exec(_vm: str, *args: str, **_kw: object) -> MpResult:
+        calls.append(("exec", args))
+        return MpResult(stdout="", stderr="", returncode=0)
+
+    def rec_transfer(_host_path: Path, _vm: str, vm_dst: str) -> MpResult:
+        calls.append(("transfer", (vm_dst,)))
+        return MpResult(stdout="", stderr="", returncode=0)
+
+    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=rec_exec)
+    mocker.patch("agents_cli.mp.transfer_to_vm", side_effect=rec_transfer)
+
+    ensure_cont_init_script(cfg)
+
+    transfers = [a[0] for kind, a in calls if kind == "transfer"]
+    assert transfers, "expected a transfer call"
+    # Transferred to a temp under the final path, never the final path itself.
+    assert all(dst != vm_path and dst.startswith(vm_path + ".") for dst in transfers)
+    vm_tmp = transfers[0]
+
+    exec_args = [a for kind, a in calls if kind == "exec"]
+    chmod_idx = next(i for i, a in enumerate(exec_args) if a[0] == "chmod")
+    mv_idx = next(i for i, a in enumerate(exec_args) if a[0] == "mv")
+    # chmod targets the temp; mv moves temp -> final; chmod happens before mv.
+    assert exec_args[chmod_idx][-1] == vm_tmp
+    assert exec_args[mv_idx][1] == vm_tmp and exec_args[mv_idx][2] == vm_path
+    assert chmod_idx < mv_idx
 
 
 def test_openclaw_fragment_uses_per_agent_paths(cfg: AgentsConfig) -> None:

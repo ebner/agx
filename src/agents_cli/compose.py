@@ -46,12 +46,19 @@ from typing import Any, Final
 
 from ruamel.yaml import YAML
 
-from agents_cli import mp, ui
+from agents_cli import mp, templates, ui
 from agents_cli.config import AgentsConfig
 from agents_cli.errors import RuntimeFailure, UserError
 
 HERMES_IMAGE_BASE: Final = "nousresearch/hermes-agent"
 OPENCLAW_IMAGE_BASE: Final = "openclaw/openclaw"
+
+# Toolkit-managed s6 cont-init.d perms hook (see templates.HERMES_CONT_INIT_FIXPERMS).
+# Lives in the project dir (shared across all Hermes agents — it reads the
+# runtime uid from the live container, so it's agent-independent) and is
+# bind-mounted read-only into each Hermes container.
+CONT_INIT_REL: Final = ".toolkit/cont-init/99-fixperms"
+CONT_INIT_CONTAINER_PATH: Final = "/etc/cont-init.d/99-toolkit-fixperms"
 # Sibling-service memory backends managed by the toolkit. Whitelisted by
 # the same parsed (registry, repo) tuple check as the agent images so an
 # attacker-controlled compose can't sneak in a typo-squatted variant.
@@ -200,6 +207,76 @@ def host_staging_dir(cfg: AgentsConfig) -> Path:
     return d
 
 
+def ensure_cont_init_script(cfg: AgentsConfig) -> None:
+    """Materialize the toolkit-managed s6 cont-init.d perms hook in the
+    project dir so the Hermes fragment's read-only bind-mount source exists
+    (and is executable) before any container start.
+
+    The script is shared across all Hermes agents and rewritten on every
+    call, so a template bump propagates on the next create / reseat /
+    recreate. Idempotent. Materialized by the toolkit paths that (re)start a
+    Hermes container with this fragment — ``create`` (before the fragment is
+    written), ``reseat``, ``fix-perms``, and ``upgrade`` — *before* the
+    ``compose up`` they issue. The file then persists on the project dir, so
+    other recreate paths (``secret set``, ``memory``, ``codex skill-*``, vm
+    rebuild) find it already present; a template bump is re-applied on the
+    next ``reseat``.
+
+    Defends against the "Docker auto-created a directory at the bind source"
+    race: if a ``compose up`` ran before the file existed, the daemon creates
+    an (empty) directory at the mount path. We detect that and remove it so
+    the atomic file write below succeeds rather than raising ``IsADirectoryError``.
+
+    Two write paths, mirroring the rest of the module:
+
+    - Host-mounted data dir (multipass / libvirt / bare-metal): write
+      straight into ``<host_data_dir>/<CONT_INIT_REL>``. That dir is already
+      mounted into the VM at ``vm_agents_root``, so the file appears there
+      with its mode bits intact — the exec bit survives host → 9p →
+      container bind-mount (verified), which s6-overlay requires for
+      cont-init.d scripts.
+    - ``--data-dir-in-vm``: stage on the host, ``multipass transfer`` into a
+      VM-side temp in the target dir, ``chmod 0755`` the temp, then ``mv`` it
+      into place — so a crash never leaves a partial/non-executable hook.
+    """
+    body = templates.HERMES_CONT_INIT_FIXPERMS
+    if cfg.paths.data_dir_in_vm:
+        vm_path = f"{cfg.paths.vm_agents_root}/{CONT_INIT_REL}"
+        vm_dir = vm_path.rsplit("/", 1)[0]
+        vm_tmp = f"{vm_path}.{os.getpid()}.{uuid.uuid4().hex[:8]}.new"
+        host_temp = host_staging_dir(cfg) / f"continit-{os.getpid()}-{uuid.uuid4().hex[:8]}.sh"
+        try:
+            host_temp.write_text(body, encoding="utf-8")
+            mp.exec_in_vm(cfg.vm.name, "mkdir", "-p", vm_dir)
+            # Clear a stray Docker-auto-created directory at the final path.
+            mp.exec_in_vm(cfg.vm.name, "rmdir", vm_path, check=False)
+            mp.transfer_to_vm(host_temp, cfg.vm.name, vm_tmp)
+            mp.exec_in_vm(cfg.vm.name, "chmod", "0755", vm_tmp)
+            mp.exec_in_vm(cfg.vm.name, "mv", vm_tmp, vm_path)
+        except Exception:
+            mp.exec_in_vm(cfg.vm.name, "rm", "-f", vm_tmp, check=False)
+            raise
+        finally:
+            host_temp.unlink(missing_ok=True)
+        return
+
+    target = cfg.paths.host_data_dir / CONT_INIT_REL
+    target.parent.mkdir(parents=True, exist_ok=True)
+    # If a `compose up` beat us to it, Docker created an (empty) directory at
+    # the bind source. Remove it so the rename below lands a file, not EISDIR.
+    if target.is_dir() and not target.is_symlink():
+        target.rmdir()
+    # Atomic create with the exec bit set, via same-filesystem rename
+    # (staging dir and target both live under the host data dir).
+    tmp = host_staging_dir(cfg) / f"continit-{os.getpid()}-{uuid.uuid4().hex[:8]}.sh"
+    try:
+        tmp.write_text(body, encoding="utf-8")
+        os.chmod(tmp, 0o755)
+        os.replace(tmp, target)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
 def cleanup_stale_temps(cfg: AgentsConfig) -> None:
     """Sweep any ``.compose.*.new`` left behind in the VM project dir by
     prior crashes. Also sweeps host-side stragglers from this process.
@@ -332,6 +409,12 @@ def hermes_service_fragment(
             f"./{name}/.data:/opt/data",
             f"{socket_path}:{socket_path}",
             "./.codex:/home/hermes/.codex:ro",
+            # Toolkit-managed perms hook. Runs as root on every boot to
+            # chown image-baked install paths + pre-create the gateway
+            # logdir, so rootless-Docker perm drift no longer needs a
+            # post-recreate `agents fix-perms`. Source materialized by
+            # compose.ensure_cont_init_script before any container start.
+            f"./{CONT_INIT_REL}:{CONT_INIT_CONTAINER_PATH}:ro",
         ],
         # Per-agent secrets: KEY=VALUE pairs in `<data-dir>/<name>/.env`
         # become container env. Skills like firecrawl read their API keys
