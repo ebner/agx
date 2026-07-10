@@ -617,6 +617,82 @@ def test_doctor_arm64_emulation_silent_on_amd64_host(
     assert check.status == "ok"
 
 
+def test_doctor_firecrawl_warns_when_installed_and_wired_but_down(
+    cfg: AgentsConfig, mocker
+) -> None:
+    """The migration-loss gap: compose still defines the firecrawl
+    services and an agent is still wired to them, but the containers
+    aren't running (the in-VM Docker state didn't survive the VM
+    rebuild). Must warn so the silent scrape failures get surfaced.
+    """
+    from agents_cli.ops import DoctorReport, _check_firecrawl_running
+
+    mocker.patch(
+        "agents_cli.firecrawl_cmd._firecrawl_services_in_compose",
+        return_value=["firecrawl-api", "firecrawl-redis"],
+    )
+    mocker.patch("agents_cli.firecrawl_cmd._service_running", return_value=False)
+    mocker.patch("agents_cli.firecrawl_cmd._list_wired_agents", return_value=["coder"])
+
+    report = DoctorReport()
+    _check_firecrawl_running(cfg, report)
+    [check] = [c for c in report.checks if c.name == "firecrawl_running"]
+    assert check.status == "warn"
+    assert "coder" in check.detail
+    assert "agents firecrawl up" in check.detail
+
+
+def test_doctor_firecrawl_ok_when_running(cfg: AgentsConfig, mocker) -> None:
+    """Healthy stack — quiet ok line."""
+    from agents_cli.ops import DoctorReport, _check_firecrawl_running
+
+    mocker.patch(
+        "agents_cli.firecrawl_cmd._firecrawl_services_in_compose",
+        return_value=["firecrawl-api"],
+    )
+    mocker.patch("agents_cli.firecrawl_cmd._service_running", return_value=True)
+
+    report = DoctorReport()
+    _check_firecrawl_running(cfg, report)
+    [check] = [c for c in report.checks if c.name == "firecrawl_running"]
+    assert check.status == "ok"
+    assert check.detail == "running"
+
+
+def test_doctor_firecrawl_ok_when_not_installed(cfg: AgentsConfig, mocker) -> None:
+    """No firecrawl services in compose — nothing to flag."""
+    from agents_cli.ops import DoctorReport, _check_firecrawl_running
+
+    mocker.patch("agents_cli.firecrawl_cmd._firecrawl_services_in_compose", return_value=[])
+
+    report = DoctorReport()
+    _check_firecrawl_running(cfg, report)
+    [check] = [c for c in report.checks if c.name == "firecrawl_running"]
+    assert check.status == "ok"
+    assert "not installed" in check.detail
+
+
+def test_doctor_firecrawl_quiet_after_deliberate_down(cfg: AgentsConfig, mocker) -> None:
+    """``agents firecrawl down`` leaves the compose blocks but drops the
+    agent wiring. A stopped + unwired stack is an intentional stop, not
+    a regression — stay at ok so doctor doesn't nag.
+    """
+    from agents_cli.ops import DoctorReport, _check_firecrawl_running
+
+    mocker.patch(
+        "agents_cli.firecrawl_cmd._firecrawl_services_in_compose",
+        return_value=["firecrawl-api", "firecrawl-redis"],
+    )
+    mocker.patch("agents_cli.firecrawl_cmd._service_running", return_value=False)
+    mocker.patch("agents_cli.firecrawl_cmd._list_wired_agents", return_value=[])
+
+    report = DoctorReport()
+    _check_firecrawl_running(cfg, report)
+    [check] = [c for c in report.checks if c.name == "firecrawl_running"]
+    assert check.status == "ok"
+    assert "down" in check.detail
+
+
 def test_doctor_version_check_reports_tag_when_running(
     with_coder: Path, cfg: AgentsConfig, mocker
 ) -> None:

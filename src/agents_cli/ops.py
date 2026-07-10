@@ -162,6 +162,7 @@ def doctor(
         _check_port_conflicts(cfg, report)
         _check_codex_auth(cfg, report)
         _check_arm64_emulation(cfg, report)
+        _check_firecrawl_running(cfg, report)
         _check_inference_health(cfg, report)
     else:
         report.add("data_dir_exists", "fail", f"{cfg.paths.host_data_dir} missing")
@@ -937,6 +938,61 @@ def _check_arm64_emulation(cfg: AgentsConfig, report: DoctorReport) -> None:
         "host is arm64. Running under qemu-user emulation: "
         + "; ".join(firecrawl_cmd.ARM64_EMULATED_IMAGES)
         + ". Works but is slower; swap via docker-compose.override.yml if it bites.",
+    )
+
+
+def _check_firecrawl_running(cfg: AgentsConfig, report: DoctorReport) -> None:
+    """Flag a firecrawl stack that's defined in compose but not running
+    while agents are still wired to use it.
+
+    This is the exact state a VM-backend migration leaves behind. The
+    host data dir survives wholesale (compose service blocks, project
+    ``.env``, postgres data, each agent's ``env_passthrough`` wiring),
+    but the sidecar containers live only in the *old* VM's Docker engine
+    and never cross over — so ``firecrawl status`` reports them ``absent``
+    and a wired agent's scrape calls fail with connection-refused,
+    silently, until someone re-runs ``agents firecrawl up``.
+
+    Nothing else surfaces it: ``firecrawl_cmd.is_installed`` (the gate on
+    the arm64 check) additionally requires ``.firecrawl-state.json``, the
+    digest-pin record — which is *also* lost in the migration — so the
+    is_installed-gated checks skip too. This check deliberately gates on
+    compose-presence alone so it still fires with the state file gone.
+
+    Gating the warning on still-wired agents is what separates a
+    migration-loss from a deliberate ``agents firecrawl down``: ``down``
+    drops the wiring, so a stack that's stopped *and* unwired is a clean,
+    intentional stop and stays quiet here. Severity is ``warn`` (not
+    ``fail``) — firecrawl is an optional sidecar; a wired agent's chat
+    keeps working, only scraping is degraded, so it shouldn't trip
+    doctor's exit-3 / break cron that gates on it.
+    """
+    from agents_cli import firecrawl_cmd
+
+    services = firecrawl_cmd._firecrawl_services_in_compose(cfg)
+    if not services:
+        report.add("firecrawl_running", "ok", "not installed")
+        return
+    if firecrawl_cmd._service_running(cfg, "firecrawl-api"):
+        report.add("firecrawl_running", "ok", "running")
+        return
+    wired = firecrawl_cmd._list_wired_agents(cfg)
+    if not wired:
+        report.add(
+            "firecrawl_running",
+            "ok",
+            "installed but stopped; no agents wired "
+            "(looks like a deliberate `agents firecrawl down`)",
+        )
+        return
+    is_are = "is" if len(wired) == 1 else "are"
+    report.add(
+        "firecrawl_running",
+        "warn",
+        f"defined in compose and {', '.join(wired)} {is_are} wired to it, "
+        "but the containers aren't running — a VM rebuild/migration drops "
+        "the in-VM Docker state. Scrape calls fail until you run "
+        "`agents firecrawl up` (reuses the pinned digests).",
     )
 
 
