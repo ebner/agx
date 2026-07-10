@@ -587,7 +587,9 @@ def restore_snapshot(
         _wait_for_vm_stopped(cfg.vm.name, timeout_s=60)
 
     try:
-        mp.restore(snapshot_id, destructive=destructive)
+        result = mp.restore(snapshot_id, destructive=destructive)
+        if result.returncode != 0:
+            raise RuntimeFailure(f"restore failed: {(result.stderr or 'unknown error').strip()}")
     finally:
         if was_running:
             ui.info(f"restarting {cfg.vm.name!r}...")
@@ -722,7 +724,10 @@ def rebuild(
 
         if not journal.is_phase_done("vm_initted"):
             # Re-init from scratch with the chosen sizing. init() persists
-            # the new values back to config.toml.
+            # the new values back to config.toml. Backend + GPU passthrough
+            # are carried over explicitly: init() defaults to multipass and
+            # writes cfg.vm.backend unconditionally, so omitting them would
+            # silently migrate a libvirt user to multipass and drop GPUs.
             init(
                 data_dir=cfg.paths.host_data_dir,
                 data_dir_in_vm=cfg.paths.data_dir_in_vm,
@@ -730,6 +735,8 @@ def rebuild(
                 memory_gb=target_memory,
                 disk_gb=target_disk,
                 ubuntu_release=target_release,
+                backend=cfg.vm.backend,
+                gpu=list(cfg.vm.gpu_passthrough) or None,
                 config_path=config_path,
             )
             journal.advance("vm_initted")
@@ -749,11 +756,8 @@ def rebuild(
             journal.advance("state_restored")
 
         if not journal.is_phase_done("services_started"):
-            for _, _ in agent_specs:
-                # `docker compose up -d` for each service via compose_runner.
-                # Iterate by service so a single broken agent doesn't take
-                # the rest down.
-                pass
+            # `docker compose up -d` per service via compose_runner, so a
+            # single broken agent doesn't take the rest down.
             for name, agent_type in agent_specs:
                 svc = agents_cmd.service_name(name, agent_type)
                 compose_runner.up(cfg, svc)
@@ -911,11 +915,10 @@ def _ensure_mount(cfg: AgentsConfig) -> None:
         host_gid=cfg.host.gid,
     )
     if was_running and requires_stop:
+        # multipass-only branch (requires_stop): mp.start_vm blocks until
+        # the VM is reachable again. libvirt never stops for a mount
+        # (virtiofs attaches --live --config), so no SSH re-wait is needed.
         mp.start_vm(cfg.vm.name)
-        if cfg.vm.backend == "libvirt":
-            from agents_cli.backends import libvirt as libvirt_mod
-
-            libvirt_mod.wait_for_ssh(cfg.vm.name)
 
 
 def _has_mount(cfg: AgentsConfig) -> bool:

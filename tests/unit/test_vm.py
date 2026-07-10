@@ -551,6 +551,42 @@ def test_rebuild_overrides_sizing(mocker, tmp_path: Path) -> None:
     assert init_kwargs["disk_gb"] == 10  # overridden (shrink)
 
 
+def test_rebuild_preserves_backend_and_gpu(mocker, tmp_path: Path) -> None:
+    """A libvirt user's rebuild must not silently migrate to multipass or
+    drop GPU passthrough — init() defaults backend='multipass' and writes
+    cfg.vm.backend unconditionally, so rebuild has to pass both through.
+    """
+    cfg = _make_config(tmp_path)
+    cfg.vm.backend = "libvirt"
+    cfg.vm.gpu_passthrough = ["0000:01:00.0", "0000:01:00.1"]
+    config_path = _saved_config(tmp_path)
+    cfg_mod.save(cfg, config_path)
+    mocks = _stub_rebuild(mocker, cfg, {})
+
+    vm.rebuild(yes=True, config_path=config_path)
+
+    init_kwargs = mocks["init"].call_args.kwargs
+    assert init_kwargs["backend"] == "libvirt"
+    assert init_kwargs["gpu"] == ["0000:01:00.0", "0000:01:00.1"]
+
+
+def test_rebuild_passes_multipass_backend_without_gpu(mocker, tmp_path: Path) -> None:
+    """Default multipass config: backend passes through unchanged and gpu
+    stays None — a truthy gpu would trip init()'s '--gpu requires
+    --backend libvirt' refusal.
+    """
+    cfg = _make_config(tmp_path)
+    config_path = _saved_config(tmp_path)
+    cfg_mod.save(cfg, config_path)
+    mocks = _stub_rebuild(mocker, cfg, {})
+
+    vm.rebuild(yes=True, config_path=config_path)
+
+    init_kwargs = mocks["init"].call_args.kwargs
+    assert init_kwargs["backend"] == "multipass"
+    assert init_kwargs["gpu"] is None
+
+
 def test_rebuild_requires_confirmation_unless_yes(mocker, tmp_path: Path) -> None:
     cfg = _make_config(tmp_path)
     config_path = _saved_config(tmp_path)
@@ -561,6 +597,167 @@ def test_rebuild_requires_confirmation_unless_yes(mocker, tmp_path: Path) -> Non
     with pytest.raises(UserError, match="aborted"):
         vm.rebuild(config_path=config_path)
     mocks["delete_vm"].assert_not_called()
+
+
+# ---------- take_snapshot / restore_snapshot ----------
+
+
+def _stub_snapshot_mp(
+    mocker,
+    *,
+    snapshot_rc: int = 0,
+    restore_rc: int = 0,
+    running: bool = True,
+) -> dict[str, MagicMock]:
+    """Stub every mp primitive + wait helper the snapshot paths touch.
+
+    ``info_vm`` drives both ``_unique_snapshot_name`` (empty snapshot
+    map → requested name wins) and ``_vm_running`` (libvirt downtime
+    decision).
+    """
+    info = {"info": {"agents": {"state": "Running" if running else "Stopped", "snapshots": {}}}}
+    return {
+        "info_vm": mocker.patch("agents_cli.mp.info_vm", return_value=_ok(json.dumps(info))),
+        "snapshot": mocker.patch(
+            "agents_cli.mp.snapshot",
+            return_value=MpResult(
+                stdout="", stderr="snapshot boom" if snapshot_rc else "", returncode=snapshot_rc
+            ),
+        ),
+        "restore": mocker.patch(
+            "agents_cli.mp.restore",
+            return_value=MpResult(
+                stdout="", stderr="revert boom" if restore_rc else "", returncode=restore_rc
+            ),
+        ),
+        "stop": mocker.patch("agents_cli.mp.stop_vm", return_value=_ok()),
+        "start": mocker.patch("agents_cli.mp.start_vm", return_value=_ok()),
+        "wait_stopped": mocker.patch("agents_cli.vm._wait_for_vm_stopped"),
+        "wait_ssh": mocker.patch("agents_cli.backends.libvirt.wait_for_ssh"),
+    }
+
+
+def _saved_snapshot_config(tmp_path: Path, *, backend: str = "multipass") -> Path:
+    cfg = _make_config(tmp_path)
+    cfg.vm.backend = backend
+    config_path = _saved_config(tmp_path)
+    cfg_mod.save(cfg, config_path)
+    return config_path
+
+
+def test_take_snapshot_multipass_runs_on_live_vm(mocker, tmp_path: Path) -> None:
+    """Multipass snapshots a running VM directly — no stop/start cycle."""
+    config_path = _saved_snapshot_config(tmp_path)
+    mocks = _stub_snapshot_mp(mocker)
+
+    name = vm.take_snapshot("pre-upgrade", config_path=config_path)
+
+    assert name == "pre-upgrade"
+    mocks["snapshot"].assert_called_once_with("agents", "pre-upgrade", comment=None)
+    mocks["stop"].assert_not_called()
+    mocks["start"].assert_not_called()
+
+
+def test_take_snapshot_raises_on_nonzero_rc(mocker, tmp_path: Path) -> None:
+    config_path = _saved_snapshot_config(tmp_path)
+    _stub_snapshot_mp(mocker, snapshot_rc=1)
+    with pytest.raises(RuntimeFailure, match="snapshot failed"):
+        vm.take_snapshot("pre-upgrade", config_path=config_path)
+
+
+def test_take_snapshot_libvirt_stops_and_restarts_running_vm(mocker, tmp_path: Path) -> None:
+    """libvirt + virtiofs can't snapshot a running VM: stop → wait →
+    snapshot → start → wait-for-ssh. ``yes=True`` skips the prompt."""
+    config_path = _saved_snapshot_config(tmp_path, backend="libvirt")
+    mocks = _stub_snapshot_mp(mocker)
+
+    vm.take_snapshot("pre-upgrade", yes=True, config_path=config_path)
+
+    mocks["stop"].assert_called_once_with("agents")
+    mocks["wait_stopped"].assert_called_once()
+    mocks["snapshot"].assert_called_once()
+    mocks["start"].assert_called_once_with("agents")
+    mocks["wait_ssh"].assert_called_once()
+
+
+def test_take_snapshot_libvirt_restarts_vm_even_on_failure(mocker, tmp_path: Path) -> None:
+    """The finally-block restart must run even when snapshot rc != 0 —
+    a failed snapshot must not leave the VM (and every agent) down."""
+    config_path = _saved_snapshot_config(tmp_path, backend="libvirt")
+    mocks = _stub_snapshot_mp(mocker, snapshot_rc=1)
+
+    with pytest.raises(RuntimeFailure, match="snapshot failed"):
+        vm.take_snapshot("pre-upgrade", yes=True, config_path=config_path)
+
+    mocks["start"].assert_called_once()
+    mocks["wait_ssh"].assert_called_once()
+
+
+def test_take_snapshot_refused_on_bare_metal(mocker, tmp_path: Path) -> None:
+    config_path = _saved_snapshot_config(tmp_path, backend="bare_metal")
+    mocks = _stub_snapshot_mp(mocker)
+    with pytest.raises(UserError, match="bare_metal"):
+        vm.take_snapshot("pre-upgrade", config_path=config_path)
+    mocks["snapshot"].assert_not_called()
+
+
+def test_restore_snapshot_multipass_succeeds_on_rc0(mocker, tmp_path: Path) -> None:
+    config_path = _saved_snapshot_config(tmp_path)
+    mocks = _stub_snapshot_mp(mocker)
+
+    vm.restore_snapshot("pre-upgrade", config_path=config_path)
+
+    mocks["restore"].assert_called_once_with("agents.pre-upgrade", destructive=False)
+    mocks["stop"].assert_not_called()
+    mocks["start"].assert_not_called()
+
+
+def test_restore_snapshot_raises_on_nonzero_rc(mocker, tmp_path: Path) -> None:
+    """libvirt's restore uses check=False and can hand back rc=1; the CLI
+    must not report 'restored' on a failed revert."""
+    config_path = _saved_snapshot_config(tmp_path)
+    _stub_snapshot_mp(mocker, restore_rc=1)
+    with pytest.raises(RuntimeFailure, match="restore failed"):
+        vm.restore_snapshot("pre-upgrade", config_path=config_path)
+
+
+def test_restore_snapshot_surfaces_backend_stderr(mocker, tmp_path: Path) -> None:
+    config_path = _saved_snapshot_config(tmp_path)
+    _stub_snapshot_mp(mocker, restore_rc=1)
+    with pytest.raises(RuntimeFailure, match="revert boom"):
+        vm.restore_snapshot("pre-upgrade", config_path=config_path)
+
+
+def test_restore_snapshot_libvirt_stops_and_restarts_running_vm(mocker, tmp_path: Path) -> None:
+    config_path = _saved_snapshot_config(tmp_path, backend="libvirt")
+    mocks = _stub_snapshot_mp(mocker)
+
+    vm.restore_snapshot("pre-upgrade", yes=True, config_path=config_path)
+
+    mocks["stop"].assert_called_once_with("agents")
+    mocks["wait_stopped"].assert_called_once()
+    mocks["restore"].assert_called_once_with("agents.pre-upgrade", destructive=False)
+    mocks["start"].assert_called_once_with("agents")
+    mocks["wait_ssh"].assert_called_once()
+
+
+def test_restore_snapshot_libvirt_failure_still_restarts_vm(mocker, tmp_path: Path) -> None:
+    config_path = _saved_snapshot_config(tmp_path, backend="libvirt")
+    mocks = _stub_snapshot_mp(mocker, restore_rc=1)
+
+    with pytest.raises(RuntimeFailure, match="restore failed"):
+        vm.restore_snapshot("pre-upgrade", yes=True, config_path=config_path)
+
+    mocks["start"].assert_called_once()
+    mocks["wait_ssh"].assert_called_once()
+
+
+def test_restore_snapshot_refused_on_bare_metal(mocker, tmp_path: Path) -> None:
+    config_path = _saved_snapshot_config(tmp_path, backend="bare_metal")
+    mocks = _stub_snapshot_mp(mocker)
+    with pytest.raises(UserError, match="bare_metal"):
+        vm.restore_snapshot("pre-upgrade", config_path=config_path)
+    mocks["restore"].assert_not_called()
 
 
 def test_rebuild_resumes_from_journal(mocker, tmp_path: Path) -> None:

@@ -252,10 +252,10 @@ def set_config(key: str, value: str | int) -> MpResult:
 
 
 def delete_vm(vm: str, *, purge: bool = False) -> MpResult:
-    """Bring the compose project fully down. The host data-dir is NOT
-    deleted (matches the multipass invariant that ``vm destroy``
-    preserves user data); ``vm.destroy`` calls this then surfaces
-    next-steps for the user.
+    """No-op: there is no VM to delete. ``vm.destroy`` never reaches this
+    on bare-metal — it branches early and brings the compose project down
+    via ``compose_runner.down`` itself — so this stub exists only to
+    satisfy the ``VmBackend`` Protocol. The host data-dir is untouched.
     """
     return MpResult(stdout="", stderr="", returncode=0)
 

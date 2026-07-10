@@ -53,6 +53,45 @@ def test_bootstrap_handshake_parses_to_failed_status_when_simulated() -> None:
     assert len(status.fail_reasons()) == 7  # every required ok-field reports fail
 
 
+def test_bootstrap_step_3c_destructive_cleanup_guarded_by_docker_info() -> None:
+    """`agents vm init` re-runs the bootstrap on an existing VM. The
+    uninstall + image-cache rm -rf in step 3c must therefore only run when
+    `docker info` fails as ubuntu — otherwise every re-init would wipe all
+    containers and the whole image cache."""
+    s = templates.VM_BOOTSTRAP_SCRIPT
+    guard = s.index("if as_ubuntu 'docker info >/dev/null 2>&1'; then")
+    uninstall = s.index("dockerd-rootless-setuptool.sh uninstall -f")
+    rm_rf = s.index("rm -rf /home/ubuntu/.local/share/docker")
+    assert guard < uninstall, "uninstall must come after the docker-info guard"
+    assert guard < rm_rf, "image-cache rm -rf must come after the docker-info guard"
+    # The guarded block closes before the (idempotent, unconditional)
+    # systemctl enable/start that keep the daemon healthy on both paths.
+    fi = s.index("\nfi\n", rm_rf)
+    enable = s.index("systemctl --user enable docker.service")
+    assert fi < enable, "the fi must close the destructive block before enable/start"
+
+
+def test_bootstrap_saves_real_stdout_before_tee_redirect() -> None:
+    """fd 3 must capture the real stdout BEFORE the process-substitution
+    tee takes over fd 1, or the handshake has nowhere flush-safe to go."""
+    s = templates.VM_BOOTSTRAP_SCRIPT
+    fd3 = s.index("exec 3>&1")
+    tee = s.index('exec > >(tee -a "$LOG") 2>&1')
+    assert fd3 < tee
+
+
+def test_bootstrap_handshake_bypasses_async_tee() -> None:
+    """bash doesn't wait for process-substitution children at exit, so the
+    BOOTSTRAP_OK line must be written synchronously to fd 3 (the saved real
+    stdout) — while still landing in the log for failure diagnostics."""
+    s = templates.VM_BOOTSTRAP_SCRIPT
+    handshake_lines = [line for line in s.splitlines() if 'echo "BOOTSTRAP_OK' in line]
+    assert len(handshake_lines) == 1
+    handshake = handshake_lines[0]
+    assert handshake.rstrip().endswith(">&3")
+    assert 'tee -a "$LOG"' in handshake  # copy still lands in the log
+
+
 def test_render_codex_sandbox_dockerfile_uses_base() -> None:
     dockerfile = render_codex_sandbox_dockerfile(HERMES_DEFAULT_SANDBOX_IMAGE)
     assert dockerfile.startswith(f"FROM {HERMES_DEFAULT_SANDBOX_IMAGE}\n")

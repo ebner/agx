@@ -138,6 +138,18 @@ def test_start_stop_set_autostart_are_no_ops(bare_metal: Any) -> None:
     assert bare_metal.set_config("foo", "bar").returncode == 0
 
 
+def test_delete_vm_is_a_pure_no_op(bare_metal: Any, mocker: Any) -> None:
+    """No VM to delete and no side effects: ``vm.destroy`` branches early
+    on bare-metal (compose-down happens there, via compose_runner), so
+    this Protocol stub must not run anything — in particular no docker
+    or compose commands.
+    """
+    run_mock = mocker.patch("subprocess.run")
+    result = bare_metal.delete_vm("ignored", purge=True)
+    assert result.returncode == 0
+    run_mock.assert_not_called()
+
+
 def test_info_vm_synthesizes_multipass_shape(bare_metal: Any) -> None:
     """``vm.status`` parses this JSON and expects ``info.<name>.state``
     + ``mounts``. The synthesized shape must satisfy that consumer

@@ -12,6 +12,12 @@ set -uo pipefail
 
 LOG=/tmp/agents-bootstrap.log
 : > "$LOG"
+# Save the real stdout on fd 3 BEFORE the tee redirect. bash does not
+# wait for process-substitution children at exit, so a final line written
+# through the async tee can be lost before the host reads the stream —
+# the closing BOOTSTRAP_OK handshake is emitted to fd 3 (a synchronous
+# write to the real stdout) and tee'd into the log separately.
+exec 3>&1
 exec > >(tee -a "$LOG") 2>&1
 
 UIDMAP_OK=fail
@@ -115,11 +121,20 @@ if ! as_ubuntu 'command -v dockerd-rootless-setuptool.sh >/dev/null 2>&1'; then
         || echo "[bootstrap] get.docker.com/rootless install warned"
 fi
 
-echo "[bootstrap] step 3c: setuptool install (clean any stale state first)"
-as_ubuntu 'dockerd-rootless-setuptool.sh uninstall -f' 2>/dev/null || true
-as_ubuntu 'rm -rf /home/ubuntu/.local/share/docker' || true
-as_ubuntu 'dockerd-rootless-setuptool.sh install' \
-    || echo "[bootstrap] setuptool install warned"
+echo "[bootstrap] step 3c: setuptool install (clean stale state only if daemon is broken)"
+# The uninstall + rm -rf below wipe every container and the whole image
+# cache. They exist to clear stale state left by a previously FAILED
+# install — but `agents vm init` re-runs this script on an existing VM,
+# so the destructive path must be guarded: a working `docker info` means
+# there is nothing stale to clean and everything to lose.
+if as_ubuntu 'docker info >/dev/null 2>&1'; then
+    echo "[bootstrap] docker already functional — skipping uninstall/reinstall"
+else
+    as_ubuntu 'dockerd-rootless-setuptool.sh uninstall -f' 2>/dev/null || true
+    as_ubuntu 'rm -rf /home/ubuntu/.local/share/docker' || true
+    as_ubuntu 'dockerd-rootless-setuptool.sh install' \
+        || echo "[bootstrap] setuptool install warned"
+fi
 as_ubuntu 'systemctl --user enable docker.service' \
     || echo "[bootstrap] systemctl --user enable warned"
 as_ubuntu 'systemctl --user start docker.service' \
@@ -155,4 +170,7 @@ if curl -sf -o /dev/null --max-time 10 https://download.docker.com/linux/ubuntu/
 fi
 
 echo "[bootstrap] handshake"
-echo "BOOTSTRAP_OK uidmap=${UIDMAP_OK} dbus=${DBUS_OK} lingering=${LINGERING_OK} docker_host=${DOCKER_HOST_OK} daemon=${DAEMON_OK} user_socket_active=${USER_SOCKET_ACTIVE_OK} net=${NET_OK} ubuntu_uid=${UBUNTU_UID} ubuntu_gid=${UBUNTU_GID} socket_path=${SOCKET_PATH}"
+# Emit to fd 3 — the real stdout saved before the tee redirect — so the
+# handshake can't be dropped in the tee child's exit race; tee a copy
+# into the log so failure diagnostics still show it.
+echo "BOOTSTRAP_OK uidmap=${UIDMAP_OK} dbus=${DBUS_OK} lingering=${LINGERING_OK} docker_host=${DOCKER_HOST_OK} daemon=${DAEMON_OK} user_socket_active=${USER_SOCKET_ACTIVE_OK} net=${NET_OK} ubuntu_uid=${UBUNTU_UID} ubuntu_gid=${UBUNTU_GID} socket_path=${SOCKET_PATH}" | tee -a "$LOG" >&3
