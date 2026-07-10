@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import sys
 import textwrap
@@ -69,12 +68,15 @@ def logs(
     cfg = cfg_mod.load(config_path)
     svc, _ = _resolve_service(cfg, name)
     if follow:
-        # Replace the process so the user gets a clean Ctrl-C exit.
-        argv = [*_multipass_compose_argv(cfg), "logs", "-f"]
+        # Stream through the backend dispatcher so `-f` works under
+        # libvirt (SSH-based) and bare_metal too. Previously did
+        # os.execvp("multipass", ...) which bypassed the dispatcher and
+        # broke under any non-multipass backend (same fix as run_in_agent).
+        argv = [*compose_runner._base_argv(cfg), "logs", "-f"]
         if since:
             argv += ["--since", since]
         argv.append(svc)
-        os.execvp("multipass", argv)
+        sys.exit(mp.exec_in_vm_interactive(cfg.vm.name, *argv))
     result = compose_runner.logs(cfg, svc, follow=False, since=since)
     ui.emit({"name": name, "logs": result.stdout}, human=result.stdout.rstrip())
 
@@ -185,24 +187,6 @@ def doctor(
     return report
 
 
-def _multipass_compose_argv(cfg: AgentsConfig) -> list[str]:
-    root = str(cfg.paths.vm_agents_root)
-    return [
-        "multipass",
-        "exec",
-        cfg.vm.name,
-        "--",
-        "docker",
-        "compose",
-        "--project-directory",
-        root,
-        "-f",
-        f"{root}/docker-compose.yml",
-        "--env-file",
-        f"{root}/.env",
-    ]
-
-
 # Container UID/GID for the agent's runtime user.
 #
 # Hermes' entrypoint reads HERMES_UID/HERMES_GID from env and remaps its
@@ -222,27 +206,6 @@ RUNTIME_UID: int = 1000
 RUNTIME_GID: int = 1000
 
 
-def compose_exec_argv(
-    cfg: AgentsConfig,
-    svc: str,
-    *cmd: str,
-    no_tty: bool = False,
-    as_root: bool = False,
-) -> list[str]:
-    """Build the full argv (incl. ``multipass exec ...``) for a
-    ``docker compose exec`` inside the VM. Use this for ``os.execvp``
-    paths (interactive shells, wizards).
-    """
-    return [
-        *_multipass_compose_argv(cfg),
-        "exec",
-        *([] if as_root else ["--user", f"{RUNTIME_UID}:{RUNTIME_GID}"]),
-        *(["-T"] if no_tty else []),
-        svc,
-        *cmd,
-    ]
-
-
 def _compose_exec_in_vm_argv(
     cfg: AgentsConfig,
     svc: str,
@@ -251,26 +214,19 @@ def _compose_exec_in_vm_argv(
     as_root: bool = False,
     env: dict[str, str] | None = None,
 ) -> list[str]:
-    """The in-VM half of ``compose_exec_argv`` — drops the ``multipass
-    exec <vm> --`` prefix so it can be passed as ``*cmd`` to
-    ``mp.exec_in_vm``. Same user/tty semantics.
+    """Build the in-VM argv for a ``docker compose exec`` against
+    ``svc`` — pass it as ``*cmd`` to ``mp.exec_in_vm`` /
+    ``mp.exec_in_vm_interactive``. Defaults to the runtime user (see
+    :data:`RUNTIME_UID` above); ``as_root=True`` opts out.
 
     ``env`` maps environment variables to inject via ``-e KEY=VALUE``
     on the ``compose exec`` subcommand.
     """
-    root = str(cfg.paths.vm_agents_root)
     env_args: list[str] = []
     for key, value in (env or {}).items():
         env_args += ["-e", f"{key}={value}"]
     return [
-        "docker",
-        "compose",
-        "--project-directory",
-        root,
-        "-f",
-        f"{root}/docker-compose.yml",
-        "--env-file",
-        f"{root}/.env",
+        *compose_runner._base_argv(cfg),
         "exec",
         *([] if as_root else ["--user", f"{RUNTIME_UID}:{RUNTIME_GID}"]),
         *(["-T"] if no_tty else []),

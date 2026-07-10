@@ -103,6 +103,26 @@ def test_logs_without_follow_dumps_stdout(with_coder: Path, mocker) -> None:
     spy_emit.assert_called_once()
 
 
+def test_logs_follow_routes_through_backend_dispatcher(with_coder: Path, mocker) -> None:
+    """`agents logs -f` used to os.execvp("multipass", ...), which broke
+    under the libvirt and bare_metal backends. It must build the in-VM
+    compose argv and stream via mp.exec_in_vm_interactive (backend-
+    dispatched), exiting with the child's return code — same fix as
+    run_in_agent.
+    """
+    interactive = mocker.patch("agents_cli.mp.exec_in_vm_interactive", return_value=3)
+    with pytest.raises(SystemExit) as exc:
+        ops.logs("coder", follow=True, since="10m", config_path=with_coder)
+    assert exc.value.code == 3
+    args, _ = interactive.call_args
+    argv = list(args[1:])
+    assert argv[:2] == ["docker", "compose"]
+    assert "multipass" not in argv
+    assert "logs" in argv and "-f" in argv
+    assert "--since" in argv and "10m" in argv
+    assert argv[-1] == "hermes-coder"
+
+
 # ---------- doctor checks (table-driven) ----------
 
 
@@ -1020,14 +1040,14 @@ def test_doctor_model_set_skipped_when_no_active_provider(
 # ---------- runtime-user default for `docker compose exec` ----------
 
 
-def test_compose_exec_argv_defaults_to_runtime_user(cfg: AgentsConfig) -> None:
+def test_in_vm_compose_exec_argv_defaults_to_runtime_user(cfg: AgentsConfig) -> None:
     """`docker compose exec` defaults to the image USER (root for the Hermes
     image). Files created by a root exec are unreadable by the long-running
     gateway process (which is `gosu hermes` to uid 1000) — silently breaks
     things like `hermes pairing approve` because the approval file ends up
     root:root. Every toolkit exec must default to --user 1000:1000.
     """
-    argv = ops.compose_exec_argv(cfg, "hermes-coder", "hermes", "pairing", "approve")
+    argv = ops._compose_exec_in_vm_argv(cfg, "hermes-coder", "hermes", "pairing", "approve")
     assert "--user" in argv
     assert f"{ops.RUNTIME_UID}:{ops.RUNTIME_GID}" in argv
     # The --user pair must come BETWEEN "exec" and the service name, not
@@ -1039,12 +1059,29 @@ def test_compose_exec_argv_defaults_to_runtime_user(cfg: AgentsConfig) -> None:
     assert exec_idx < user_flag_idx < svc_idx
 
 
-def test_compose_exec_argv_as_root_omits_user(cfg: AgentsConfig) -> None:
+def test_in_vm_compose_exec_argv_as_root_omits_user(cfg: AgentsConfig) -> None:
     """The escape hatch for chown / apt install / other admin work."""
-    argv = ops.compose_exec_argv(
+    argv = ops._compose_exec_in_vm_argv(
         cfg, "hermes-coder", "chown", "hermes:hermes", "/opt/data/x", as_root=True
     )
     assert "--user" not in argv
+
+
+def test_in_vm_compose_exec_argv_includes_override_iff_present(cfg: AgentsConfig) -> None:
+    """Exec paths must see the same merged compose view as the runner
+    verbs — otherwise `docker compose exec` can't resolve a service whose
+    definition depends on the override layer."""
+    argv = ops._compose_exec_in_vm_argv(cfg, "hermes-coder", "true")
+    assert argv.count("-f") == 1
+
+    (cfg.paths.host_data_dir / "docker-compose.override.yml").write_text(
+        "services: {}\n", encoding="utf-8"
+    )
+    argv = ops._compose_exec_in_vm_argv(cfg, "hermes-coder", "true")
+    f_idx = [i for i, a in enumerate(argv) if a == "-f"]
+    assert len(f_idx) == 2
+    assert argv[f_idx[0] + 1].endswith("/docker-compose.yml")
+    assert argv[f_idx[1] + 1].endswith("/docker-compose.override.yml")
 
 
 def test_in_vm_compose_exec_argv_threads_env_vars(cfg: AgentsConfig) -> None:

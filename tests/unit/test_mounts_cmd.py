@@ -481,6 +481,78 @@ def test_add_rw_flag_drops_ro_suffix(
     assert not vol.endswith(":ro")
 
 
+# ---------- --restart: recreate, not `compose restart` ----------
+
+
+def test_add_restart_recreates_via_compose_up(
+    host_folder: Path, saved_config: Path, mounts_mocked, mocker
+) -> None:
+    """`docker compose restart` never reloads compose config — routing
+    --restart through it silently left the new mount unapplied. It must
+    go through `compose up -d <svc>`, which recreates on config drift
+    (same trap secrets_cmd documents for env_file changes)."""
+    up = mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    restart = mocker.patch("agents_cli.compose_runner.restart", return_value=_ok())
+    mounts_cmd.add(
+        agent="coder",
+        host=str(host_folder),
+        container="/workspace/x",
+        readonly=True,
+        target="runtime",
+        restart=True,
+        config_path=saved_config,
+    )
+    up.assert_called_once()
+    assert up.call_args.args[1] == "hermes-coder"
+    restart.assert_not_called()
+
+
+def test_remove_restart_recreates_via_compose_up(
+    host_folder: Path, saved_config: Path, mounts_mocked, mocker
+) -> None:
+    mounts_cmd.add(
+        agent="coder",
+        host=str(host_folder),
+        container="/workspace/x",
+        readonly=True,
+        target="runtime",
+        restart=False,
+        config_path=saved_config,
+    )
+    up = mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    restart = mocker.patch("agents_cli.compose_runner.restart", return_value=_ok())
+    mounts_cmd.remove(
+        agent="coder",
+        container="/workspace/x",
+        restart=True,
+        config_path=saved_config,
+    )
+    up.assert_called_once()
+    assert up.call_args.args[1] == "hermes-coder"
+    restart.assert_not_called()
+
+
+def test_add_without_restart_warns_with_recreate_hint(
+    host_folder: Path, saved_config: Path, mounts_mocked, mocker
+) -> None:
+    """The manual hint must not point at `agents restart` as the fix —
+    that command doesn't reload compose config either."""
+    warn = mocker.spy(mounts_cmd.ui, "warn")
+    mounts_cmd.add(
+        agent="coder",
+        host=str(host_folder),
+        container="/workspace/x",
+        readonly=True,
+        target="runtime",
+        restart=False,
+        config_path=saved_config,
+    )
+    hints = [c.args[0] for c in warn.call_args_list if "recreate" in c.args[0]]
+    assert hints, "expected a recreate-required warning"
+    assert "--restart" in hints[0]
+    assert "won't reload compose config" in hints[0]
+
+
 # ---------- list ----------
 
 

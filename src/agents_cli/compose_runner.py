@@ -8,12 +8,16 @@ so callers can inspect rc/stdout/stderr.
 
 from __future__ import annotations
 
-from agents_cli import mp
+from agents_cli import compose, mp
 from agents_cli.config import AgentsConfig
 from agents_cli.mp import MpResult
 
 
 def _base_argv(cfg: AgentsConfig) -> list[str]:
+    # docker compose only auto-merges docker-compose.override.yml when no
+    # -f is given at all; since we pin the main compose explicitly, the
+    # override (architecture rule #10 — `agents mount` + user hand edits)
+    # must be passed explicitly too, or it's silently ignored.
     root = str(cfg.paths.vm_agents_root)
     return [
         "docker",
@@ -22,6 +26,7 @@ def _base_argv(cfg: AgentsConfig) -> list[str]:
         root,
         "-f",
         f"{root}/docker-compose.yml",
+        *compose.override_file_args(cfg),
         "--env-file",
         f"{root}/.env",
     ]

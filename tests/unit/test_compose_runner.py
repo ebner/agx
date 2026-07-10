@@ -87,3 +87,40 @@ def test_docker_image_inspect_uses_ref(cfg: AgentsConfig, mocker) -> None:
         "nousresearch/hermes-agent:v1.0.0",
     ]
     assert kwargs.get("check") is False
+
+
+def test_base_argv_includes_override_iff_file_exists(cfg: AgentsConfig, mocker) -> None:
+    """docker compose only auto-merges docker-compose.override.yml when NO
+    explicit -f is given. Every wrapper pins the main compose with -f, so
+    the override (the `agents mount` delivery layer) must be passed as a
+    second -f — and only when the file actually exists.
+    """
+    runner = mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok())
+
+    # Absent: exact base argv, no override -f.
+    compose_runner.up(cfg, "hermes-coder")
+    args, _ = runner.call_args
+    assert list(args[1:]) == [*_base_argv(), "up", "-d", "hermes-coder"]
+
+    # Present (host-side authoritative copy): override -f follows the main -f.
+    cfg.paths.host_data_dir.mkdir(parents=True, exist_ok=True)
+    (cfg.paths.host_data_dir / "docker-compose.override.yml").write_text(
+        "services: {}\n", encoding="utf-8"
+    )
+    compose_runner.up(cfg, "hermes-coder")
+    args, _ = runner.call_args
+    assert list(args[1:]) == [
+        "docker",
+        "compose",
+        "--project-directory",
+        "/home/ubuntu/agents",
+        "-f",
+        "/home/ubuntu/agents/docker-compose.yml",
+        "-f",
+        "/home/ubuntu/agents/docker-compose.override.yml",
+        "--env-file",
+        "/home/ubuntu/agents/.env",
+        "up",
+        "-d",
+        "hermes-coder",
+    ]

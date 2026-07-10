@@ -31,11 +31,14 @@ from agents_cli.compose import (
     load_compose,
     next_free_port,
     openclaw_service_fragment,
+    override_file_args,
+    read_override_doc,
     remove_service,
     rename_service,
     used_ports,
     validate_image_ref,
     write_compose_atomically,
+    write_override_atomically,
 )
 from agents_cli.config import AgentsConfig, DefaultsConfig, HostConfig, PathsConfig, VmRuntimeConfig
 from agents_cli.errors import UserError
@@ -455,6 +458,88 @@ def test_write_compose_atomically_validation_failure_keeps_old_file(
     assert not any(cfg.paths.host_data_dir.glob(".compose.*.new"))
 
 
+def test_write_compose_atomically_validation_includes_override(cfg: AgentsConfig, mocker) -> None:
+    """A broken override must be caught at write time: the ``docker
+    compose config -q`` validation has to see the same merged view the
+    runtime verbs use — staged main compose first, then the override.
+    """
+    from tests.conftest import install_vm_fs_simulation
+
+    (cfg.paths.host_data_dir / "docker-compose.override.yml").write_text(
+        "services: {}\n", encoding="utf-8"
+    )
+    mocks = install_vm_fs_simulation(mocker, cfg)
+    doc = load_compose(cfg.paths.host_data_dir / "docker-compose.yml")
+    add_service(doc, "hermes-coder", {"image": "x:y"})
+    write_compose_atomically(cfg, doc)
+
+    config_calls = [
+        c.args for c in mocks["exec_in_vm"].call_args_list if "config" in c.args and "-q" in c.args
+    ]
+    assert config_calls, "expected a `compose config -q` validation call"
+    argv = list(config_calls[0])
+    f_idx = [i for i, a in enumerate(argv) if a == "-f"]
+    assert len(f_idx) == 2
+    assert argv[f_idx[0] + 1].startswith(f"{cfg.paths.vm_agents_root}/.compose.")
+    assert argv[f_idx[1] + 1] == f"{cfg.paths.vm_agents_root}/docker-compose.override.yml"
+
+
+# ---------- override file ----------
+
+
+def test_override_file_args_present_iff_file_exists(cfg: AgentsConfig) -> None:
+    assert override_file_args(cfg) == []
+    (cfg.paths.host_data_dir / "docker-compose.override.yml").write_text(
+        "services: {}\n", encoding="utf-8"
+    )
+    assert override_file_args(cfg) == [
+        "-f",
+        f"{cfg.paths.vm_agents_root}/docker-compose.override.yml",
+    ]
+
+
+def test_write_override_atomically_host_mode_needs_no_transfer(cfg: AgentsConfig, mocker) -> None:
+    """Host-mount mode: the host data dir IS the VM project dir (via the
+    mount), so the host-side write is the whole job — no transfer."""
+    transfer = mocker.patch("agents_cli.mp.transfer_to_vm")
+    doc = read_override_doc(cfg)
+    doc["services"]["hermes-a"] = {"volumes": ["/x:/y:ro"]}
+    write_override_atomically(cfg, doc)
+    transfer.assert_not_called()
+    content = (cfg.paths.host_data_dir / "docker-compose.override.yml").read_text(encoding="utf-8")
+    assert "hermes-a" in content
+    # No staging residue.
+    assert not list((cfg.paths.host_data_dir / ".staging").glob("override-*"))
+
+
+def test_write_override_atomically_mirrors_into_vm_in_data_dir_in_vm_mode(
+    cfg: AgentsConfig, mocker
+) -> None:
+    """--data-dir-in-vm: the VM project dir is a separate filesystem, so
+    the override must be transferred in (stage → atomic mv) or the
+    VM-side ``docker compose`` can't see it — every verb would fail on
+    the ``-f`` pointing at a missing file."""
+    from tests.conftest import install_vm_fs_simulation
+
+    cfg.paths.data_dir_in_vm = True
+    mocks = install_vm_fs_simulation(mocker, cfg)
+    doc = read_override_doc(cfg)
+    doc["services"]["hermes-a"] = {"volumes": ["/x:/y:ro"]}
+    write_override_atomically(cfg, doc)
+
+    # Host-side authoritative copy written (drives override_file_args).
+    assert (cfg.paths.host_data_dir / "docker-compose.override.yml").exists()
+    # Transferred to a VM-side stage, never straight to the final path...
+    transfer_dsts = [c.args[2] for c in mocks["transfer_to_vm"].call_args_list]
+    assert transfer_dsts, "expected a transfer into the VM"
+    assert all(dst.startswith(f"{cfg.paths.vm_agents_root}/.compose.") for dst in transfer_dsts)
+    # ...then atomically mv'd into place.
+    mv_calls = [c.args for c in mocks["exec_in_vm"].call_args_list if c.args[1] == "mv"]
+    assert mv_calls, "expected a VM-side mv"
+    assert mv_calls[-1][2] == transfer_dsts[-1]
+    assert mv_calls[-1][3] == f"{cfg.paths.vm_agents_root}/docker-compose.override.yml"
+
+
 def test_write_supports_data_dir_in_vm_mode(cfg: AgentsConfig, mocker) -> None:
     """Under --data-dir-in-vm the mutation pattern is identical; only
     the read side differs. The simulator treats both modes the same."""
@@ -519,14 +604,68 @@ def test_used_ports_parses_compose_config_json(cfg: AgentsConfig, mocker) -> Non
     assert used_ports(cfg) == {8642, 18789}
 
 
-def test_used_ports_handles_compose_failure(cfg: AgentsConfig, mocker) -> None:
+def test_used_ports_passes_override_flag_iff_present(cfg: AgentsConfig, mocker) -> None:
+    """The rendered-config invocation must merge the override — a port
+    published only via docker-compose.override.yml would otherwise be
+    invisible to the allocator."""
+    runner = mocker.patch(
+        "agents_cli.mp.exec_in_vm", return_value=_ok(json.dumps({"services": {}}))
+    )
+    used_ports(cfg)
+    argv = list(runner.call_args.args[1:])
+    assert argv.count("-f") == 1
+
+    (cfg.paths.host_data_dir / "docker-compose.override.yml").write_text(
+        "services: {}\n", encoding="utf-8"
+    )
+    used_ports(cfg)
+    argv = list(runner.call_args.args[1:])
+    f_idx = [i for i, a in enumerate(argv) if a == "-f"]
+    assert len(f_idx) == 2
+    assert argv[f_idx[0] + 1].endswith("/docker-compose.yml")
+    assert argv[f_idx[1] + 1].endswith("/docker-compose.override.yml")
+
+
+def test_used_ports_falls_back_to_doc_parse_on_compose_failure(cfg: AgentsConfig, mocker) -> None:
+    """`docker compose config` failing (VM down, broken .env) must NOT
+    read as "no ports in use" — that fail-open would let the allocator
+    hand a new agent an already-published port. Fall back to parsing the
+    compose docs (main + override) directly, with a warning."""
+    (cfg.paths.host_data_dir / "docker-compose.yml").write_text(
+        "services:\n  hermes-a:\n    ports:\n      - 127.0.0.1:8642:8642\n",
+        encoding="utf-8",
+    )
+    (cfg.paths.host_data_dir / "docker-compose.override.yml").write_text(
+        "services:\n  extra:\n    ports:\n      - 127.0.0.1:9100:9100\n",
+        encoding="utf-8",
+    )
     mocker.patch("agents_cli.mp.exec_in_vm", return_value=_fail())
-    assert used_ports(cfg) == set()
+    warn = mocker.patch("agents_cli.ui.warn")
+    assert used_ports(cfg) == {8642, 9100}
+    warn.assert_called_once()
 
 
-def test_used_ports_handles_bad_json(cfg: AgentsConfig, mocker) -> None:
+def test_used_ports_falls_back_to_doc_parse_on_bad_json(cfg: AgentsConfig, mocker) -> None:
+    """Same fallback for unparseable stdout; also covers the long dict
+    form of a ports entry in the raw doc."""
+    (cfg.paths.host_data_dir / "docker-compose.yml").write_text(
+        "services:\n  hermes-a:\n    ports:\n      - target: 8642\n        published: 8643\n",
+        encoding="utf-8",
+    )
     mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok("not json"))
+    warn = mocker.patch("agents_cli.ui.warn")
+    assert used_ports(cfg) == {8643}
+    warn.assert_called_once()
+
+
+def test_used_ports_empty_project_still_returns_empty_on_failure(cfg: AgentsConfig, mocker) -> None:
+    """A project with genuinely no ports (no compose file yet) may return
+    the empty set even when the runner fails — but the degraded path is
+    still surfaced via a warning."""
+    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_fail())
+    warn = mocker.patch("agents_cli.ui.warn")
     assert used_ports(cfg) == set()
+    warn.assert_called_once()
 
 
 def test_next_free_port_returns_base_when_unused(cfg: AgentsConfig) -> None:

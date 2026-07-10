@@ -296,12 +296,19 @@ def add(
             raise
 
     if restart:
-        from agents_cli import ops
+        from agents_cli import compose_runner
 
-        ui.info(f"restarting {agent!r} to pick up the new mount...")
-        ops.restart(agent, config_path=config_path)
+        # `docker compose restart` does NOT reload compose config — only
+        # `up -d` recreates the container when its config drifted (same
+        # trap secrets_cmd documents for env_file changes).
+        ui.info(f"recreating {agent!r} to pick up the new mount...")
+        compose_runner.up(cfg, svc)
     else:
-        ui.warn(f"agent restart required to apply: `agents restart {agent}`")
+        ui.warn(
+            f"container recreate required to apply (`agents restart {agent}` "
+            f"won't reload compose config) — re-run with --restart, or run "
+            f"`agents upgrade {agent} --recreate`"
+        )
 
     ui.emit(
         {
@@ -374,11 +381,17 @@ def remove(
         save_manifest(cfg, agent, entries)
 
     if restart:
-        from agents_cli import ops
+        from agents_cli import compose_runner
 
-        ops.restart(agent, config_path=config_path)
+        # `up -d`, not `restart` — see the twin comment in add().
+        ui.info(f"recreating {agent!r} to drop the removed mount...")
+        compose_runner.up(cfg, svc)
     else:
-        ui.warn(f"agent restart required to finish removal: `agents restart {agent}`")
+        ui.warn(
+            f"container recreate required to finish removal (`agents restart "
+            f"{agent}` won't reload compose config) — re-run with --restart, "
+            f"or run `agents upgrade {agent} --recreate`"
+        )
 
     ui.emit(
         {"agent": agent, "container_path": container, "removed": True, "restarted": restart},

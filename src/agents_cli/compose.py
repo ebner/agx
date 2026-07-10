@@ -165,14 +165,38 @@ def read_override_doc(cfg: AgentsConfig) -> Any:
     return load_compose(override_path(cfg))
 
 
+def override_file_args(cfg: AgentsConfig) -> list[str]:
+    """Extra ``-f`` pair for the override file — present iff it exists.
+
+    ``docker compose`` only auto-merges ``docker-compose.override.yml``
+    when NO explicit ``-f`` is given. Every toolkit invocation pins the
+    main compose with ``-f``, so the override layer (the delivery
+    mechanism for ``agents mount`` and user hand edits — architecture
+    rule #10) must be passed explicitly or it is silently ignored.
+
+    Existence is checked against the host-side authoritative copy;
+    the path handed to ``docker compose`` is the VM-side one (identical
+    on bare-metal, where ``vm_agents_root == host_data_dir``).
+    """
+    if override_path(cfg).exists():
+        return ["-f", f"{cfg.paths.vm_agents_root}/{OVERRIDE_FILENAME}"]
+    return []
+
+
 def write_override_atomically(cfg: AgentsConfig, doc: Any) -> None:
     """Write the override file via host-temp → rename (same-filesystem).
 
-    Unlike the main compose, the override file lives only on the host
-    side — `docker compose` reads it from the project directory it
-    auto-detects, which is the same dir whether the project lives on
-    a host mount (multipass/libvirt) or directly on the host (bare-
-    metal). No ``multipass transfer`` step needed.
+    The host-side copy is authoritative — :func:`override_file_args`
+    checks it to decide whether the extra ``-f`` gets passed. In
+    host-mount mode (and on bare-metal) the host write is all that's
+    needed: the file lands in the very project dir the VM's ``docker
+    compose`` reads. In ``--data-dir-in-vm`` mode the VM-side project
+    dir is a separate filesystem, so the file is additionally mirrored
+    into the VM via the same staging → transfer → atomic ``mv`` pattern
+    the main compose uses. The VM mirror happens BEFORE the host
+    ``os.replace``: if the transfer fails, the host copy — and thus the
+    extra ``-f`` — stays at its previous state instead of pointing at a
+    file the VM doesn't have.
 
     Atomic via ``os.replace`` on the same filesystem (host data-dir).
     """
@@ -181,6 +205,17 @@ def write_override_atomically(cfg: AgentsConfig, doc: Any) -> None:
     tmp = host_staging_dir(cfg) / f"override-{os.getpid()}-{uuid.uuid4().hex[:8]}.yml"
     try:
         tmp.write_text(content, encoding="utf-8")
+        if cfg.paths.data_dir_in_vm:
+            vm_stage = (
+                f"{cfg.paths.vm_agents_root}/.compose.{os.getpid()}.{uuid.uuid4().hex[:8]}.new"
+            )
+            vm_target = f"{cfg.paths.vm_agents_root}/{OVERRIDE_FILENAME}"
+            try:
+                mp.transfer_to_vm(tmp, cfg.vm.name, vm_stage)
+                mp.exec_in_vm(cfg.vm.name, "mv", vm_stage, vm_target)
+            except Exception:
+                mp.exec_in_vm(cfg.vm.name, "rm", "-f", vm_stage, check=False)
+                raise
         os.replace(tmp, target)
         ui.info(f"compose: wrote {target}")
     finally:
@@ -351,6 +386,10 @@ def write_compose_atomically(cfg: AgentsConfig, doc: Any) -> None:
 
 
 def _validate_via_vm(cfg: AgentsConfig, vm_path: str) -> None:
+    # The override is merged into every runtime compose invocation, so
+    # validate the same combined view — a broken override (or a staged
+    # main compose that conflicts with it) is caught at write time
+    # instead of on the next `compose up`.
     env_file = f"{cfg.paths.vm_agents_root}/.env"
     project_dir = str(cfg.paths.vm_agents_root)
     result = mp.exec_in_vm(
@@ -361,6 +400,7 @@ def _validate_via_vm(cfg: AgentsConfig, vm_path: str) -> None:
         project_dir,
         "-f",
         vm_path,
+        *override_file_args(cfg),
         "--env-file",
         env_file,
         "config",
@@ -853,7 +893,7 @@ def list_services(doc: Any) -> list[str]:
 
 
 def used_ports(cfg: AgentsConfig) -> set[int]:
-    """Read the live compose (which includes any docker-compose.override.yml)
+    """Read the live compose (main file + any docker-compose.override.yml)
     and return all published host ports."""
     result = mp.exec_in_vm(
         cfg.vm.name,
@@ -863,6 +903,7 @@ def used_ports(cfg: AgentsConfig) -> set[int]:
         str(cfg.paths.vm_agents_root),
         "-f",
         f"{cfg.paths.vm_agents_root}/docker-compose.yml",
+        *override_file_args(cfg),
         "--env-file",
         f"{cfg.paths.vm_agents_root}/.env",
         "config",
@@ -870,12 +911,23 @@ def used_ports(cfg: AgentsConfig) -> set[int]:
         "json",
         check=False,
     )
-    if result.returncode != 0:
-        return set()
-    try:
-        data = json.loads(result.stdout)
-    except json.JSONDecodeError:
-        return set()
+    data: Any = None
+    if result.returncode == 0:
+        try:
+            data = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            data = None
+    if data is None:
+        # Don't fail open: "couldn't determine" must not read as "no
+        # ports in use" — the port allocator would hand a fresh agent an
+        # already-published port. Fall back to parsing the compose docs
+        # directly (less precise — no ${VAR} interpolation — but the
+        # toolkit always writes literal host ports).
+        ui.warn(
+            "could not read published ports via `docker compose config` "
+            f"(rc={result.returncode}); falling back to parsing the compose files directly"
+        )
+        return _used_ports_from_docs(cfg)
     ports: set[int] = set()
     for service in (data.get("services") or {}).values():
         for entry in service.get("ports", []) or []:
@@ -884,6 +936,30 @@ def used_ports(cfg: AgentsConfig) -> set[int]:
                 continue
             with contextlib.suppress(TypeError, ValueError):
                 ports.add(int(published))
+    return ports
+
+
+def _used_ports_from_docs(cfg: AgentsConfig) -> set[int]:
+    """Fallback for :func:`used_ports`: parse the main compose + override
+    docs directly. Handles both the short string form the toolkit writes
+    (``127.0.0.1:8642:8642`` — host port is the second-to-last field)
+    and the long dict form (``{target: ..., published: ...}``).
+    """
+    ports: set[int] = set()
+    for doc in (read_compose_doc(cfg), read_override_doc(cfg)):
+        for service in (doc.get("services") or {}).values():
+            for entry in service.get("ports", []) or []:
+                published: Any = None
+                if isinstance(entry, str):
+                    parts = entry.split(":")
+                    if len(parts) >= 2:
+                        published = parts[-2]
+                elif isinstance(entry, dict):
+                    published = entry.get("published")
+                if published is None:
+                    continue
+                with contextlib.suppress(TypeError, ValueError):
+                    ports.add(int(published))
     return ports
 
 
