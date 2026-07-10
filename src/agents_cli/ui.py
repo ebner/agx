@@ -74,6 +74,24 @@ def info(message: str) -> None:
     click.echo(message, err=True)
 
 
+def progress(message: str) -> None:
+    """Always-on progress line for long-running operations.
+
+    Goes to stderr so stdout stays reserved for the final result —
+    under ``--json`` stdout still carries exactly one JSON object per
+    command, while progress arrives as ``{"progress": ...}`` events on
+    stderr that a machine consumer can parse or discard (same channel
+    split as :func:`warn`). Unlike :func:`info`, NOT gated on
+    ``--verbose``: these lines exist for the default UX of minutes-long
+    ops (upgrade's VM snapshot, image pulls), where a silent terminal
+    reads as a hang.
+    """
+    if is_json():
+        click.echo(json.dumps({"progress": message}, sort_keys=True), err=True)
+    else:
+        click.echo(message, err=True)
+
+
 def confirm(prompt: str, *, default: bool = False) -> bool:
     """Prompt for yes/no. Bypassed by --yes. In --json mode without --yes, refuses."""
     if is_yes():

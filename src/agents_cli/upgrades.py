@@ -22,6 +22,7 @@ from __future__ import annotations
 import datetime
 import json
 import tarfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -119,6 +120,7 @@ def upgrade(
         # to "whatever we had before" silently would defeat the intent.
         from agents_cli import outdated_cmd
 
+        ui.progress(f"resolving latest upstream {agent_type} tag from GitHub Releases...")
         latest = outdated_cmd.fetch_latest_tag(agent_type, include_prerelease=False)
         if not latest:
             raise UserError(
@@ -173,26 +175,68 @@ def upgrade(
             vm_snapshot=None,
         )
 
+    # Progress numbering runs over the phases this invocation can
+    # actually execute — snapshots drop out under --no-snapshot, and the
+    # config-migrate phase is a silent no-op for OpenClaw — so "[2/5]"
+    # never refers to work the user won't see happen. The journal keeps
+    # the full canonical phase list regardless; only the narration
+    # adapts.
+    unplanned: set[str] = set()
+    if no_snapshot:
+        unplanned |= {"host_data_snapshot", "vm_snapshot"}
+    if agent_type != "hermes":
+        unplanned.add(CONFIG_MIGRATE_PHASE)
+    planned = [p for p in UPGRADE_PHASES if p not in unplanned]
+
+    def _step(phase: str, message: str) -> None:
+        ui.progress(f"[{planned.index(phase) + 1}/{len(planned)}] {message}")
+
+    ui.progress(f"upgrading {name!r}: {old_tag} -> {new_tag} ({len(planned)} phases)")
+
     with compose.acquire_lock(cfg.paths.host_data_dir):
-        journal = Journal.find_resumable(cfg.paths.host_data_dir, "upgrade", name) or Journal.begin(
-            cfg.paths.host_data_dir, "upgrade", name, UPGRADE_PHASES
-        )
+        journal = Journal.find_resumable(cfg.paths.host_data_dir, "upgrade", name)
+        if journal is None:
+            journal = Journal.begin(cfg.paths.host_data_dir, "upgrade", name, UPGRADE_PHASES)
+        elif journal.completed_phases:
+            ui.progress(
+                "resuming interrupted upgrade "
+                f"(already done: {', '.join(journal.completed_phases)})"
+            )
 
         host_snap: Path | None = None
         vm_snap: str | None = None
         try:
             if not no_snapshot and not journal.is_phase_done("host_data_snapshot"):
+                _step(
+                    "host_data_snapshot",
+                    "host data snapshot: tarring compose + .env + agent dir...",
+                )
+                t0 = time.monotonic()
                 host_snap = _host_data_snapshot(cfg, name)
+                _step(
+                    "host_data_snapshot",
+                    f"host data snapshot: {host_snap.name} "
+                    f"({_fmt_size(host_snap.stat().st_size)}, {_fmt_elapsed(t0)})",
+                )
                 journal.advance("host_data_snapshot")
             if not no_snapshot and not journal.is_phase_done("vm_snapshot"):
+                _step(
+                    "vm_snapshot",
+                    "VM snapshot (may stop + restart the VM — all agents pause briefly)...",
+                )
+                t0 = time.monotonic()
                 vm_snap = _vm_snapshot(cfg, name)
+                _step("vm_snapshot", f"VM snapshot: {vm_snap} ({_fmt_elapsed(t0)})")
                 journal.advance("vm_snapshot")
 
             if not journal.is_phase_done("tag_pinned"):
+                _step("tag_pinned", f"pinning {base}:{new_tag} in compose")
                 _set_image_tag(cfg, svc, base, new_tag)
                 journal.advance("tag_pinned")
 
             if not journal.is_phase_done("pulled"):
+                _step("pulled", f"pulling {base}:{new_tag} (large images take minutes)...")
+                t0 = time.monotonic()
                 compose_runner.pull(cfg, svc)
                 inspect = compose_runner.docker_image_inspect(cfg, f"{base}:{new_tag}")
                 if inspect.returncode != 0:
@@ -200,9 +244,12 @@ def upgrade(
                         f"docker image inspect failed for {base}:{new_tag} "
                         f"(rc={inspect.returncode}): {inspect.stderr.strip()}"
                     )
+                _step("pulled", f"pulled {base}:{new_tag} ({_fmt_elapsed(t0)})")
                 journal.advance("pulled")
 
             if not journal.is_phase_done("recreated"):
+                _step("recreated", "recreating the container on the new image...")
+                t0 = time.monotonic()
                 if agent_type == "hermes":
                     # Materialize the cont-init.d perms hook so a reseated
                     # agent's bind mount has its source. AND re-apply the
@@ -222,13 +269,20 @@ def upgrade(
                     except RuntimeFailure:
                         huid = 1000  # best-effort; entrypoint usually maps to 1000
                     fixperms_cmd.chown_hermes_install_paths(cfg, svc, huid)
+                _step("recreated", f"container recreated ({_fmt_elapsed(t0)})")
                 journal.advance("recreated")
 
             if not journal.is_phase_done(CONFIG_MIGRATE_PHASE):
+                if agent_type == "hermes":
+                    _step(
+                        CONFIG_MIGRATE_PHASE,
+                        "running `hermes config migrate` in the container...",
+                    )
                 _run_config_migrate(cfg, svc, agent_type)
                 journal.advance(CONFIG_MIGRATE_PHASE)
 
             if not journal.is_phase_done("doctor_passed"):
+                _step("doctor_passed", "running doctor health checks on the upgraded agent...")
                 ops.doctor(target=name, config_path=config_path)
                 journal.advance("doctor_passed")
 
@@ -301,8 +355,12 @@ def upgrade_all(
         names.remove(canary)
         names.insert(0, canary)
 
+    if len(names) > 1:
+        ui.progress(f"upgrading {len(names)} agents: {', '.join(names)}")
     outcomes: list[UpgradeOutcome] = []
-    for n in names:
+    for i, n in enumerate(names, 1):
+        if len(names) > 1:
+            ui.progress(f"--- {n} ({i}/{len(names)}) ---")
         outcomes.append(upgrade(n, config_path=config_path))
     return outcomes
 
@@ -379,13 +437,18 @@ def rollback(
         raise UserError("aborted by user")
 
     if archive is not None:
+        ui.progress(f"restoring host data from {archive.name}...")
         _restore_host_snapshot(cfg, archive)
 
     vm_snap_name = snapshot_id if vm_only else _latest_vm_snapshot(cfg.vm.name, name)
     if vm_snap_name:
+        ui.progress(
+            f"restoring VM snapshot {vm_snap_name} (stop -> restore -> start; all agents pause)..."
+        )
         mp.stop_vm(cfg.vm.name)
         mp.restore(f"{cfg.vm.name}.{vm_snap_name}", destructive=True)
         mp.start_vm(cfg.vm.name)
+        ui.progress("VM restored and restarted")
 
     ui.emit(
         {
@@ -408,6 +471,18 @@ def rollback(
 
 def _utc_stamp() -> str:
     return datetime.datetime.now(datetime.UTC).strftime("%Y%m%dT%H%M%SZ")
+
+
+def _fmt_elapsed(start: float) -> str:
+    """Elapsed since ``start`` (a ``time.monotonic()`` value), humanized."""
+    seconds = time.monotonic() - start
+    return f"{seconds:.0f}s" if seconds < 120 else f"{seconds / 60:.1f}m"
+
+
+def _fmt_size(n: int) -> str:
+    if n >= 1024**3:
+        return f"{n / 1024**3:.1f} GiB"
+    return f"{n / 1024**2:.0f} MiB"
 
 
 def _host_data_snapshot(cfg: AgentsConfig, name: str) -> Path:

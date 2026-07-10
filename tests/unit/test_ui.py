@@ -52,6 +52,40 @@ def test_emit_string_payload_under_json_wraps_as_message() -> None:
     assert payload == {"message": "hi"}
 
 
+def test_progress_human_goes_to_stderr_not_stdout() -> None:
+    """Progress lines must stay off stdout so piping a command's result
+    (or capturing its single --json object) never picks up narration."""
+
+    def body(ctx: click.Context) -> None:
+        ui.progress("[1/7] pulling image...")
+
+    result = _invoke({"json": False, "yes": False, "verbose": False}, body)
+    assert "[1/7] pulling image..." in result.stderr
+    assert result.stdout == ""
+
+
+def test_progress_json_emits_structured_event_on_stderr() -> None:
+    def body(ctx: click.Context) -> None:
+        ui.progress("step one")
+
+    result = _invoke({"json": True, "yes": False, "verbose": False}, body)
+    assert json.loads(result.stderr.strip()) == {"progress": "step one"}
+    assert result.stdout == ""
+
+
+def test_progress_is_not_gated_on_verbose() -> None:
+    """Unlike ui.info — progress exists precisely for default-mode UX
+    during minutes-long operations."""
+
+    def body(ctx: click.Context) -> None:
+        ui.info("hidden")
+        ui.progress("shown")
+
+    result = _invoke({"json": False, "yes": False, "verbose": False}, body)
+    assert "shown" in result.stderr
+    assert "hidden" not in result.stderr
+
+
 def test_confirm_with_yes_flag_returns_true_without_prompting() -> None:
     captured = []
 

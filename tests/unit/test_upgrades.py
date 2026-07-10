@@ -258,6 +258,73 @@ def test_upgrade_resume_from_post_snapshot_phase(
     mocks["stop"].assert_not_called()
 
 
+# ---------- progress narration ----------
+
+
+def _progress_lines(spy) -> list[str]:
+    return [c.args[0] for c in spy.call_args_list]
+
+
+def test_upgrade_narrates_every_phase_with_stable_numbering(
+    with_coder: Path, mocker, cfg: AgentsConfig
+) -> None:
+    """The VM snapshot and image pull run for minutes; a silent terminal
+    reads as a hang. A full Hermes upgrade with snapshots plans all 7
+    phases and numbers each progress line [i/7].
+    """
+    _stub_happy_upgrade(mocker, cfg)
+    spy = mocker.spy(upgrades.ui, "progress")
+
+    upgrades.upgrade("coder", tag="v1.0.1", config_path=with_coder)
+
+    lines = _progress_lines(spy)
+    assert any("upgrading 'coder': v1.0.0 -> v1.0.1 (7 phases)" in ln for ln in lines)
+    for i in range(1, 8):
+        assert any(ln.startswith(f"[{i}/7]") for ln in lines), f"no [{i}/7] line in {lines}"
+    # The slow phases carry a duration hint / artifact.
+    assert any("large images take minutes" in ln for ln in lines)
+    assert any("all agents pause" in ln for ln in lines)
+
+
+def test_upgrade_no_snapshot_renumbers_progress_over_planned_phases(
+    with_coder: Path, mocker, cfg: AgentsConfig
+) -> None:
+    """--no-snapshot drops two phases from the plan; numbering must
+    follow ([i/5]) so the narration never promises skipped work."""
+    _stub_happy_upgrade(mocker, cfg)
+    spy = mocker.spy(upgrades.ui, "progress")
+
+    upgrades.upgrade("coder", tag="v1.0.1", no_snapshot=True, config_path=with_coder)
+
+    lines = _progress_lines(spy)
+    assert any("(5 phases)" in ln for ln in lines)
+    assert any(ln.startswith("[5/5]") for ln in lines)
+    assert not any("/7]" in ln for ln in lines)
+    assert not any("snapshot" in ln for ln in lines)
+
+
+def test_upgrade_resume_announces_already_done_phases(
+    with_coder: Path, mocker, cfg: AgentsConfig
+) -> None:
+    _stub_happy_upgrade(mocker, cfg)
+    j = Journal.begin(cfg.paths.host_data_dir, "upgrade", "coder", upgrades.UPGRADE_PHASES)
+    j.advance("host_data_snapshot")
+    j.advance("vm_snapshot")
+    spy = mocker.spy(upgrades.ui, "progress")
+
+    upgrades.upgrade("coder", tag="v1.0.1", config_path=with_coder)
+
+    lines = _progress_lines(spy)
+    assert any(
+        "resuming interrupted upgrade" in ln and "host_data_snapshot" in ln and "vm_snapshot" in ln
+        for ln in lines
+    )
+    # The done phases are skipped, so their [1/7]/[2/7] start lines
+    # must not reappear — first executed phase is tag_pinned at [3/7].
+    assert not any(ln.startswith("[1/7]") or ln.startswith("[2/7]") for ln in lines)
+    assert any(ln.startswith("[3/7]") for ln in lines)
+
+
 # ---------- rollback ----------
 
 
