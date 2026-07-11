@@ -401,7 +401,7 @@ def test_rename_updates_compose_and_dir(
     cfg: AgentsConfig, saved_config: Path, stub_runners
 ) -> None:
     create(name="coder", agent_type="hermes", config_path=saved_config)
-    rename("coder", "writer", config_path=saved_config)
+    rename("coder", "writer", yes=True, config_path=saved_config)
 
     doc = compose.load_compose(cfg.paths.host_data_dir / "docker-compose.yml")
     assert "hermes-writer" in doc["services"]
@@ -410,11 +410,68 @@ def test_rename_updates_compose_and_dir(
     vols = doc["services"]["hermes-writer"]["volumes"]
     assert any("./writer/.data:/opt/data" in v for v in vols)
     assert not any("./coder/" in v for v in vols)
+    # env_file rewritten too — a stale `./coder/.env` would break EVERY
+    # compose op for EVERY agent once the old dir is gone.
+    assert doc["services"]["hermes-writer"]["env_file"] == ["./writer/.env"]
     # Container name rewritten
     assert doc["services"]["hermes-writer"]["container_name"] == "hermes-writer"
     # Dir renamed
     assert (cfg.paths.host_data_dir / "writer").is_dir()
     assert not (cfg.paths.host_data_dir / "coder").exists()
+
+
+def test_rename_rewrites_openclaw_env_file_and_volumes(
+    cfg: AgentsConfig, saved_config: Path, stub_runners
+) -> None:
+    """Both fragments carry `env_file: [./<name>/.env]` — the OpenClaw
+    block must round-trip through rename just like the Hermes one."""
+    create(name="personal", agent_type="openclaw", config_path=saved_config)
+    rename("personal", "friend", yes=True, config_path=saved_config)
+
+    doc = compose.load_compose(cfg.paths.host_data_dir / "docker-compose.yml")
+    svc = doc["services"]["openclaw-friend"]
+    assert svc["env_file"] == ["./friend/.env"]
+    assert any("./friend/.openclaw" in v for v in svc["volumes"])
+    assert any("./friend/workspace" in v for v in svc["volumes"])
+    flat = str(dict(svc))
+    assert "./personal/" not in flat
+
+
+def test_rename_rewrites_string_form_env_file(
+    cfg: AgentsConfig, saved_config: Path, stub_runners
+) -> None:
+    """Compose accepts `env_file: ./<name>/.env` (bare string) as well as
+    the list form — hand-edited blocks use it. Rename must rewrite both."""
+    create(name="coder", agent_type="hermes", config_path=saved_config)
+    compose_path = cfg.paths.host_data_dir / "docker-compose.yml"
+    doc = compose.load_compose(compose_path)
+    doc["services"]["hermes-coder"]["env_file"] = "./coder/.env"
+    compose_path.write_text(compose.dump_compose(doc), encoding="utf-8")
+
+    rename("coder", "writer", yes=True, config_path=saved_config)
+
+    doc = compose.load_compose(compose_path)
+    assert doc["services"]["hermes-writer"]["env_file"] == "./writer/.env"
+
+
+def test_rename_renames_dir_before_compose_write(
+    cfg: AgentsConfig, saved_config: Path, stub_runners, mocker
+) -> None:
+    """The rewritten block points env_file at ./<new>/.env, and the
+    compose write validates via `docker compose config -q` — which
+    errors on a missing env file. The dir rename must land first or
+    the rewritten block can never validate in production."""
+    create(name="coder", agent_type="hermes", config_path=saved_config)
+    real_write = compose.write_compose_atomically
+    new_env_present_at_write: list[bool] = []
+
+    def wrapper(cfg_arg, doc):
+        new_env_present_at_write.append((cfg.paths.host_data_dir / "writer" / ".env").exists())
+        return real_write(cfg_arg, doc)
+
+    mocker.patch("agents_cli.compose.write_compose_atomically", side_effect=wrapper)
+    rename("coder", "writer", yes=True, config_path=saved_config)
+    assert new_env_present_at_write and all(new_env_present_at_write)
 
 
 def test_rename_refuses_when_target_exists(
@@ -429,3 +486,99 @@ def test_rename_refuses_when_target_exists(
 def test_rename_refuses_unknown_source(saved_config: Path, stub_runners) -> None:
     with pytest.raises(UserError, match="not in compose"):
         rename("ghost", "x", config_path=saved_config)
+
+
+def test_rename_refuses_openviking_sidecar_in_compose(
+    cfg: AgentsConfig, saved_config: Path, stub_runners
+) -> None:
+    """A sibling `openviking-<name>` service can't be migrated by rename
+    (container_name, volume path, DNS endpoint in config.yaml all carry
+    the old name) — refuse rather than half-rename."""
+    create(name="coder", agent_type="hermes", config_path=saved_config)
+    compose_path = cfg.paths.host_data_dir / "docker-compose.yml"
+    doc = compose.load_compose(compose_path)
+    compose.add_service(doc, "openviking-coder", {"image": "volcengine/openviking:v0.1"})
+    doc["services"]["hermes-coder"]["depends_on"] = ["openviking-coder"]
+    compose_path.write_text(compose.dump_compose(doc), encoding="utf-8")
+
+    with pytest.raises(UserError, match=r"[Dd]isable memory"):
+        rename("coder", "writer", yes=True, config_path=saved_config)
+    # Nothing was touched.
+    doc = compose.load_compose(compose_path)
+    assert "hermes-coder" in doc["services"]
+    assert (cfg.paths.host_data_dir / "coder").is_dir()
+
+
+def test_rename_refuses_openviking_via_memory_state_file(
+    cfg: AgentsConfig, saved_config: Path, stub_runners
+) -> None:
+    """Detection also fires off the memory state file — covers a state
+    where the sidecar's compose block was lost (e.g. VM rebuild)."""
+    import json
+
+    create(name="coder", agent_type="hermes", config_path=saved_config)
+    state_dir = cfg.paths.host_data_dir / ".memory-state"
+    state_dir.mkdir()
+    (state_dir / "coder.json").write_text(
+        json.dumps({"plugin": "openviking", "sidecar_service": "openviking-coder"}),
+        encoding="utf-8",
+    )
+    with pytest.raises(UserError, match=r"[Dd]isable memory"):
+        rename("coder", "writer", yes=True, config_path=saved_config)
+
+
+def test_rename_allows_non_openviking_memory_state(
+    cfg: AgentsConfig, saved_config: Path, stub_runners
+) -> None:
+    """In-process backends (holographic, mem0) have no sibling service —
+    the refusal must not over-trigger on them."""
+    import json
+
+    create(name="coder", agent_type="hermes", config_path=saved_config)
+    state_dir = cfg.paths.host_data_dir / ".memory-state"
+    state_dir.mkdir()
+    (state_dir / "coder.json").write_text(json.dumps({"plugin": "holographic"}), encoding="utf-8")
+    rename("coder", "writer", yes=True, config_path=saved_config)
+    doc = compose.load_compose(cfg.paths.host_data_dir / "docker-compose.yml")
+    assert "hermes-writer" in doc["services"]
+
+
+def test_rename_aborts_without_confirmation(
+    cfg: AgentsConfig, saved_config: Path, stub_runners, mocker
+) -> None:
+    """Rename force-recreates a running container — it must confirm the
+    downtime like reseat does."""
+    create(name="coder", agent_type="hermes", config_path=saved_config)
+    mocker.patch("agents_cli.ui.confirm", return_value=False)
+    with pytest.raises(UserError, match="aborted"):
+        rename("coder", "writer", config_path=saved_config)
+    doc = compose.load_compose(cfg.paths.host_data_dir / "docker-compose.yml")
+    assert "hermes-coder" in doc["services"]
+    assert (cfg.paths.host_data_dir / "coder").is_dir()
+
+
+def test_rename_yes_skips_confirmation(
+    cfg: AgentsConfig, saved_config: Path, stub_runners, mocker
+) -> None:
+    create(name="coder", agent_type="hermes", config_path=saved_config)
+    confirm_spy = mocker.spy(agents_cmd.ui, "confirm")
+    rename("coder", "writer", yes=True, config_path=saved_config)
+    confirm_spy.assert_not_called()
+
+
+def test_rename_cli_yes_flag_wires_through(
+    cfg: AgentsConfig, saved_config: Path, stub_runners, mocker
+) -> None:
+    """`agents rename -y old new` must skip the prompt (cli.py wiring)."""
+    from click.testing import CliRunner
+
+    from agents_cli import cli as cli_mod
+
+    create(name="coder", agent_type="hermes", config_path=saved_config)
+    mocker.patch("agents_cli.config.load", return_value=cfg)
+    confirm_spy = mocker.spy(agents_cmd.ui, "confirm")
+    result = CliRunner().invoke(cli_mod.main, ["rename", "coder", "writer", "-y"])
+    assert result.exit_code == 0, result.output
+    confirm_spy.assert_not_called()
+    doc = compose.load_compose(cfg.paths.host_data_dir / "docker-compose.yml")
+    assert "hermes-writer" in doc["services"]

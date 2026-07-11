@@ -353,6 +353,65 @@ def test_export_is_idempotent(with_coder: Path, tmp_path: Path, mocker: Any) -> 
     assert first == second
 
 
+def _minimal_session(sid: str) -> dict[str, Any]:
+    return {
+        "id": sid,
+        "source": "cli",
+        "title": "t",
+        "started_at": 1.0,
+        "ended_at": None,
+        "message_count": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "model": None,
+        "messages": [],
+    }
+
+
+def test_export_skips_hostile_session_ids_but_continues(
+    with_coder: Path, tmp_path: Path, mocker: Any
+) -> None:
+    """Session ids come from the agent-writable state.db. An absolute id
+    REPLACES to_dir under pathlib join semantics; `..` escapes it; a
+    leading dot hides the file. All three must be skipped with a warning
+    — NOT written, and NOT fatal to the rest of the export (it's
+    advertised cron-safe)."""
+    abs_escape = str(tmp_path / "abs-escape")
+    canned = {
+        "sessions": [
+            _minimal_session(abs_escape),
+            _minimal_session("../escape"),
+            _minimal_session(".hidden"),
+            _minimal_session("good_id-1.2"),
+        ]
+    }
+    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok(json.dumps(canned)))
+    warn_spy = mocker.spy(conversations_cmd.ui, "warn")
+
+    out_dir = tmp_path / "transcripts"
+    payload = conversations_cmd.export("coder", to_dir=out_dir, config_path=with_coder)
+
+    assert payload["sessions_written"] == 1
+    assert payload["files"] == ["good_id-1.2.md"]
+    assert sorted(payload["skipped_ids"]) == sorted([abs_escape, "../escape", ".hidden"])
+    # Only the sane file landed, and only inside the target dir.
+    assert {p.name for p in out_dir.iterdir()} == {"good_id-1.2.md"}
+    assert not (tmp_path / "escape.md").exists()
+    assert not (tmp_path / "abs-escape.md").exists()
+    assert not (out_dir / ".hidden.md").exists()
+    assert warn_spy.call_count == 3
+
+
+def test_export_without_hostile_ids_omits_skipped_key(
+    with_coder: Path, tmp_path: Path, mocker: Any
+) -> None:
+    canned = {"sessions": [_minimal_session("plain")]}
+    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok(json.dumps(canned)))
+    payload = conversations_cmd.export("coder", to_dir=tmp_path / "out", config_path=with_coder)
+    assert "skipped_ids" not in payload
+    assert payload["sessions_written"] == 1
+
+
 def test_export_rejects_openclaw(with_openclaw_personal: Path, tmp_path: Path, mocker: Any) -> None:
     exec_spy = mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok())
     with pytest.raises(UserError, match="Hermes-only"):

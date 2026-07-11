@@ -460,6 +460,87 @@ def test_add_rolls_back_vm_mount_on_compose_failure(
     mounts_mocked["mp_umount"].assert_called_once()
 
 
+def test_add_failure_rolls_back_override_entry_and_acls(
+    host_folder: Path,
+    cfg_with_agent: AgentsConfig,
+    saved_config: Path,
+    mounts_mocked,
+) -> None:
+    """Phase-3 (sandbox config) failure after phase-2 wrote the override:
+    the manifest is only written in the final phase, so remove() can
+    never see these orphans — the rollback itself must revert the
+    override volume entry, the VM mount, AND the phase-0 ACLs."""
+    mounts_mocked["hermes_write"].side_effect = OSError("simulated config write failure")
+    with pytest.raises(OSError, match="config write failure"):
+        mounts_cmd.add(
+            agent="coder",
+            host=str(host_folder),
+            container="/workspace/x",
+            readonly=True,
+            target="both",
+            restart=False,
+            config_path=saved_config,
+        )
+    # Manifest never persisted.
+    assert mounts_cmd.load_manifest(cfg_with_agent, "coder") == []
+    # Override entry reverted (file may exist with an empty doc).
+    override_path = cfg_with_agent.paths.host_data_dir / "docker-compose.override.yml"
+    if override_path.exists():
+        doc = YAML().load(override_path.read_text(encoding="utf-8"))
+        services = (doc or {}).get("services") or {}
+        assert "hermes-coder" not in services or not services["hermes-coder"].get("volumes")
+    # VM mount rolled back.
+    mounts_mocked["mp_umount"].assert_called_once()
+    # ACLs stripped (a `-x` setfacl ran) — no other manifest references
+    # the host folder, so the strip is safe.
+    flat = [
+        arg
+        for call in mounts_mocked["acl_run_owned"].call_args_list
+        for cmd in call.args[0]
+        for arg in cmd
+    ]
+    assert "-x" in flat
+
+
+def test_add_failure_rollback_preserves_acls_shared_with_other_agent(
+    host_folder: Path,
+    cfg_with_agent: AgentsConfig,
+    saved_config: Path,
+    mounts_mocked,
+) -> None:
+    """If another agent's manifest already references the same host
+    folder, the failed add's rollback must NOT strip the shared ACLs —
+    all agents map to the same container subuid."""
+    mounts_cmd.add(
+        agent="bob",
+        host=str(host_folder),
+        container="/workspace/x",
+        readonly=True,
+        target="runtime",
+        restart=False,
+        config_path=saved_config,
+    )
+    mounts_mocked["acl_run_owned"].reset_mock()
+    mounts_mocked["hermes_write"].side_effect = OSError("simulated failure")
+    with pytest.raises(OSError):
+        mounts_cmd.add(
+            agent="coder",
+            host=str(host_folder),
+            container="/workspace/x",
+            readonly=True,
+            target="both",
+            restart=False,
+            config_path=saved_config,
+        )
+    flat = [
+        arg
+        for call in mounts_mocked["acl_run_owned"].call_args_list
+        for cmd in call.args[0]
+        for arg in cmd
+    ]
+    assert "-x" not in flat, "shared ACLs must survive the rollback"
+
+
 def test_add_rw_flag_drops_ro_suffix(
     host_folder: Path, cfg_with_agent: AgentsConfig, saved_config: Path, mounts_mocked
 ) -> None:
@@ -846,6 +927,62 @@ def test_remove_strips_the_acl_entries_we_added(
     assert mounts_mocked["acl_run_owned"].call_count > add_call_count
     last_argv = mounts_mocked["acl_run_owned"].call_args_list[-1].args[0]
     assert any("-x" in c for c in last_argv)
+
+
+def test_remove_preserves_acl_shared_with_another_agent(
+    host_folder: Path,
+    cfg_with_agent: AgentsConfig,
+    saved_config: Path,
+    mounts_mocked,
+    mocker,
+) -> None:
+    """coder and bob both mount the same host folder. Removing coder's
+    mount must NOT strip the folder's ACL entries — every agent maps to
+    the SAME container subuid, so bob's mount depends on the very same
+    entries. Removing the last reference strips as usual."""
+    for agent in ("coder", "bob"):
+        mounts_cmd.add(
+            agent=agent,
+            host=str(host_folder),
+            container="/workspace/x",
+            readonly=True,
+            target="runtime",
+            restart=False,
+            config_path=saved_config,
+        )
+    mounts_mocked["acl_run_owned"].reset_mock()
+    info_spy = mocker.spy(mounts_cmd.ui, "info")
+
+    mounts_cmd.remove(
+        agent="coder",
+        container="/workspace/x",
+        restart=False,
+        config_path=saved_config,
+    )
+    flat = [
+        arg
+        for call in mounts_mocked["acl_run_owned"].call_args_list
+        for cmd in call.args[0]
+        for arg in cmd
+    ]
+    assert "-x" not in flat, "ACL strip must be skipped while bob still references the folder"
+    notes = [c.args[0] for c in info_spy.call_args_list if "still referenced" in c.args[0]]
+    assert notes and "bob" in notes[0]
+
+    # Last reference gone → strip proceeds.
+    mounts_cmd.remove(
+        agent="bob",
+        container="/workspace/x",
+        restart=False,
+        config_path=saved_config,
+    )
+    flat = [
+        arg
+        for call in mounts_mocked["acl_run_owned"].call_args_list
+        for cmd in call.args[0]
+        for arg in cmd
+    ]
+    assert "-x" in flat
 
 
 def test_manifest_corrupt_raises_user_error(cfg_with_agent: AgentsConfig) -> None:

@@ -30,12 +30,12 @@ adds *additional* per-folder hops on demand. Per the design lock-in:
     (the sandbox concept is Hermes-specific).
 - **Refused on OpenClaw with ``--target sandbox``** — OpenClaw owns
   its plugin lifecycle; the toolkit stays out of it.
-- **Atomic across phases.** If the VM-mount step succeeds but compose-
-  override / config.yaml writes fail, the VM mount is rolled back so
-  the system isn't left in a half-applied state.
-- **End-to-end probe after add.** Write a sentinel through the new
-  mount, read it from inside the target container, fail (with rollback)
-  if the round-trip doesn't work.
+- **Atomic across phases.** If any later phase fails after the VM
+  mount succeeded, everything already applied is rolled back — the
+  override volume entry, the sandbox volume, the VM mount, and the
+  host-folder ACLs (unless another manifest still references the same
+  host folder) — so the system isn't left in a half-applied state the
+  manifest-driven ``remove`` can't see.
 """
 
 from __future__ import annotations
@@ -190,6 +190,27 @@ def _default_target(agent_type: str) -> str:
     return "both" if agent_type == "hermes" else "runtime"
 
 
+def _agents_referencing_host_path(cfg: AgentsConfig, host_path: str) -> list[str]:
+    """Agents whose ``.mounts.json`` references ``host_path``.
+
+    Every agent's container uid maps to the SAME rootless-Docker subuid,
+    so the ACL entries on a host folder are shared state: stripping them
+    while any other mount (this agent's or another's) still uses the
+    folder silently breaks that mount's access. Corrupt manifests are
+    skipped — they can't prove a reference.
+    """
+    referencing: list[str] = []
+    for manifest in sorted(cfg.paths.host_data_dir.glob("*/.mounts.json")):
+        agent = manifest.parent.name
+        try:
+            entries = load_manifest(cfg, agent)
+        except UserError:
+            continue
+        if any(e.host_path == host_path for e in entries):
+            referencing.append(agent)
+    return referencing
+
+
 def _resolve_agent(cfg: AgentsConfig, agent: str) -> tuple[str, str]:
     """Return ``(service_name, agent_type)`` or raise."""
     doc = compose.read_compose_doc(cfg)
@@ -217,7 +238,8 @@ def add(
     config_path: Path,
 ) -> MountEntry:
     """Append a mount entry: VM mount + compose-override edit (+
-    Hermes terminal volume) + manifest persist. End-to-end probed.
+    Hermes terminal volume) + manifest persist. Rolled back as a unit
+    on any phase failure.
     """
     from agents_cli import config as cfg_mod
 
@@ -276,23 +298,42 @@ def add(
                     f"{(result.stderr or '').strip() or 'unknown error'}"
                 )
 
+        applied_runtime = False
+        applied_sandbox = False
         try:
             # Phase 2: compose-override (runtime target).
             if effective_target in {"runtime", "both"}:
                 _add_runtime_volume(cfg, svc, vm_path, container_resolved, readonly)
+                applied_runtime = True
 
             # Phase 3: hermes config.yaml (sandbox target).
             if effective_target in {"sandbox", "both"}:
                 _add_sandbox_volume(cfg, svc, agent, vm_path, container_resolved, readonly)
+                applied_sandbox = True
 
             # Phase 4: manifest persist.
             entries.append(new_entry)
             save_manifest(cfg, agent, entries)
         except BaseException:
-            # Roll back the VM mount so the next add isn't blocked.
+            # Unwind everything already applied, in reverse order. The
+            # manifest was never written (it's the last phase), so
+            # ``remove`` cannot see — let alone clean up — any of these
+            # orphans; the rollback has to do it here.
+            if applied_sandbox:
+                with _suppress():
+                    _remove_sandbox_volume(cfg, svc, agent, vm_path, container_resolved, readonly)
+            if applied_runtime:
+                with _suppress():
+                    _remove_runtime_volume(cfg, svc, vm_path, container_resolved, readonly)
             if cfg.vm.backend != "bare_metal":
                 with _suppress():
                     mp.umount(cfg.vm.name, vm_path)
+            # Phase-0 ACLs: strip only when no other manifest still
+            # references this host folder (shared-subuid rule — see
+            # _agents_referencing_host_path).
+            with _suppress():
+                if not _agents_referencing_host_path(cfg, str(host_resolved)):
+                    _auto_acl_host_folder_remove(cfg, host_resolved, readonly)
             raise
 
     if restart:
@@ -370,15 +411,27 @@ def remove(
         if cfg.vm.backend != "bare_metal":
             mp.umount(cfg.vm.name, vm_path)
 
-        # Symmetric to add: strip the ACL entries we added so the host
-        # folder is back to whatever ACL state the user originally
-        # had. Best-effort — don't fail the whole remove if the user
-        # already setfacl'd manually since add.
-        with _suppress():
-            _auto_acl_host_folder_remove(cfg, Path(entry.host_path), entry.readonly)
-
         entries = [e for e in entries if e.container_path != container]
         save_manifest(cfg, agent, entries)
+
+        # Symmetric to add: strip the ACL entries we added so the host
+        # folder is back to whatever ACL state the user originally had.
+        # BUT: all agents share one container subuid, so the ACLs are
+        # shared state — if any remaining mount (this agent's or any
+        # other's) still references the same host folder, leave them in
+        # place or that mount silently loses access. Best-effort — don't
+        # fail the whole remove if the user already setfacl'd manually
+        # since add. Manifest is saved first so the scan doesn't count
+        # the entry being removed.
+        still_used_by = _agents_referencing_host_path(cfg, entry.host_path)
+        if still_used_by:
+            ui.info(
+                f"leaving ACLs on {entry.host_path} in place — still referenced "
+                f"by mount(s) of: {', '.join(still_used_by)}"
+            )
+        else:
+            with _suppress():
+                _auto_acl_host_folder_remove(cfg, Path(entry.host_path), entry.readonly)
 
     if restart:
         from agents_cli import compose_runner

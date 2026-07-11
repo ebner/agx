@@ -25,6 +25,7 @@ mutations.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +41,13 @@ from agents_cli.ops import _compose_exec_in_vm_argv
 # doesn't carry ``agent.gateway_auto_continue_freshness``. Matches the
 # Hermes upstream default at time of writing.
 DEFAULT_FRESHNESS_S = 3600
+
+# Session ids come from the agent-writable ``state.db`` — treat them as
+# hostile before joining them into a host path. An absolute id would
+# REPLACE ``to_dir`` entirely under pathlib join semantics; ``..``
+# segments would escape it. Leading dots are rejected separately (they
+# match this charset but hide files / cover ``.``-only ids).
+_SAFE_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 # Run inside the agent's container. Emits one JSON object on stdout
 # describing all sessions + which are within the freshness window.
@@ -203,18 +211,34 @@ def export(
     sessions = data.get("sessions") or []
 
     to_dir.mkdir(parents=True, exist_ok=True)
+    resolved_dir = to_dir.resolve()
     written: list[str] = []
+    skipped: list[str] = []
     for s in sessions:
-        path = to_dir / f"{s['id']}.md"
+        sid = str(s["id"])
+        if not _SAFE_SESSION_ID_RE.match(sid) or sid.startswith("."):
+            ui.warn(f"skipping session with unsafe id {sid!r} — not usable as a filename")
+            skipped.append(sid)
+            continue
+        path = to_dir / f"{sid}.md"
+        # Belt and braces: even if the sanitizer above regresses, never
+        # write outside the target dir. Export is advertised cron-safe,
+        # so a hostile id must skip the session, not abort the run.
+        if not path.resolve().is_relative_to(resolved_dir):
+            ui.warn(f"skipping session id {sid!r} — resolves outside {to_dir}")
+            skipped.append(sid)
+            continue
         path.write_text(_render_session_md(s), encoding="utf-8")
         written.append(path.name)
 
-    payload = {
+    payload: dict[str, Any] = {
         "agent": name,
         "to_dir": str(to_dir),
         "sessions_written": len(written),
         "files": written,
     }
+    if skipped:
+        payload["skipped_ids"] = skipped
     ui.emit(
         payload,
         human=(

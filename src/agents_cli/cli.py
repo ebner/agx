@@ -46,6 +46,7 @@ from agents_cli import (
 from agents_cli import (
     vm as vm_mod,
 )
+from agents_cli.errors import UserError
 
 
 def _run(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> None:
@@ -415,11 +416,26 @@ def agents_remove(
     yes = yes_local or ctx.obj.get("yes", False)
 
     def body() -> None:
+        effective_yes = yes
+        if export_first and not effective_yes:
+            # Consent must precede the export: otherwise a declined
+            # removal still leaves a fresh tarball (and an extra JSON
+            # object) behind. Fail fast on unknown agents so we don't
+            # prompt for something that can't be removed anyway.
+            cfg = cfg_mod.load()
+            if agents_cmd._detect_type_from_compose(cfg, name) is None:
+                raise UserError(f"agent {name!r} not found in compose")
+            if not ui.confirm(
+                agents_cmd.removal_confirm_message(cfg, name, delete_data=not keep_data),
+                default=False,
+            ):
+                raise UserError("aborted by user")
+            effective_yes = True
         if export_first:
             export_cmd.export(name)
         agents_cmd.remove(
             name,
-            yes=yes,
+            yes=effective_yes,
             delete_data=not keep_data,
         )
 
@@ -429,9 +445,16 @@ def agents_remove(
 @main.command("rename")
 @click.argument("old_name")
 @click.argument("new_name")
-def agents_rename(old_name: str, new_name: str) -> None:
-    """Rename an agent (compose service + dir + container)."""
-    _run(agents_cmd.rename, old_name, new_name)
+@click.option("-y", "--yes", "yes_local", is_flag=True, help="Skip the downtime confirmation.")
+@click.pass_context
+def agents_rename(ctx: click.Context, old_name: str, new_name: str, yes_local: bool) -> None:
+    """Rename an agent (compose service + dir + container).
+
+    Force-recreates the running container under the new name — brief
+    downtime. Prompts before proceeding unless ``-y`` / global ``--yes``.
+    """
+    yes = yes_local or ctx.obj.get("yes", False)
+    _run(agents_cmd.rename, old_name, new_name, yes=yes)
 
 
 @main.command("reseat")

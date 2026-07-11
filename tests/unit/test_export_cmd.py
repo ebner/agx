@@ -241,6 +241,157 @@ def test_import_refuses_missing_archive(saved_config: Path, tmp_path: Path) -> N
         export_cmd.import_archive("coder", tmp_path / "nothing.tar.gz", config_path=saved_config)
 
 
+HOSTILE_ARCHIVE_NAME = "a;rm -rf $HOME;.tar.zst"
+
+
+def test_import_vm_temp_path_excludes_user_filename(with_coder: Path, cfg: AgentsConfig) -> None:
+    """The VM-side temp path lands inside (sudo'd) mp.exec_bash script
+    text — interpolating the user-supplied archive filename there is
+    shell injection. The temp name must be built only from generated
+    parts (validated agent name + pid + uuid), and the import must
+    still work end-to-end with a hostile filename."""
+    import re
+    import shutil
+
+    from agents_cli import mp
+
+    archive = export_cmd.export("coder", config_path=with_coder)
+    hostile = archive.parent / HOSTILE_ARCHIVE_NAME
+    archive.rename(hostile)
+    shutil.rmtree(cfg.paths.host_data_dir / "coder")
+
+    export_cmd.import_archive("coder", hostile, yes=True, config_path=with_coder)
+
+    # End-to-end restore still works despite the hostile name.
+    assert (cfg.paths.host_data_dir / "coder" / ".data" / "state.db").read_text() == "fake-db"
+    # No shell text ever saw the filename.
+    scripts = [c.args[1] for c in mp.exec_bash.call_args_list if "tar -xf" in c.args[1]]
+    assert scripts, "expected an extraction script"
+    for script in scripts:
+        assert "rm -rf $HOME" not in script
+        assert HOSTILE_ARCHIVE_NAME not in script
+        assert re.search(r"/tmp/agents-import-coder-\d+-[0-9a-f]{8}\.tar\b", script)
+    # The transfer destination (also a shell-adjacent VM path) is clean too.
+    vm_dst = mp.transfer_to_vm.call_args.args[2]
+    assert "rm -rf" not in vm_dst and HOSTILE_ARCHIVE_NAME not in vm_dst
+
+
+def test_import_in_vm_mode_temp_path_excludes_user_filename(
+    cfg: AgentsConfig, saved_config: Path, tmp_path: Path, mocker
+) -> None:
+    """Same guarantee for the --data-dir-in-vm branch (non-sudo'd but
+    still shell text)."""
+    import re
+
+    from tests.conftest import install_vm_fs_simulation
+
+    mocks = install_vm_fs_simulation(mocker, cfg)
+    cfg.paths.data_dir_in_vm = True
+    cfg_mod.save(cfg, saved_config)
+    hostile = tmp_path / HOSTILE_ARCHIVE_NAME
+    hostile.write_bytes(b"not-really-a-tar")
+
+    export_cmd.import_archive("coder", hostile, yes=True, config_path=saved_config)
+
+    script = mocks["exec_bash"].call_args.args[1]
+    assert "rm -rf $HOME" not in script
+    assert HOSTILE_ARCHIVE_NAME not in script
+    assert re.search(r"/tmp/agents-import-coder-\d+-[0-9a-f]{8}\.tar\b", script)
+
+
+# ---------- remove --export-first (CLI ordering) ----------
+
+
+def test_remove_export_first_declined_leaves_no_archive(
+    with_coder: Path, cfg: AgentsConfig, mocker
+) -> None:
+    """The confirmation must precede the export: a declined removal used
+    to leave a fresh tarball (and an extra JSON object) behind."""
+    from click.testing import CliRunner
+
+    from agents_cli import cli as cli_mod
+
+    mocker.patch("agents_cli.config.load", return_value=cfg)
+    confirm = mocker.patch("agents_cli.ui.confirm", return_value=False)
+
+    result = CliRunner().invoke(cli_mod.main, ["remove", "coder", "--export-first"])
+
+    assert result.exit_code == 1
+    confirm.assert_called_once()
+    backups = cfg.paths.host_data_dir / "backups"
+    assert not backups.exists() or not list(backups.glob("coder-*"))
+    # Agent untouched.
+    assert (cfg.paths.host_data_dir / "coder").is_dir()
+
+
+def test_remove_export_first_confirms_then_exports_then_removes(
+    with_coder: Path, cfg: AgentsConfig, mocker
+) -> None:
+    from click.testing import CliRunner
+
+    from agents_cli import cli as cli_mod
+
+    mocker.patch("agents_cli.config.load", return_value=cfg)
+    order: list[str] = []
+    mocker.patch(
+        "agents_cli.ui.confirm",
+        side_effect=lambda *a, **k: order.append("confirm") or True,
+    )
+    mocker.patch(
+        "agents_cli.export_cmd.export",
+        side_effect=lambda *a, **k: order.append("export"),
+    )
+    remove_mock = mocker.patch(
+        "agents_cli.agents_cmd.remove",
+        side_effect=lambda *a, **k: order.append("remove"),
+    )
+
+    result = CliRunner().invoke(cli_mod.main, ["remove", "coder", "--export-first"])
+
+    assert result.exit_code == 0, result.output
+    assert order == ["confirm", "export", "remove"]
+    # Consent already given — must not prompt a second time downstream.
+    assert remove_mock.call_args.kwargs["yes"] is True
+
+
+def test_remove_export_first_with_yes_skips_prompt_but_still_exports(
+    with_coder: Path, cfg: AgentsConfig, mocker
+) -> None:
+    from click.testing import CliRunner
+
+    from agents_cli import cli as cli_mod
+
+    mocker.patch("agents_cli.config.load", return_value=cfg)
+    confirm = mocker.patch("agents_cli.ui.confirm", return_value=True)
+    export_mock = mocker.patch("agents_cli.export_cmd.export")
+    remove_mock = mocker.patch("agents_cli.agents_cmd.remove")
+
+    result = CliRunner().invoke(cli_mod.main, ["remove", "coder", "--export-first", "-y"])
+
+    assert result.exit_code == 0, result.output
+    confirm.assert_not_called()
+    export_mock.assert_called_once()
+    assert remove_mock.call_args.kwargs["yes"] is True
+
+
+def test_remove_export_first_unknown_agent_fails_before_prompt_and_export(
+    cfg: AgentsConfig, saved_config: Path, mocker
+) -> None:
+    from click.testing import CliRunner
+
+    from agents_cli import cli as cli_mod
+
+    mocker.patch("agents_cli.config.load", return_value=cfg)
+    confirm = mocker.patch("agents_cli.ui.confirm", return_value=True)
+    export_mock = mocker.patch("agents_cli.export_cmd.export")
+
+    result = CliRunner().invoke(cli_mod.main, ["remove", "ghost", "--export-first"])
+
+    assert result.exit_code == 1
+    confirm.assert_not_called()
+    export_mock.assert_not_called()
+
+
 # ---------- host-cron ----------
 
 

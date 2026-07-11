@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import re
 import shutil
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterator
 from pathlib import Path
 
 from agents_cli import compose, compose_runner, mp, ui
@@ -413,6 +413,19 @@ def list_agents(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> list[dict
 REMOVE_PHASES = ["mounts_torn_down", "container_stopped", "compose_updated", "data_dir_deleted"]
 
 
+def removal_confirm_message(cfg: AgentsConfig, name: str, *, delete_data: bool) -> str:
+    """Confirmation prompt for removing an agent.
+
+    Shared by :func:`remove` and the CLI layer — ``agents remove
+    --export-first`` hoists the prompt above the export so a declined
+    removal never leaves a fresh tarball behind.
+    """
+    msg = f"remove agent {name!r}"
+    if delete_data:
+        msg += f" and its data dir at {cfg.paths.host_data_dir / name}"
+    return msg + "?"
+
+
 def remove(
     name: str,
     *,
@@ -429,11 +442,9 @@ def remove(
         raise UserError(f"agent {name!r} not found in compose")
     svc = service_name(name, agent_type)
 
-    confirm_msg = f"remove agent {name!r}"
-    if delete_data:
-        confirm_msg += f" and its data dir at {cfg.paths.host_data_dir / name}"
-    confirm_msg += "?"
-    if not yes and not ui.confirm(confirm_msg, default=False):
+    if not yes and not ui.confirm(
+        removal_confirm_message(cfg, name, delete_data=delete_data), default=False
+    ):
         raise UserError("aborted by user")
 
     with compose.acquire_lock(cfg.paths.host_data_dir):
@@ -491,13 +502,19 @@ def _detect_type_from_compose(cfg: AgentsConfig, name: str) -> str | None:
 # ---------- rename ----------
 
 
-RENAME_PHASES = ["compose_updated", "dir_renamed", "container_recreated"]
+# ``dir_renamed`` deliberately precedes ``compose_updated``: the rewritten
+# service block points its env_file (and volumes) at ``./<new>/…``, and
+# ``write_compose_atomically`` validates via ``docker compose config -q``,
+# which errors on a missing env_file. The new dir must therefore exist
+# before the compose write — the reverse order can never validate.
+RENAME_PHASES = ["dir_renamed", "compose_updated", "container_recreated"]
 
 
 def rename(
     old_name: str,
     new_name: str,
     *,
+    yes: bool = False,
     config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH,
 ) -> None:
     validate_name(old_name)
@@ -509,6 +526,14 @@ def rename(
         raise UserError(f"agent {old_name!r} not in compose")
     if _detect_type_from_compose(cfg, new_name) is not None:
         raise UserError(f"agent {new_name!r} already exists")
+    _refuse_rename_with_openviking_sidecar(cfg, old_name)
+
+    if not yes and not ui.confirm(
+        f"rename will force-recreate {old_name!r}'s container as {new_name!r} "
+        f"(brief downtime while the container is replaced). Proceed?",
+        default=False,
+    ):
+        raise UserError("aborted by user")
 
     old_svc = service_name(old_name, agent_type)
     new_svc = service_name(new_name, agent_type)
@@ -521,15 +546,7 @@ def rename(
         ) or Journal.begin(cfg.paths.host_data_dir, "rename", old_name, RENAME_PHASES)
 
         for phase in _phases_to_run(journal):
-            if phase == "compose_updated":
-                doc = compose.read_compose_doc(cfg)
-                if old_svc in (doc.get("services") or {}):
-                    compose.rename_service(doc, old_svc, new_svc)
-                    # Also update container_name and any path references that mention old_name.
-                    _rewrite_service_paths(doc["services"][new_svc], old_name, new_name)
-                    compose.write_compose_atomically(cfg, doc)
-                journal.advance(phase)
-            elif phase == "dir_renamed":
+            if phase == "dir_renamed":
                 if cfg.paths.data_dir_in_vm:
                     mp.exec_bash(
                         cfg.vm.name,
@@ -542,6 +559,14 @@ def rename(
                     )
                 elif old_dir.exists() and not new_dir.exists():
                     old_dir.rename(new_dir)
+                journal.advance(phase)
+            elif phase == "compose_updated":
+                doc = compose.read_compose_doc(cfg)
+                if old_svc in (doc.get("services") or {}):
+                    compose.rename_service(doc, old_svc, new_svc)
+                    # Also update container_name and any path references that mention old_name.
+                    _rewrite_service_paths(doc["services"][new_svc], old_name, new_name)
+                    compose.write_compose_atomically(cfg, doc)
                 journal.advance(phase)
             elif phase == "container_recreated":
                 # Old container's container_name no longer matches anything in
@@ -560,20 +585,70 @@ def rename(
     )
 
 
+def _refuse_rename_with_openviking_sidecar(cfg: AgentsConfig, name: str) -> None:
+    """Refuse to rename an agent that has an OpenViking memory sidecar.
+
+    The sidecar is a *sibling* compose service (``openviking-<name>``,
+    referenced from the agent's ``depends_on``) with its own
+    container_name, volume path, and DNS-based endpoint baked into the
+    agent's config.yaml. Renaming only the agent would strand all of
+    that under the old name — a partially-renamed sidecar is worse
+    than a refusal.
+    """
+    doc = compose.read_compose_doc(cfg)
+    has_sidecar_service = f"openviking-{name}" in (doc.get("services") or {})
+    if not has_sidecar_service:
+        # Lazy import: memory/__init__ imports from this module.
+        from agents_cli import memory as memory_mod
+
+        state = memory_mod.read_state(cfg, name)
+        if not (state and state.get("plugin") == "openviking"):
+            return
+    raise UserError(
+        f"agent {name!r} has an OpenViking memory sidecar (openviking-{name}) "
+        f"that rename cannot migrate. Disable memory first "
+        f"(`agents memory disable {name}`), rename, then re-enable."
+    )
+
+
 def _rewrite_service_paths(service: dict[str, object], old_name: str, new_name: str) -> None:
-    """Update container_name and any `./<old>/...` volume entries in place."""
+    """Update container_name and every ``./<old>/...``-prefixed string value
+    in the service block, in place.
+
+    ``env_file`` matters as much as ``volumes``: both agent fragments carry
+    ``env_file: [./<name>/.env]``, and a stale entry breaks EVERY compose
+    op for EVERY agent once the old dir is gone ("env file not found").
+    Rather than enumerating keys, rewrite any matching string anywhere in
+    the block (handles string and list forms of env_file, nested maps,
+    and future fragment evolution).
+    """
     container_name = service.get("container_name")
     if isinstance(container_name, str):
         service["container_name"] = container_name.replace(old_name, new_name)
-    volumes = service.get("volumes")
-    if isinstance(volumes, Iterable):
-        new_volumes: list[object] = []
-        for v in volumes:
-            if isinstance(v, str) and v.startswith(f"./{old_name}/"):
-                new_volumes.append(f"./{new_name}/" + v[len(f"./{old_name}/") :])
-            else:
-                new_volumes.append(v)
-        service["volumes"] = new_volumes
+
+    old_prefix = f"./{old_name}/"
+    new_prefix = f"./{new_name}/"
+
+    def rewrite(value: str) -> str:
+        if value.startswith(old_prefix):
+            return new_prefix + value[len(old_prefix) :]
+        return value
+
+    def walk(node: object) -> None:
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if isinstance(value, str):
+                    node[key] = rewrite(value)
+                else:
+                    walk(value)
+        elif isinstance(node, list):
+            for i, value in enumerate(node):
+                if isinstance(value, str):
+                    node[i] = rewrite(value)
+                else:
+                    walk(value)
+
+    walk(service)
 
 
 # ---------- reseat ----------

@@ -25,9 +25,11 @@ backup picks up.
 from __future__ import annotations
 
 import datetime
+import os
 import shutil
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 
 from agents_cli import archive as archive_mod
@@ -232,6 +234,20 @@ def export_all(
 # ---------- import ----------
 
 
+def _vm_import_temp_path(name: str) -> str:
+    """VM-side temp path for a transferred import archive.
+
+    Built exclusively from safe generated parts: the agent name (already
+    ``validate_name``-checked, ``[a-z0-9_-]`` only), the pid, and a uuid4
+    hex. The user-supplied archive filename is deliberately excluded —
+    both import branches interpolate this path into ``mp.exec_bash``
+    scripts (one of them sudo'd), so a hostile filename would be shell
+    injection. ``tar -xf`` detects compression by content, so the fixed
+    ``.tar`` extension is only cosmetic.
+    """
+    return f"/tmp/agents-import-{name}-{os.getpid()}-{uuid.uuid4().hex[:8]}.tar"
+
+
 def import_archive(
     name: str,
     archive_path: Path,
@@ -259,8 +275,11 @@ def import_archive(
             )
         ):
             raise UserError("aborted by user")
-        # tar -xf auto-detects compression by content (zst, gz, etc).
-        vm_tmp = f"/tmp/agents-import-{name}-{archive_path.stat().st_mtime_ns}{archive_path.suffix}"
+        # tar -xf auto-detects compression by content (zst, gz, etc), so
+        # the VM-side temp name needs no real extension. Built ONLY from
+        # generated parts (validated name + pid + uuid) — the archive
+        # filename is user-supplied and must never reach shell text.
+        vm_tmp = _vm_import_temp_path(name)
         mp.transfer_to_vm(archive_path, cfg.vm.name, vm_tmp)
         mp.exec_bash(
             cfg.vm.name,
@@ -292,7 +311,9 @@ def import_archive(
     # sees its own files unchanged.
     from agents_cli import mp
 
-    vm_archive = f"/tmp/agents-import-{name}-{archive_path.name}"
+    # Same rule as the --data-dir-in-vm branch: never interpolate the
+    # user-supplied archive filename into the (sudo'd) shell script.
+    vm_archive = _vm_import_temp_path(name)
     mp.transfer_to_vm(archive_path, cfg.vm.name, vm_archive)
     mp.exec_bash(
         cfg.vm.name,
