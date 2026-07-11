@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import re
 import tarfile
 import time
 from dataclasses import dataclass
@@ -101,79 +102,104 @@ def upgrade(
 
     doc = compose.read_compose_doc(cfg)
     current_image = doc["services"][svc].get("image", "")
-    old_tag = current_image.split(":", 1)[1] if ":" in current_image else ""
-    if not old_tag:
+    pinned_tag = current_image.split(":", 1)[1] if ":" in current_image else ""
+    if not pinned_tag:
         raise UserError(f"current image for {name!r} has no tag: {current_image!r}")
 
-    # Bare ``agents upgrade <name>`` (no ``--tag``, no ``--latest``,
-    # no ``--recreate``) implicitly fetches the latest upstream tag —
-    # matches the convention from ``apt upgrade`` / ``brew upgrade`` /
-    # ``npm update``: if the user types ``upgrade`` without a version
-    # selector, they want to be brought to the newest available. The
-    # explicit ``--latest`` flag becomes documentation rather than
-    # behavior-changing. ``--recreate`` is the opt-out — it signals
-    # "refresh in place at the current tag", so we skip the fetch.
-    implicit_latest = tag is None and not to_latest and not recreate
-    if to_latest or implicit_latest:
-        # Resolve latest upstream tag via the same /releases/latest path
-        # `outdated` uses. Refuses if the network fetch fails — bumping
-        # to "whatever we had before" silently would defeat the intent.
-        from agents_cli import outdated_cmd
+    # An interrupted upgrade may already have mutated the compose pin
+    # (``tag_pinned`` runs before pull/recreate), so the pin is NOT a
+    # trustworthy "currently running version" when a resumable journal
+    # exists. Check for one BEFORE the no-op short-circuit below:
+    # without this, a retry after a SIGKILL-post-tag_pinned reads the
+    # NEW tag back out of compose, concludes "already at vNEW —
+    # nothing to do", and leaves the container running vOLD forever.
+    # Resume with the tags the journal recorded at begin-time so the
+    # retry completes the ORIGINAL upgrade faithfully — including
+    # skipping the latest-fetch, which could otherwise silently
+    # retarget the resume at a release that appeared upstream after
+    # the crash. Journals from before the meta field existed carry no
+    # tags; those fall through to the normal resolution path.
+    resumable = Journal.find_resumable(cfg.paths.host_data_dir, "upgrade", name)
+    resume_tags: tuple[str, str] | None = None
+    if resumable is not None and resumable.meta.get("old_tag") and resumable.meta.get("new_tag"):
+        resume_tags = (str(resumable.meta["old_tag"]), str(resumable.meta["new_tag"]))
 
-        ui.progress(f"resolving latest upstream {agent_type} tag from GitHub Releases...")
-        latest = outdated_cmd.fetch_latest_tag(agent_type, include_prerelease=False)
-        if not latest:
-            raise UserError(
-                f"could not resolve latest upstream tag for {agent_type!r} "
-                f"— GitHub API unreachable? Pass --tag <T> to pin explicitly, "
-                f"or --recreate to force-refresh at the current pin."
-            )
-        new_tag = latest
-        # Refresh the toolkit-wide default so future `agents create` of
-        # this type starts on the latest baseline rather than the
-        # `vm init`-time snapshot.
-        if agent_type == "hermes" and cfg.defaults.hermes_image_tag != latest:
-            cfg.defaults.hermes_image_tag = latest
-            cfg_mod.save(cfg, config_path)
-        elif agent_type == "openclaw" and cfg.defaults.openclaw_image_tag != latest:
-            cfg.defaults.openclaw_image_tag = latest
-            cfg_mod.save(cfg, config_path)
+    # Deferred defaults bump (item: never re-baseline `agents create`
+    # onto a tag a failed upgrade never proved out). Resolution stays
+    # here; persistence happens only on the success paths — the no-op
+    # return (the agent demonstrably runs that tag already) and after
+    # ``journal.complete()``.
+    resolved_latest: str | None = None
+    if resume_tags is not None:
+        old_tag, new_tag = resume_tags
+        ui.progress(
+            f"interrupted upgrade journal found for {name!r} ({old_tag} -> {new_tag}); resuming it"
+        )
     else:
-        new_tag = tag or old_tag  # explicit tag wins; otherwise refresh in place
-    base = HERMES_IMAGE_BASE if agent_type == "hermes" else OPENCLAW_IMAGE_BASE
+        old_tag = pinned_tag
+        # Bare ``agents upgrade <name>`` (no ``--tag``, no ``--latest``,
+        # no ``--recreate``) implicitly fetches the latest upstream tag —
+        # matches the convention from ``apt upgrade`` / ``brew upgrade`` /
+        # ``npm update``: if the user types ``upgrade`` without a version
+        # selector, they want to be brought to the newest available. The
+        # explicit ``--latest`` flag becomes documentation rather than
+        # behavior-changing. ``--recreate`` is the opt-out — it signals
+        # "refresh in place at the current tag", so we skip the fetch.
+        implicit_latest = tag is None and not to_latest and not recreate
+        if to_latest or implicit_latest:
+            # Resolve latest upstream tag via the same /releases/latest path
+            # `outdated` uses. Refuses if the network fetch fails — bumping
+            # to "whatever we had before" silently would defeat the intent.
+            from agents_cli import outdated_cmd
 
-    # No-op short-circuit when the target tag matches the current pin.
-    # Covers both:
-    # - bare ``agents upgrade <name>`` after the implicit-latest fetch
-    #   resolved to the same tag the agent is already on
-    # - ``--tag X`` where X happens to equal the current pin
-    # Without this, the upgrade would do ~30-60s of avoidable agent
-    # downtime (``vm.take_snapshot`` on libvirt+virtiofs needs the
-    # VM stopped), print a misleading ``vX.Y.Z -> vX.Y.Z`` summary,
-    # and look like a no-op anyway. ``--recreate`` is the explicit
-    # opt-in for the legitimate force-refresh use cases (env-file
-    # changes, wedged container, re-running doctor with the snapshot
-    # safety net intact).
-    if new_tag == old_tag and not recreate:
-        ui.emit(
-            {
-                "name": name,
-                "old_tag": old_tag,
-                "new_tag": new_tag,
-                "noop": True,
-            },
-            human=(
-                f"{name!r}: already at {new_tag} — nothing to do "
-                f"(pass --recreate to force-refresh anyway)"
-            ),
-        )
-        return UpgradeOutcome(
-            name=name,
-            old_tag=old_tag,
-            new_tag=new_tag,
-            host_snapshot=None,
-            vm_snapshot=None,
-        )
+            ui.progress(f"resolving latest upstream {agent_type} tag from GitHub Releases...")
+            latest = outdated_cmd.fetch_latest_tag(agent_type, include_prerelease=False)
+            if not latest:
+                raise UserError(
+                    f"could not resolve latest upstream tag for {agent_type!r} "
+                    f"— GitHub API unreachable? Pass --tag <T> to pin explicitly, "
+                    f"or --recreate to force-refresh at the current pin."
+                )
+            new_tag = latest
+            resolved_latest = latest
+        else:
+            new_tag = tag or old_tag  # explicit tag wins; otherwise refresh in place
+
+        # No-op short-circuit when the target tag matches the current pin.
+        # Covers both:
+        # - bare ``agents upgrade <name>`` after the implicit-latest fetch
+        #   resolved to the same tag the agent is already on
+        # - ``--tag X`` where X happens to equal the current pin
+        # Without this, the upgrade would do ~30-60s of avoidable agent
+        # downtime (``vm.take_snapshot`` on libvirt+virtiofs needs the
+        # VM stopped), print a misleading ``vX.Y.Z -> vX.Y.Z`` summary,
+        # and look like a no-op anyway. ``--recreate`` is the explicit
+        # opt-in for the legitimate force-refresh use cases (env-file
+        # changes, wedged container, re-running doctor with the snapshot
+        # safety net intact). Skipped entirely when resuming a journal —
+        # the mutated pin is exactly what makes this check lie.
+        if new_tag == old_tag and not recreate:
+            _persist_default_tag(cfg, agent_type, resolved_latest, config_path)
+            ui.emit(
+                {
+                    "name": name,
+                    "old_tag": old_tag,
+                    "new_tag": new_tag,
+                    "noop": True,
+                },
+                human=(
+                    f"{name!r}: already at {new_tag} — nothing to do "
+                    f"(pass --recreate to force-refresh anyway)"
+                ),
+            )
+            return UpgradeOutcome(
+                name=name,
+                old_tag=old_tag,
+                new_tag=new_tag,
+                host_snapshot=None,
+                vm_snapshot=None,
+            )
+    base = HERMES_IMAGE_BASE if agent_type == "hermes" else OPENCLAW_IMAGE_BASE
 
     # Progress numbering runs over the phases this invocation can
     # actually execute — snapshots drop out under --no-snapshot, and the
@@ -194,9 +220,18 @@ def upgrade(
     ui.progress(f"upgrading {name!r}: {old_tag} -> {new_tag} ({len(planned)} phases)")
 
     with compose.acquire_lock(cfg.paths.host_data_dir):
+        # Re-find under the lock (the peek above ran unlocked; a
+        # parallel invocation may have begun or completed a journal
+        # in between).
         journal = Journal.find_resumable(cfg.paths.host_data_dir, "upgrade", name)
         if journal is None:
-            journal = Journal.begin(cfg.paths.host_data_dir, "upgrade", name, UPGRADE_PHASES)
+            journal = Journal.begin(
+                cfg.paths.host_data_dir,
+                "upgrade",
+                name,
+                UPGRADE_PHASES,
+                meta={"old_tag": old_tag, "new_tag": new_tag},
+            )
         elif journal.completed_phases:
             ui.progress(
                 "resuming interrupted upgrade "
@@ -289,11 +324,21 @@ def upgrade(
             journal.complete()
         except Exception as failure:
             ui.warn(f"upgrade failed: {failure}; reverting compose tag")
-            _set_image_tag(cfg, svc, base, old_tag)
+            # The revert itself talks to the VM (compose write via
+            # transfer + docker compose up) — and an unreachable VM is
+            # often the very reason we're in this handler. Guard every
+            # step so a failing revert can't replace the original
+            # exception or skip the journal-clear and the snapshot
+            # hint below.
             try:
-                compose_runner.up(cfg, svc)
-            except Exception as recreate_err:
-                ui.warn(f"could not recreate with old tag: {recreate_err}")
+                _set_image_tag(cfg, svc, base, old_tag)
+            except Exception as revert_err:
+                ui.warn(f"could not revert compose tag to {old_tag!r}: {revert_err}")
+            else:
+                try:
+                    compose_runner.up(cfg, svc)
+                except Exception as recreate_err:
+                    ui.warn(f"could not recreate with old tag: {recreate_err}")
             # The rollback just undid the new-tag side of every
             # phase the state machine had advanced past (tag, pull,
             # recreate). Leaving the journal with those phases marked
@@ -310,6 +355,14 @@ def upgrade(
                 f"run `agents rollback {name}` if the live state is broken"
             )
             raise
+
+    # Only now — after the upgrade demonstrably landed — is the
+    # resolved-latest tag a sane baseline for future ``agents create``.
+    # Persisting at resolve time meant a failed-and-rolled-back upgrade
+    # still re-baselined new agents onto the bad tag. Outside the
+    # try/except above so a config-save hiccup can't trigger the revert
+    # handler on an upgrade that already succeeded.
+    _persist_default_tag(cfg, agent_type, resolved_latest, config_path)
 
     ui.emit(
         {
@@ -404,11 +457,9 @@ def rollback(
         vm_only = True
     else:
         upgrades_dir = cfg.paths.host_data_dir / ".upgrades"
+        pattern = _host_archive_re(name)
         candidates = (
-            sorted(
-                list(upgrades_dir.glob(f"{name}-*{archive_mod.ARCHIVE_SUFFIX}"))
-                + list(upgrades_dir.glob(f"{name}-*.tar.gz"))
-            )
+            sorted(p for p in upgrades_dir.iterdir() if pattern.fullmatch(p.name))
             if upgrades_dir.exists()
             else []
         )
@@ -436,19 +487,49 @@ def rollback(
     ):
         raise UserError("aborted by user")
 
-    if archive is not None:
-        ui.progress(f"restoring host data from {archive.name}...")
-        _restore_host_snapshot(cfg, archive)
+    # Rollback rewrites docker-compose.yml, .env, and the agent's data
+    # dir — a mutation like any other; hold the flock so it serializes
+    # against parallel create/upgrade/reseat invocations.
+    with compose.acquire_lock(cfg.paths.host_data_dir):
+        # Resolve the agent's service so the container can be stopped
+        # before extraction and recreated afterwards. Rolling back a
+        # REMOVED agent's archive is legitimate — there's simply no
+        # container to stop, so skip that part with a warning.
+        agent_type = _detect_type_from_compose(cfg, name)
+        svc = _service_name_for(name, agent_type) if agent_type is not None else None
+        if svc is None:
+            ui.warn(f"agent {name!r} not in compose — restoring without container stop/recreate")
 
-    vm_snap_name = snapshot_id if vm_only else _latest_vm_snapshot(cfg.vm.name, name)
-    if vm_snap_name:
-        ui.progress(
-            f"restoring VM snapshot {vm_snap_name} (stop -> restore -> start; all agents pause)..."
-        )
-        mp.stop_vm(cfg.vm.name)
-        mp.restore(f"{cfg.vm.name}.{vm_snap_name}", destructive=True)
-        mp.start_vm(cfg.vm.name)
-        ui.progress("VM restored and restarted")
+        if archive is not None:
+            if svc is not None:
+                # Extracting over a LIVE container's SQLite/WAL files
+                # (state.db, kanban.db, ...) is a straight corruption
+                # path — stop the container first.
+                ui.progress(f"stopping {svc} before restore...")
+                compose_runner.stop(cfg, svc)
+            ui.progress(f"restoring host data from {archive.name}...")
+            _restore_host_snapshot(cfg, archive)
+
+        vm_snap_name = snapshot_id if vm_only else _latest_vm_snapshot(cfg.vm.name, name)
+        if vm_snap_name:
+            ui.progress(
+                f"restoring VM snapshot {vm_snap_name} "
+                f"(stop -> restore -> start; all agents pause)..."
+            )
+            # vm_mod.restore_snapshot owns the restore orchestration:
+            # ACPI-stop + wait-for-stopped where the backend needs it,
+            # a returncode check on the restore itself (the raw
+            # mp.restore call this replaces never checked its result),
+            # and restart + SSH wait. ``yes=True`` — the user already
+            # confirmed the rollback above.
+            vm_mod.restore_snapshot(
+                vm_snap_name, destructive=True, yes=True, config_path=config_path
+            )
+            ui.progress("VM restored and restarted")
+
+        if archive is not None and svc is not None:
+            ui.progress(f"recreating {svc} from the restored compose...")
+            compose_runner.up(cfg, svc)
 
     ui.emit(
         {
@@ -471,6 +552,59 @@ def rollback(
 
 def _utc_stamp() -> str:
     return datetime.datetime.now(datetime.UTC).strftime("%Y%m%dT%H%M%SZ")
+
+
+# The stamp format emitted by ``_utc_stamp`` above (and journal.py's
+# twin). Snapshot lookups must match ``<name>-<stamp>`` STRICTLY: a
+# prefix glob like ``foo-*`` also catches agent ``foo-bar``'s
+# artifacts, and since letters sort after digits, ``foo-bar``'s
+# newest would beat ``foo``'s own in a ``sorted(...)[-1]`` pick.
+_UTC_STAMP_RE = r"\d{8}T\d{6}Z"
+
+
+def _host_archive_re(name: str) -> re.Pattern[str]:
+    """Match ``<name>-<UTC stamp>`` + a known archive suffix, exactly."""
+    return re.compile(
+        re.escape(name)
+        + "-"
+        + _UTC_STAMP_RE
+        + "(?:"
+        + re.escape(archive_mod.ARCHIVE_SUFFIX)
+        + r"|\.tar\.gz)"
+    )
+
+
+def _vm_snapshot_re(agent_name: str) -> re.Pattern[str]:
+    """Match ``pre-upgrade-<name>-<UTC stamp>`` exactly, allowing the
+    ``-<n>`` counter suffix that ``vm._unique_snapshot_name`` appends
+    on collision."""
+    return re.compile("pre-upgrade-" + re.escape(agent_name) + "-" + _UTC_STAMP_RE + r"(?:-\d+)?")
+
+
+def _persist_default_tag(
+    cfg: AgentsConfig,
+    agent_type: str,
+    latest: str | None,
+    config_path: Path,
+) -> None:
+    """Refresh the toolkit-wide default so future ``agents create`` of
+    this type starts on the latest baseline rather than the ``vm
+    init``-time snapshot.
+
+    Deliberately called only from the success paths (the no-op return
+    — the agent demonstrably already runs the tag — and after
+    ``journal.complete()``): persisting at resolve time re-baselined
+    new agents onto a tag that a failed-and-rolled-back upgrade never
+    proved out.
+    """
+    if latest is None:
+        return
+    if agent_type == "hermes" and cfg.defaults.hermes_image_tag != latest:
+        cfg.defaults.hermes_image_tag = latest
+        cfg_mod.save(cfg, config_path)
+    elif agent_type == "openclaw" and cfg.defaults.openclaw_image_tag != latest:
+        cfg.defaults.openclaw_image_tag = latest
+        cfg_mod.save(cfg, config_path)
 
 
 def _fmt_elapsed(start: float) -> str:
@@ -586,12 +720,12 @@ def _latest_host_snapshot(cfg: AgentsConfig, name: str) -> Path | None:
     upgrades_dir = cfg.paths.host_data_dir / ".upgrades"
     if not upgrades_dir.exists():
         return None
-    # Look for both the canonical .tar.zst and legacy .tar.gz archives so
-    # rollbacks of older upgrades keep working.
-    candidates = sorted(
-        list(upgrades_dir.glob(f"{name}-*{archive_mod.ARCHIVE_SUFFIX}"))
-        + list(upgrades_dir.glob(f"{name}-*.tar.gz"))
-    )
+    # The pattern accepts both the canonical .tar.zst and legacy
+    # .tar.gz archives so rollbacks of older upgrades keep working —
+    # and matches strictly (no ``foo-*`` prefix glob that would pick
+    # up agent ``foo-bar``'s archives for agent ``foo``).
+    pattern = _host_archive_re(name)
+    candidates = sorted(p for p in upgrades_dir.iterdir() if pattern.fullmatch(p.name))
     return candidates[-1] if candidates else None
 
 
@@ -672,7 +806,8 @@ def _latest_vm_snapshot(vm_name: str, agent_name: str) -> str | None:
     except json.JSONDecodeError:
         return None
     snapshots = info.get("info", {}).get(vm_name, {}).get("snapshots", {})
-    candidates = sorted(n for n in snapshots if n.startswith(f"pre-upgrade-{agent_name}-"))
+    pattern = _vm_snapshot_re(agent_name)
+    candidates = sorted(n for n in snapshots if pattern.fullmatch(n))
     return candidates[-1] if candidates else None
 
 

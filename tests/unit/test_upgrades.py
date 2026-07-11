@@ -258,6 +258,82 @@ def test_upgrade_resume_from_post_snapshot_phase(
     mocks["stop"].assert_not_called()
 
 
+def test_upgrade_resume_after_tag_pinned_completes_original_upgrade(
+    with_coder: Path, mocker, cfg: AgentsConfig
+) -> None:
+    """Regression for the resume-false-no-op bug: a SIGKILL after
+    tag_pinned leaves the compose pin already mutated to the NEW tag.
+    A retry that reads old_tag from the pin concludes "already at vNEW
+    — nothing to do" while the container still runs vOLD. The journal
+    records {old_tag, new_tag} at begin; the retry must find it BEFORE
+    the no-op short-circuit and complete the ORIGINAL upgrade: recreate
+    runs, no noop emit, and the outcome reports the true old -> new.
+    """
+    mocks = _stub_happy_upgrade(mocker, cfg)
+    # Even if upstream released something newer mid-crash, resume must
+    # not retarget — and must not even ask.
+    mocks["fetch_latest_tag"].return_value = "v9.9.9"
+
+    j = Journal.begin(
+        cfg.paths.host_data_dir,
+        "upgrade",
+        "coder",
+        upgrades.UPGRADE_PHASES,
+        meta={"old_tag": "v1.0.0", "new_tag": "v2.0.0"},
+    )
+    j.advance("host_data_snapshot")
+    j.advance("vm_snapshot")
+    j.advance("tag_pinned")
+    # Simulate the dead run's tag_pinned phase: pin already rewritten.
+    doc = compose.load_compose(cfg.paths.host_data_dir / "docker-compose.yml")
+    doc["services"]["hermes-coder"]["image"] = f"{compose.HERMES_IMAGE_BASE}:v2.0.0"
+    (cfg.paths.host_data_dir / "docker-compose.yml").write_text(
+        compose.dump_compose(doc), encoding="utf-8"
+    )
+    emit_spy = mocker.spy(upgrades.ui, "emit")
+
+    outcome = upgrades.upgrade("coder", config_path=with_coder)  # bare retry
+
+    assert outcome.old_tag == "v1.0.0"
+    assert outcome.new_tag == "v2.0.0"
+    # The remaining phases actually ran — no false no-op.
+    mocks["pull"].assert_called_once()
+    mocks["compose_up"].assert_called_once()
+    noop_emits = [
+        c for c in emit_spy.call_args_list if isinstance(c.args[0], dict) and c.args[0].get("noop")
+    ]
+    assert noop_emits == [], f"resume emitted a false no-op: {noop_emits}"
+    # Journal is gone after the resumed upgrade completes.
+    assert Journal.find_resumable(cfg.paths.host_data_dir, "upgrade", "coder") is None
+
+
+def test_upgrade_resume_does_not_refetch_latest_or_bump_defaults(
+    with_coder: Path, mocker, cfg: AgentsConfig
+) -> None:
+    """Resume completes the recorded upgrade — it must not re-resolve
+    upstream (a vNEWER released mid-crash would silently retarget the
+    resume) and must not rewrite defaults.<type>_image_tag (the resumed
+    target was never resolved as "latest" by THIS invocation)."""
+    mocks = _stub_happy_upgrade(mocker, cfg)
+    mocks["fetch_latest_tag"].return_value = "v9.9.9"
+    j = Journal.begin(
+        cfg.paths.host_data_dir,
+        "upgrade",
+        "coder",
+        upgrades.UPGRADE_PHASES,
+        meta={"old_tag": "v1.0.0", "new_tag": "v2.0.0"},
+    )
+    j.advance("host_data_snapshot")
+    j.advance("vm_snapshot")
+
+    outcome = upgrades.upgrade("coder", config_path=with_coder)
+
+    assert outcome.new_tag == "v2.0.0"
+    mocks["fetch_latest_tag"].assert_not_called()
+    reloaded = cfg_mod.load(with_coder)
+    assert reloaded.defaults.hermes_image_tag == "v1.0.0"
+
+
 # ---------- progress narration ----------
 
 
@@ -364,6 +440,183 @@ def test_rollback_aborts_without_confirmation(with_coder: Path, mocker, cfg: Age
 def test_rollback_refuses_when_no_archive(with_coder: Path) -> None:
     with pytest.raises(UserError, match="no host snapshot"):
         upgrades.rollback("coder", config_path=with_coder)
+
+
+def _write_rollback_archive(cfg: AgentsConfig, name: str, stamp: str = "20260512T120000Z") -> Path:
+    upgrades_dir = cfg.paths.host_data_dir / ".upgrades"
+    upgrades_dir.mkdir(exist_ok=True)
+    marker = cfg.paths.host_data_dir / f"{name}-marker.txt"
+    marker.write_text("from-snapshot", encoding="utf-8")
+    archive = upgrades_dir / f"{name}-{stamp}.tar.gz"
+    with tarfile.open(archive, "w:gz") as tf:
+        tf.add(marker, arcname=f"{name}/marker.txt")
+    return archive
+
+
+def test_rollback_locks_stops_restores_and_recreates_in_order(
+    with_coder: Path, mocker, cfg: AgentsConfig
+) -> None:
+    """Rollback is a compose/data mutation: it must hold the flock,
+    stop the live container BEFORE extracting over its SQLite/WAL
+    files, delegate the VM restore to vm_mod.restore_snapshot (which
+    owns stop/wait/rc-check/restart — the raw mp.stop_vm/restore/
+    start_vm calls it replaces never checked mp.restore's result), and
+    recreate the container from the restored compose at the end."""
+    _write_rollback_archive(cfg, "coder")
+    mocker.patch("agents_cli.ui.confirm", return_value=True)
+    mocker.patch(
+        "agents_cli.mp.info_vm",
+        return_value=_ok(
+            json.dumps(
+                {"info": {"agents": {"snapshots": {"pre-upgrade-coder-20260512T120000Z": {}}}}}
+            )
+        ),
+    )
+    order: list[str] = []
+    mocker.patch(
+        "agents_cli.compose_runner.stop",
+        side_effect=lambda *a, **k: order.append("stop") or _ok(),
+    )
+    mocker.patch(
+        "agents_cli.upgrades._restore_host_snapshot",
+        side_effect=lambda *a, **k: order.append("restore_host"),
+    )
+    vm_restore = mocker.patch(
+        "agents_cli.vm.restore_snapshot",
+        side_effect=lambda *a, **k: order.append("restore_vm"),
+    )
+    mocker.patch(
+        "agents_cli.compose_runner.up",
+        side_effect=lambda *a, **k: order.append("up") or _ok(),
+    )
+    raw_stop = mocker.patch("agents_cli.mp.stop_vm", return_value=_ok())
+    raw_restore = mocker.patch("agents_cli.mp.restore", return_value=_ok())
+    raw_start = mocker.patch("agents_cli.mp.start_vm", return_value=_ok())
+    lock_spy = mocker.spy(upgrades.compose, "acquire_lock")
+
+    upgrades.rollback("coder", config_path=with_coder)
+
+    assert order == ["stop", "restore_host", "restore_vm", "up"]
+    lock_spy.assert_called_once_with(cfg.paths.host_data_dir)
+    vm_restore.assert_called_once_with(
+        "pre-upgrade-coder-20260512T120000Z",
+        destructive=True,
+        yes=True,
+        config_path=with_coder,
+    )
+    # The raw un-orchestrated VM calls must be gone.
+    raw_stop.assert_not_called()
+    raw_restore.assert_not_called()
+    raw_start.assert_not_called()
+
+
+def test_rollback_of_removed_agent_skips_stop_and_up_with_warning(
+    cfg: AgentsConfig, saved_config: Path, mocker
+) -> None:
+    """Rolling back an archive of an agent that is no longer in compose
+    is legitimate (restore-after-remove). There is no service to stop
+    or recreate — warn and restore the data anyway, don't fail."""
+    _write_rollback_archive(cfg, "ghost")
+    mocker.patch("agents_cli.ui.confirm", return_value=True)
+    mocker.patch(
+        "agents_cli.mp.info_vm",
+        return_value=_ok(json.dumps({"info": {"agents": {"snapshots": {}}}})),
+    )
+    restore_host = mocker.patch("agents_cli.upgrades._restore_host_snapshot")
+    stop = mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())
+    up = mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    warn_spy = mocker.spy(upgrades.ui, "warn")
+
+    upgrades.rollback("ghost", config_path=saved_config)
+
+    restore_host.assert_called_once()
+    stop.assert_not_called()
+    up.assert_not_called()
+    assert any("not in compose" in c.args[0] for c in warn_spy.call_args_list)
+
+
+def test_rollback_explicit_snapshot_id_ignores_prefix_colliding_agent(
+    cfg: AgentsConfig, saved_config: Path, mocker
+) -> None:
+    """Agent ``foo``'s candidate listing must not include ``foo-bar``'s
+    archives: with the old prefix glob, a shared timestamp suffix made
+    the id "ambiguous" (or worse, matched the wrong agent's archive)."""
+    foo_archive = _write_rollback_archive(cfg, "foo", "20260512T120000Z")
+    _write_rollback_archive(cfg, "foo-bar", "20260512T120000Z")
+    mocker.patch("agents_cli.ui.confirm", return_value=True)
+    mocker.patch(
+        "agents_cli.mp.info_vm",
+        return_value=_ok(json.dumps({"info": {"agents": {"snapshots": {}}}})),
+    )
+    restore_host = mocker.patch("agents_cli.upgrades._restore_host_snapshot")
+
+    upgrades.rollback("foo", snapshot_id="20260512T120000Z", config_path=saved_config)
+
+    restore_host.assert_called_once()
+    assert restore_host.call_args.args[1] == foo_archive
+
+
+# ---------- snapshot lookup: strict name matching ----------
+
+
+def test_latest_host_snapshot_ignores_prefix_colliding_agent(cfg: AgentsConfig) -> None:
+    """Agent ``foo``'s lookup must not pick up agent ``foo-bar``'s
+    archives. With the old ``foo-*`` glob, ``foo-bar``'s newest beat
+    ``foo``'s own in the sorted()[-1] pick (letters sort after digits)."""
+    upgrades_dir = cfg.paths.host_data_dir / ".upgrades"
+    upgrades_dir.mkdir(exist_ok=True)
+    (upgrades_dir / "foo-20260101T000000Z.tar.zst").write_bytes(b"")
+    (upgrades_dir / "foo-bar-20260201T000000Z.tar.zst").write_bytes(b"")
+
+    got = upgrades._latest_host_snapshot(cfg, "foo")
+    assert got is not None
+    assert got.name == "foo-20260101T000000Z.tar.zst"
+
+    other = upgrades._latest_host_snapshot(cfg, "foo-bar")
+    assert other is not None
+    assert other.name == "foo-bar-20260201T000000Z.tar.zst"
+
+
+def test_latest_host_snapshot_still_accepts_legacy_tar_gz(cfg: AgentsConfig) -> None:
+    upgrades_dir = cfg.paths.host_data_dir / ".upgrades"
+    upgrades_dir.mkdir(exist_ok=True)
+    (upgrades_dir / "foo-20260101T000000Z.tar.gz").write_bytes(b"")
+    (upgrades_dir / "foo-20260201T000000Z.tar.zst").write_bytes(b"")
+    # Stray non-snapshot files with a matching prefix are ignored.
+    (upgrades_dir / "foo-notes.txt").write_bytes(b"")
+
+    got = upgrades._latest_host_snapshot(cfg, "foo")
+    assert got is not None
+    assert got.name == "foo-20260201T000000Z.tar.zst"
+
+
+def test_latest_vm_snapshot_ignores_prefix_colliding_agent(mocker) -> None:
+    snapshots = {
+        "pre-upgrade-foo-20260101T000000Z": {},
+        "pre-upgrade-foo-bar-20260201T000000Z": {},
+    }
+    mocker.patch(
+        "agents_cli.mp.info_vm",
+        return_value=_ok(json.dumps({"info": {"agents": {"snapshots": snapshots}}})),
+    )
+    assert upgrades._latest_vm_snapshot("agents", "foo") == "pre-upgrade-foo-20260101T000000Z"
+    assert (
+        upgrades._latest_vm_snapshot("agents", "foo-bar") == "pre-upgrade-foo-bar-20260201T000000Z"
+    )
+
+
+def test_latest_vm_snapshot_accepts_collision_counter_suffix(mocker) -> None:
+    """``vm._unique_snapshot_name`` appends ``-2``/``-3`` on name
+    collision; the strict matcher must still count those as foo's."""
+    snapshots = {
+        "pre-upgrade-foo-20260101T000000Z": {},
+        "pre-upgrade-foo-20260101T000000Z-2": {},
+    }
+    mocker.patch(
+        "agents_cli.mp.info_vm",
+        return_value=_ok(json.dumps({"info": {"agents": {"snapshots": snapshots}}})),
+    )
+    assert upgrades._latest_vm_snapshot("agents", "foo") == "pre-upgrade-foo-20260101T000000Z-2"
 
 
 # ---------- snapshot name collision ----------
@@ -619,6 +872,72 @@ def test_upgrade_rollback_clears_journal_to_force_clean_retry(
         f"a retry would skip tag_pinned/pulled/recreated and report success "
         f"against the OLD tag."
     )
+
+
+def test_upgrade_failed_run_does_not_bump_default_tag(
+    with_coder: Path, mocker, cfg: AgentsConfig
+) -> None:
+    """defaults.<type>_image_tag must only move once the upgrade has
+    demonstrably landed. Persisting at resolve time meant a failed-and-
+    rolled-back upgrade still re-baselined every future `agents create`
+    onto the bad tag."""
+    _stub_happy_upgrade(mocker, cfg)
+    mocker.patch("agents_cli.outdated_cmd.fetch_latest_tag", return_value="v9.9.9")
+    mocker.patch("agents_cli.ops.doctor", side_effect=RuntimeFailure("doctor probe blew up"))
+
+    with pytest.raises(RuntimeFailure, match="doctor probe"):
+        upgrades.upgrade("coder", to_latest=True, config_path=with_coder)
+
+    reloaded = cfg_mod.load(with_coder)
+    assert reloaded.defaults.hermes_image_tag == "v1.0.0"
+
+
+def test_upgrade_noop_at_latest_still_refreshes_default_tag(
+    with_coder: Path, mocker, cfg: AgentsConfig
+) -> None:
+    """The no-op path is also a success path: the agent demonstrably
+    runs the resolved-latest tag, so a stale default may be refreshed
+    even though no upgrade machinery runs."""
+    cfg.defaults.hermes_image_tag = "v0.9.0"  # stale default, agent pinned at v1.0.0
+    cfg_mod.save(cfg, with_coder)
+    _stub_happy_upgrade(mocker, cfg)
+    mocker.patch("agents_cli.outdated_cmd.fetch_latest_tag", return_value="v1.0.0")
+
+    outcome = upgrades.upgrade("coder", to_latest=True, config_path=with_coder)
+
+    assert outcome.old_tag == outcome.new_tag == "v1.0.0"
+    reloaded = cfg_mod.load(with_coder)
+    assert reloaded.defaults.hermes_image_tag == "v1.0.0"
+
+
+def test_upgrade_revert_failure_preserves_original_error_and_cleanup(
+    with_coder: Path, mocker, cfg: AgentsConfig
+) -> None:
+    """The failure handler's compose-tag revert talks to the VM — and an
+    unreachable VM is often the very reason the upgrade failed. A raising
+    revert must NOT replace the original exception, and the journal clear
+    plus the snapshots-preserved hint must still run."""
+    _stub_happy_upgrade(mocker, cfg)
+    from agents_cli.errors import HealthCheckFailure
+
+    mocker.patch("agents_cli.ops.doctor", side_effect=HealthCheckFailure("doctor says no"))
+    # First call = the tag_pinned phase; second = the revert in the
+    # except handler, which blows up like an unreachable VM would.
+    mocker.patch(
+        "agents_cli.upgrades._set_image_tag",
+        side_effect=[None, RuntimeError("VM unreachable")],
+    )
+    warn_spy = mocker.spy(upgrades.ui, "warn")
+
+    with pytest.raises(HealthCheckFailure, match="doctor says no"):
+        upgrades.upgrade("coder", tag="v1.0.1", config_path=with_coder)
+
+    warnings = [c.args[0] for c in warn_spy.call_args_list]
+    assert any("could not revert compose tag" in w for w in warnings)
+    assert any("snapshots preserved" in w for w in warnings)
+    # Journal still cleared so the retry starts from a clean slate.
+    journals = list((cfg.paths.host_data_dir / ".journal").glob("upgrade-coder-*.json"))
+    assert journals == []
 
 
 def test_host_data_snapshot_runs_sudo_tar_inside_vm_in_host_mount_mode(

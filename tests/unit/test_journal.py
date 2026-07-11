@@ -104,6 +104,59 @@ def test_find_resumable_skips_corrupt_files(tmp_path: Path) -> None:
     assert Journal.find_resumable(tmp_path, "create", "coder") is None
 
 
+def test_find_resumable_falls_back_past_corrupt_newest(tmp_path: Path) -> None:
+    """A corrupt newest candidate must not hide an older valid journal —
+    candidates are skipped individually, not abandoned at the last one."""
+    d = tmp_path / ".journal"
+    d.mkdir()
+    valid = {
+        "op": "create",
+        "name": "coder",
+        "started_at": "2026-05-01T00:00:00+00:00",
+        "phases": ["a"],
+        "completed_phases": ["a"],
+    }
+    (d / "create-coder-20260501T000000Z.json").write_text(json.dumps(valid))
+    (d / "create-coder-20260512T120000Z.json").write_text("not json")
+    found = Journal.find_resumable(tmp_path, "create", "coder")
+    assert found is not None
+    assert found.completed_phases == ["a"]
+
+
+def test_find_resumable_ignores_prefix_colliding_agent_name(tmp_path: Path) -> None:
+    """The filename glob for agent ``foo`` also matches agent ``foo-bar``'s
+    journals, and ``foo-bar``'s sort AFTER ``foo``'s own (letters beat the
+    timestamp digits) — so without payload verification the wrong agent's
+    journal wins. Regression for the prefix-glob collision class."""
+    d = tmp_path / ".journal"
+    d.mkdir()
+    foo = {
+        "op": "upgrade",
+        "name": "foo",
+        "started_at": "2026-01-01T00:00:00+00:00",
+        "phases": ["a"],
+        "completed_phases": ["a"],
+    }
+    foo_bar = {**foo, "name": "foo-bar", "completed_phases": []}
+    (d / "upgrade-foo-20260101T000000Z.json").write_text(json.dumps(foo))
+    (d / "upgrade-foo-bar-20260201T000000Z.json").write_text(json.dumps(foo_bar))
+
+    found = Journal.find_resumable(tmp_path, "upgrade", "foo")
+    assert found is not None
+    assert found.name == "foo"
+    assert found.completed_phases == ["a"]
+
+    # And foo-bar's own lookup is unaffected.
+    other = Journal.find_resumable(tmp_path, "upgrade", "foo-bar")
+    assert other is not None
+    assert other.name == "foo-bar"
+
+
+def test_find_resumable_returns_none_when_only_prefix_collision_exists(tmp_path: Path) -> None:
+    Journal.begin(tmp_path, "upgrade", "foo-bar", ["a"])
+    assert Journal.find_resumable(tmp_path, "upgrade", "foo") is None
+
+
 def test_find_dangling_returns_old_journals(tmp_path: Path) -> None:
     j = Journal.begin(tmp_path, "create", "coder", ["a"])
     old_payload = json.loads(j.path.read_text())
@@ -164,3 +217,48 @@ def test_atomic_write_leaves_no_tmp_files(tmp_path: Path) -> None:
     Journal.begin(tmp_path, "create", "coder", ["a"])
     d = tmp_path / journal.JOURNAL_DIR_NAME
     assert not any(d.glob("*.tmp"))
+
+
+# ---------- meta ----------
+
+
+def test_begin_without_meta_defaults_to_empty(tmp_path: Path) -> None:
+    j = Journal.begin(tmp_path, "create", "coder", ["a"])
+    assert j.meta == {}
+    payload = json.loads(j.path.read_text())
+    assert payload["meta"] == {}
+
+
+def test_meta_round_trips_through_advance_and_load(tmp_path: Path) -> None:
+    j = Journal.begin(
+        tmp_path,
+        "upgrade",
+        "coder",
+        ["a", "b"],
+        meta={"old_tag": "v1.0.0", "new_tag": "v2.0.0"},
+    )
+    j.advance("a")  # rewrite must preserve meta
+    loaded = Journal.load(j.path)
+    assert loaded.meta == {"old_tag": "v1.0.0", "new_tag": "v2.0.0"}
+    assert loaded.completed_phases == ["a"]
+
+
+def test_load_legacy_journal_without_meta_defaults_to_empty(tmp_path: Path) -> None:
+    """Journals written before the meta field existed must load with
+    ``meta == {}`` rather than raising KeyError."""
+    d = tmp_path / ".journal"
+    d.mkdir()
+    legacy = {
+        "op": "upgrade",
+        "name": "coder",
+        "started_at": "2026-05-01T00:00:00+00:00",
+        "phases": ["a"],
+        "completed_phases": [],
+    }
+    p = d / "upgrade-coder-20260501T000000Z.json"
+    p.write_text(json.dumps(legacy))
+    loaded = Journal.load(p)
+    assert loaded.meta == {}
+    found = Journal.find_resumable(tmp_path, "upgrade", "coder")
+    assert found is not None
+    assert found.meta == {}

@@ -26,9 +26,10 @@ import contextlib
 import json
 import os
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 from agents_cli.errors import UserError
 
@@ -58,6 +59,12 @@ class Journal:
     started_at: datetime
     phases: list[str]
     completed_phases: list[str]
+    # Op-scoped metadata captured at begin-time (e.g. the upgrade
+    # state machine records {"old_tag", "new_tag"} so a resumed run
+    # doesn't have to re-derive them from state the interrupted run
+    # already mutated). Journals written before this field existed
+    # load with an empty dict.
+    meta: dict[str, Any] = field(default_factory=dict)
 
     # ---------- begin / advance / complete ----------
 
@@ -68,6 +75,8 @@ class Journal:
         op: str,
         name: str,
         phases: list[str],
+        *,
+        meta: dict[str, Any] | None = None,
     ) -> Journal:
         started = _utc_now()
         path = _journal_dir(data_dir) / f"{op}-{name}-{_utc_stamp(started)}.json"
@@ -78,6 +87,7 @@ class Journal:
             started_at=started,
             phases=list(phases),
             completed_phases=[],
+            meta=dict(meta) if meta else {},
         )
         j._write()
         return j
@@ -103,6 +113,7 @@ class Journal:
             "started_at": self.started_at.isoformat(),
             "phases": self.phases,
             "completed_phases": self.completed_phases,
+            "meta": self.meta,
         }
         tmp = self.path.parent / f"{self.path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
         try:
@@ -126,19 +137,29 @@ class Journal:
             started_at=datetime.fromisoformat(data["started_at"]),
             phases=list(data.get("phases", [])),
             completed_phases=list(data.get("completed_phases", [])),
+            meta=dict(data.get("meta") or {}),
         )
 
     @classmethod
     def find_resumable(cls, data_dir: Path, op: str, name: str) -> Journal | None:
-        """Return the most-recent journal for ``(op, name)`` if any exists."""
+        """Return the most-recent journal for ``(op, name)`` if any exists.
+
+        The filename glob is a prefix match, so agent ``foo`` would also
+        pick up ``upgrade-foo-bar-<utc>.json`` (and ``foo-bar`` sorts
+        AFTER ``foo``'s own journals — letters beat the digits of the
+        timestamp — so the wrong journal would win). Verify the loaded
+        payload's ``(op, name)`` before returning; skip mismatches and
+        corrupt files rather than giving up at the newest candidate.
+        """
         d = _journal_dir(data_dir)
-        candidates = sorted(d.glob(f"{op}-{name}-*.json"))
-        if not candidates:
-            return None
-        try:
-            return cls.load(candidates[-1])
-        except (json.JSONDecodeError, KeyError, ValueError):
-            return None
+        for candidate in sorted(d.glob(f"{op}-{name}-*.json"), reverse=True):
+            try:
+                j = cls.load(candidate)
+            except (json.JSONDecodeError, KeyError, ValueError):
+                continue
+            if j.op == op and j.name == name:
+                return j
+        return None
 
     @classmethod
     def find_dangling(
