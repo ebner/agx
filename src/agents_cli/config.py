@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import tomlkit
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -185,7 +186,13 @@ class OllamaConfig(BaseModel):
             raise ValueError(f"ollama.url must be http(s)://... — got {v!r}")
         # Reject the obvious host-vs-VM trap. Memory backends called from
         # the Hermes container would route localhost back to the VM.
-        host = v.split("://", 1)[1].split("/", 1)[0].split(":", 1)[0]
+        # urlsplit().hostname lowercases and strips IPv6 brackets, so
+        # ``http://LOCALHOST`` and ``http://[::1]`` can't slip past the
+        # blocklist the way a hand-rolled split let them.
+        try:
+            host = urlsplit(v).hostname or ""
+        except ValueError as e:
+            raise ValueError(f"ollama.url is not a valid URL: {v!r} ({e})") from e
         if host in {"localhost", "127.0.0.1", "::1", "0.0.0.0"}:
             raise ValueError(
                 f"ollama.url host {host!r} is not reachable from inside the "

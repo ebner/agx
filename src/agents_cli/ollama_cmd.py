@@ -30,7 +30,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from agents_cli import compose, mp, ui
+from agents_cli import compose, mp, sidecar, ui
 from agents_cli import config as cfg_mod
 from agents_cli.config import AgentsConfig, OllamaConfig
 from agents_cli.errors import RuntimeFailure, UserError
@@ -82,10 +82,13 @@ def configure(
 
     cfg_mod.save(cfg, config_path)
 
-    if api_key:
-        _write_env_secret(cfg, env_name, api_key)
-    elif api_key == "":
-        _write_env_secret(cfg, env_name, "")
+    if api_key is not None:
+        # Empty string clears the key; any other value sets it. The
+        # project .env is shared with `firecrawl up` / `vm init` writers
+        # — hold the mutation lock so a concurrent locked writer can't
+        # lose this key (or vice versa). Rule #7.
+        with compose.acquire_lock(cfg.paths.host_data_dir):
+            _write_env_secret(cfg, env_name, api_key)
 
     # Probe reachability. Probes are best-effort but loud: we report each
     # outcome via ui.warn rather than raising, so a working setup behind a
@@ -152,7 +155,9 @@ def clear(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> None:
     cfg.ollama = OllamaConfig()
     cfg_mod.save(cfg, config_path)
     if prior_env:
-        _write_env_secret(cfg, prior_env, "")
+        # Same locked read-modify-write as configure — see rule #7.
+        with compose.acquire_lock(cfg.paths.host_data_dir):
+            _write_env_secret(cfg, prior_env, "")
     ui.emit({"cleared": True}, human="ollama: configuration cleared")
 
 
@@ -160,31 +165,23 @@ def clear(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> None:
 
 
 def _write_env_secret(cfg: AgentsConfig, key: str, value: str) -> None:
-    """Set or remove ``key=value`` in ``<data-dir>/.env`` without
+    """Set or remove ``key=value`` in the project ``.env`` without
     disturbing other entries. Empty ``value`` removes the line.
+
+    Mode-aware via :func:`sidecar.write_project_env` — in
+    ``--data-dir-in-vm`` mode the file the containers actually read
+    lives at ``<vm_agents_root>/.env`` inside the VM; a host-only write
+    there would leave probes passing with auth the containers never
+    see. Same dict-based whole-file render as ``firecrawl up`` uses, so
+    comments in the project ``.env`` are not preserved. Callers hold
+    ``compose.acquire_lock``.
     """
-    env_path = cfg.paths.host_data_dir / ".env"
-    lines: list[str] = []
-    if env_path.exists():
-        lines = env_path.read_text(encoding="utf-8").splitlines()
-    out: list[str] = []
-    replaced = False
-    for line in lines:
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or "=" not in stripped:
-            out.append(line)
-            continue
-        k, _, _v = stripped.partition("=")
-        if k.strip() == key:
-            replaced = True
-            if value:
-                out.append(f"{key}={value}")
-            # else: drop the line
-            continue
-        out.append(line)
-    if not replaced and value:
-        out.append(f"{key}={value}")
-    env_path.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
+    env = sidecar.read_project_env(cfg)
+    if value:
+        env[key] = value
+    else:
+        env.pop(key, None)
+    sidecar.write_project_env(cfg, env)
 
 
 def _probe_reachability(cfg: AgentsConfig, *, agent_filter: str | None) -> list[dict[str, str]]:
@@ -274,17 +271,8 @@ def _curl_auth_args(cfg: AgentsConfig) -> list[str]:
 
 
 def _read_env(cfg: AgentsConfig) -> dict[str, str]:
-    env_path = cfg.paths.host_data_dir / ".env"
-    if not env_path.exists():
-        return {}
-    out: dict[str, str] = {}
-    for line in env_path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k, _, v = line.partition("=")
-        out[k.strip()] = v.strip()
-    return out
+    """Mode-aware project-.env read (values stripped for header use)."""
+    return {k: v.strip() for k, v in sidecar.read_project_env(cfg).items()}
 
 
 def _hermes_services(cfg: AgentsConfig, agent_filter: str | None) -> list[str]:

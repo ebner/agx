@@ -33,11 +33,10 @@ re-resolve on ``--upgrade``. ``cfg.inference.ollama_image`` /
 
 from __future__ import annotations
 
-import platform
 from pathlib import Path
 from typing import Any
 
-from agents_cli import compose, compose_runner, mp, ui
+from agents_cli import compose, compose_runner, mp, sidecar, ui
 from agents_cli import config as cfg_mod
 from agents_cli.compose import (
     LLAMACPP_IMAGE_BASE,
@@ -49,15 +48,6 @@ from agents_cli.config import AgentsConfig
 from agents_cli.errors import RuntimeFailure, UserError
 
 SUPPORTED_ENGINES: tuple[str, ...] = ("ollama", "llama-cpp")
-
-
-def _docker_arch() -> str:
-    """Same logic as firecrawl_cmd._docker_arch — host == VM arch under
-    Multipass. Centralizing it here would create a circular dependency
-    via the doctor module; duplication is cheaper.
-    """
-    m = platform.machine().lower()
-    return "arm64" if m in ("aarch64", "arm64") else "amd64"
 
 
 # ---------- public CLI entry points ----------
@@ -140,8 +130,14 @@ def status(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> dict[str, Any]
 def _up_ollama(cfg: AgentsConfig, *, upgrade: bool, config_path: Path) -> dict[str, Any]:
     image_digest = cfg.inference.ollama_image
     if not image_digest or upgrade:
-        image_digest = _resolve_ollama_digest(cfg)
+        # resolve_digest allowlist-validates before returning (rule #5).
+        image_digest = sidecar.resolve_digest(cfg, f"{OLLAMA_IMAGE_BASE}:latest")
         cfg.inference.ollama_image = image_digest
+    else:
+        # Reuse path: the ref comes straight out of config.toml — a
+        # doctored config must not deploy an off-allowlist image, so
+        # validate before anything lands in compose (rule #5).
+        compose.validate_image_ref(image_digest)
 
     _ensure_models_dir(cfg, "ollama")
 
@@ -152,12 +148,14 @@ def _up_ollama(cfg: AgentsConfig, *, upgrade: bool, config_path: Path) -> dict[s
     )
     compose.write_compose_atomically(cfg, doc)
 
+    # Compose-up brings it up (raises RuntimeFailure on a non-zero exit).
+    compose_runner.up(cfg, OLLAMA_SERVICE_NAME)
+
+    # Persist enabled + digest pin only AFTER a successful up — a failed
+    # first up must not leave enabled-but-never-ran state in config.toml
+    # (doctor would then probe a service that never existed).
     cfg.inference.ollama_enabled = True
     cfg_mod.save(cfg, config_path)
-
-    # Compose-up brings it up; the fragment's healthcheck means
-    # the call doesn't return until ollama responds to `ollama list`.
-    compose_runner.up(cfg, OLLAMA_SERVICE_NAME)
 
     payload = {
         "engine": "ollama",
@@ -220,36 +218,6 @@ def _status_ollama(cfg: AgentsConfig) -> dict[str, Any]:
     return out
 
 
-def _resolve_ollama_digest(cfg: AgentsConfig) -> str:
-    """Pull the upstream floating tag, capture the resulting RepoDigest.
-
-    Always pins to a digest — same policy as Firecrawl. Multi-arch
-    image; Docker daemon picks the right manifest for the VM's arch
-    (which is the host's arch under Multipass).
-    """
-    floating = f"{OLLAMA_IMAGE_BASE}:latest"
-    ui.info(f"pulling {floating}")
-    pull = mp.exec_in_vm(cfg.vm.name, "docker", "pull", floating, check=False)
-    if pull.returncode != 0:
-        raise RuntimeFailure(f"docker pull {floating} failed: {pull.stderr.strip()}")
-    inspect = mp.exec_in_vm(
-        cfg.vm.name,
-        "docker",
-        "image",
-        "inspect",
-        "--format",
-        "{{index .RepoDigests 0}}",
-        floating,
-        check=False,
-    )
-    if inspect.returncode != 0:
-        raise RuntimeFailure(f"docker image inspect {floating} failed: {inspect.stderr.strip()}")
-    digest = inspect.stdout.strip()
-    if not digest or "@sha256:" not in digest:
-        raise RuntimeFailure(f"unparseable repo-digest for {floating}: {digest!r}")
-    return digest
-
-
 def _ollama_list_models(cfg: AgentsConfig) -> list[dict[str, Any]]:
     """Query `ollama list` inside the container; parse the table.
 
@@ -293,8 +261,14 @@ def _pin_llamacpp_image(cfg: AgentsConfig, *, upgrade: bool, config_path: Path) 
     """
     if cfg.inference.llamacpp_image and not upgrade:
         digest = cfg.inference.llamacpp_image
+        # Reuse path: cfg-supplied ref — allowlist-validate before it can
+        # reach any compose write (rule #5).
+        compose.validate_image_ref(digest)
     else:
-        digest = _resolve_llamacpp_digest(cfg)
+        # resolve_digest allowlist-validates before returning (rule #5).
+        # The llama.cpp image is multi-arch (amd64/arm64/s390x); the
+        # daemon picks the right manifest for the VM's arch.
+        digest = sidecar.resolve_digest(cfg, f"{LLAMACPP_IMAGE_BASE}:server")
         cfg.inference.llamacpp_image = digest
         cfg_mod.save(cfg, config_path)
 
@@ -321,32 +295,6 @@ def _pin_llamacpp_image(cfg: AgentsConfig, *, upgrade: bool, config_path: Path) 
         ),
     )
     return payload
-
-
-def _resolve_llamacpp_digest(cfg: AgentsConfig) -> str:
-    """Same pull-and-inspect dance as Ollama. The llama.cpp image is
-    multi-arch (amd64/arm64/s390x); Docker picks the right manifest."""
-    floating = f"{LLAMACPP_IMAGE_BASE}:server"
-    ui.info(f"pulling {floating}")
-    pull = mp.exec_in_vm(cfg.vm.name, "docker", "pull", floating, check=False)
-    if pull.returncode != 0:
-        raise RuntimeFailure(f"docker pull {floating} failed: {pull.stderr.strip()}")
-    inspect = mp.exec_in_vm(
-        cfg.vm.name,
-        "docker",
-        "image",
-        "inspect",
-        "--format",
-        "{{index .RepoDigests 0}}",
-        floating,
-        check=False,
-    )
-    if inspect.returncode != 0:
-        raise RuntimeFailure(f"docker image inspect {floating} failed: {inspect.stderr.strip()}")
-    digest = inspect.stdout.strip()
-    if not digest or "@sha256:" not in digest:
-        raise RuntimeFailure(f"unparseable repo-digest for {floating}: {digest!r}")
-    return digest
 
 
 def _down_all_llamacpp(cfg: AgentsConfig) -> dict[str, Any]:
@@ -413,6 +361,10 @@ def up_llamacpp_model(
     cfg = cfg_mod.load(config_path)
     if not cfg.inference.llamacpp_image:
         raise UserError("llama-cpp image not pinned — run `agents inference up llama-cpp` first")
+    # cfg-supplied ref goes verbatim into the service fragment below —
+    # allowlist-validate first (rule #5; a doctored config.toml must not
+    # deploy an arbitrary registry image).
+    compose.validate_image_ref(cfg.inference.llamacpp_image)
     _validate_slug(slug)
     gguf_abs = cfg.paths.host_data_dir / "models" / "llama-cpp" / gguf_relative_path
     if not gguf_abs.exists():
@@ -491,17 +443,10 @@ def _ollama_in_compose(cfg: AgentsConfig) -> bool:
 
 
 def _service_running(cfg: AgentsConfig, svc: str) -> bool:
-    """Probe whether ``svc`` is up. Reuses ops.py's ``_container_state_for``
-    parser so docker compose's per-version output quirks (jsonl vs array)
-    are handled in one place.
+    """Thin alias for :func:`sidecar.service_running` — kept because
+    models_cmd imports it by this name.
     """
-    from agents_cli.ops import _container_state_for
-
-    result = compose_runner.ps(cfg)
-    if result.returncode != 0:
-        return False
-    state = _container_state_for(result.stdout, svc).lower()
-    return state in ("running", "healthy")
+    return sidecar.service_running(cfg, svc)
 
 
 def _ensure_models_dir(cfg: AgentsConfig, engine: str) -> None:

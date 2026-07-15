@@ -713,6 +713,112 @@ def test_doctor_firecrawl_quiet_after_deliberate_down(cfg: AgentsConfig, mocker)
     assert "down" in check.detail
 
 
+# ---------- doctor: llama-cpp per-model services ----------
+
+
+def _seed_llamacpp_service(cfg: AgentsConfig, *slugs: str) -> None:
+    body = "services:\n"
+    for slug in slugs:
+        body += f"  llama-cpp-{slug}:\n    image: x\n"
+    (cfg.paths.host_data_dir / "docker-compose.yml").write_text(body, encoding="utf-8")
+
+
+def test_doctor_llamacpp_warns_when_defined_but_absent(cfg: AgentsConfig, mocker) -> None:
+    """The VM-rebuild stranding class: the compose blocks survive the
+    migration, the containers don't. Same gap _check_firecrawl_running
+    covers — gate on compose presence, warn with the recovery hint.
+    """
+    from agents_cli.ops import DoctorReport, _check_inference_llamacpp
+
+    _seed_llamacpp_service(cfg, "qwen")
+    mocker.patch("agents_cli.compose_runner.ps", return_value=_ok("[]"))
+
+    report = DoctorReport()
+    _check_inference_llamacpp(cfg, report)
+    [check] = [c for c in report.checks if c.name == "inference_llamacpp"]
+    assert check.status == "warn"
+    assert "llama-cpp-qwen" in check.detail
+    assert "not running" in check.detail
+    # The recovery hint must name the REAL command — loading lives under
+    # the `inference` group (`agents inference load ...`); the `model`
+    # group has no `load` subcommand.
+    assert "agents inference load llama-cpp" in check.detail
+    assert "agents model load" not in check.detail
+
+
+def test_doctor_llamacpp_ok_when_running(cfg: AgentsConfig, mocker) -> None:
+    from agents_cli.ops import DoctorReport, _check_inference_llamacpp
+
+    _seed_llamacpp_service(cfg, "qwen")
+    mocker.patch(
+        "agents_cli.compose_runner.ps",
+        return_value=_ok(json.dumps([{"Service": "llama-cpp-qwen", "State": "running"}])),
+    )
+
+    report = DoctorReport()
+    _check_inference_llamacpp(cfg, report)
+    [check] = [c for c in report.checks if c.name == "inference_llamacpp"]
+    assert check.status == "ok"
+
+
+def test_doctor_llamacpp_warns_on_partial_stranding(cfg: AgentsConfig, mocker) -> None:
+    """Two services defined, one exited — only the stranded one is named."""
+    from agents_cli.ops import DoctorReport, _check_inference_llamacpp
+
+    _seed_llamacpp_service(cfg, "qwen", "phi")
+    mocker.patch(
+        "agents_cli.compose_runner.ps",
+        return_value=_ok(
+            json.dumps(
+                [
+                    {"Service": "llama-cpp-qwen", "State": "running"},
+                    {"Service": "llama-cpp-phi", "State": "exited"},
+                ]
+            )
+        ),
+    )
+
+    report = DoctorReport()
+    _check_inference_llamacpp(cfg, report)
+    [check] = [c for c in report.checks if c.name == "inference_llamacpp"]
+    assert check.status == "warn"
+    assert "llama-cpp-phi" in check.detail
+    assert "llama-cpp-qwen" not in check.detail
+
+
+def test_doctor_llamacpp_skips_when_none_defined(cfg: AgentsConfig, mocker) -> None:
+    """Most users won't run local inference — no compose entries means
+    an ok/skip, not a probe.
+    """
+    from agents_cli.ops import DoctorReport, _check_inference_llamacpp
+
+    ps_spy = mocker.patch("agents_cli.compose_runner.ps", return_value=_ok("[]"))
+
+    report = DoctorReport()
+    _check_inference_llamacpp(cfg, report)
+    [check] = [c for c in report.checks if c.name == "inference_llamacpp"]
+    assert check.status == "ok"
+    assert "skipped" in check.detail
+    ps_spy.assert_not_called()
+
+
+def test_doctor_inference_health_covers_both_engines(cfg: AgentsConfig, mocker) -> None:
+    """_check_inference_health fans out to BOTH the ollama probe and the
+    per-model llama-cpp probes — the llama-cpp half was the doctor
+    blind spot (docstring claimed it, code skipped it).
+    """
+    from agents_cli.ops import DoctorReport, _check_inference_health
+
+    _seed_llamacpp_service(cfg, "qwen")
+    mocker.patch("agents_cli.compose_runner.ps", return_value=_ok("[]"))
+
+    report = DoctorReport()
+    _check_inference_health(cfg, report)
+    names = {c.name for c in report.checks}
+    assert "inference_ollama" in names
+    assert "inference_llamacpp" in names
+
+
 def test_doctor_version_check_reports_tag_when_running(
     with_coder: Path, cfg: AgentsConfig, mocker
 ) -> None:

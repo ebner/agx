@@ -47,12 +47,12 @@ resolves them naturally.
 from __future__ import annotations
 
 import json
-import platform
 import secrets
+import time
 from pathlib import Path
 from typing import Any
 
-from agents_cli import compose, compose_runner, hermes_config, mp, ui
+from agents_cli import compose, compose_runner, hermes_config, mp, sidecar, ui
 from agents_cli import config as cfg_mod
 from agents_cli.compose import (
     FIRECRAWL_API_IMAGE_BASE,
@@ -67,22 +67,10 @@ from agents_cli.errors import RuntimeFailure, UserError
 
 
 def _docker_arch() -> str:
-    """Map the host's CPU arch to Docker's tag convention.
-
-    Multipass always launches a same-arch guest VM (no cross-arch
-    virtualization), so the host's arch IS the in-VM Docker daemon's
-    arch — which is what tag selection actually needs to match.
-
-    Returns ``"arm64"`` on aarch64 / arm64, ``"amd64"`` everywhere else.
-    Uncommon architectures (riscv64, ppc64le, etc.) fall through to
-    ``"amd64"`` since none of the upstream Firecrawl tags target them
-    — emulation is the only path and the amd64 tag is the safer bet
-    than a guessed mapping.
+    """Thin alias for :func:`sidecar.docker_arch` — kept because ops.py's
+    doctor checks (and their tests) reference it by this name.
     """
-    m = platform.machine().lower()
-    if m in ("aarch64", "arm64"):
-        return "arm64"
-    return "amd64"
+    return sidecar.docker_arch()
 
 
 # Upstream-floating references the toolkit uses ONCE to resolve digests.
@@ -200,10 +188,13 @@ def up(
 
     First-run flow: pull floating tags, resolve digests, generate
     compose entries, populate project ``.env`` secrets, ``compose up``,
-    wait for ``firecrawl-api`` healthcheck, add the FIRECRAWL_API_KEY /
-    FIRECRAWL_API_URL pair to each Hermes agent's
-    ``terminal.env_passthrough`` so the wiring is visible to sandboxed
-    tools too.
+    probe ``firecrawl-api`` until it answers (bounded wait — the api has
+    no healthcheck and ``up -d`` wouldn't wait on one anyway), and only
+    then add the FIRECRAWL_API_KEY / FIRECRAWL_API_URL pair to each
+    Hermes agent's ``terminal.env_passthrough`` so the wiring is visible
+    to sandboxed tools too. A failed up / probe raises
+    :class:`RuntimeFailure` (exit 2 — the documented exit-code contract)
+    after persisting the degraded state; nothing new is wired.
 
     ``upgrade=True`` re-resolves digests against the upstream floating
     tags, even if a state file already exists.
@@ -214,7 +205,7 @@ def up(
 
     with compose.acquire_lock(cfg.paths.host_data_dir):
         state = read_state(cfg)
-        if not state or upgrade:
+        if "images" not in state or upgrade:
             images = _resolve_digests(cfg)
             state = {"images": images, "api_url": "http://firecrawl-api:3002"}
         else:
@@ -230,30 +221,95 @@ def up(
             services[svc_name] = fragment
         compose.write_compose_atomically(cfg, doc)
 
+        # Persist the digest pins BEFORE the (long, lock-free) compose
+        # up: a failed up must NOT make the retry re-resolve floating
+        # tags — that would be an unintended upgrade (see module
+        # docstring). ``degraded`` marks a stack whose api never came
+        # up healthy; it's cleared once the probe below passes, and it
+        # keeps ``ensure_agent_wired`` (the `agents create` hook) from
+        # advertising a dead stack to new agents in the meantime.
+        state["degraded"] = True
         write_state(cfg, state)
 
-        # Auto-wire every existing Hermes agent's passthrough.
-        # OpenClaw agents are wired purely via compose-fragment env
-        # interpolation (no passthrough analogue) — see
-        # ``compose.openclaw_service_fragment``.
-        wired_hermes = _ensure_all_agents_wired(cfg)
+    # Bring the stack up, then PROBE. `compose up -d` returning 0 means
+    # "containers created/started", not "api serving" — the api fragment
+    # carries no healthcheck and `up -d` doesn't wait on health anyway.
+    # Only a passing probe earns `running: True` and the agent wiring.
+    failure_reason: str | None = None
+    try:
+        compose_runner.up(cfg, *fragments.keys())
+    except RuntimeFailure as e:
+        failure_reason = f"compose up failed: {e}"
+    if failure_reason is None and not _wait_api_healthy(cfg):
+        failure_reason = f"firecrawl-api did not become healthy within {int(_HEALTH_TIMEOUT_S)}s"
 
-    # Bring the stack up. Healthchecks declared in the fragments mean
-    # `compose up -d` returns after the api is healthy.
-    compose_runner.up(cfg, *fragments.keys())
+    if failure_reason is not None:
+        # The degraded state (digest pins + flag) is already on disk from
+        # the locked window above. Raise — not emit-and-return — so
+        # `cli._run` exits 2 per the exit-code contract; shell scripts
+        # must not sail past a stack that never came up. ui's error
+        # handler emits the single error object, keeping the
+        # one-JSON-object stdout contract (emitting a payload here AND
+        # raising would print two).
+        raise RuntimeFailure(
+            f"firecrawl did not start: {failure_reason}. "
+            "Digests stay pinned in .firecrawl-state.json; re-run "
+            "`agents firecrawl up` to retry without re-resolving. "
+            "No new agents were wired."
+        )
+
+    with compose.acquire_lock(cfg.paths.host_data_dir):
+        # Revalidate before committing success: the up/probe window ran
+        # lock-free, so another mutating command may have interleaved.
+        # Committing the stale local `state` blindly would resurrect a
+        # destroyed stack's state file and wire agents to nothing.
+        current = read_state(cfg)
+        if "images" not in current or not _firecrawl_services_in_compose(cfg):
+            # `agents firecrawl destroy` (or equivalent teardown) won the
+            # race: state file and/or compose services are gone. Abort
+            # the success commit — no state rewrite, no wiring.
+            raise RuntimeFailure(
+                "firecrawl came up healthy, but a concurrent command tore "
+                "the stack down during the start window (state file or "
+                "compose services are gone — `agents firecrawl destroy`?). "
+                "Nothing was rewritten and no agents were wired; re-run "
+                "`agents firecrawl up` if the stack is still wanted."
+            )
+        if current["images"] == images:
+            # No interleaving re-pin — commit our success by clearing the
+            # degraded marker written before the up.
+            current.pop("degraded", None)
+            write_state(cfg, current)
+        else:
+            # A concurrent `firecrawl up --upgrade` re-resolved the pins
+            # during our window. Its state file is newer than our
+            # in-memory copy — prefer the CURRENT pins, skip rewriting
+            # ours (its own success commit will clear its flag).
+            ui.warn(
+                "a concurrent `agents firecrawl up` re-pinned the image "
+                "digests during the start window; keeping its newer pins."
+            )
+        images = current["images"]
+        api_url = str(current.get("api_url") or state["api_url"])
+
+        # Auto-wire every existing Hermes agent's passthrough — only now
+        # that the stack is observably serving. OpenClaw agents are wired
+        # purely via compose-fragment env interpolation (no passthrough
+        # analogue) — see ``compose.openclaw_service_fragment``.
+        wired_hermes = _ensure_all_agents_wired(cfg)
 
     wired_openclaw = _openclaw_agents_with_env(cfg)
     wired = wired_hermes + wired_openclaw
     stale = _agents_with_stale_fragment(cfg)
-    payload = {
+    payload: dict[str, Any] = {
         "running": True,
-        "api_url": state["api_url"],
+        "api_url": api_url,
         "wired_agents": wired,
         "stale_agents": stale,
         "images": images,
     }
     human_lines = [
-        f"firecrawl: up at {state['api_url']}",
+        f"firecrawl: up at {api_url}",
         f"  wired agents: {', '.join(wired) or '(none)'}",
     ]
     if wired_openclaw:
@@ -473,10 +529,15 @@ def ensure_agent_wired(cfg: AgentsConfig, agent_name: str) -> None:
     agent's ``terminal.env_passthrough`` — called from ``agents create``
     so a new Hermes agent auto-picks-up firecrawl when it's already up.
 
-    No-op when firecrawl isn't installed. Idempotent on the agent side
-    (``hermes_config.add_env_passthrough`` deduplicates).
+    No-op when firecrawl isn't installed. Also a no-op while the state
+    file carries the ``degraded`` flag (last ``up`` never saw the api
+    healthy) — don't advertise a dead stack to a brand-new agent.
+    Idempotent on the agent side (``hermes_config.add_env_passthrough``
+    deduplicates).
     """
     if not is_installed(cfg):
+        return
+    if read_state(cfg).get("degraded"):
         return
     _wire_agent(cfg, agent_name)
 
@@ -484,37 +545,39 @@ def ensure_agent_wired(cfg: AgentsConfig, agent_name: str) -> None:
 # ---------- internals ----------
 
 
+# Bounded wait for the api to start serving after `compose up`.
+# Host-side module — plain time.sleep is fine.
+_HEALTH_TIMEOUT_S = 60.0
+_HEALTH_INTERVAL_S = 2.0
+
+
+def _wait_api_healthy(
+    cfg: AgentsConfig,
+    *,
+    timeout_s: float = _HEALTH_TIMEOUT_S,
+    interval_s: float = _HEALTH_INTERVAL_S,
+) -> bool:
+    """Poll :func:`_api_health` until it reports ``healthy`` or the
+    window closes. The api typically needs a few seconds after container
+    start before its TCP port answers.
+    """
+    deadline = time.monotonic() + timeout_s
+    while True:
+        if _api_health(cfg) == "healthy":
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(interval_s)
+
+
 def _resolve_digests(cfg: AgentsConfig) -> dict[str, str]:
     """Pull each upstream floating tag, harvest its repo-digest, return
     a map of role → ``<repo>@sha256:…``. The compose file only ever
     references the digest form so the toolkit's "no ``:latest``" rule
-    holds.
+    holds. Allowlist validation happens inside
+    :func:`sidecar.resolve_digest`, before any ref is returned.
     """
-    out: dict[str, str] = {}
-    for role, floating in FLOATING_REFS.items():
-        ui.info(f"pulling {floating}")
-        pull = mp.exec_in_vm(cfg.vm.name, "docker", "pull", floating, check=False)
-        if pull.returncode != 0:
-            raise RuntimeFailure(f"docker pull failed for {floating}: {pull.stderr.strip()}")
-        inspect = mp.exec_in_vm(
-            cfg.vm.name,
-            "docker",
-            "image",
-            "inspect",
-            floating,
-            "--format",
-            "{{index .RepoDigests 0}}",
-            check=False,
-        )
-        if inspect.returncode != 0 or not inspect.stdout.strip():
-            raise RuntimeFailure(
-                f"could not resolve digest for {floating}: {inspect.stderr.strip()}"
-            )
-        digest_ref = inspect.stdout.strip()
-        # Validate it's on the allowlist BEFORE we let it land in compose.
-        compose.validate_image_ref(digest_ref)
-        out[role] = digest_ref
-    return out
+    return {role: sidecar.resolve_digest(cfg, floating) for role, floating in FLOATING_REFS.items()}
 
 
 def _ensure_project_env(cfg: AgentsConfig) -> None:
@@ -524,9 +587,11 @@ def _ensure_project_env(cfg: AgentsConfig) -> None:
 
     Picks the right ``.env`` for the current mode: host file in
     host-mount mode (visible to VM via the multipass mount), VM-side
-    file in ``--data-dir-in-vm`` mode (where the host has no copy).
+    file in ``--data-dir-in-vm`` mode (where the host has no copy) —
+    both via :func:`sidecar.read_project_env` /
+    :func:`sidecar.write_project_env`.
     """
-    existing = _read_project_env_file(cfg)
+    existing = sidecar.read_project_env(cfg)
     if not existing.get("FIRECRAWL_API_KEY"):
         existing["FIRECRAWL_API_KEY"] = f"fc-self-hosted-{secrets.token_hex(8)}"
     if not existing.get("FIRECRAWL_API_URL"):
@@ -535,86 +600,16 @@ def _ensure_project_env(cfg: AgentsConfig) -> None:
         existing["FIRECRAWL_BULL_AUTH_KEY"] = secrets.token_hex(32)
     if not existing.get("FIRECRAWL_POSTGRES_PASSWORD"):
         existing["FIRECRAWL_POSTGRES_PASSWORD"] = secrets.token_hex(16)
-    _write_project_env_file(cfg, existing)
+    sidecar.write_project_env(cfg, existing)
 
 
 def _drop_project_env_keys(cfg: AgentsConfig) -> None:
-    existing = _read_project_env_file(cfg)
+    existing = sidecar.read_project_env(cfg)
     if not existing:
         return
     for k in PROJECT_ENV_KEYS:
         existing.pop(k, None)
-    _write_project_env_file(cfg, existing)
-
-
-def _read_project_env_file(cfg: AgentsConfig) -> dict[str, str]:
-    """Mode-aware read of the project ``.env``. Returns ``{}`` when the
-    file is missing.
-    """
-    if cfg.paths.data_dir_in_vm:
-        import os as _os
-        import uuid as _uuid
-
-        vm_path = f"{cfg.paths.vm_agents_root}/.env"
-        check = mp.exec_in_vm(cfg.vm.name, "test", "-f", vm_path, check=False)
-        if check.returncode != 0:
-            return {}
-        host_temp = (
-            compose.host_staging_dir(cfg)
-            / f"projectenv-read-{_os.getpid()}-{_uuid.uuid4().hex[:8]}.env"
-        )
-        try:
-            mp.transfer_from_vm(cfg.vm.name, vm_path, host_temp)
-            return _parse_env_string(host_temp.read_text(encoding="utf-8"))
-        finally:
-            host_temp.unlink(missing_ok=True)
-    path = cfg.paths.host_data_dir / ".env"
-    if not path.exists():
-        return {}
-    return _parse_env_string(path.read_text(encoding="utf-8"))
-
-
-def _write_project_env_file(cfg: AgentsConfig, env: dict[str, str]) -> None:
-    """Mode-aware write to the project ``.env``. In ``--data-dir-in-vm``
-    mode, stages on host and ``multipass transfer``s into the VM.
-
-    The project ``.env`` is at ``<vm_agents_root>/.env`` (ubuntu-owned),
-    NOT inside any container — so SFTP works in both modes. Unlike
-    per-agent ``.env`` files which live under subuid-owned ``/opt/data``.
-    """
-    content = _render_env_string(env)
-    if cfg.paths.data_dir_in_vm:
-        import os as _os
-        import uuid as _uuid
-
-        vm_path = f"{cfg.paths.vm_agents_root}/.env"
-        host_temp = (
-            compose.host_staging_dir(cfg)
-            / f"projectenv-write-{_os.getpid()}-{_uuid.uuid4().hex[:8]}.env"
-        )
-        try:
-            host_temp.write_text(content, encoding="utf-8")
-            mp.transfer_to_vm(host_temp, cfg.vm.name, vm_path)
-        finally:
-            host_temp.unlink(missing_ok=True)
-        return
-    path = cfg.paths.host_data_dir / ".env"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
-
-
-def _parse_env_string(content: str) -> dict[str, str]:
-    out: dict[str, str] = {}
-    for line in content.splitlines():
-        if not line.strip() or line.lstrip().startswith("#") or "=" not in line:
-            continue
-        k, _, v = line.partition("=")
-        out[k.strip()] = v
-    return out
-
-
-def _render_env_string(env: dict[str, str]) -> str:
-    return "\n".join(f"{k}={v}" for k, v in env.items()) + ("\n" if env else "")
+    sidecar.write_project_env(cfg, existing)
 
 
 def _ensure_postgres_dir(cfg: AgentsConfig) -> None:
@@ -1182,23 +1177,7 @@ def _service_in_compose(cfg: AgentsConfig, name: str) -> bool:
 
 
 def _service_running(cfg: AgentsConfig, svc: str) -> bool:
-    result = compose_runner.ps(cfg)
-    if result.returncode != 0:
-        return False
-    try:
-        entries = json.loads(result.stdout) if result.stdout.strip() else []
-        if isinstance(entries, dict):
-            entries = [entries]
-    except json.JSONDecodeError:
-        entries = []
-        for line in result.stdout.splitlines():
-            try:
-                entries.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        if entry.get("Service") == svc and entry.get("State") == "running":
-            return True
-    return False
+    """Thin alias for :func:`sidecar.service_running` — kept because
+    ops.py's doctor checks (and their tests) reference it by this name.
+    """
+    return sidecar.service_running(cfg, svc)

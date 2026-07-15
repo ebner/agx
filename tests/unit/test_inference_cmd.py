@@ -352,12 +352,126 @@ def test_status_lists_loaded_models_when_running(
     assert names == ["llama3.2:3b", "qwen2.5:1.5b"]
 
 
-def test_docker_arch_mirrors_firecrawl_logic(mocker: Any) -> None:
-    """The inference module duplicates _docker_arch to avoid a
-    circular import via doctor. Verify the mapping stays in sync
-    with firecrawl_cmd's version (both should map aarch64 → arm64).
+# ---------- allowlist enforcement (rule #5) ----------
+
+
+def test_up_ollama_rejects_off_allowlist_digest_from_daemon(
+    cfg: AgentsConfig, saved_config: Path, mocker: Any, vm_fs: dict[str, Any]
+) -> None:
+    """Resolve path: even when the daemon reports a digest for some
+    other repo (mirror misconfig, tampered daemon), nothing off the
+    allowlist may land in compose or config.toml.
     """
-    mocker.patch("platform.machine", return_value="aarch64")
-    assert inference_cmd._docker_arch() == "arm64"
-    mocker.patch("platform.machine", return_value="x86_64")
-    assert inference_cmd._docker_arch() == "amd64"
+    evil = "evil.example/notollama@sha256:" + "f" * 64
+    mocker.patch(
+        "agents_cli.mp.exec_in_vm",
+        side_effect=_layer_runner(
+            vm_fs,
+            {
+                ("docker", "pull"): _ok(),
+                ("docker", "image", "inspect"): _ok(stdout=evil + "\n"),
+            },
+        ),
+    )
+    up_spy = mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+
+    with pytest.raises(UserError, match="not on the allowlist"):
+        inference_cmd.up("ollama", config_path=saved_config)
+
+    up_spy.assert_not_called()
+    doc = compose.read_compose_doc(cfg)
+    assert OLLAMA_SERVICE_NAME not in (doc.get("services") or {})
+    reloaded = cfg_mod.load(saved_config)
+    assert reloaded.inference.ollama_enabled is False
+    assert reloaded.inference.ollama_image == ""
+
+
+def test_up_ollama_reuse_path_rejects_doctored_config_image(
+    cfg: AgentsConfig, saved_config: Path, mocker: Any, vm_fs: dict[str, Any]
+) -> None:
+    """Reuse path: a doctored config.toml pin must not be written into
+    compose verbatim — validate before any compose write.
+    """
+    cfg.inference.ollama_image = "evil.example/miner@sha256:" + "a" * 64
+    cfg_mod.save(cfg, saved_config)
+    up_spy = mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+
+    with pytest.raises(UserError, match="not on the allowlist"):
+        inference_cmd.up("ollama", config_path=saved_config)
+
+    up_spy.assert_not_called()
+    doc = compose.read_compose_doc(cfg)
+    assert OLLAMA_SERVICE_NAME not in (doc.get("services") or {})
+
+
+def test_up_llamacpp_reuse_path_rejects_doctored_config_image(
+    cfg: AgentsConfig, saved_config: Path, mocker: Any
+) -> None:
+    cfg.inference.llamacpp_image = "evil.example/miner@sha256:" + "b" * 64
+    cfg_mod.save(cfg, saved_config)
+
+    with pytest.raises(UserError, match="not on the allowlist"):
+        inference_cmd.up("llama-cpp", config_path=saved_config)
+
+
+def test_load_llamacpp_model_rejects_doctored_pinned_image(
+    cfg: AgentsConfig, saved_config: Path
+) -> None:
+    """`model load` writes the pinned llama-cpp image into a fresh
+    compose service block — the cfg-supplied ref must be validated
+    there too, not just at pin time.
+    """
+    cfg.inference.llamacpp_image = "evil.example/miner@sha256:" + "c" * 64
+    cfg_mod.save(cfg, saved_config)
+    gguf = cfg.paths.host_data_dir / "models" / "llama-cpp" / "model.gguf"
+    gguf.parent.mkdir(parents=True, exist_ok=True)
+    gguf.write_bytes(b"gguf")
+
+    with pytest.raises(UserError, match="not on the allowlist"):
+        inference_cmd.up_llamacpp_model(
+            "test-model",
+            gguf_relative_path="model.gguf",
+            port=8080,
+            config_path=saved_config,
+        )
+
+    doc = compose.read_compose_doc(cfg)
+    assert not any(s.startswith("llama-cpp-") for s in (doc.get("services") or {}))
+
+
+# ---------- enabled flag persisted only after successful up ----------
+
+
+def test_up_ollama_failed_up_does_not_persist_enabled_flag(
+    cfg: AgentsConfig, saved_config: Path, mocker: Any, vm_fs: dict[str, Any]
+) -> None:
+    """A failed first `compose up` must not leave enabled-but-never-ran
+    state in config.toml (doctor would then probe a service that never
+    existed).
+    """
+    from agents_cli.errors import RuntimeFailure
+
+    digest = f"{OLLAMA_IMAGE_BASE}@sha256:" + "f" * 64
+    mocker.patch(
+        "agents_cli.mp.exec_in_vm",
+        side_effect=_layer_runner(
+            vm_fs,
+            {
+                ("docker", "pull"): _ok(),
+                ("docker", "image", "inspect"): _ok(stdout=digest + "\n"),
+            },
+        ),
+    )
+    mocker.patch(
+        "agents_cli.compose_runner.up",
+        side_effect=RuntimeFailure("compose up failed (exit 1)"),
+    )
+
+    with pytest.raises(RuntimeFailure):
+        inference_cmd.up("ollama", config_path=saved_config)
+
+    reloaded = cfg_mod.load(saved_config)
+    assert reloaded.inference.ollama_enabled is False
+    # The digest pin is also only persisted on success — the retry
+    # re-resolves (cheap; the pull is already in the daemon cache).
+    assert reloaded.inference.ollama_image == ""

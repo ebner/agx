@@ -236,14 +236,18 @@ def test_probe_uses_bearer_when_api_key_env_present(
 # ---------- .env round-trip ----------
 
 
-def test_write_env_secret_preserves_unrelated_lines(cfg: AgentsConfig) -> None:
+def test_write_env_secret_preserves_unrelated_keys(cfg: AgentsConfig) -> None:
+    """Unrelated entries survive the read-modify-write. (Comments are
+    not preserved — the project .env goes through the same dict-based
+    sidecar writer `firecrawl up` uses, which has always re-rendered
+    the whole file.)
+    """
     env_path = cfg.paths.host_data_dir / ".env"
-    env_path.write_text("HERMES_UID=1000\nHERMES_GID=1000\n# a comment\n", encoding="utf-8")
+    env_path.write_text("HERMES_UID=1000\nHERMES_GID=1000\n", encoding="utf-8")
     ollama_cmd._write_env_secret(cfg, "OLLAMA_API_KEY", "x")
     txt = env_path.read_text(encoding="utf-8")
     assert "HERMES_UID=1000" in txt
     assert "HERMES_GID=1000" in txt
-    assert "# a comment" in txt
     assert "OLLAMA_API_KEY=x" in txt
 
 
@@ -263,3 +267,92 @@ def test_write_env_secret_empty_value_removes_line(cfg: AgentsConfig) -> None:
     txt = env_path.read_text(encoding="utf-8")
     assert "OLLAMA_API_KEY" not in txt
     assert "OTHER=x" in txt
+
+
+# ---------- locking + mode-awareness of the .env mutation ----------
+
+
+def test_configure_holds_mutation_lock_around_env_write(
+    cfg: AgentsConfig, saved_config: Path, mocker: Any
+) -> None:
+    """The project-.env read-modify-write races `firecrawl up`'s locked
+    writes (lost keys) unless configure serializes on the same
+    <data-dir>/.agents.lock (rule #7). Assert the flock is taken and
+    the write happens while it's held.
+    """
+    import contextlib
+
+    events: list[str] = []
+
+    @contextlib.contextmanager
+    def fake_lock(path: Path) -> Any:
+        assert path == cfg.paths.host_data_dir
+        events.append("lock:enter")
+        yield
+        events.append("lock:exit")
+
+    mocker.patch("agents_cli.compose.acquire_lock", side_effect=fake_lock)
+    mocker.patch(
+        "agents_cli.sidecar.write_project_env",
+        side_effect=lambda *a, **k: events.append("env:write"),
+    )
+    mocker.patch("agents_cli.ollama_cmd._probe_reachability", return_value=[])
+
+    ollama_cmd.configure(
+        url="http://10.20.30.1:11434", api_key="gsk_secret", config_path=saved_config
+    )
+
+    assert events == ["lock:enter", "env:write", "lock:exit"]
+
+
+def test_clear_holds_mutation_lock_around_env_write(
+    cfg: AgentsConfig, saved_config: Path, mocker: Any
+) -> None:
+    import contextlib
+
+    events: list[str] = []
+
+    @contextlib.contextmanager
+    def fake_lock(path: Path) -> Any:
+        events.append("lock:enter")
+        yield
+        events.append("lock:exit")
+
+    mocker.patch("agents_cli.ollama_cmd._probe_reachability", return_value=[])
+    ollama_cmd.configure(
+        url="http://10.20.30.1:11434", api_key="gsk_secret", config_path=saved_config
+    )
+
+    mocker.patch("agents_cli.compose.acquire_lock", side_effect=fake_lock)
+    mocker.patch(
+        "agents_cli.sidecar.write_project_env",
+        side_effect=lambda *a, **k: events.append("env:write"),
+    )
+    ollama_cmd.clear(config_path=saved_config)
+
+    assert events == ["lock:enter", "env:write", "lock:exit"]
+
+
+def test_configure_writes_api_key_to_vm_env_in_data_dir_in_vm_mode(
+    cfg: AgentsConfig, saved_config: Path, mocker: Any
+) -> None:
+    """Regression: in --data-dir-in-vm mode the containers read
+    <vm_agents_root>/.env inside the VM. A host-only write would leave
+    the probes passing with auth the containers never see.
+    """
+    from tests.conftest import install_vm_fs_simulation
+
+    cfg.paths.data_dir_in_vm = True
+    cfg_mod.save(cfg, saved_config)
+    mocks = install_vm_fs_simulation(mocker, cfg)
+    mocker.patch("agents_cli.ollama_cmd._probe_reachability", return_value=[])
+
+    ollama_cmd.configure(
+        url="http://10.20.30.1:11434", api_key="gsk_secret", config_path=saved_config
+    )
+
+    # The write went through multipass transfer to the VM-side path
+    # (mapped back to the host file by the simulator).
+    assert mocks["transfer_to_vm"].called
+    env_text = (cfg.paths.host_data_dir / ".env").read_text(encoding="utf-8")
+    assert "OLLAMA_API_KEY=gsk_secret" in env_text

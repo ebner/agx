@@ -136,6 +136,48 @@ def test_round_trip_preserves_comments(tmp_path: Path) -> None:
     assert 'hermes_image_tag = "v1.0.1"' in after
 
 
+# ---------- [ollama] URL localhost-refusal (host-vs-VM trap) ----------
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://localhost:11434",
+        "http://127.0.0.1:11434",
+        "http://0.0.0.0:11434",
+        "https://0.0.0.0:11434",
+        # urlsplit().hostname strips IPv6 brackets — the old hand-rolled
+        # parse yielded "[" for this one and let it through.
+        "http://[::1]:11434",
+        # ...and lowercases — the old compare was case-sensitive.
+        "http://LOCALHOST:11434",
+        "http://LocalHost:11434",
+        # userinfo must not mask the host either.
+        "http://user:pass@localhost:11434",
+    ],
+)
+def test_ollama_url_loopback_variants_refused(url: str) -> None:
+    from agents_cli.config import OllamaConfig
+
+    with pytest.raises(ValueError, match="not reachable from inside the VM"):
+        OllamaConfig(url=url)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://10.20.30.1:11434",  # multipass NAT gateway
+        "http://192.168.1.50:11434",  # LAN IP
+        "https://api.example.com/v1",  # hosted OpenAI-compatible
+        "http://gpu-box.tail1234.ts.net:11434",  # Tailscale hostname
+    ],
+)
+def test_ollama_url_reachable_forms_accepted(url: str) -> None:
+    from agents_cli.config import OllamaConfig
+
+    assert OllamaConfig(url=url).url == url
+
+
 def test_vm_runtime_is_populated_flag() -> None:
     c = AgentsConfig(paths=PathsConfig(host_data_dir="/tmp/data"))
     assert not c.vm_runtime.is_populated()

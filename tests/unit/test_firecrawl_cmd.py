@@ -338,6 +338,241 @@ def test_up_upgrade_re_resolves_digests(
     assert pull_count_after - pull_count_before == 5
 
 
+# ---------- up ordering + health gating ----------
+
+
+def test_up_starts_stack_before_wiring_agents(
+    with_coder: Path, cfg: AgentsConfig, mocker: Any, vm_fs_mocks: dict[str, Any]
+) -> None:
+    """compose up (and the health probe) must come BEFORE the agent
+    wiring — otherwise a failed up leaves agents wired to a stack that
+    never served a byte.
+    """
+    order: list[str] = []
+
+    def tracked_up(*a: Any, **k: Any) -> MpResult:
+        order.append("up")
+        return _ok()
+
+    mocker.patch("agents_cli.compose_runner.up", side_effect=tracked_up)
+    mocker.patch(
+        "agents_cli.firecrawl_cmd._wire_agent",
+        side_effect=lambda *a, **k: order.append("wire"),
+    )
+    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+
+    firecrawl_cmd.up(config_path=with_coder)
+
+    assert order == ["up", "wire"]
+
+
+def test_up_failed_compose_up_raises_exit2_and_wires_nothing(
+    with_coder: Path, cfg: AgentsConfig, mocker: Any, vm_fs_mocks: dict[str, Any]
+) -> None:
+    """A failed `compose up` must RAISE RuntimeFailure (exit 2 per the
+    documented exit-code contract — shell scripts must not sail past a
+    stack that never started), wire no agents, emit no payload (the
+    error handler emits the single JSON error object), and keep the
+    resolved digests in state (flagged degraded) so a retry doesn't
+    re-resolve floating tags — the unintended-upgrade trap.
+    """
+    from agents_cli.errors import RuntimeFailure
+
+    mocker.patch(
+        "agents_cli.compose_runner.up",
+        side_effect=RuntimeFailure("compose up failed (exit 1)"),
+    )
+    wire_spy = mocker.patch("agents_cli.firecrawl_cmd._wire_agent")
+    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+    emit_spy = mocker.spy(firecrawl_cmd.ui, "emit")
+
+    with pytest.raises(RuntimeFailure, match="firecrawl did not start") as excinfo:
+        firecrawl_cmd.up(config_path=with_coder)
+
+    assert excinfo.value.exit_code == 2
+    # Full recovery guidance travels in the exception message.
+    assert "compose up failed" in str(excinfo.value)
+    assert "re-run `agents firecrawl up`" in str(excinfo.value)
+    assert "No new agents were wired" in str(excinfo.value)
+    # One-JSON-object stdout contract: no payload emitted alongside the
+    # raise — ui.handle_cli_errors emits the single error object.
+    emit_spy.assert_not_called()
+    wire_spy.assert_not_called()
+    doc = hermes_config.load(hermes_config.config_path(cfg, "coder"))
+    passthrough = (doc.get("terminal") or {}).get("env_passthrough") or []
+    assert "FIRECRAWL_API_KEY" not in passthrough
+    # Digests are pinned for retry, but flagged degraded.
+    state = firecrawl_cmd.read_state(cfg)
+    assert "images" in state
+    assert state["degraded"] is True
+
+
+def test_up_unhealthy_probe_raises_and_wires_nothing(
+    with_coder: Path, cfg: AgentsConfig, mocker: Any, vm_fs_mocks: dict[str, Any]
+) -> None:
+    """`up -d` exiting 0 is NOT success — the api fragment has no
+    healthcheck and `up -d` doesn't wait on health anyway. Only a
+    passing probe earns running:True + wiring; a timed-out probe raises.
+    """
+    from agents_cli.errors import RuntimeFailure
+
+    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agents_cli.firecrawl_cmd._wait_api_healthy", return_value=False)
+    wire_spy = mocker.patch("agents_cli.firecrawl_cmd._wire_agent")
+    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+
+    with pytest.raises(RuntimeFailure, match="did not become healthy") as excinfo:
+        firecrawl_cmd.up(config_path=with_coder)
+
+    assert excinfo.value.exit_code == 2
+    wire_spy.assert_not_called()
+    assert firecrawl_cmd.read_state(cfg)["degraded"] is True
+
+
+def test_up_retry_after_failure_reuses_digests_and_clears_degraded(
+    with_coder: Path, cfg: AgentsConfig, mocker: Any, vm_fs_mocks: dict[str, Any]
+) -> None:
+    """The recovery path: first up fails (degraded state written with
+    the pinned digests), the retry succeeds WITHOUT re-pulling floating
+    tags and clears the degraded flag.
+    """
+    from agents_cli.errors import RuntimeFailure
+
+    in_vm_spy = mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+    mocker.patch(
+        "agents_cli.compose_runner.up",
+        side_effect=RuntimeFailure("compose up failed"),
+    )
+    with pytest.raises(RuntimeFailure, match="firecrawl did not start"):
+        firecrawl_cmd.up(config_path=with_coder)
+    pull_count_before = sum(
+        1 for c in in_vm_spy.call_args_list if c.args[1:3] == ("docker", "pull")
+    )
+
+    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    second = firecrawl_cmd.up(config_path=with_coder)
+    assert second["running"] is True
+
+    pull_count_after = sum(1 for c in in_vm_spy.call_args_list if c.args[1:3] == ("docker", "pull"))
+    assert pull_count_after == pull_count_before  # no re-resolution
+    state = firecrawl_cmd.read_state(cfg)
+    assert "degraded" not in state
+    # And the retry DID wire the agent.
+    doc = hermes_config.load(hermes_config.config_path(cfg, "coder"))
+    assert "FIRECRAWL_API_KEY" in doc["terminal"]["env_passthrough"]
+
+
+def test_ensure_agent_wired_skips_degraded_stack(
+    with_coder: Path, cfg: AgentsConfig, mocker: Any, vm_fs_mocks: dict[str, Any]
+) -> None:
+    """`agents create`'s auto-wire hook must not advertise a stack whose
+    last up never came healthy.
+    """
+    from agents_cli.errors import RuntimeFailure
+
+    mocker.patch(
+        "agents_cli.compose_runner.up",
+        side_effect=RuntimeFailure("compose up failed"),
+    )
+    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+    with pytest.raises(RuntimeFailure):
+        firecrawl_cmd.up(config_path=with_coder)  # leaves degraded state
+
+    firecrawl_cmd.ensure_agent_wired(cfg, "coder")
+
+    doc = hermes_config.load(hermes_config.config_path(cfg, "coder"))
+    passthrough = (doc.get("terminal") or {}).get("env_passthrough") or []
+    assert "FIRECRAWL_API_KEY" not in passthrough
+
+
+def test_up_success_commit_aborts_when_destroy_interleaves(
+    with_coder: Path, cfg: AgentsConfig, mocker: Any, vm_fs_mocks: dict[str, Any]
+) -> None:
+    """The up/probe window runs lock-free — a concurrent
+    `firecrawl destroy` can tear the stack down after the health check
+    passes. Committing the stale local state would resurrect the state
+    file and wire agents to a nonexistent stack; the success commit must
+    revalidate under the lock and abort instead.
+    """
+    from agents_cli.errors import RuntimeFailure
+
+    def destroy_during_up(*a: Any, **k: Any) -> MpResult:
+        # What `firecrawl destroy` leaves behind: no state file, no
+        # firecrawl compose services.
+        firecrawl_cmd.clear_state(cfg)
+        doc = compose.read_compose_doc(cfg)
+        services = doc.get("services") or {}
+        for svc in [s for s in services if s.startswith(FIRECRAWL_SERVICE_PREFIX)]:
+            del services[svc]
+        compose.write_compose_atomically(cfg, doc)
+        return _ok()
+
+    mocker.patch("agents_cli.compose_runner.up", side_effect=destroy_during_up)
+    wire_spy = mocker.patch("agents_cli.firecrawl_cmd._wire_agent")
+    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+
+    with pytest.raises(RuntimeFailure, match="concurrent command tore") as excinfo:
+        firecrawl_cmd.up(config_path=with_coder)
+
+    assert excinfo.value.exit_code == 2
+    wire_spy.assert_not_called()
+    # State file NOT resurrected — the destroy's outcome stands.
+    assert firecrawl_cmd.read_state(cfg) == {}
+    doc = hermes_config.load(hermes_config.config_path(cfg, "coder"))
+    passthrough = (doc.get("terminal") or {}).get("env_passthrough") or []
+    assert "FIRECRAWL_API_KEY" not in passthrough
+
+
+def test_up_success_commit_keeps_concurrent_repin(
+    with_coder: Path, cfg: AgentsConfig, mocker: Any, vm_fs_mocks: dict[str, Any]
+) -> None:
+    """A concurrent `firecrawl up --upgrade` can re-resolve the digest
+    pins during our lock-free window. The success commit must prefer the
+    CURRENT (newer) state file's pins instead of clobbering them with
+    our stale in-memory copy — wiring still proceeds (the stack is
+    healthy and installed, just on newer pins).
+    """
+    newer_images = {
+        "api": "ghcr.io/firecrawl/firecrawl@sha256:" + "9" * 64,
+        "playwright": "ghcr.io/firecrawl/playwright-service@sha256:" + "9" * 64,
+        "postgres": "ghcr.io/firecrawl/nuq-postgres@sha256:" + "9" * 64,
+        "redis": "redis@sha256:" + "9" * 64,
+        "rabbitmq": "rabbitmq@sha256:" + "9" * 64,
+    }
+
+    def repin_during_up(*a: Any, **k: Any) -> MpResult:
+        firecrawl_cmd.write_state(
+            cfg, {"images": newer_images, "api_url": "http://firecrawl-api:3002"}
+        )
+        return _ok()
+
+    mocker.patch("agents_cli.compose_runner.up", side_effect=repin_during_up)
+    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+
+    payload = firecrawl_cmd.up(config_path=with_coder)
+
+    assert payload["running"] is True
+    # The concurrent run's pins won — reported AND on disk.
+    assert payload["images"] == newer_images
+    assert firecrawl_cmd.read_state(cfg)["images"] == newer_images
+    # Wiring still happened (healthy, installed stack).
+    assert "coder" in payload["wired_agents"]
+
+
+def test_wait_api_healthy_polls_until_healthy(cfg: AgentsConfig, mocker: Any) -> None:
+    probe = mocker.patch(
+        "agents_cli.firecrawl_cmd._api_health",
+        side_effect=["unknown", "unhealthy", "healthy"],
+    )
+    assert firecrawl_cmd._wait_api_healthy(cfg, timeout_s=5.0, interval_s=0.0) is True
+    assert probe.call_count == 3
+
+
+def test_wait_api_healthy_gives_up_after_window(cfg: AgentsConfig, mocker: Any) -> None:
+    mocker.patch("agents_cli.firecrawl_cmd._api_health", return_value="unhealthy")
+    assert firecrawl_cmd._wait_api_healthy(cfg, timeout_s=0.05, interval_s=0.01) is False
+
+
 # ---------- down ----------
 
 

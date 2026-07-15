@@ -823,13 +823,26 @@ def _check_hermes_codex_mount(
 def _check_inference_health(cfg: AgentsConfig, report: DoctorReport) -> None:
     """Probe in-VM inference engines that the toolkit owns.
 
-    Ollama: hits ``/api/tags`` via ``docker exec`` (no network probe
-    needed since we're already in the daemon's domain). llama-cpp's
-    per-model services are checked individually when present.
+    Ollama (``inference_ollama``): gated on ``inference.ollama_enabled``;
+    hits ``ollama list`` via ``docker exec`` (no network probe needed
+    since we're already in the daemon's domain).
 
-    Skips silently when no engine is enabled — most users won't have
-    local inference up.
+    llama-cpp (``inference_llamacpp``): every ``llama-cpp-*`` service
+    defined in compose gets a container-state probe. Defined-but-not-
+    running is the VM-rebuild stranding class (same failure mode
+    ``_check_firecrawl_running`` covers — the compose blocks survive a
+    VM migration, the containers don't), so it warns with the recovery
+    hint. Gated on compose presence, not on any config flag, so it
+    still fires when config was lost alongside the VM.
+
+    Skips (``ok``) when no engine is enabled/defined — most users won't
+    have local inference up.
     """
+    _check_inference_ollama(cfg, report)
+    _check_inference_llamacpp(cfg, report)
+
+
+def _check_inference_ollama(cfg: AgentsConfig, report: DoctorReport) -> None:
     if not cfg.inference.ollama_enabled:
         report.add(
             "inference_ollama",
@@ -862,6 +875,52 @@ def _check_inference_health(cfg: AgentsConfig, report: DoctorReport) -> None:
             "fail",
             f"`ollama list` failed inside container: {err or 'rc=' + str(result.returncode)}. "
             f"Try `agents restart-service ollama` or `agents inference down ollama && agents inference up ollama`.",
+        )
+
+
+def _check_inference_llamacpp(cfg: AgentsConfig, report: DoctorReport) -> None:
+    """Warn on per-model llama-cpp services that are defined in compose
+    but whose containers aren't running — mirrors
+    ``_check_firecrawl_running``'s compose-presence gating.
+    """
+    from agents_cli.compose import LLAMACPP_SERVICE_PREFIX
+
+    try:
+        doc = compose.read_compose_doc(cfg)
+    except (RuntimeFailure, UserError):
+        report.add("inference_llamacpp", "warn", "compose file unreadable")
+        return
+    services = sorted(
+        s for s in (doc.get("services") or {}) if s.startswith(LLAMACPP_SERVICE_PREFIX)
+    )
+    if not services:
+        report.add("inference_llamacpp", "ok", "skipped (no per-model services defined)")
+        return
+
+    result = compose_runner.ps(cfg)
+    if result.returncode != 0:
+        report.add("inference_llamacpp", "warn", "docker compose ps failed; cannot probe")
+        return
+    stranded = [
+        s
+        for s in services
+        if _container_state_for(result.stdout, s).lower() not in ("running", "healthy")
+    ]
+    if stranded:
+        report.add(
+            "inference_llamacpp",
+            "warn",
+            f"defined in compose but not running: {', '.join(stranded)}. "
+            "A VM rebuild/migration drops in-VM container state; re-run "
+            "`agents inference load llama-cpp <slug> --gguf <path>` (the "
+            "compose blocks and GGUFs are preserved) or `agents inference "
+            "down llama-cpp` if no longer wanted.",
+        )
+    else:
+        report.add(
+            "inference_llamacpp",
+            "ok",
+            f"{len(services)} per-model service(s) running",
         )
 
 

@@ -27,7 +27,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from agents_cli import compose_runner, hermes_config
+from agents_cli import compose_runner, hermes_config, sidecar
 from agents_cli.agents_cmd import service_name as _service_name_for
 from agents_cli.config import AgentsConfig
 from agents_cli.errors import UserError
@@ -98,7 +98,13 @@ def enable(
     )
 
     svc = _service_name_for(agent_name, "hermes")
+    # `up -d` only creates the container when it's missing — the memory
+    # config lives in config.yaml, not compose, so up alone is a NO-OP
+    # for an already-running container and the gateway would keep the
+    # old memory provider while the CLI claims mem0 is enabled. Restart
+    # forces the gateway to re-read config.yaml.
     compose_runner.up(cfg, svc)
+    compose_runner.restart(cfg, svc)
 
     return {
         "vector_path": DEFAULT_VECTOR_PATH,
@@ -126,7 +132,10 @@ def disable(cfg: AgentsConfig, agent_name: str) -> None:
     clear_state(cfg, agent_name)
 
     svc = _service_name_for(agent_name, "hermes")
+    # Same as enable: compose config didn't change, so restart (not a
+    # no-op `up`) is what actually drops the provider from the gateway.
     compose_runner.up(cfg, svc)
+    compose_runner.restart(cfg, svc)
 
 
 def status(cfg: AgentsConfig, agent_name: str) -> dict[str, Any]:
@@ -252,14 +261,9 @@ def _api_key_env_value(cfg: AgentsConfig) -> str | None:
 
 
 def _read_env(cfg: AgentsConfig) -> dict[str, str]:
-    env_path = cfg.paths.host_data_dir / ".env"
-    if not env_path.exists():
-        return {}
-    out: dict[str, str] = {}
-    for line in env_path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k, _, v = line.partition("=")
-        out[k.strip()] = v.strip()
-    return out
+    """Mode-aware project-.env read — in ``--data-dir-in-vm`` mode the
+    file compose actually feeds the container lives inside the VM, so a
+    host-only read would miss the OPENAI_API_KEY the container has (or
+    "see" one it doesn't).
+    """
+    return {k: v.strip() for k, v in sidecar.read_project_env(cfg).items()}
