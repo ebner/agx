@@ -232,11 +232,34 @@ def upgrade(
                 UPGRADE_PHASES,
                 meta={"old_tag": old_tag, "new_tag": new_tag},
             )
-        elif journal.completed_phases:
-            ui.progress(
-                "resuming interrupted upgrade "
-                f"(already done: {', '.join(journal.completed_phases)})"
-            )
+        else:
+            # A journal found HERE is authoritative over whatever the
+            # unlocked peek decided. If a parallel invocation began a
+            # v1->v2 upgrade (and died after tag_pinned) while this one
+            # resolved v3 waiting for the lock, keeping the local v3
+            # tags would skip the pin (tag_pinned already done), pull
+            # v3, recreate from the compose file still pinned to v2,
+            # and report v3 as deployed. Adopt the journal's tags for
+            # everything downstream — pin, pull, emit, and the defaults
+            # bump. The pre-lock peek remains only the fast path that
+            # skips the no-op short-circuit.
+            if journal.meta.get("old_tag") and journal.meta.get("new_tag"):
+                adopted = (str(journal.meta["old_tag"]), str(journal.meta["new_tag"]))
+                if adopted != (old_tag, new_tag):
+                    old_tag, new_tag = adopted
+                    # The locally resolved "latest" was never proven out
+                    # by the upgrade this run is now completing — it must
+                    # not re-baseline future ``agents create``.
+                    resolved_latest = None
+                    ui.progress(
+                        f"interrupted upgrade journal found under the lock for {name!r} "
+                        f"({old_tag} -> {new_tag}); completing it instead"
+                    )
+            if journal.completed_phases:
+                ui.progress(
+                    "resuming interrupted upgrade "
+                    f"(already done: {', '.join(journal.completed_phases)})"
+                )
 
         host_snap: Path | None = None
         vm_snap: str | None = None
@@ -500,32 +523,52 @@ def rollback(
         if svc is None:
             ui.warn(f"agent {name!r} not in compose — restoring without container stop/recreate")
 
-        if archive is not None:
-            if svc is not None:
-                # Extracting over a LIVE container's SQLite/WAL files
-                # (state.db, kanban.db, ...) is a straight corruption
-                # path — stop the container first.
-                ui.progress(f"stopping {svc} before restore...")
-                compose_runner.stop(cfg, svc)
-            ui.progress(f"restoring host data from {archive.name}...")
-            _restore_host_snapshot(cfg, archive)
+        # Once the live container is stopped, ANY failure in the restore
+        # steps below (invalid archive, extraction error, VM snapshot
+        # restore failure) would otherwise raise before the final
+        # ``compose_runner.up`` — turning a failed rollback ATTEMPT into
+        # an outage. Track the stop and best-effort restart the service
+        # before re-raising the original error.
+        stopped_svc: str | None = None
+        try:
+            if archive is not None:
+                if svc is not None:
+                    # Extracting over a LIVE container's SQLite/WAL files
+                    # (state.db, kanban.db, ...) is a straight corruption
+                    # path — stop the container first.
+                    ui.progress(f"stopping {svc} before restore...")
+                    compose_runner.stop(cfg, svc)
+                    stopped_svc = svc
+                ui.progress(f"restoring host data from {archive.name}...")
+                _restore_host_snapshot(cfg, archive)
 
-        vm_snap_name = snapshot_id if vm_only else _latest_vm_snapshot(cfg.vm.name, name)
-        if vm_snap_name:
-            ui.progress(
-                f"restoring VM snapshot {vm_snap_name} "
-                f"(stop -> restore -> start; all agents pause)..."
-            )
-            # vm_mod.restore_snapshot owns the restore orchestration:
-            # ACPI-stop + wait-for-stopped where the backend needs it,
-            # a returncode check on the restore itself (the raw
-            # mp.restore call this replaces never checked its result),
-            # and restart + SSH wait. ``yes=True`` — the user already
-            # confirmed the rollback above.
-            vm_mod.restore_snapshot(
-                vm_snap_name, destructive=True, yes=True, config_path=config_path
-            )
-            ui.progress("VM restored and restarted")
+            vm_snap_name = snapshot_id if vm_only else _latest_vm_snapshot(cfg.vm.name, name)
+            if vm_snap_name:
+                ui.progress(
+                    f"restoring VM snapshot {vm_snap_name} "
+                    f"(stop -> restore -> start; all agents pause)..."
+                )
+                # vm_mod.restore_snapshot owns the restore orchestration:
+                # ACPI-stop + wait-for-stopped where the backend needs it,
+                # a returncode check on the restore itself (the raw
+                # mp.restore call this replaces never checked its result),
+                # and restart + SSH wait. ``yes=True`` — the user already
+                # confirmed the rollback above.
+                vm_mod.restore_snapshot(
+                    vm_snap_name, destructive=True, yes=True, config_path=config_path
+                )
+                ui.progress("VM restored and restarted")
+        except Exception as restore_err:
+            if stopped_svc is not None:
+                ui.warn(
+                    f"rollback failed after {stopped_svc} was stopped ({restore_err}); "
+                    f"restarting it with the pre-rollback state..."
+                )
+                try:
+                    compose_runner.up(cfg, stopped_svc)
+                except Exception as up_err:
+                    ui.warn(f"could not restart {stopped_svc}: {up_err}")
+            raise
 
         if archive is not None and svc is not None:
             ui.progress(f"recreating {svc} from the restored compose...")

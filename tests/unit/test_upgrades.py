@@ -334,6 +334,82 @@ def test_upgrade_resume_does_not_refetch_latest_or_bump_defaults(
     assert reloaded.defaults.hermes_image_tag == "v1.0.0"
 
 
+def test_upgrade_adopts_journal_tags_found_under_the_lock(
+    with_coder: Path, mocker, cfg: AgentsConfig
+) -> None:
+    """Regression for the unlocked-peek/locked-find disagreement: while
+    this invocation resolved v3 upstream and waited for the lock, a
+    parallel invocation began a v1->v2 upgrade and died after
+    tag_pinned. Keeping the locally resolved v3 tags would skip the pin
+    (tag_pinned already done), pull v3, recreate from the compose file
+    still pinned to v2, and report v3 as deployed. The journal found
+    under the lock is authoritative: the run must complete v2, emit
+    v1->v2, leave the defaults alone, and never pin or verify v3.
+    """
+    mocks = _stub_happy_upgrade(mocker, cfg)
+    mocks["fetch_latest_tag"].return_value = "v3.0.0"
+
+    # The parallel invocation's journal: begun with tag meta, dead
+    # right after tag_pinned — the compose pin already reads v2.0.0.
+    j = Journal.begin(
+        cfg.paths.host_data_dir,
+        "upgrade",
+        "coder",
+        upgrades.UPGRADE_PHASES,
+        meta={"old_tag": "v1.0.0", "new_tag": "v2.0.0"},
+    )
+    j.advance("host_data_snapshot")
+    j.advance("vm_snapshot")
+    j.advance("tag_pinned")
+    doc = compose.load_compose(cfg.paths.host_data_dir / "docker-compose.yml")
+    doc["services"]["hermes-coder"]["image"] = f"{compose.HERMES_IMAGE_BASE}:v2.0.0"
+    (cfg.paths.host_data_dir / "docker-compose.yml").write_text(
+        compose.dump_compose(doc), encoding="utf-8"
+    )
+
+    # Simulate the race: the journal "does not exist yet" at the
+    # unlocked peek but IS found by the re-find under the lock.
+    real_find = Journal.find_resumable
+    finds = {"n": 0}
+
+    def raced_find(data_dir: Path, op: str, name: str) -> Journal | None:
+        finds["n"] += 1
+        if finds["n"] == 1:
+            return None
+        return real_find(data_dir, op, name)
+
+    mocker.patch.object(Journal, "find_resumable", side_effect=raced_find)
+    set_tag_spy = mocker.spy(upgrades, "_set_image_tag")
+    emit_spy = mocker.spy(upgrades.ui, "emit")
+
+    outcome = upgrades.upgrade("coder", config_path=with_coder)  # bare form resolves v3
+
+    # The run completed the journal's v1->v2 upgrade, not the local v3.
+    assert outcome.old_tag == "v1.0.0"
+    assert outcome.new_tag == "v2.0.0"
+    # tag_pinned was already done — no re-pin, and certainly not to v3.
+    assert set_tag_spy.call_count == 0
+    doc = compose.load_compose(cfg.paths.host_data_dir / "docker-compose.yml")
+    assert doc["services"]["hermes-coder"]["image"].endswith(":v2.0.0")
+    # The pulled-image verification targets the adopted tag, not v3.
+    mocks["inspect"].assert_called_once()
+    assert mocks["inspect"].call_args.args[1] == f"{compose.HERMES_IMAGE_BASE}:v2.0.0"
+    # Upstream was consulted exactly once (the pre-lock resolution);
+    # adoption must not re-fetch.
+    mocks["fetch_latest_tag"].assert_called_once()
+    # The locally resolved v3 was never proven out — defaults stay put.
+    reloaded = cfg_mod.load(with_coder)
+    assert reloaded.defaults.hermes_image_tag == "v1.0.0"
+    # The summary reports the adopted upgrade; v3 appears nowhere.
+    final = emit_spy.call_args_list[-1].args[0]
+    assert (final["old_tag"], final["new_tag"]) == ("v1.0.0", "v2.0.0")
+    assert not any("v3.0.0" in json.dumps(c.args[0]) for c in emit_spy.call_args_list), (
+        "v3 leaked into an emit"
+    )
+    # The adopted journal completed.
+    assert list((cfg.paths.host_data_dir / ".journal").glob("upgrade-coder-*.json")) == []
+
+
 # ---------- progress narration ----------
 
 
@@ -508,6 +584,103 @@ def test_rollback_locks_stops_restores_and_recreates_in_order(
     raw_stop.assert_not_called()
     raw_restore.assert_not_called()
     raw_start.assert_not_called()
+
+
+def test_rollback_restarts_service_when_host_restore_fails(
+    with_coder: Path, mocker, cfg: AgentsConfig
+) -> None:
+    """Regression: once the live container is stopped, a failure in the
+    restore steps (corrupt archive, extraction error) used to raise
+    before the final ``compose_runner.up`` — turning a failed rollback
+    ATTEMPT into an outage. The service must be brought back up
+    best-effort and the ORIGINAL error must propagate."""
+    _write_rollback_archive(cfg, "coder")
+    mocker.patch("agents_cli.ui.confirm", return_value=True)
+    mocker.patch(
+        "agents_cli.mp.info_vm",
+        return_value=_ok(json.dumps({"info": {"agents": {"snapshots": {}}}})),
+    )
+    order: list[str] = []
+    mocker.patch(
+        "agents_cli.compose_runner.stop",
+        side_effect=lambda *a, **k: order.append("stop") or _ok(),
+    )
+    mocker.patch(
+        "agents_cli.upgrades._restore_host_snapshot",
+        side_effect=RuntimeFailure("archive is corrupt"),
+    )
+    up = mocker.patch(
+        "agents_cli.compose_runner.up",
+        side_effect=lambda *a, **k: order.append("up") or _ok(),
+    )
+    warn_spy = mocker.spy(upgrades.ui, "warn")
+
+    with pytest.raises(RuntimeFailure, match="archive is corrupt"):
+        upgrades.rollback("coder", config_path=with_coder)
+
+    # The recovery up ran for the stopped service, after the stop.
+    assert order == ["stop", "up"]
+    up.assert_called_once()
+    assert up.call_args.args[1] == "hermes-coder"
+    assert any("restarting" in c.args[0] for c in warn_spy.call_args_list)
+
+
+def test_rollback_restarts_service_when_vm_restore_fails(
+    with_coder: Path, mocker, cfg: AgentsConfig
+) -> None:
+    """Same guarantee for the later restore step: the host data already
+    extracted fine, but the VM snapshot restore blows up before the
+    final up. The service was stopped for the extraction — bring it
+    back up and re-raise the VM error."""
+    _write_rollback_archive(cfg, "coder")
+    mocker.patch("agents_cli.ui.confirm", return_value=True)
+    mocker.patch(
+        "agents_cli.mp.info_vm",
+        return_value=_ok(
+            json.dumps(
+                {"info": {"agents": {"snapshots": {"pre-upgrade-coder-20260512T120000Z": {}}}}}
+            )
+        ),
+    )
+    mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())
+    mocker.patch("agents_cli.upgrades._restore_host_snapshot")
+    mocker.patch(
+        "agents_cli.vm.restore_snapshot",
+        side_effect=RuntimeFailure("snapshot restore blew up"),
+    )
+    up = mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+
+    with pytest.raises(RuntimeFailure, match="snapshot restore blew up"):
+        upgrades.rollback("coder", config_path=with_coder)
+
+    up.assert_called_once()
+    assert up.call_args.args[1] == "hermes-coder"
+
+
+def test_rollback_secondary_up_failure_only_warns(
+    with_coder: Path, mocker, cfg: AgentsConfig
+) -> None:
+    """If the best-effort recovery up ALSO fails (e.g. the VM is the
+    problem), that failure must only warn — the original restore error
+    is the one the user needs to see."""
+    _write_rollback_archive(cfg, "coder")
+    mocker.patch("agents_cli.ui.confirm", return_value=True)
+    mocker.patch(
+        "agents_cli.mp.info_vm",
+        return_value=_ok(json.dumps({"info": {"agents": {"snapshots": {}}}})),
+    )
+    mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())
+    mocker.patch(
+        "agents_cli.upgrades._restore_host_snapshot",
+        side_effect=RuntimeFailure("archive is corrupt"),
+    )
+    mocker.patch("agents_cli.compose_runner.up", side_effect=RuntimeError("VM unreachable"))
+    warn_spy = mocker.spy(upgrades.ui, "warn")
+
+    with pytest.raises(RuntimeFailure, match="archive is corrupt"):
+        upgrades.rollback("coder", config_path=with_coder)
+
+    assert any("could not restart hermes-coder" in c.args[0] for c in warn_spy.call_args_list)
 
 
 def test_rollback_of_removed_agent_skips_stop_and_up_with_warning(
