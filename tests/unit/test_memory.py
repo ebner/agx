@@ -154,6 +154,52 @@ def test_holographic_enable_is_idempotent(
     assert doc["plugins"]["hermes-memory-store"]["db_path"] == holographic.DEFAULT_DB_PATH
 
 
+def test_holographic_enable_ups_then_restarts_container(
+    with_coder: Path, cfg: AgentsConfig, mocker: Any
+) -> None:
+    """The enable is a config.yaml-only edit, so `compose up -d` alone is
+    a NO-OP for a running container (the gateway would keep the old
+    provider) — but `restart` alone cannot CREATE an absent container
+    (VM rebuild, `docker compose rm`). Must be `up` (guarantee
+    existence) then `restart` (force the config.yaml re-read), in that
+    order — same pattern as mem0.
+    """
+    parent = mocker.Mock()
+    parent.attach_mock(mocker.patch("agents_cli.compose_runner.up", return_value=_ok()), "up")
+    parent.attach_mock(
+        mocker.patch("agents_cli.compose_runner.restart", return_value=_ok()), "restart"
+    )
+
+    memory.enable("holographic", "coder", config_path=with_coder)
+
+    assert [name for name, _args, _kw in parent.mock_calls] == ["up", "restart"]
+    assert parent.up.call_args.args[1] == "hermes-coder"
+    assert parent.restart.call_args.args[1] == "hermes-coder"
+
+
+def test_holographic_disable_ups_then_restarts_container(
+    with_coder: Path, cfg: AgentsConfig, mocker: Any
+) -> None:
+    """Same up-then-restart requirement on the disable path — restoring
+    built-in memory is also a config.yaml-only edit, and the container
+    may equally be absent.
+    """
+    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    memory.enable("holographic", "coder", config_path=with_coder)
+
+    parent = mocker.Mock()
+    parent.attach_mock(mocker.patch("agents_cli.compose_runner.up", return_value=_ok()), "up")
+    parent.attach_mock(
+        mocker.patch("agents_cli.compose_runner.restart", return_value=_ok()), "restart"
+    )
+
+    memory.disable("coder", config_path=with_coder)
+
+    assert [name for name, _args, _kw in parent.mock_calls] == ["up", "restart"]
+    assert parent.up.call_args.args[1] == "hermes-coder"
+    assert parent.restart.call_args.args[1] == "hermes-coder"
+
+
 # ---------- mem0 ----------
 
 

@@ -121,6 +121,104 @@ def test_pull_rejects_unknown_engine(with_coder: Path) -> None:
         models_cmd.pull("vllm", "anything", config_path=with_coder)
 
 
+def _llamacpp_pull_runner(
+    cfg: AgentsConfig, captured: list[tuple[str, ...]], *, mount_visible: bool
+) -> Any:
+    """Fake mp.exec_in_vm for llama-cpp pulls. When ``mount_visible``,
+    the sentinel touch inside the container materializes host-side —
+    simulating a container whose /llama-cpp bind actually reaches
+    <data-dir>/models/llama-cpp/. Otherwise the write stays on the
+    (simulated) overlay and the host never sees it.
+    """
+    sentinel = cfg.paths.host_data_dir / "models" / "llama-cpp" / ".toolkit-mount-probe"
+
+    def runner(vm_name: str, *cmd: str, check: bool = True) -> MpResult:
+        captured.append(cmd)
+        joined = " ".join(cmd)
+        if "touch /llama-cpp/.toolkit-mount-probe" in joined and mount_visible:
+            sentinel.parent.mkdir(parents=True, exist_ok=True)
+            sentinel.touch()
+        if "rm" in cmd and "/llama-cpp/.toolkit-mount-probe" in joined:
+            sentinel.unlink(missing_ok=True)
+        return _ok()
+
+    return runner
+
+
+def test_pull_llamacpp_downloads_into_bind_mounted_dir(
+    cfg: AgentsConfig, saved_config: Path, mocker: Any
+) -> None:
+    """The hf_hub_download MUST target /llama-cpp (the ollama fragment's
+    bind to <data-dir>/models/llama-cpp/). The historical
+    '/root/.ollama/../llama-cpp' resolved to /root/llama-cpp on the
+    container OVERLAY — multi-GB download invisible to `model list` and
+    wiped on recreate.
+    """
+    captured: list[tuple[str, ...]] = []
+    mocker.patch(
+        "agents_cli.mp.exec_in_vm",
+        side_effect=_llamacpp_pull_runner(cfg, captured, mount_visible=True),
+    )
+    mocker.patch("agents_cli.inference_cmd._service_running", return_value=True)
+
+    payload = models_cmd.pull(
+        "llama-cpp",
+        "bartowski/Llama-3.2-3B-Instruct-GGUF:Llama-3.2-3B-Instruct-Q4_K_M.gguf",
+        config_path=saved_config,
+    )
+    assert payload["pulled"] is True
+
+    download = next(c for c in captured if any("hf_hub_download" in a for a in c))
+    snippet = next(a for a in download if "hf_hub_download" in a)
+    assert "local_dir='/llama-cpp'" in snippet
+    assert "/root/.ollama" not in snippet
+
+
+def test_pull_llamacpp_refuses_when_bind_not_host_visible(
+    cfg: AgentsConfig, saved_config: Path, mocker: Any
+) -> None:
+    """An ollama container created from the pre-bind fragment only gains
+    the /llama-cpp volume on recreate. The pull must fail loudly with
+    the recreate hint BEFORE downloading, not let the multi-GB pull land
+    on the overlay.
+    """
+    captured: list[tuple[str, ...]] = []
+    mocker.patch(
+        "agents_cli.mp.exec_in_vm",
+        side_effect=_llamacpp_pull_runner(cfg, captured, mount_visible=False),
+    )
+    mocker.patch("agents_cli.inference_cmd._service_running", return_value=True)
+
+    with pytest.raises(UserError, match="agents inference down ollama && agents inference up"):
+        models_cmd.pull("llama-cpp", "some/repo:file.gguf", config_path=saved_config)
+    # And the download itself must never have started.
+    assert not any(any("hf_hub_download" in a for a in c) for c in captured)
+
+
+def test_pull_llamacpp_apt_bootstrap_is_guarded(
+    cfg: AgentsConfig, saved_config: Path, mocker: Any
+) -> None:
+    """`command -v python3 || apt-get update && apt-get install ...`
+    parses as (A||B)&&C — apt-get install would run on EVERY pull and
+    hard-fail when apt lists are stale/offline. The apt pair must be
+    brace-grouped behind the python3 probe.
+    """
+    captured: list[tuple[str, ...]] = []
+    mocker.patch(
+        "agents_cli.mp.exec_in_vm",
+        side_effect=_llamacpp_pull_runner(cfg, captured, mount_visible=True),
+    )
+    mocker.patch("agents_cli.inference_cmd._service_running", return_value=True)
+
+    models_cmd.pull("llama-cpp", "some/repo:file.gguf", config_path=saved_config)
+
+    bootstrap = next(a for c in captured for a in c if "apt-get" in a)
+    assert (
+        "command -v python3 >/dev/null 2>&1 || { apt-get -qq update && "
+        "apt-get -qq install -y python3 python3-pip; }" in bootstrap
+    )
+
+
 # ---------- use (wiring) ----------
 
 

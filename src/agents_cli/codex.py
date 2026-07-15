@@ -281,19 +281,17 @@ def _per_agent_mount_status(cfg: AgentsConfig) -> list[dict[str, Any]]:
 
 
 def _container_codex_mount_probe(cfg: AgentsConfig, svc_name: str) -> str:
-    """Return 'ok' / 'missing' / 'container-down' / 'skipped'."""
+    """Return 'ok' / 'missing' / 'container-down' / 'skipped'.
+
+    Built on ``compose_runner._base_argv`` so the override file
+    (architecture rule #10) is merged like every other compose
+    invocation — a hand-rolled single ``-f`` argv would silently drop it.
+    """
     if not (cfg.paths.host_data_dir / ".codex" / "auth.json").exists():
         return "skipped"
     result = mp.exec_in_vm(
         cfg.vm.name,
-        "docker",
-        "compose",
-        "--project-directory",
-        str(cfg.paths.vm_agents_root),
-        "-f",
-        f"{cfg.paths.vm_agents_root}/docker-compose.yml",
-        "--env-file",
-        f"{cfg.paths.vm_agents_root}/.env",
+        *compose_runner._base_argv(cfg),
         "exec",
         "-T",
         svc_name,
@@ -360,34 +358,52 @@ def skill_enable(name: str, *, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) 
         current_image = (
             hermes_config.get_terminal_docker_image(doc) or templates.HERMES_DEFAULT_SANDBOX_IMAGE
         )
+        state_path = _skill_state_path(cfg, name)
 
         if current_image.startswith(SANDBOX_IMAGE_PREFIX):
-            # Already running our derived image; idempotent re-enable.
+            # Already running our derived image; idempotent re-enable —
+            # but ONLY if the state file still knows the true base.
+            # Recording the derived image as "original" would make the
+            # base unrecoverable and wedge every enable/disable cycle on
+            # the derived image forever.
+            if not state_path.exists():
+                raise UserError(
+                    f"terminal.docker_image for {name!r} is already the derived sandbox "
+                    f"image ({current_image}) but the skill state file recording the "
+                    f"original base image is missing ({state_path}). Refusing to enable — "
+                    f"the base image would be unrecoverable. Set terminal.docker_image in "
+                    f"the agent's config.yaml back to the intended base image first, then "
+                    f"re-run `agents codex skill-enable {name}`."
+                )
             derived = current_image
         else:
             derived = _sandbox_image_tag(current_image)
             _build_sandbox_image_in_vm(cfg, derived, current_image)
-
-        # Persist the original image so skill-disable can restore it. Skip
-        # rewrite when we're already on the derived image AND state file
-        # exists, to keep re-enable a true no-op.
-        state_path = _skill_state_path(cfg, name)
-        if not state_path.exists():
-            state_path.parent.mkdir(parents=True, exist_ok=True)
-            state_path.write_text(
-                json.dumps(
-                    {"original_docker_image": current_image, "derived_image": derived},
-                    indent=2,
-                ),
-                encoding="utf-8",
-            )
+            # Persist the original image so skill-disable can restore it.
+            # Skip rewrite when the state file exists, to keep re-enable
+            # a true no-op.
+            if not state_path.exists():
+                state_path.parent.mkdir(parents=True, exist_ok=True)
+                state_path.write_text(
+                    json.dumps(
+                        {"original_docker_image": current_image, "derived_image": derived},
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
 
         hermes_config.set_terminal_docker_image(doc, derived)
         hermes_config.add_docker_volume(doc, _sandbox_volume_mapping(cfg))
         hermes_config.write_atomically(cfg, name, doc)
 
         svc = _service_name_for(name, "hermes")
+        # `up -d` only creates the container when it's missing (restart
+        # cannot — e.g. after a VM rebuild or `docker compose rm`). The
+        # edit above is config.yaml-only, so up alone is a NO-OP for an
+        # already-running container and the agent would keep the old
+        # sandbox image; the restart forces the config.yaml re-read.
         compose_runner.up(cfg, svc)
+        compose_runner.restart(cfg, svc)
 
     ui.emit(
         {"name": name, "derived_image": derived},
@@ -422,11 +438,18 @@ def skill_disable(name: str, *, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH)
         state_path.unlink()
 
         svc = _service_name_for(name, "hermes")
+        # Same up-then-restart as skill_enable: up creates the container
+        # if absent; restart forces the config.yaml re-read that a no-op
+        # `up` wouldn't trigger.
         compose_runner.up(cfg, svc)
+        compose_runner.restart(cfg, svc)
 
     ui.emit(
         {"name": name, "restored_image": original_image},
-        human=f"codex skill disabled for {name!r}; sandbox image restored to {original_image}",
+        human=(
+            f"codex skill disabled for {name!r}; sandbox image restored to "
+            f"{original_image}; container restarted"
+        ),
     )
 
 

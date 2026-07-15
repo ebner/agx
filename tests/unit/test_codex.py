@@ -126,7 +126,11 @@ def test_skill_enable_unknown_agent(saved_config: Path) -> None:
 def test_skill_enable_builds_image_and_updates_config(
     with_coder: Path, mocker, cfg: AgentsConfig, vm_fs_mocks: dict
 ) -> None:
-    up_spy = mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    parent = mocker.Mock()
+    parent.attach_mock(mocker.patch("agents_cli.compose_runner.up", return_value=_ok()), "up")
+    parent.attach_mock(
+        mocker.patch("agents_cli.compose_runner.restart", return_value=_ok()), "restart"
+    )
     result = codex.skill_enable("coder", config_path=with_coder)
 
     # Derived image tag returned
@@ -142,8 +146,14 @@ def test_skill_enable_builds_image_and_updates_config(
     # which user the base image runs as).
     assert any("/home/ubuntu/agents/.codex:/codex:ro" in v for v in volumes)
 
-    # Container restarted
-    up_spy.assert_called_once()
+    # Container truly restarted, and created first if absent: `up` alone
+    # would no-op for a running container (the edit is config.yaml-only,
+    # compose config unchanged) leaving the old sandbox image live, while
+    # `restart` alone cannot create an absent container (VM rebuild,
+    # `docker compose rm`). Must be up THEN restart — mem0's pattern.
+    assert [name for name, _args, _kw in parent.mock_calls] == ["up", "restart"]
+    assert parent.up.call_args.args[1] == "hermes-coder"
+    assert parent.restart.call_args.args[1] == "hermes-coder"
     # docker build was invoked through the simulator's exec_in_vm
     build_calls = vm_fs_mocks["exec_in_vm"].call_args_list
     assert any("docker" in c.args and "build" in c.args for c in build_calls)
@@ -152,7 +162,7 @@ def test_skill_enable_builds_image_and_updates_config(
 def test_skill_enable_persists_original_for_restore(
     with_coder: Path, mocker, cfg: AgentsConfig
 ) -> None:
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agents_cli.compose_runner.restart", return_value=_ok())
     codex.skill_enable("coder", config_path=with_coder)
     state_path = codex._skill_state_path(cfg, "coder")
     state = json.loads(state_path.read_text())
@@ -162,10 +172,39 @@ def test_skill_enable_persists_original_for_restore(
 
 
 def test_skill_enable_is_idempotent(with_coder: Path, mocker) -> None:
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agents_cli.compose_runner.restart", return_value=_ok())
     first = codex.skill_enable("coder", config_path=with_coder)
     second = codex.skill_enable("coder", config_path=with_coder)
     assert first["derived_image"] == second["derived_image"]
+
+
+def test_skill_enable_refuses_derived_image_without_state_file(
+    with_coder: Path, mocker, cfg: AgentsConfig
+) -> None:
+    """terminal.docker_image already points at our derived sandbox image
+    but the .codex-skill/<name>.json state file is gone (lost, migrated
+    partially, hand-deleted). Recording the DERIVED image as the
+    original would make the true base unrecoverable and wedge every
+    enable/disable cycle on the derived image — refuse instead, naming
+    the state file and the manual fix.
+    """
+    mocker.patch("agents_cli.compose_runner.restart", return_value=_ok())
+    # Simulate the trap: config.yaml points at a derived image, no state.
+    p = hermes_config.config_path(cfg, "coder")
+    doc = hermes_config.load(p)
+    hermes_config.set_terminal_docker_image(doc, f"{codex.SANDBOX_IMAGE_PREFIX}:cafebabe0000")
+    p.write_text(hermes_config.dump(doc), encoding="utf-8")
+    assert not codex._skill_state_path(cfg, "coder").exists()
+
+    with pytest.raises(UserError) as exc:
+        codex.skill_enable("coder", config_path=with_coder)
+    msg = str(exc.value)
+    # Must name the state file and the recovery step, not silently
+    # fall back to recording the derived image as the original.
+    assert str(codex._skill_state_path(cfg, "coder")) in msg
+    assert "terminal.docker_image" in msg
+    # And it must NOT have created a poisoned state file.
+    assert not codex._skill_state_path(cfg, "coder").exists()
 
 
 def test_skill_enable_propagates_docker_build_failure(
@@ -190,12 +229,22 @@ def test_skill_enable_propagates_docker_build_failure(
 
 
 def test_skill_disable_restores_original(with_coder: Path, mocker, cfg: AgentsConfig) -> None:
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agents_cli.compose_runner.restart", return_value=_ok())
     codex.skill_enable("coder", config_path=with_coder)
     state = json.loads(codex._skill_state_path(cfg, "coder").read_text())
     original = state["original_docker_image"]
 
+    parent = mocker.Mock()
+    parent.attach_mock(mocker.patch("agents_cli.compose_runner.up", return_value=_ok()), "up")
+    parent.attach_mock(
+        mocker.patch("agents_cli.compose_runner.restart", return_value=_ok()), "restart"
+    )
     codex.skill_disable("coder", config_path=with_coder)
+    # Disable is also a config.yaml-only edit on a possibly-absent
+    # container → same up-then-restart order as enable.
+    assert [name for name, _args, _kw in parent.mock_calls] == ["up", "restart"]
+    assert parent.up.call_args.args[1] == "hermes-coder"
+    assert parent.restart.call_args.args[1] == "hermes-coder"
     doc = hermes_config.load(hermes_config.config_path(cfg, "coder"))
     assert hermes_config.get_terminal_docker_image(doc) == original
     # Sandbox volume mapping removed
@@ -281,7 +330,7 @@ def test_status_no_warning_when_far_from_expiry(cfg: AgentsConfig, saved_config:
 def test_status_includes_per_agent_mount_status(
     with_coder: Path, mocker, cfg: AgentsConfig
 ) -> None:
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agents_cli.compose_runner.restart", return_value=_ok())
     info = codex.status(config_path=with_coder)
     names = {entry["name"] for entry in info["per_agent_mounts"]}
     assert "coder" in names
@@ -292,6 +341,33 @@ def test_status_includes_per_agent_mount_status(
     info = codex.status(config_path=with_coder)
     coder = next(e for e in info["per_agent_mounts"] if e["name"] == "coder")
     assert coder["skill_enabled"] is True
+
+
+# ---------- mount probe argv (override merge consistency) ----------
+
+
+def test_mount_probe_argv_merges_override_iff_present(cfg: AgentsConfig, mocker) -> None:
+    """The probe's compose exec must be built on compose_runner._base_argv
+    so the override file (architecture rule #10) is merged exactly like
+    every other compose invocation: no override -f when the file is
+    absent, the extra -f pair when it exists.
+    """
+    (cfg.paths.host_data_dir / ".codex").mkdir()
+    (cfg.paths.host_data_dir / ".codex" / "auth.json").write_text("{}", encoding="utf-8")
+    exec_spy = mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok())
+
+    assert codex._container_codex_mount_probe(cfg, "hermes-coder") == "ok"
+    argv = exec_spy.call_args.args
+    assert "-f" in argv
+    assert "/home/ubuntu/agents/docker-compose.yml" in argv
+    assert not any("docker-compose.override.yml" in str(a) for a in argv)
+
+    (cfg.paths.host_data_dir / "docker-compose.override.yml").write_text(
+        "services: {}\n", encoding="utf-8"
+    )
+    codex._container_codex_mount_probe(cfg, "hermes-coder")
+    argv = exec_spy.call_args.args
+    assert "/home/ubuntu/agents/docker-compose.override.yml" in argv
 
 
 # ---------- login / refresh (subprocess wrappers) ----------

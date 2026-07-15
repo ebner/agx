@@ -18,6 +18,7 @@ from agents_cli.compose import (
     FIRECRAWL_RABBITMQ_IMAGE_BASE,
     FIRECRAWL_REDIS_IMAGE_BASE,
     HERMES_IMAGE_BASE,
+    LLAMACPP_DOWNLOAD_MOUNT,
     LLAMACPP_IMAGE_BASE,
     OLLAMA_IMAGE_BASE,
     OPENCLAW_IMAGE_BASE,
@@ -28,8 +29,10 @@ from agents_cli.compose import (
     ensure_cont_init_script,
     hermes_service_fragment,
     list_services,
+    llamacpp_service_fragment,
     load_compose,
     next_free_port,
+    ollama_service_fragment,
     openclaw_service_fragment,
     override_file_args,
     read_override_doc,
@@ -240,6 +243,34 @@ def test_openclaw_named_agents_dont_collide(cfg: AgentsConfig) -> None:
     a = openclaw_service_fragment(name="personal", port=18789, image_tag="0.1.0")
     b = openclaw_service_fragment(name="home", port=18790, image_tag="0.1.0")
     assert set(a["volumes"]).isdisjoint(b["volumes"])
+
+
+def test_ollama_fragment_binds_llamacpp_download_dir() -> None:
+    """The ollama container doubles as the HF download host for
+    `agents model pull --engine llama-cpp` — without this second bind
+    the multi-GB download lands on the container overlay (invisible to
+    `model list`, wiped on recreate).
+    """
+    s = ollama_service_fragment(image="ollama/ollama@sha256:abc")
+    assert "./models/ollama:/root/.ollama" in s["volumes"]
+    assert f"./models/llama-cpp:{LLAMACPP_DOWNLOAD_MOUNT}" in s["volumes"]
+
+
+def test_llamacpp_fragment_reads_same_dir_ollama_downloads_into() -> None:
+    """Cross-fragment invariant: the host dir the ollama fragment's
+    download bind writes into (./models/llama-cpp) must be the very dir
+    the per-model llama-cpp service mounts read-only at /models —
+    otherwise `model pull` and `inference load` disagree on where GGUFs
+    live.
+    """
+    s = llamacpp_service_fragment(
+        model_slug="llama-3-2-3b",
+        image="ghcr.io/ggml-org/llama.cpp@sha256:abc",
+        gguf_relative_path="Llama-3.2-3B-Q4_K_M.gguf",
+        port=18080,
+    )
+    assert "./models/llama-cpp:/models:ro" in s["volumes"]
+    assert "/models/Llama-3.2-3B-Q4_K_M.gguf" in s["command"]
 
 
 def test_hermes_socket_path_comes_from_config(tmp_path: Path) -> None:

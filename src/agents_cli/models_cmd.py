@@ -28,6 +28,7 @@ from agents_cli import compose, hermes_config, mp, ui
 from agents_cli import config as cfg_mod
 from agents_cli.agents_cmd import _detect_type_from_compose
 from agents_cli.compose import (
+    LLAMACPP_DOWNLOAD_MOUNT,
     LLAMACPP_SERVICE_PREFIX,
     OLLAMA_SERVICE_NAME,
 )
@@ -261,7 +262,14 @@ def _pull_llamacpp_gguf(cfg: AgentsConfig, model: str) -> dict[str, Any]:
 
     Uses ``huggingface_hub.hf_hub_download`` inside the running ollama
     container (which has Python available) so we don't grow another
-    image just for downloads.
+    image just for downloads. The download target is the container's
+    ``LLAMACPP_DOWNLOAD_MOUNT`` bind (see ``compose.ollama_service_fragment``),
+    which is ``<data-dir>/models/llama-cpp/`` on the host — the same dir
+    ``model list``/``model rm`` walk and the per-model ``llama-cpp-*``
+    services mount at ``/models``. Before downloading we probe that the
+    bind is actually present (an ollama container created from an older
+    fragment lacks it — anything written there would land on the
+    overlay fs and vanish on recreate).
     """
     if ":" not in model:
         raise UserError(
@@ -275,8 +283,12 @@ def _pull_llamacpp_gguf(cfg: AgentsConfig, model: str) -> dict[str, Any]:
             "for HF GGUF pulls. Start ollama first: `agents inference up ollama`."
         )
 
+    _require_llamacpp_mount_visible(cfg)
+
     # Install hf_hub on first use (lives in container's overlay fs, lost
     # on recreate — but that's fine; we'll reinstall on next pull).
+    # NOTE the braces: `A || B && C` parses as `(A || B) && C`, which
+    # would run apt-get install on EVERY pull (and hard-fail offline).
     pip = mp.exec_in_vm(
         cfg.vm.name,
         "docker",
@@ -284,7 +296,7 @@ def _pull_llamacpp_gguf(cfg: AgentsConfig, model: str) -> dict[str, Any]:
         OLLAMA_SERVICE_NAME,
         "sh",
         "-c",
-        "command -v python3 >/dev/null 2>&1 || apt-get -qq update && apt-get -qq install -y python3 python3-pip; "
+        "command -v python3 >/dev/null 2>&1 || { apt-get -qq update && apt-get -qq install -y python3 python3-pip; }; "
         "python3 -m pip install --quiet --break-system-packages huggingface_hub",
         check=False,
     )
@@ -293,10 +305,8 @@ def _pull_llamacpp_gguf(cfg: AgentsConfig, model: str) -> dict[str, Any]:
             f"could not install huggingface_hub in ollama container: {pip.stderr.strip()}"
         )
 
-    # Download via hf_hub into a path the host can see. Inside the
-    # ollama container the path is /root/.ollama (the bind mount); we
-    # write to a sibling subdir reachable from the host as
-    # <data-dir>/models/llama-cpp/.
+    # Download via hf_hub into the bind-mounted dir the host sees as
+    # <data-dir>/models/llama-cpp/ (probed above).
     download = mp.exec_in_vm(
         cfg.vm.name,
         "docker",
@@ -306,7 +316,7 @@ def _pull_llamacpp_gguf(cfg: AgentsConfig, model: str) -> dict[str, Any]:
         "-c",
         f"from huggingface_hub import hf_hub_download; "
         f"p = hf_hub_download(repo_id={repo!r}, filename={filename!r}, "
-        f"local_dir='/root/.ollama/../llama-cpp', "
+        f"local_dir={LLAMACPP_DOWNLOAD_MOUNT!r}, "
         f"local_dir_use_symlinks=False); print(p)",
         check=False,
     )
@@ -322,6 +332,68 @@ def _pull_llamacpp_gguf(cfg: AgentsConfig, model: str) -> dict[str, Any]:
         ),
     )
     return {"engine": "llama-cpp", "repo": repo, "filename": filename, "pulled": True}
+
+
+def _require_llamacpp_mount_visible(cfg: AgentsConfig) -> None:
+    """Refuse the pull unless the ollama container's ``/llama-cpp`` bind
+    actually reaches ``<data-dir>/models/llama-cpp/``.
+
+    An ollama service created from a pre-bind compose fragment keeps its
+    old volume set until the container is recreated — writes to
+    ``/llama-cpp`` would then land on the container overlay: invisible
+    to ``model list``, refused by ``inference load``, and wiped on the
+    next recreate. Probe by touching a sentinel inside the container and
+    checking it appears on the shared dir; fail loudly with the recreate
+    hint if it doesn't. Runs BEFORE the download so a multi-GB pull
+    isn't wasted on a doomed destination.
+    """
+    sentinel = ".toolkit-mount-probe"
+    probe = mp.exec_in_vm(
+        cfg.vm.name,
+        "docker",
+        "exec",
+        OLLAMA_SERVICE_NAME,
+        "sh",
+        "-c",
+        f"mkdir -p {LLAMACPP_DOWNLOAD_MOUNT} && touch {LLAMACPP_DOWNLOAD_MOUNT}/{sentinel}",
+        check=False,
+    )
+    if probe.returncode != 0:
+        raise RuntimeFailure(
+            f"could not write to {LLAMACPP_DOWNLOAD_MOUNT} in the ollama container: "
+            f"{probe.stderr.strip()}"
+        )
+    try:
+        if cfg.paths.data_dir_in_vm:
+            check = mp.exec_in_vm(
+                cfg.vm.name,
+                "test",
+                "-e",
+                f"{cfg.paths.vm_agents_root}/models/llama-cpp/{sentinel}",
+                check=False,
+            )
+            visible = check.returncode == 0
+        else:
+            visible = (cfg.paths.host_data_dir / "models" / "llama-cpp" / sentinel).exists()
+    finally:
+        mp.exec_in_vm(
+            cfg.vm.name,
+            "docker",
+            "exec",
+            OLLAMA_SERVICE_NAME,
+            "rm",
+            "-f",
+            f"{LLAMACPP_DOWNLOAD_MOUNT}/{sentinel}",
+            check=False,
+        )
+    if not visible:
+        raise UserError(
+            f"the ollama container has no {LLAMACPP_DOWNLOAD_MOUNT} bind mount — it was "
+            "created from an older compose fragment, so the download would land on the "
+            "container's overlay fs (invisible to `agents model list`, wiped on recreate). "
+            "Recreate it first: `agents inference down ollama && agents inference up ollama`, "
+            "then retry the pull."
+        )
 
 
 def _list_llamacpp(cfg: AgentsConfig) -> list[dict[str, Any]]:

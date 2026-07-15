@@ -600,6 +600,12 @@ FIRECRAWL_SERVICE_PREFIX: Final = "firecrawl-"
 OLLAMA_SERVICE_NAME: Final = "ollama"
 OLLAMA_DEFAULT_PORT: Final = 11434
 LLAMACPP_SERVICE_PREFIX: Final = "llama-cpp-"
+# Where the ollama container sees the shared llama-cpp GGUF dir
+# (``<data-dir>/models/llama-cpp/``). ``agents model pull --engine
+# llama-cpp`` runs hf_hub_download inside the ollama container and MUST
+# target this path — anything else lands on the container overlay and is
+# wiped on recreate.
+LLAMACPP_DOWNLOAD_MOUNT: Final = "/llama-cpp"
 
 
 def ollama_service_fragment(*, image: str, port: int = OLLAMA_DEFAULT_PORT) -> dict[str, Any]:
@@ -618,6 +624,15 @@ def ollama_service_fragment(*, image: str, port: int = OLLAMA_DEFAULT_PORT) -> d
     down``. The full Ollama blob store layout is under that path
     (manifests + blobs subdirs).
 
+    A second bind at ``./models/llama-cpp/`` → :data:`LLAMACPP_DOWNLOAD_MOUNT`
+    exists because ``agents model pull --engine llama-cpp`` reuses this
+    container as its HF download host (it has Python; no extra image
+    needed). Downloads land host-visible in the same dir the per-model
+    ``llama-cpp-*`` services mount read-only at ``/models``. An ollama
+    container created from the pre-bind fragment only gains this mount
+    on recreate (``agents inference down ollama && agents inference up
+    ollama``) — the pull path probes for it and refuses with that hint.
+
     ``OLLAMA_KEEP_ALIVE: -1m`` keeps loaded models in RAM until
     explicitly evicted; the default 5-minute idle timeout would
     constantly unload-and-reload the agent's chosen model between
@@ -635,7 +650,10 @@ def ollama_service_fragment(*, image: str, port: int = OLLAMA_DEFAULT_PORT) -> d
         "container_name": OLLAMA_SERVICE_NAME,
         "restart": "unless-stopped",
         "ports": [f"127.0.0.1:{port}:11434"],
-        "volumes": ["./models/ollama:/root/.ollama"],
+        "volumes": [
+            "./models/ollama:/root/.ollama",
+            f"./models/llama-cpp:{LLAMACPP_DOWNLOAD_MOUNT}",
+        ],
         "environment": {
             "OLLAMA_HOST": "0.0.0.0:11434",
             "OLLAMA_KEEP_ALIVE": "-1m",

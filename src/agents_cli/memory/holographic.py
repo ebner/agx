@@ -42,7 +42,12 @@ def enable(cfg: AgentsConfig, agent_name: str, **_opts: Any) -> dict[str, Any]:
     """Flip ``memory.provider`` to ``holographic`` in the agent's config.yaml
     and write the matching ``plugins.hermes-memory-store`` block.
 
-    Restarts the container so the new provider takes effect.
+    Restarts the container so the new provider takes effect: ``up`` first
+    to guarantee the container exists (``compose restart`` cannot create
+    an absent one — e.g. after a VM rebuild or ``docker compose rm``),
+    then a real ``restart``, because ``up`` alone is a NO-OP for an
+    already-running container when only config.yaml changed — the
+    gateway would silently keep the old provider.
     """
     doc = hermes_config.read_doc(cfg, agent_name)
 
@@ -65,7 +70,13 @@ def enable(cfg: AgentsConfig, agent_name: str, **_opts: Any) -> dict[str, Any]:
     )
 
     svc = _service_name_for(agent_name, "hermes")
+    # `up -d` only creates the container when it's missing — the memory
+    # config lives in config.yaml, not compose, so up alone is a NO-OP
+    # for an already-running container and the gateway would keep the
+    # old memory provider while the CLI claims holographic is enabled.
+    # Restart forces the gateway to re-read config.yaml.
     compose_runner.up(cfg, svc)
+    compose_runner.restart(cfg, svc)
 
     return {
         "db_path": DEFAULT_DB_PATH,
@@ -79,6 +90,10 @@ def disable(cfg: AgentsConfig, agent_name: str) -> None:
 
     Leaves ``$HERMES_HOME/memory_store.db`` in place — the user may want
     to re-enable later or export the memories separately.
+
+    Same up-then-restart rationale as :func:`enable`: ``up`` creates the
+    container if absent; ``restart`` forces the config.yaml re-read that
+    a no-op ``up`` wouldn't trigger.
     """
     doc = hermes_config.read_doc(cfg, agent_name)
 
@@ -98,7 +113,11 @@ def disable(cfg: AgentsConfig, agent_name: str) -> None:
     clear_state(cfg, agent_name)
 
     svc = _service_name_for(agent_name, "hermes")
+    # Same as enable: compose config didn't change, so restart (not a
+    # no-op `up`) is what actually drops the provider from the gateway;
+    # the `up` guarantees the container exists to be restarted.
     compose_runner.up(cfg, svc)
+    compose_runner.restart(cfg, svc)
 
 
 def status(cfg: AgentsConfig, agent_name: str) -> dict[str, Any]:
