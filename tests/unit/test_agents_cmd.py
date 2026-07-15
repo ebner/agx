@@ -17,7 +17,7 @@ from agents_cli.agents_cmd import (
     validate_name,
 )
 from agents_cli.config import AgentsConfig, DefaultsConfig, HostConfig, PathsConfig, VmRuntimeConfig
-from agents_cli.errors import UserError
+from agents_cli.errors import RuntimeFailure, UserError
 from agents_cli.journal import Journal
 from agents_cli.mp import MpResult
 
@@ -582,3 +582,168 @@ def test_rename_cli_yes_flag_wires_through(
     confirm_spy.assert_not_called()
     doc = compose.load_compose(cfg.paths.host_data_dir / "docker-compose.yml")
     assert "hermes-writer" in doc["services"]
+
+
+# ---------- rename: dir_renamed phase must fail loudly, resume idempotently ----------
+
+
+def _flip_to_vm_mode(cfg: AgentsConfig, saved_config: Path) -> None:
+    """Re-save the config in ``--data-dir-in-vm`` mode with
+    ``vm_agents_root`` aliased onto the host data dir, so a locally
+    executed bash script (see ``_local_bash``) acts on the exact tree
+    the assertions inspect."""
+    cfg.paths.data_dir_in_vm = True
+    cfg.paths.vm_agents_root = cfg.paths.host_data_dir
+    cfg_mod.save(cfg, saved_config)
+
+
+def _local_bash(vm_name: str, script: str, *, check: bool = True, timeout=None) -> MpResult:
+    """Execute the VM-bound bash script on the host. With
+    ``vm_agents_root`` aliased to the host data dir this runs the REAL
+    script (the branch logic under test) against a real filesystem
+    instead of hand-simulating its outcome."""
+    import subprocess
+
+    proc = subprocess.run(["bash", "-s"], input=script.encode(), capture_output=True)
+    return MpResult(
+        stdout=proc.stdout.decode(), stderr=proc.stderr.decode(), returncode=proc.returncode
+    )
+
+
+def test_rename_vm_mode_mv_failure_raises_and_resume_retries_move(
+    cfg: AgentsConfig, saved_config: Path, stub_runners, mocker
+) -> None:
+    """A transient VM/mv failure in --data-dir-in-vm mode must raise
+    BEFORE the journal advances: a journaled-but-unmoved dir would make
+    the compose validation fail (env_file points at ./<new>/) while
+    every retry skips the dir phase — unrecoverable without hand-editing
+    the journal. The resumed run must retry the move and complete."""
+    create(name="coder", agent_type="hermes", config_path=saved_config)
+    _flip_to_vm_mode(cfg, saved_config)
+
+    def failing_bash(vm_name, script, *, check=True, timeout=None):
+        if "mv " in script:
+            return MpResult(stdout="", stderr="mv: cannot move: I/O error", returncode=1)
+        return _local_bash(vm_name, script, check=check, timeout=timeout)
+
+    mocker.patch("agents_cli.mp.exec_bash", side_effect=failing_bash)
+    with pytest.raises(RuntimeFailure, match="could not move VM data dir"):
+        rename("coder", "writer", yes=True, config_path=saved_config)
+
+    journal = Journal.find_resumable(cfg.paths.host_data_dir, "rename", "coder")
+    assert journal is not None, "journal must survive for the resume"
+    assert "dir_renamed" not in journal.completed_phases
+    # Nothing moved, compose untouched.
+    assert (cfg.paths.host_data_dir / "coder").is_dir()
+    doc = compose.load_compose(cfg.paths.host_data_dir / "docker-compose.yml")
+    assert "hermes-coder" in doc["services"]
+
+    # Resume with the transient failure gone: the move is retried and
+    # the rename completes end-to-end.
+    executed: list[str] = []
+
+    def working_bash(vm_name, script, *, check=True, timeout=None):
+        executed.append(script)
+        return _local_bash(vm_name, script, check=check, timeout=timeout)
+
+    mocker.patch("agents_cli.mp.exec_bash", side_effect=working_bash)
+    rename("coder", "writer", yes=True, config_path=saved_config)
+    assert any("mv " in s for s in executed), "resume must retry the move"
+    assert (cfg.paths.host_data_dir / "writer").is_dir()
+    assert not (cfg.paths.host_data_dir / "coder").exists()
+    doc = compose.load_compose(cfg.paths.host_data_dir / "docker-compose.yml")
+    assert "hermes-writer" in doc["services"]
+    assert Journal.find_resumable(cfg.paths.host_data_dir, "rename", "coder") is None
+
+
+def test_rename_vm_mode_resume_skips_mv_when_move_already_landed(
+    cfg: AgentsConfig, saved_config: Path, stub_runners, mocker
+) -> None:
+    """Crash window: a previous run's mv landed but the journal never
+    advanced. The re-run must treat "new exists, old gone" as success
+    WITHOUT executing a second mv (which would fail on the now-missing
+    source)."""
+    create(name="coder", agent_type="hermes", config_path=saved_config)
+    _flip_to_vm_mode(cfg, saved_config)
+    (cfg.paths.host_data_dir / "coder").rename(cfg.paths.host_data_dir / "writer")
+    Journal.begin(cfg.paths.host_data_dir, "rename", "coder", agents_cmd.RENAME_PHASES)
+
+    traces: list[str] = []
+
+    def tracing_bash(vm_name, script, *, check=True, timeout=None):
+        import subprocess
+
+        # `bash -x` so the xtrace proves which branch actually executed.
+        proc = subprocess.run(["bash", "-x", "-s"], input=script.encode(), capture_output=True)
+        traces.append(proc.stderr.decode())
+        return MpResult(
+            stdout=proc.stdout.decode(), stderr=proc.stderr.decode(), returncode=proc.returncode
+        )
+
+    mocker.patch("agents_cli.mp.exec_bash", side_effect=tracing_bash)
+    rename("coder", "writer", yes=True, config_path=saved_config)
+
+    assert (cfg.paths.host_data_dir / "writer").is_dir()
+    doc = compose.load_compose(cfg.paths.host_data_dir / "docker-compose.yml")
+    assert "hermes-writer" in doc["services"]
+    # The early-exit branch ran; no second mv was attempted.
+    assert not any("+ mv" in t for t in traces)
+    assert Journal.find_resumable(cfg.paths.host_data_dir, "rename", "coder") is None
+
+
+def test_rename_vm_mode_missing_source_fails_loudly(
+    cfg: AgentsConfig, saved_config: Path, stub_runners, mocker
+) -> None:
+    """No source dir AND no target dir is not a resume — it's a broken
+    state. Advancing the journal would strand the rename; raise instead."""
+    import shutil
+
+    create(name="coder", agent_type="hermes", config_path=saved_config)
+    _flip_to_vm_mode(cfg, saved_config)
+    shutil.rmtree(cfg.paths.host_data_dir / "coder")
+
+    mocker.patch("agents_cli.mp.exec_bash", side_effect=_local_bash)
+    with pytest.raises(RuntimeFailure, match="is missing"):
+        rename("coder", "writer", yes=True, config_path=saved_config)
+    journal = Journal.find_resumable(cfg.paths.host_data_dir, "rename", "coder")
+    assert journal is not None
+    assert "dir_renamed" not in journal.completed_phases
+
+
+def test_rename_host_mode_missing_source_fails_loudly(
+    cfg: AgentsConfig, saved_config: Path, stub_runners
+) -> None:
+    """Host-mount mode shares the phase contract: missing source with no
+    target must not silently advance."""
+    import shutil
+
+    create(name="coder", agent_type="hermes", config_path=saved_config)
+    shutil.rmtree(cfg.paths.host_data_dir / "coder")
+    with pytest.raises(RuntimeFailure, match="missing"):
+        rename("coder", "writer", yes=True, config_path=saved_config)
+    doc = compose.load_compose(cfg.paths.host_data_dir / "docker-compose.yml")
+    assert "hermes-coder" in doc["services"]
+
+
+def test_rename_host_mode_resumes_when_move_already_landed(
+    cfg: AgentsConfig, saved_config: Path, stub_runners
+) -> None:
+    """Host-mount twin of the VM resume case: dir already at the new
+    name + old gone counts as success, not an error."""
+    create(name="coder", agent_type="hermes", config_path=saved_config)
+    (cfg.paths.host_data_dir / "coder").rename(cfg.paths.host_data_dir / "writer")
+    rename("coder", "writer", yes=True, config_path=saved_config)
+    doc = compose.load_compose(cfg.paths.host_data_dir / "docker-compose.yml")
+    assert "hermes-writer" in doc["services"]
+
+
+def test_rename_host_mode_stray_target_dir_fails_loudly(
+    cfg: AgentsConfig, saved_config: Path, stub_runners
+) -> None:
+    """Source AND target both present: renaming would nest the old dir
+    inside the stray target (mv semantics) — refuse instead."""
+    create(name="coder", agent_type="hermes", config_path=saved_config)
+    (cfg.paths.host_data_dir / "writer").mkdir()
+    with pytest.raises(RuntimeFailure, match="already exists"):
+        rename("coder", "writer", yes=True, config_path=saved_config)
+    assert (cfg.paths.host_data_dir / "coder").is_dir()

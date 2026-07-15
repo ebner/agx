@@ -547,17 +547,52 @@ def rename(
 
         for phase in _phases_to_run(journal):
             if phase == "dir_renamed":
+                # This phase must FAIL LOUDLY rather than advance on a
+                # botched move: the next phase rewrites env_file to
+                # ``./<new>/.env`` and validates via `docker compose
+                # config -q`, which errors on a missing env file — and a
+                # journaled-but-not-actually-moved dir means every retry
+                # skips this phase, leaving the rename unrecoverable
+                # without hand-editing the journal. The idempotency
+                # contract: already-moved (new exists, old gone) is a
+                # resume and counts as success; a missing source with no
+                # target — or a stray target alongside the source — is
+                # an error.
                 if cfg.paths.data_dir_in_vm:
-                    mp.exec_bash(
+                    vm_old = f"{cfg.paths.vm_agents_root}/{old_name}"
+                    vm_new = f"{cfg.paths.vm_agents_root}/{new_name}"
+                    result = mp.exec_bash(
                         cfg.vm.name,
                         f"set -eu\n"
-                        f"if [ -d {cfg.paths.vm_agents_root}/{old_name} ] && "
-                        f"[ ! -d {cfg.paths.vm_agents_root}/{new_name} ]; then "
-                        f"mv {cfg.paths.vm_agents_root}/{old_name} "
-                        f"{cfg.paths.vm_agents_root}/{new_name}; fi\n",
+                        f"if [ -d {vm_new} ] && [ ! -d {vm_old} ]; then exit 0; fi\n"
+                        f"if [ ! -d {vm_old} ]; then "
+                        f"echo 'source dir {vm_old} is missing' >&2; exit 1; fi\n"
+                        f"if [ -d {vm_new} ]; then "
+                        f"echo 'target dir {vm_new} already exists' >&2; exit 1; fi\n"
+                        f"mv {vm_old} {vm_new}\n",
                         check=False,
                     )
-                elif old_dir.exists() and not new_dir.exists():
+                    if result.returncode != 0:
+                        raise RuntimeFailure(
+                            f"could not move VM data dir {vm_old} -> {vm_new} "
+                            f"(exit {result.returncode}): "
+                            f"{(result.stderr or '').strip() or 'unknown error'}. "
+                            f"Nothing was journaled — re-run "
+                            f"`agents rename {old_name} {new_name}` to retry."
+                        )
+                elif new_dir.is_dir() and not old_dir.exists():
+                    pass  # already moved by a previous partially-completed run
+                elif not old_dir.exists():
+                    raise RuntimeFailure(
+                        f"data dir {old_dir} is missing and {new_dir} does not "
+                        f"exist — cannot rename the agent's data dir"
+                    )
+                elif new_dir.exists():
+                    raise RuntimeFailure(
+                        f"target data dir {new_dir} already exists while {old_dir} "
+                        f"is still present — move it aside and re-run the rename"
+                    )
+                else:
                     old_dir.rename(new_dir)
                 journal.advance(phase)
             elif phase == "compose_updated":

@@ -31,11 +31,14 @@ adds *additional* per-folder hops on demand. Per the design lock-in:
 - **Refused on OpenClaw with ``--target sandbox``** — OpenClaw owns
   its plugin lifecycle; the toolkit stays out of it.
 - **Atomic across phases.** If any later phase fails after the VM
-  mount succeeded, everything already applied is rolled back — the
+  mount succeeded, everything *this call* applied is rolled back — the
   override volume entry, the sandbox volume, the VM mount, and the
   host-folder ACLs (unless another manifest still references the same
   host folder) — so the system isn't left in a half-applied state the
-  manifest-driven ``remove`` can't see.
+  manifest-driven ``remove`` can't see. Pre-existing state (a volume
+  entry the user hand-added to the override, an ACL grant that was
+  already present) is never removed by the rollback: each apply helper
+  reports whether it actually changed anything.
 """
 
 from __future__ import annotations
@@ -281,7 +284,7 @@ def add(
         # agent creates back (so the user can read what the agent
         # wrote). No-op on bare-metal (container uid maps to host
         # user) and when the fs doesn't support ACLs (warn).
-        _auto_acl_host_folder(cfg, host_resolved, readonly)
+        applied_acl = _auto_acl_host_folder(cfg, host_resolved, readonly)
 
         # Phase 1: VM mount. No-op on bare-metal.
         if cfg.vm.backend != "bare_metal":
@@ -301,38 +304,62 @@ def add(
         applied_runtime = False
         applied_sandbox = False
         try:
-            # Phase 2: compose-override (runtime target).
+            # Phase 2: compose-override (runtime target). The helper
+            # reports whether it actually inserted anything — an entry
+            # the user already hand-added to the override is not ours,
+            # and the rollback below must not delete it (rule #10).
             if effective_target in {"runtime", "both"}:
-                _add_runtime_volume(cfg, svc, vm_path, container_resolved, readonly)
-                applied_runtime = True
+                applied_runtime = _add_runtime_volume(
+                    cfg, svc, vm_path, container_resolved, readonly
+                )
 
-            # Phase 3: hermes config.yaml (sandbox target).
+            # Phase 3: hermes config.yaml (sandbox target). Same
+            # actually-inserted contract as phase 2.
             if effective_target in {"sandbox", "both"}:
-                _add_sandbox_volume(cfg, svc, agent, vm_path, container_resolved, readonly)
-                applied_sandbox = True
+                applied_sandbox = _add_sandbox_volume(
+                    cfg, svc, agent, vm_path, container_resolved, readonly
+                )
 
             # Phase 4: manifest persist.
             entries.append(new_entry)
             save_manifest(cfg, agent, entries)
         except BaseException:
-            # Unwind everything already applied, in reverse order. The
+            # Unwind everything THIS CALL applied, in reverse order. The
             # manifest was never written (it's the last phase), so
             # ``remove`` cannot see — let alone clean up — any of these
-            # orphans; the rollback has to do it here.
+            # orphans; the rollback has to do it here. Pre-existing
+            # state (user-added volume entries, pre-set ACLs) is left
+            # untouched — the applied_* flags are False for those.
             if applied_sandbox:
                 with _suppress():
-                    _remove_sandbox_volume(cfg, svc, agent, vm_path, container_resolved, readonly)
+                    _remove_sandbox_volume(
+                        cfg,
+                        svc,
+                        agent,
+                        vm_path,
+                        container_resolved,
+                        readonly,
+                        include_flipped=False,
+                    )
             if applied_runtime:
                 with _suppress():
-                    _remove_runtime_volume(cfg, svc, vm_path, container_resolved, readonly)
+                    _remove_runtime_volume(
+                        cfg,
+                        svc,
+                        vm_path,
+                        container_resolved,
+                        readonly,
+                        include_flipped=False,
+                    )
             if cfg.vm.backend != "bare_metal":
                 with _suppress():
                     mp.umount(cfg.vm.name, vm_path)
-            # Phase-0 ACLs: strip only when no other manifest still
-            # references this host folder (shared-subuid rule — see
+            # Phase-0 ACLs: strip only when this call introduced the
+            # grant AND no other manifest still references this host
+            # folder (shared-subuid rule — see
             # _agents_referencing_host_path).
             with _suppress():
-                if not _agents_referencing_host_path(cfg, str(host_resolved)):
+                if applied_acl and not _agents_referencing_host_path(cfg, str(host_resolved)):
                     _auto_acl_host_folder_remove(cfg, host_resolved, readonly)
             raise
 
@@ -539,15 +566,25 @@ def _add_runtime_volume(
     vm_path: str,
     container_path: str,
     readonly: bool,
-) -> None:
+) -> bool:
+    """Add the volume entry to the compose override.
+
+    Returns True only when this call actually inserted the entry.
+    A pre-existing identical entry (the user hand-added it to the
+    override — which is theirs to edit) returns False WITHOUT
+    rewriting the file, so ``add``'s rollback knows the entry is not
+    ours to remove (rule #10: the override is sacred).
+    """
     doc = compose.read_override_doc(cfg)
     services = doc.setdefault("services", {})
     svc_block = services.setdefault(svc, {})
     volumes = svc_block.setdefault("volumes", [])
     entry = _format_volume(vm_path, container_path, readonly)
-    if entry not in volumes:
-        volumes.append(entry)
+    if entry in volumes:
+        return False
+    volumes.append(entry)
     compose.write_override_atomically(cfg, doc)
+    return True
 
 
 def _remove_runtime_volume(
@@ -556,6 +593,8 @@ def _remove_runtime_volume(
     vm_path: str,
     container_path: str,
     readonly: bool,
+    *,
+    include_flipped: bool = True,
 ) -> None:
     doc = compose.read_override_doc(cfg)
     services = doc.get("services") or {}
@@ -566,8 +605,13 @@ def _remove_runtime_volume(
     target = _format_volume(vm_path, container_path, readonly)
     # Tolerate that the user may have flipped the :ro suffix manually
     # since add — remove the canonical form AND the toggled form.
-    flipped = _format_volume(vm_path, container_path, not readonly)
-    new_volumes = [v for v in volumes if v not in {target, flipped}]
+    # ``add``'s rollback passes ``include_flipped=False``: it must only
+    # remove the exact entry it inserted moments earlier, never a
+    # flipped-suffix twin the user may have hand-added.
+    forms = {target}
+    if include_flipped:
+        forms.add(_format_volume(vm_path, container_path, not readonly))
+    new_volumes = [v for v in volumes if v not in forms]
     if new_volumes == list(volumes):
         return
     if new_volumes:
@@ -587,15 +631,23 @@ def _add_sandbox_volume(
     vm_path: str,
     container_path: str,
     readonly: bool,
-) -> None:
+) -> bool:
     """Append to ``terminal.docker_volumes`` in the agent's
     config.yaml. Uses the existing ``hermes_config`` round-trip
     helpers — same path the codex skill-enable command uses.
+
+    Returns True only when this call actually inserted the entry —
+    same actually-changed contract as :func:`_add_runtime_volume`, so
+    ``add``'s rollback never strips a user-added pre-existing entry.
     """
     entry = _format_volume(vm_path, container_path, readonly)
     doc = hermes_config.read_doc(cfg, agent)
+    volumes = (doc.get("terminal") or {}).get("docker_volumes") or []
+    if entry in volumes:
+        return False
     hermes_config.add_docker_volume(doc, entry)
     hermes_config.write_atomically(cfg, agent, doc)
+    return True
 
 
 def _remove_sandbox_volume(
@@ -605,17 +657,25 @@ def _remove_sandbox_volume(
     vm_path: str,
     container_path: str,
     readonly: bool,
+    *,
+    include_flipped: bool = True,
 ) -> None:
     doc = hermes_config.read_doc(cfg, agent)
     hermes_config.remove_docker_volume(doc, _format_volume(vm_path, container_path, readonly))
-    hermes_config.remove_docker_volume(doc, _format_volume(vm_path, container_path, not readonly))
+    if include_flipped:
+        # Same rationale as _remove_runtime_volume: only the manifest-
+        # driven remove tolerates a user-flipped :ro suffix; add's
+        # rollback removes exactly what it inserted.
+        hermes_config.remove_docker_volume(
+            doc, _format_volume(vm_path, container_path, not readonly)
+        )
     hermes_config.write_atomically(cfg, agent, doc)
 
 
 # ---------- helpers ----------
 
 
-def _auto_acl_host_folder(cfg: AgentsConfig, host_path: Path, readonly: bool) -> None:
+def _auto_acl_host_folder(cfg: AgentsConfig, host_path: Path, readonly: bool) -> bool:
     """Apply ACL on the user-owned host folder so the agent's subuid
     can reach it (and the user can read what the agent writes back
     when ``--rw``). Idempotent — setfacl on an already-present entry
@@ -625,11 +685,19 @@ def _auto_acl_host_folder(cfg: AgentsConfig, host_path: Path, readonly: bool) ->
     host user there. Warn-only if the filesystem can't carry ACLs;
     the mount still works in the obvious case (mode-permissive files)
     but file-level permission errors will surface at runtime.
+
+    Returns True only when the subuid grant did NOT pre-exist — i.e.
+    this call introduced it. When the folder already carried an ACL
+    entry for the container subuid (the user set one manually, or an
+    earlier grant drifted out of the manifests), setfacl still runs to
+    converge recursion/mask, but the return is False so ``add``'s
+    rollback leaves the pre-existing grant in place rather than
+    stripping state this call didn't create.
     """
     from agents_cli import permissions
 
     if cfg.vm.backend == "bare_metal":
-        return
+        return False
     ok, err = permissions.probe_acl_support(host_path)
     if not ok:
         ui.warn(
@@ -638,8 +706,10 @@ def _auto_acl_host_folder(cfg: AgentsConfig, host_path: Path, readonly: bool) ->
             "may hit permission errors on files with restrictive mode bits. "
             "Move the folder to ext4/btrfs/zfs to fix."
         )
-        return
-    recipients = [permissions.container_recipient(cfg.host.uid, writable=not readonly)]
+        return False
+    subuid_recipient = permissions.container_recipient(cfg.host.uid, writable=not readonly)
+    preexisting = permissions.has_user_acl(host_path, subuid_recipient.uid)
+    recipients = [subuid_recipient]
     if not readonly:
         # Future agent writes carry default ACL granting the user rwx
         # so `--rw` mounts are symmetric: user → agent works via the
@@ -647,6 +717,7 @@ def _auto_acl_host_folder(cfg: AgentsConfig, host_path: Path, readonly: bool) ->
         recipients.append(permissions.host_user_recipient(cfg.host.uid, writable=True))
     cmds = permissions.apply_acl_argv(host_path, recipients=recipients, recurse=True, defaults=True)
     permissions.run_owned(cmds)
+    return not preexisting
 
 
 def _auto_acl_host_folder_remove(cfg: AgentsConfig, host_path: Path, readonly: bool) -> None:

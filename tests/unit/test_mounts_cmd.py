@@ -541,6 +541,188 @@ def test_add_failure_rollback_preserves_acls_shared_with_other_agent(
     assert "-x" not in flat, "shared ACLs must survive the rollback"
 
 
+# ---------- rollback removes ONLY what this call inserted (rule #10) ----------
+
+
+def _coder_volume(container_path: str, *, readonly: bool) -> str:
+    """The exact override/sandbox volume string add() would write for
+    coder at ``container_path`` (vm_path is a pure function of the
+    container path + agent name)."""
+    entry = MountEntry(
+        host_path="/irrelevant", container_path=container_path, readonly=readonly, target="both"
+    )
+    suffix = ":ro" if readonly else ""
+    return f"{entry.vm_path('coder')}:{container_path}{suffix}"
+
+
+def test_add_failure_rollback_preserves_preexisting_override_entry(
+    host_folder: Path,
+    cfg_with_agent: AgentsConfig,
+    saved_config: Path,
+    mounts_mocked,
+) -> None:
+    """The user may have hand-added the IDENTICAL volume entry to
+    docker-compose.override.yml before running `agents mount add`. The
+    override is sacred (rule #10): a later-phase failure must roll back
+    only entries THIS call inserted — the pre-existing one stays."""
+    volume = _coder_volume("/workspace/x", readonly=True)
+    override_path = cfg_with_agent.paths.host_data_dir / "docker-compose.override.yml"
+    override_path.write_text(
+        f"services:\n  hermes-coder:\n    volumes:\n      - {volume}\n",
+        encoding="utf-8",
+    )
+
+    mounts_mocked["hermes_write"].side_effect = OSError("simulated config write failure")
+    with pytest.raises(OSError, match="config write failure"):
+        mounts_cmd.add(
+            agent="coder",
+            host=str(host_folder),
+            container="/workspace/x",
+            readonly=True,
+            target="both",
+            restart=False,
+            config_path=saved_config,
+        )
+    doc = YAML().load(override_path.read_text(encoding="utf-8"))
+    assert doc["services"]["hermes-coder"]["volumes"] == [volume], (
+        "user-added override entry must survive the rollback"
+    )
+
+
+def test_add_failure_rollback_removes_inserted_entry_but_keeps_user_entries(
+    host_folder: Path,
+    cfg_with_agent: AgentsConfig,
+    saved_config: Path,
+    mounts_mocked,
+) -> None:
+    """Contrast case: the entry THIS call inserted is rolled back, while
+    an unrelated user-added volume in the same service block survives."""
+    user_volume = "/srv/user-thing:/data/user-thing:ro"
+    override_path = cfg_with_agent.paths.host_data_dir / "docker-compose.override.yml"
+    override_path.write_text(
+        f"services:\n  hermes-coder:\n    volumes:\n      - {user_volume}\n",
+        encoding="utf-8",
+    )
+
+    mounts_mocked["hermes_write"].side_effect = OSError("simulated config write failure")
+    with pytest.raises(OSError, match="config write failure"):
+        mounts_cmd.add(
+            agent="coder",
+            host=str(host_folder),
+            container="/workspace/x",
+            readonly=True,
+            target="both",
+            restart=False,
+            config_path=saved_config,
+        )
+    doc = YAML().load(override_path.read_text(encoding="utf-8"))
+    assert doc["services"]["hermes-coder"]["volumes"] == [user_volume], (
+        "the inserted entry is removed; the user's other entry stays"
+    )
+
+
+def test_add_failure_rollback_keeps_user_flipped_suffix_twin(
+    host_folder: Path,
+    cfg_with_agent: AgentsConfig,
+    saved_config: Path,
+    mounts_mocked,
+) -> None:
+    """remove()'s flipped-:ro-suffix tolerance must NOT leak into add()'s
+    rollback: when the user hand-added the rw twin of the entry this
+    call inserts as ro, the rollback removes only the exact ro form."""
+    flipped_twin = _coder_volume("/workspace/x", readonly=False)
+    override_path = cfg_with_agent.paths.host_data_dir / "docker-compose.override.yml"
+    override_path.write_text(
+        f"services:\n  hermes-coder:\n    volumes:\n      - {flipped_twin}\n",
+        encoding="utf-8",
+    )
+
+    mounts_mocked["hermes_write"].side_effect = OSError("simulated config write failure")
+    with pytest.raises(OSError, match="config write failure"):
+        mounts_cmd.add(
+            agent="coder",
+            host=str(host_folder),
+            container="/workspace/x",
+            readonly=True,
+            target="both",
+            restart=False,
+            config_path=saved_config,
+        )
+    doc = YAML().load(override_path.read_text(encoding="utf-8"))
+    assert doc["services"]["hermes-coder"]["volumes"] == [flipped_twin], (
+        "the user's rw twin must survive; only the ro entry this call inserted is removed"
+    )
+
+
+def test_add_failure_rollback_preserves_preexisting_sandbox_entry(
+    host_folder: Path,
+    cfg_with_agent: AgentsConfig,
+    saved_config: Path,
+    mounts_mocked,
+    mocker,
+) -> None:
+    """Same actually-inserted rule for terminal.docker_volumes: a user-
+    added identical sandbox entry survives a later-phase failure — the
+    rollback must not even rewrite config.yaml."""
+    volume = _coder_volume("/workspace/x", readonly=True)
+    config_yaml = cfg_with_agent.paths.host_data_dir / "coder" / ".data" / "config.yaml"
+    config_yaml.write_text(
+        f"terminal:\n  backend: docker\n  docker_volumes:\n    - {volume}\n",
+        encoding="utf-8",
+    )
+    mocker.patch(
+        "agents_cli.mounts_cmd.save_manifest",
+        side_effect=OSError("simulated manifest failure"),
+    )
+    with pytest.raises(OSError, match="manifest failure"):
+        mounts_cmd.add(
+            agent="coder",
+            host=str(host_folder),
+            container="/workspace/x",
+            readonly=True,
+            target="both",
+            restart=False,
+            config_path=saved_config,
+        )
+    # Neither the add (entry pre-existed) nor the rollback wrote the file.
+    mounts_mocked["hermes_write"].assert_not_called()
+    doc = YAML().load(config_yaml.read_text(encoding="utf-8"))
+    assert doc["terminal"]["docker_volumes"] == [volume]
+
+
+def test_add_failure_rollback_preserves_preexisting_acl_grant(
+    host_folder: Path,
+    cfg_with_agent: AgentsConfig,
+    saved_config: Path,
+    mounts_mocked,
+    mocker,
+) -> None:
+    """A subuid ACL grant that predates this call (user-set, or drifted
+    outside any manifest) must survive the rollback even though no other
+    manifest references the folder. The apply still runs (setfacl is
+    idempotent and converges recursion/mask) but the strip must not."""
+    mocker.patch("agents_cli.permissions.has_user_acl", return_value=True)
+    mounts_mocked["hermes_write"].side_effect = OSError("simulated config write failure")
+    with pytest.raises(OSError, match="config write failure"):
+        mounts_cmd.add(
+            agent="coder",
+            host=str(host_folder),
+            container="/workspace/x",
+            readonly=True,
+            target="both",
+            restart=False,
+            config_path=saved_config,
+        )
+    flat = [
+        arg
+        for call in mounts_mocked["acl_run_owned"].call_args_list
+        for cmd in call.args[0]
+        for arg in cmd
+    ]
+    assert "-m" in flat, "the grant is still applied (converges recursion/mask)"
+    assert "-x" not in flat, "a pre-existing grant must survive the rollback"
+
+
 def test_add_rw_flag_drops_ro_suffix(
     host_folder: Path, cfg_with_agent: AgentsConfig, saved_config: Path, mounts_mocked
 ) -> None:
