@@ -1,5 +1,7 @@
 # `agents` — multi-agent VM toolkit
 
+[![CI](https://github.com/ebner/agents/actions/workflows/ci.yml/badge.svg)](https://github.com/ebner/agents/actions/workflows/ci.yml)
+
 Host-side CLI for managing AI agents (Hermes Agent from Nous Research, OpenClaw) as rootless-Docker containers behind a pluggable isolation backend:
 
 - **`multipass`** (default, cross-platform) — a single Multipass VM; the host shells out only to `multipass`.
@@ -146,4 +148,4 @@ See [docs/threat-model.md](docs/threat-model.md). Short version:
 
 ## Status
 
-v0.1.0 — initial implementation. See [`the design plan`](the design plan) for the locked design.
+v0.1.0 — initial implementation. The locked architecture rules and their rationale live in [`CLAUDE.md`](CLAUDE.md) and [`docs/architecture.md`](docs/architecture.md).
