@@ -47,6 +47,7 @@ resolves them naturally.
 from __future__ import annotations
 
 import json
+import re
 import secrets
 import time
 from pathlib import Path
@@ -134,6 +135,10 @@ OPENCLAW_ENV_KEYS: tuple[str, ...] = (
 # can rely on them.
 STATUS_KEYS: tuple[str, ...] = ("running", "api_url", "wired_agents", "images")
 
+# The api's address on the project docker network — what lands in the
+# state file, the project .env, and every agent's container env.
+API_URL_IN_VM = "http://firecrawl-api:3002"
+
 
 def _state_path(cfg: AgentsConfig) -> Path:
     return cfg.paths.host_data_dir / ".firecrawl-state.json"
@@ -183,6 +188,7 @@ def up(
     *,
     upgrade: bool = False,
     config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH,
+    emit: bool = True,
 ) -> dict[str, Any]:
     """Install (or upgrade) the firecrawl stack and wire every Hermes agent.
 
@@ -198,6 +204,16 @@ def up(
 
     ``upgrade=True`` re-resolves digests against the upstream floating
     tags, even if a state file already exists.
+
+    When the state file is missing (or lacks ``images``) but the compose
+    doc still carries the firecrawl service blocks — the post-VM-
+    migration stranding — the digest pins are reconstructed from compose
+    instead of re-resolved, so a plain ``up`` never turns into an
+    unintended upgrade. See :func:`_reconstruct_pins_from_compose`.
+
+    ``emit=False`` skips the final :func:`ui.emit` so composite callers
+    (``vm rebuild``) that own the command's single stdout object can
+    embed this flow; the payload is still returned.
     """
     cfg = cfg_mod.load(config_path)
     if not cfg.vm_runtime.is_populated():
@@ -205,11 +221,23 @@ def up(
 
     with compose.acquire_lock(cfg.paths.host_data_dir):
         state = read_state(cfg)
-        if "images" not in state or upgrade:
+        if upgrade:
             images = _resolve_digests(cfg)
-            state = {"images": images, "api_url": "http://firecrawl-api:3002"}
-        else:
+            state = {"images": images, "api_url": API_URL_IN_VM}
+        elif "images" in state:
             images = state["images"]
+        else:
+            reconstructed = _reconstruct_pins_from_compose(cfg)
+            if reconstructed is not None:
+                ui.progress(
+                    "reconstructing digest pins from compose — a VM migration "
+                    "likely lost .firecrawl-state.json; reusing the exact "
+                    "pinned digests instead of re-resolving upstream tags..."
+                )
+                images = reconstructed
+            else:
+                images = _resolve_digests(cfg)
+            state = {"images": images, "api_url": API_URL_IN_VM}
 
         _ensure_project_env(cfg)
         _ensure_postgres_dir(cfg)
@@ -327,7 +355,8 @@ def up(
         )
     human_lines.append("  images:")
     human_lines.extend(f"    {k}: {v}" for k, v in images.items())
-    ui.emit(payload, human="\n".join(human_lines))
+    if emit:
+        ui.emit(payload, human="\n".join(human_lines))
     if stale:
         ui.warn(
             "Agents created before the firecrawl interpolation entries "
@@ -597,6 +626,81 @@ def _resolve_digests(cfg: AgentsConfig) -> dict[str, str]:
     return images
 
 
+def _reconstruct_pins_from_compose(cfg: AgentsConfig) -> dict[str, str] | None:
+    """Self-heal a lost ``.firecrawl-state.json`` from the compose doc.
+
+    ``compose.firecrawl_service_fragments`` writes ``images[role]``
+    verbatim into the ``firecrawl-<role>`` service's ``image`` field, so
+    the mapping round-trips: each service block still carries the exact
+    digest pin the lost state file recorded. The real-world trigger is a
+    VM migration (multipass → libvirt) or rebuild — the host data-dir
+    (compose included) survives wholesale while the state file sometimes
+    doesn't, and the naive no-state ``up`` would re-resolve upstream
+    floating tags = an unintended upgrade (2026-07 incident).
+
+    Compose-read failures PROPAGATE instead of returning ``None`` —
+    ``None`` is reserved for a *successfully read* compose doc with no
+    usable pins, because the caller treats ``None`` as "first install,
+    resolve upstream". A transient multipass transfer error (the normal
+    read path in ``--data-dir-in-vm`` mode) must surface as the exit-2
+    failure it is, never silently trigger an unintended upgrade.
+
+    Returns ``None`` when reconstruction isn't possible, leaving the
+    caller to resolve upstream for ALL roles:
+
+    - no firecrawl services in compose at all → genuine first install,
+      resolving is the intended path (no warning);
+    - only SOME role services present, an ``image`` that isn't a
+      well-formed digest pin, or a digest from the WRONG repository for
+      its role (e.g. ``firecrawl-api`` pointing at ``redis@sha256:…``)
+      → mixed/misassigned pins would be incoherent, so warn and
+      re-resolve everything.
+
+    Role-matching each pin against its :data:`FLOATING_REFS` repository
+    implies allowlist membership (rule #5): only refs whose base equals
+    the toolkit's own upstream repo for that role are accepted, so a
+    doctored compose can't launder an off-allowlist image back through
+    the reconstructed state file — it falls into the warn-and-re-resolve
+    path like any other unusable pin.
+    """
+    doc = compose.read_compose_doc(cfg)
+    services = doc.get("services") or {}
+    images: dict[str, str] = {}
+    unusable: list[str] = []
+    for role, floating in FLOATING_REFS.items():
+        svc_name = f"{FIRECRAWL_SERVICE_PREFIX}{role}"
+        svc = services.get(svc_name)
+        image = svc.get("image") if isinstance(svc, dict) else None
+        if isinstance(image, str) and _is_valid_pin_for_role(image, floating):
+            images[role] = image
+        else:
+            unusable.append(svc_name)
+    if not images:
+        return None
+    if unusable:
+        ui.warn(
+            "firecrawl services found in compose, but a complete digest-pin "
+            "set could not be reconstructed from them ("
+            + ", ".join(unusable)
+            + " missing, not digest-pinned, or pinned to the wrong repository "
+            "for their role). Mixed pins would be incoherent, so ALL roles "
+            "will be re-resolved against upstream floating tags — "
+            "effectively an upgrade."
+        )
+        return None
+    return images
+
+
+def _is_valid_pin_for_role(image: str, floating_ref: str) -> bool:
+    """True iff ``image`` is a well-formed digest pin
+    (``<repo>@sha256:<64 hex>``) whose repository matches the role's
+    upstream repository (``floating_ref`` with its tag stripped).
+    """
+    expected_repo = floating_ref.rsplit(":", 1)[0]
+    repo, sep, digest = image.partition("@sha256:")
+    return bool(sep) and repo == expected_repo and re.fullmatch(r"[0-9a-f]{64}", digest) is not None
+
+
 def _ensure_project_env(cfg: AgentsConfig) -> None:
     """Write the four project-level env vars (api key, url, bull auth,
     postgres password) into the project ``.env`` if not already set.
@@ -612,7 +716,7 @@ def _ensure_project_env(cfg: AgentsConfig) -> None:
     if not existing.get("FIRECRAWL_API_KEY"):
         existing["FIRECRAWL_API_KEY"] = f"fc-self-hosted-{secrets.token_hex(8)}"
     if not existing.get("FIRECRAWL_API_URL"):
-        existing["FIRECRAWL_API_URL"] = "http://firecrawl-api:3002"
+        existing["FIRECRAWL_API_URL"] = API_URL_IN_VM
     if not existing.get("FIRECRAWL_BULL_AUTH_KEY"):
         existing["FIRECRAWL_BULL_AUTH_KEY"] = secrets.token_hex(32)
     if not existing.get("FIRECRAWL_POSTGRES_PASSWORD"):

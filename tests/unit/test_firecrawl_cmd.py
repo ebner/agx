@@ -338,6 +338,198 @@ def test_up_upgrade_re_resolves_digests(
     assert pull_count_after - pull_count_before == 5
 
 
+# ---------- self-healing: reconstruct pins from compose ----------
+
+
+def test_up_reconstructs_pins_from_compose_when_state_lost(
+    with_coder: Path, cfg: AgentsConfig, mocker: Any, vm_fs_mocks: dict[str, Any]
+) -> None:
+    """The 2026-07 incident: a VM migration preserved the host data-dir
+    (compose blocks included) but lost .firecrawl-state.json. `up` must
+    reconstruct the images map from the compose service blocks — the
+    exact digests round-trip — and NEVER touch the upstream resolver
+    (which would be an unintended upgrade).
+    """
+    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+    firecrawl_cmd.up(config_path=with_coder)
+    original_images = firecrawl_cmd.read_state(cfg)["images"]
+
+    firecrawl_cmd.clear_state(cfg)  # what the migration leaves behind
+    resolve_spy = mocker.patch("agents_cli.firecrawl_cmd._resolve_digests")
+    progress_spy = mocker.spy(firecrawl_cmd.ui, "progress")
+
+    payload = firecrawl_cmd.up(config_path=with_coder)
+
+    resolve_spy.assert_not_called()
+    assert payload["running"] is True
+    assert payload["images"] == original_images
+    state = firecrawl_cmd.read_state(cfg)
+    assert state["images"] == original_images
+    assert "degraded" not in state
+    # Narrated: the user learns why no pulls are happening.
+    lines = [c.args[0] for c in progress_spy.call_args_list]
+    assert any("reconstructing digest pins from compose" in ln for ln in lines)
+
+
+def test_up_reconstruction_still_gates_on_health_probe(
+    with_coder: Path, cfg: AgentsConfig, mocker: Any, vm_fs_mocks: dict[str, Any]
+) -> None:
+    """Reconstruction feeds the SAME degraded→up→probe→commit machinery:
+    an unhealthy probe still raises RuntimeFailure, wires nothing, and
+    leaves the reconstructed pins on disk flagged degraded for retry.
+    """
+    from agents_cli.errors import RuntimeFailure
+
+    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+    firecrawl_cmd.up(config_path=with_coder)
+    original_images = firecrawl_cmd.read_state(cfg)["images"]
+    firecrawl_cmd.clear_state(cfg)
+
+    resolve_spy = mocker.patch("agents_cli.firecrawl_cmd._resolve_digests")
+    mocker.patch("agents_cli.firecrawl_cmd._wait_api_healthy", return_value=False)
+    wire_spy = mocker.patch("agents_cli.firecrawl_cmd._wire_agent")
+
+    with pytest.raises(RuntimeFailure, match="did not become healthy") as excinfo:
+        firecrawl_cmd.up(config_path=with_coder)
+
+    assert excinfo.value.exit_code == 2
+    resolve_spy.assert_not_called()
+    wire_spy.assert_not_called()
+    state = firecrawl_cmd.read_state(cfg)
+    assert state["images"] == original_images  # pinned for retry
+    assert state["degraded"] is True
+
+
+def test_up_partial_compose_falls_back_to_full_resolve_with_warn(
+    with_coder: Path, cfg: AgentsConfig, mocker: Any, vm_fs_mocks: dict[str, Any]
+) -> None:
+    """Some-but-not-all firecrawl services in compose → mixed pins would
+    be incoherent, so ALL roles re-resolve upstream, with a warning
+    explaining why.
+    """
+    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    in_vm_spy = mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+    firecrawl_cmd.up(config_path=with_coder)
+    firecrawl_cmd.clear_state(cfg)
+
+    doc = compose.read_compose_doc(cfg)
+    del doc["services"]["firecrawl-redis"]
+    compose.write_compose_atomically(cfg, doc)
+    pull_count_before = sum(
+        1 for c in in_vm_spy.call_args_list if c.args[1:3] == ("docker", "pull")
+    )
+    warn_spy = mocker.spy(firecrawl_cmd.ui, "warn")
+
+    payload = firecrawl_cmd.up(config_path=with_coder)
+
+    assert payload["running"] is True
+    pull_count_after = sum(1 for c in in_vm_spy.call_args_list if c.args[1:3] == ("docker", "pull"))
+    assert pull_count_after - pull_count_before == 5  # all roles, not just the missing one
+    warnings = [c.args[0] for c in warn_spy.call_args_list]
+    assert any("could not be reconstructed" in w and "firecrawl-redis" in w for w in warnings)
+
+
+@pytest.mark.parametrize(
+    "bad_api_image",
+    [
+        # Off-allowlist repo — role match against FLOATING_REFS fails,
+        # so nothing gets laundered back through the state file.
+        "evil.example/miner@sha256:" + "f" * 64,
+        # Allowlisted repo, WRONG role: redis' digest under firecrawl-api.
+        "redis@sha256:" + "d" * 64,
+        # Right repo, malformed digest (not 64 hex chars).
+        "ghcr.io/firecrawl/firecrawl@sha256:deadbeef",
+        # Right repo, floating tag instead of a digest pin.
+        "ghcr.io/firecrawl/firecrawl:linux-amd64",
+    ],
+)
+def test_up_reconstruction_falls_back_on_unusable_api_pin(
+    bad_api_image: str,
+    with_coder: Path,
+    cfg: AgentsConfig,
+    mocker: Any,
+    vm_fs_mocks: dict[str, Any],
+) -> None:
+    """A pin that is off-allowlist, role-mismatched (e.g. firecrawl-api
+    carrying redis' digest), malformed, or floating cannot be trusted —
+    mixed/misassigned pins would be incoherent, so ALL roles re-resolve
+    upstream with a warning (consistent with the partial-compose path).
+    """
+    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    in_vm_spy = mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+    firecrawl_cmd.up(config_path=with_coder)
+    firecrawl_cmd.clear_state(cfg)
+
+    doc = compose.read_compose_doc(cfg)
+    doc["services"]["firecrawl-api"]["image"] = bad_api_image
+    compose.write_compose_atomically(cfg, doc)
+    pull_count_before = sum(
+        1 for c in in_vm_spy.call_args_list if c.args[1:3] == ("docker", "pull")
+    )
+    warn_spy = mocker.spy(firecrawl_cmd.ui, "warn")
+
+    payload = firecrawl_cmd.up(config_path=with_coder)
+
+    assert payload["running"] is True
+    pull_count_after = sum(1 for c in in_vm_spy.call_args_list if c.args[1:3] == ("docker", "pull"))
+    assert pull_count_after - pull_count_before == 5  # full re-resolve, every role
+    warnings = [c.args[0] for c in warn_spy.call_args_list]
+    assert any("could not be reconstructed" in w and "firecrawl-api" in w for w in warnings)
+    # The re-resolve replaced the bad pin with a clean upstream digest.
+    assert firecrawl_cmd.read_state(cfg)["images"]["api"].startswith(
+        "ghcr.io/firecrawl/firecrawl@sha256:"
+    )
+
+
+def test_up_reconstruction_propagates_compose_read_failure(
+    with_coder: Path, cfg: AgentsConfig, mocker: Any, vm_fs_mocks: dict[str, Any]
+) -> None:
+    """A transient compose read failure (multipass transfer error in
+    --data-dir-in-vm mode) must FAIL the command, not be mistaken for
+    "no compose = first install" — that misread would re-resolve all
+    floating tags, the exact unintended-upgrade trap reconstruction
+    exists to prevent.
+    """
+    from agents_cli.errors import RuntimeFailure
+
+    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+    firecrawl_cmd.up(config_path=with_coder)
+    firecrawl_cmd.clear_state(cfg)
+
+    resolve_spy = mocker.patch("agents_cli.firecrawl_cmd._resolve_digests")
+    mocker.patch(
+        "agents_cli.compose.read_compose_doc",
+        side_effect=RuntimeFailure("multipass transfer failed: ssh timeout"),
+    )
+
+    with pytest.raises(RuntimeFailure, match="transfer failed"):
+        firecrawl_cmd.up(config_path=with_coder)
+
+    resolve_spy.assert_not_called()  # no unintended upgrade
+    assert firecrawl_cmd.read_state(cfg) == {}  # nothing half-written
+
+
+def test_up_emit_false_suppresses_stdout_object(
+    with_coder: Path, cfg: AgentsConfig, mocker: Any, vm_fs_mocks: dict[str, Any]
+) -> None:
+    """vm rebuild embeds `firecrawl up` and owns its command's single
+    stdout object — the final emit must be suppressible while the
+    payload is still returned.
+    """
+    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+    emit_spy = mocker.patch("agents_cli.ui.emit")
+
+    payload = firecrawl_cmd.up(config_path=with_coder, emit=False)
+
+    emit_spy.assert_not_called()
+    assert payload["running"] is True
+    assert "coder" in payload["wired_agents"]
+
+
 # ---------- up ordering + health gating ----------
 
 

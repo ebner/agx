@@ -888,3 +888,270 @@ def test_rebuild_resumes_from_journal(mocker, tmp_path: Path) -> None:
     mocks["init"].assert_called_once()
     mocks["import_archive"].assert_called_once()
     mocks["up"].assert_called_once()
+
+
+# ---------- rebuild: sidecar stack re-up ----------
+
+
+def _stub_sidecar_reups(mocker) -> dict[str, MagicMock]:
+    """Stub the sidecar entry points rebuild's last phase calls."""
+    return {
+        "firecrawl_up": mocker.patch(
+            "agents_cli.firecrawl_cmd.up",
+            return_value={"running": True, "wired_agents": ["coder"]},
+        ),
+        "inference_up": mocker.patch(
+            "agents_cli.inference_cmd.up",
+            return_value={"engine": "ollama", "running": True},
+        ),
+        "reup_llamacpp": mocker.patch(
+            "agents_cli.inference_cmd.reup_llamacpp_services",
+            return_value={"started": [], "failed": []},
+        ),
+    }
+
+
+def test_rebuild_reups_sidecars_when_installed(mocker, tmp_path: Path) -> None:
+    """The 2026-07 migration incident: agent containers get restored but
+    sidecar stacks (firecrawl, ollama, llama-cpp models) lived only in
+    the old VM's Docker engine and stayed silently absent. rebuild must
+    re-up each installed sidecar via the Python API with emit=False
+    (rebuild owns the command's single stdout object) and fold a summary
+    into its final payload.
+    """
+    cfg = _make_config(tmp_path)
+    cfg.inference.ollama_enabled = True
+    config_path = _saved_config(tmp_path)
+    cfg_mod.save(cfg, config_path)
+    mocks = _stub_rebuild(
+        mocker,
+        cfg,
+        {"hermes-coder": "hermes", "firecrawl-api": "x", "llama-cpp-tiny": "x"},
+    )
+    staging = cfg.paths.host_data_dir / ".rebuild-staging"
+    staging.mkdir(parents=True, exist_ok=True)
+    (staging / "coder-stamp.tar.zst").write_bytes(b"")
+    sidecars = _stub_sidecar_reups(mocker)
+    sidecars["reup_llamacpp"].return_value = {"started": ["llama-cpp-tiny"], "failed": []}
+    emit = mocker.patch("agents_cli.ui.emit")
+
+    vm.rebuild(yes=True, config_path=config_path)
+
+    sidecars["firecrawl_up"].assert_called_once_with(config_path=config_path, emit=False)
+    sidecars["inference_up"].assert_called_once_with("ollama", config_path=config_path, emit=False)
+    sidecars["reup_llamacpp"].assert_called_once()
+    # Exactly one stdout object, with the sidecar summary folded in.
+    emit.assert_called_once()
+    payload = emit.call_args.args[0]
+    assert payload["rebuilt"] is True
+    assert payload["sidecars"] == {
+        "firecrawl": "running",
+        "ollama": "running",
+        "llamacpp": {"started": ["llama-cpp-tiny"], "failed": []},
+    }
+    del mocks
+
+
+def test_rebuild_skips_sidecars_cleanly_when_absent(mocker, tmp_path: Path) -> None:
+    """No firecrawl in compose, ollama disabled, no llama-cpp services →
+    no sidecar entry point is touched and the summary says so.
+    """
+    cfg = _make_config(tmp_path)
+    config_path = _saved_config(tmp_path)
+    cfg_mod.save(cfg, config_path)
+    _stub_rebuild(mocker, cfg, {"hermes-coder": "hermes"})
+    staging = cfg.paths.host_data_dir / ".rebuild-staging"
+    staging.mkdir(parents=True, exist_ok=True)
+    (staging / "coder-stamp.tar.zst").write_bytes(b"")
+    sidecars = _stub_sidecar_reups(mocker)
+    emit = mocker.patch("agents_cli.ui.emit")
+
+    vm.rebuild(yes=True, config_path=config_path)
+
+    sidecars["firecrawl_up"].assert_not_called()
+    sidecars["inference_up"].assert_not_called()
+    sidecars["reup_llamacpp"].assert_not_called()
+    payload = emit.call_args.args[0]
+    assert payload["sidecars"] == {
+        "firecrawl": "absent",
+        "ollama": "absent",
+        "llamacpp": {"started": [], "failed": []},
+    }
+
+
+def test_rebuild_sidecar_failure_warns_but_rebuild_succeeds(mocker, tmp_path: Path) -> None:
+    """A sidecar that won't come back must not fail the rebuild — the
+    agents matter more. Each failure warns with the exact manual
+    command; the journal still completes and exactly one object is
+    emitted.
+    """
+    from agents_cli.journal import Journal
+
+    cfg = _make_config(tmp_path)
+    cfg.inference.ollama_enabled = True
+    config_path = _saved_config(tmp_path)
+    cfg_mod.save(cfg, config_path)
+    _stub_rebuild(mocker, cfg, {"hermes-coder": "hermes", "firecrawl-api": "x"})
+    staging = cfg.paths.host_data_dir / ".rebuild-staging"
+    staging.mkdir(parents=True, exist_ok=True)
+    (staging / "coder-stamp.tar.zst").write_bytes(b"")
+    sidecars = _stub_sidecar_reups(mocker)
+    sidecars["firecrawl_up"].side_effect = RuntimeFailure("firecrawl did not start: probe timeout")
+    sidecars["inference_up"].side_effect = RuntimeFailure("compose up failed (exit 1)")
+    emit = mocker.patch("agents_cli.ui.emit")
+    warn = mocker.patch("agents_cli.ui.warn")
+
+    vm.rebuild(yes=True, config_path=config_path)  # must NOT raise
+
+    emit.assert_called_once()
+    payload = emit.call_args.args[0]
+    assert payload["rebuilt"] is True
+    assert payload["sidecars"]["firecrawl"] == "failed"
+    assert payload["sidecars"]["ollama"] == "failed"
+    warnings = [c.args[0] for c in warn.call_args_list]
+    assert any("agents firecrawl up" in w for w in warnings)
+    assert any("agents inference up ollama" in w for w in warnings)
+    # Journal completed despite the sidecar failures — nothing resumable left.
+    assert Journal.find_resumable(cfg.paths.host_data_dir, "rebuild", cfg.vm.name) is None
+
+
+def test_rebuild_resume_skips_already_done_sidecars(mocker, tmp_path: Path) -> None:
+    """A rebuild that crashed AFTER the sidecar phase must not re-up the
+    sidecars on resume (firecrawl up force-recreates nothing, but the
+    probe window alone is a minute of pointless wait).
+    """
+    from agents_cli.journal import Journal
+
+    cfg = _make_config(tmp_path)
+    config_path = _saved_config(tmp_path)
+    cfg_mod.save(cfg, config_path)
+    _stub_rebuild(mocker, cfg, {"hermes-coder": "hermes", "firecrawl-api": "x"})
+    staging = cfg.paths.host_data_dir / ".rebuild-staging"
+    staging.mkdir(parents=True, exist_ok=True)
+    (staging / "coder-stamp.tar.zst").write_bytes(b"")
+    sidecars = _stub_sidecar_reups(mocker)
+    emit = mocker.patch("agents_cli.ui.emit")
+
+    j = Journal.begin(cfg.paths.host_data_dir, "rebuild", cfg.vm.name, vm.REBUILD_PHASES)
+    for phase in vm.REBUILD_PHASES:
+        j.advance(phase)
+
+    vm.rebuild(yes=True, config_path=config_path)
+
+    sidecars["firecrawl_up"].assert_not_called()
+    payload = emit.call_args.args[0]
+    assert payload["sidecars"] == {"skipped": True}
+
+
+def test_rebuild_reups_ollama_on_compose_presence_with_flag_false(mocker, tmp_path: Path) -> None:
+    """`inference up ollama` persists ollama_enabled only AFTER a
+    successful compose up — a process that died between the service
+    start and that final config save leaves a live compose block with
+    the flag still false. Rebuild must treat compose presence as
+    installed too, or it silently skips Ollama.
+    """
+    cfg = _make_config(tmp_path)
+    assert cfg.inference.ollama_enabled is False  # the lagging-flag scenario
+    config_path = _saved_config(tmp_path)
+    cfg_mod.save(cfg, config_path)
+    _stub_rebuild(mocker, cfg, {"hermes-coder": "hermes", "ollama": "x"})
+    staging = cfg.paths.host_data_dir / ".rebuild-staging"
+    staging.mkdir(parents=True, exist_ok=True)
+    (staging / "coder-stamp.tar.zst").write_bytes(b"")
+    sidecars = _stub_sidecar_reups(mocker)
+    emit = mocker.patch("agents_cli.ui.emit")
+
+    vm.rebuild(yes=True, config_path=config_path)
+
+    sidecars["inference_up"].assert_called_once_with("ollama", config_path=config_path, emit=False)
+    assert emit.call_args.args[0]["sidecars"]["ollama"] == "running"
+
+
+# ---------- rebuild: --data-dir-in-vm sidecar state (consent + staging) ----------
+
+
+def test_rebuild_data_dir_in_vm_refuses_sidecar_loss_without_consent(
+    mocker, tmp_path: Path
+) -> None:
+    """In --data-dir-in-vm mode the sidecars' bulk state (firecrawl's
+    postgres, model weights) lives on the VM disk the rebuild destroys.
+    Without explicit consent the rebuild must refuse BEFORE anything is
+    exported or destroyed — silent loss is not an option.
+    """
+    from tests.conftest import install_vm_fs_simulation
+
+    cfg = _make_config(tmp_path)
+    cfg.paths.data_dir_in_vm = True
+    config_path = _saved_config(tmp_path)
+    cfg_mod.save(cfg, config_path)
+    mocks = _stub_rebuild(mocker, cfg, {"hermes-coder": "hermes", "firecrawl-api": "x"})
+    install_vm_fs_simulation(mocker, cfg)
+    _stub_sidecar_reups(mocker)
+    # Plan confirm accepted; sidecar-loss consent declined.
+    mocks["confirm"].side_effect = [True, False]
+
+    with pytest.raises(UserError, match="sidecar state"):
+        vm.rebuild(config_path=config_path)
+
+    mocks["export"].assert_not_called()
+    mocks["delete_vm"].assert_not_called()
+
+
+def test_rebuild_data_dir_in_vm_stages_and_restores_sidecar_fragments(
+    mocker, tmp_path: Path
+) -> None:
+    """--data-dir-in-vm: the compose file (and with it the sidecar
+    fragments + digest pins) lives on the doomed VM disk. The rebuild
+    must stage the fragments host-side before the destroy, restore them
+    into the freshly seeded compose, re-up the stack against the SAME
+    pins, and warn that the bulk state (postgres, model weights) did
+    not survive.
+    """
+    from agents_cli import compose as compose_mod
+    from tests.conftest import install_vm_fs_simulation
+
+    cfg = _make_config(tmp_path)
+    cfg.paths.data_dir_in_vm = True
+    config_path = _saved_config(tmp_path)
+    cfg_mod.save(cfg, config_path)
+    mocks = _stub_rebuild(mocker, cfg, {"hermes-coder": "hermes"})
+    install_vm_fs_simulation(mocker, cfg)
+    api_image = "ghcr.io/firecrawl/firecrawl@sha256:" + "a" * 64
+    compose_doc = {
+        "services": {
+            "hermes-coder": {"image": "x:y"},
+            "firecrawl-api": {"image": api_image},
+        }
+    }
+    (cfg.paths.host_data_dir / "docker-compose.yml").write_text(
+        json.dumps(compose_doc), encoding="utf-8"
+    )
+
+    def seed_fresh_vm(**kw) -> None:
+        # What a real init does in this mode: brand-new VM disk, compose
+        # seeded empty. The old fragments are GONE unless staged.
+        (cfg.paths.host_data_dir / "docker-compose.yml").write_text(
+            "services: {}\n", encoding="utf-8"
+        )
+
+    mocks["init"].side_effect = seed_fresh_vm
+    staging = cfg.paths.host_data_dir / ".rebuild-staging"
+    staging.mkdir(parents=True, exist_ok=True)
+    (staging / "coder-stamp.tar.zst").write_bytes(b"")
+    sidecars = _stub_sidecar_reups(mocker)
+    mocker.patch("agents_cli.ui.emit")
+    warn = mocker.patch("agents_cli.ui.warn")
+
+    vm.rebuild(yes=True, config_path=config_path)
+
+    # Fragments staged host-side before the destroy...
+    staged = json.loads((staging / "sidecar-services.json").read_text(encoding="utf-8"))
+    assert staged["firecrawl-api"]["image"] == api_image
+    # ...and restored into the fresh compose with the exact pin intact.
+    doc = compose_mod.read_compose_doc(cfg)
+    assert doc["services"]["firecrawl-api"]["image"] == api_image
+    # The re-up phase then finds the stack and brings it back.
+    sidecars["firecrawl_up"].assert_called_once()
+    # The bulk-state loss is surfaced, never silent.
+    warnings = [c.args[0] for c in warn.call_args_list]
+    assert any("postgres starts empty" in w and "re-pulled" in w for w in warnings)

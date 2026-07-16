@@ -302,6 +302,183 @@ def test_load_llamacpp_model_validates_slug(cfg: AgentsConfig, saved_config: Pat
         inference_cmd._validate_slug("")
 
 
+# ---------- models-dir pre-create ----------
+
+
+def test_up_ollama_ensures_llamacpp_models_dir_too(
+    cfg: AgentsConfig, saved_config: Path, mocker: Any, vm_fs: dict[str, Any]
+) -> None:
+    """The ollama fragment bind-mounts ./models/llama-cpp as the HF
+    download bridge — pre-create it at `up ollama` so the toolkit owns
+    it with correct ownership instead of Docker auto-creating it
+    root-owned on first start.
+    """
+    cfg.inference.ollama_image = f"{OLLAMA_IMAGE_BASE}@sha256:" + "a" * 64
+    cfg_mod.save(cfg, saved_config)
+    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+
+    inference_cmd.up("ollama", config_path=saved_config)
+
+    assert (cfg.paths.host_data_dir / "models" / "ollama").is_dir()
+    assert (cfg.paths.host_data_dir / "models" / "llama-cpp").is_dir()
+
+
+# ---------- emit suppression for composite callers ----------
+
+
+def test_up_ollama_emit_false_suppresses_stdout_object(
+    cfg: AgentsConfig, saved_config: Path, mocker: Any, vm_fs: dict[str, Any]
+) -> None:
+    """vm rebuild embeds `inference up ollama` and owns its command's
+    single stdout object — the final emit must be suppressible while
+    the payload is still returned.
+    """
+    cfg.inference.ollama_image = f"{OLLAMA_IMAGE_BASE}@sha256:" + "a" * 64
+    cfg_mod.save(cfg, saved_config)
+    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    emit_spy = mocker.patch("agents_cli.ui.emit")
+
+    payload = inference_cmd.up("ollama", config_path=saved_config, emit=False)
+
+    emit_spy.assert_not_called()
+    assert payload["running"] is True
+    assert payload["engine"] == "ollama"
+
+
+def test_up_llamacpp_emit_false_suppresses_stdout_object(
+    cfg: AgentsConfig, saved_config: Path, mocker: Any, vm_fs: dict[str, Any]
+) -> None:
+    cfg.inference.llamacpp_image = "ghcr.io/ggml-org/llama.cpp@sha256:" + "d" * 64
+    cfg_mod.save(cfg, saved_config)
+    emit_spy = mocker.patch("agents_cli.ui.emit")
+
+    payload = inference_cmd.up("llama-cpp", config_path=saved_config, emit=False)
+
+    emit_spy.assert_not_called()
+    assert payload["engine"] == "llama-cpp"
+
+
+# ---------- reup_llamacpp_services (vm rebuild helper) ----------
+
+
+def _seed_llamacpp_services(cfg: AgentsConfig, *slugs: str) -> None:
+    """Write one digest-pinned llama-cpp service block per slug (plus a
+    hermes bystander) into compose, the way `inference load` leaves it.
+    """
+    doc = compose.read_compose_doc(cfg)
+    services = doc.setdefault("services", {})
+    services["hermes-coder"] = {"image": "nousresearch/hermes-agent:v1.0.0"}
+    for i, slug in enumerate(slugs):
+        services[f"llama-cpp-{slug}"] = compose.llamacpp_service_fragment(
+            model_slug=slug,
+            image="ghcr.io/ggml-org/llama.cpp@sha256:" + "d" * 64,
+            gguf_relative_path=f"{slug}.gguf",
+            port=8081 + i,
+        )
+    compose.write_compose_atomically(cfg, doc)
+
+
+def test_reup_llamacpp_services_ups_each_defined_service(
+    cfg: AgentsConfig, saved_config: Path, mocker: Any, vm_fs: dict[str, Any]
+) -> None:
+    """One `compose up` per llama-cpp service (a broken model must not
+    block the rest); non-llama-cpp services untouched.
+    """
+    _seed_llamacpp_services(cfg, "tiny", "big")
+    up_spy = mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agents_cli.inference_cmd._wait_service_running", return_value=True)
+
+    result = inference_cmd.reup_llamacpp_services(cfg)
+
+    assert result == {"started": ["llama-cpp-tiny", "llama-cpp-big"], "failed": []}
+    upped = [c.args[1] for c in up_spy.call_args_list]
+    assert upped == ["llama-cpp-tiny", "llama-cpp-big"]  # hermes-coder NOT upped here
+
+
+def test_reup_llamacpp_services_warns_and_continues_on_failure(
+    cfg: AgentsConfig, saved_config: Path, mocker: Any, vm_fs: dict[str, Any]
+) -> None:
+    """A model service that fails to start is warned about — with the
+    exact `agents inference load` recovery command including the GGUF
+    from the fragment — and the remaining services still come up.
+    """
+    from agents_cli.errors import RuntimeFailure
+
+    _seed_llamacpp_services(cfg, "bad", "good")
+
+    def failing_up(cfg_arg: Any, svc: str, **kw: Any) -> MpResult:
+        if svc == "llama-cpp-bad":
+            raise RuntimeFailure("compose up failed (exit 1)")
+        return _ok()
+
+    mocker.patch("agents_cli.compose_runner.up", side_effect=failing_up)
+    mocker.patch("agents_cli.inference_cmd._wait_service_running", return_value=True)
+    warn_spy = mocker.spy(inference_cmd.ui, "warn")
+
+    result = inference_cmd.reup_llamacpp_services(cfg)
+
+    assert result == {"started": ["llama-cpp-good"], "failed": ["llama-cpp-bad"]}
+    warnings = [c.args[0] for c in warn_spy.call_args_list]
+    assert any(
+        "llama-cpp-bad" in w and "agents inference load llama-cpp bad --gguf bad.gguf" in w
+        for w in warnings
+    )
+
+
+def test_reup_llamacpp_services_counts_only_actually_running(
+    cfg: AgentsConfig, saved_config: Path, mocker: Any, vm_fs: dict[str, Any]
+) -> None:
+    """Detached `compose up` returns 0 once the container is CREATED —
+    llama-server exiting immediately (missing/corrupt GGUF after a
+    rebuild wiped the models dir) still looks like success. Only a
+    service that probes as running counts as started; a crash-looper
+    gets the recovery warning.
+    """
+    _seed_llamacpp_services(cfg, "crashy", "good")
+    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch(
+        "agents_cli.inference_cmd._wait_service_running",
+        side_effect=lambda cfg_arg, svc, **kw: svc != "llama-cpp-crashy",
+    )
+    warn_spy = mocker.spy(inference_cmd.ui, "warn")
+
+    result = inference_cmd.reup_llamacpp_services(cfg)
+
+    assert result == {"started": ["llama-cpp-good"], "failed": ["llama-cpp-crashy"]}
+    warnings = [c.args[0] for c in warn_spy.call_args_list]
+    assert any(
+        "llama-cpp-crashy" in w
+        and "not running" in w
+        and "agents inference load llama-cpp crashy --gguf crashy.gguf" in w
+        for w in warnings
+    )
+
+
+def test_wait_service_running_polls_until_running(cfg: AgentsConfig, mocker: Any) -> None:
+    probe = mocker.patch(
+        "agents_cli.inference_cmd._service_running",
+        side_effect=[False, False, True],
+    )
+    assert inference_cmd._wait_service_running(cfg, "llama-cpp-x", timeout_s=5.0, interval_s=0.0)
+    assert probe.call_count == 3
+
+
+def test_wait_service_running_gives_up_after_window(cfg: AgentsConfig, mocker: Any) -> None:
+    mocker.patch("agents_cli.inference_cmd._service_running", return_value=False)
+    assert not inference_cmd._wait_service_running(
+        cfg, "llama-cpp-x", timeout_s=0.05, interval_s=0.01
+    )
+
+
+def test_reup_llamacpp_services_noop_when_none_defined(
+    cfg: AgentsConfig, saved_config: Path, mocker: Any, vm_fs: dict[str, Any]
+) -> None:
+    up_spy = mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    result = inference_cmd.reup_llamacpp_services(cfg)
+    assert result == {"started": [], "failed": []}
+    up_spy.assert_not_called()
+
+
 # ---------- status ----------
 
 

@@ -18,7 +18,7 @@ from typing import Any
 from agents_cli import config as cfg_mod
 from agents_cli import mp, templates, ui
 from agents_cli.config import AgentsConfig, ExportCronConfig, HostConfig, PathsConfig, VmConfig
-from agents_cli.errors import HealthCheckFailure, RuntimeFailure, UserError
+from agents_cli.errors import CliError, HealthCheckFailure, RuntimeFailure, UserError
 from agents_cli.mp import BootstrapStatus
 
 GITHUB_LATEST_URLS = {
@@ -645,6 +645,7 @@ REBUILD_PHASES = [
     "vm_initted",
     "state_restored",
     "services_started",
+    "sidecars_started",
 ]
 
 
@@ -663,7 +664,12 @@ def rebuild(
     bumping the Ubuntu release, or fixing a broken VM. Sequence:
 
     1. **staged_exports** — ``agents export --all`` writes ``.tar.zst``
-       archives into ``<data-dir>/.rebuild-staging/``.
+       archives into ``<data-dir>/.rebuild-staging/``. In
+       ``--data-dir-in-vm`` mode the sidecar compose fragments (with
+       their digest pins) are staged there too — the compose file lives
+       on the doomed VM disk in that mode. The sidecars' bulk state
+       (firecrawl's postgres, model weights) is NOT staged; the user
+       must consent to losing it up front.
     2. **vm_destroyed** — ``mp.delete_vm`` removes the VM. Host data-dir
        stays put (in host-mount mode all the agent state is here
        already; in ``--data-dir-in-vm`` only the staged archives are).
@@ -671,9 +677,17 @@ def rebuild(
        sizing. ``cpus``/``memory_gb``/``disk_gb``/``ubuntu_release``
        default to the existing config; pass any to override.
     4. **state_restored** — ``agents import`` each archive back into its
-       agent's data dir.
+       agent's data dir (plus, in ``--data-dir-in-vm`` mode, the staged
+       sidecar fragments back into the freshly seeded compose).
     5. **services_started** — bring every agent's container up via
        ``docker compose up -d``.
+    6. **sidecars_started** — re-up the project-scoped sidecar stacks
+       (firecrawl, ollama, llama-cpp model services). Their compose
+       blocks and digest pins survive on the host data-dir, but the
+       containers lived only in the old VM's Docker engine — without
+       this they'd sit silently stranded. Best-effort: a sidecar that
+       fails to come back warns (with the manual command) and never
+       fails the rebuild.
 
     Journaled — each phase advances the on-disk journal so a crashed
     rebuild can resume by re-running the command. Phases are
@@ -711,9 +725,6 @@ def rebuild(
     ):
         raise UserError("aborted by user")
 
-    staging_dir = cfg.paths.host_data_dir / ".rebuild-staging"
-    staging_dir.mkdir(parents=True, exist_ok=True)
-
     # Names of all agents currently in the compose file, captured BEFORE
     # destroy so we know what to restore.
     doc = compose.read_compose_doc(cfg)
@@ -726,6 +737,39 @@ def rebuild(
         name = agents_cmd._name_from_service(svc, agent_type)
         agent_specs.append((name, agent_type))
 
+    # Sidecar service definitions, also captured BEFORE destroy. In
+    # --data-dir-in-vm mode the compose file itself lives on the VM disk
+    # about to be destroyed, so these fragments (which carry the digest
+    # pins) would be lost with it — stage them host-side and restore
+    # after init. Their BULK state (firecrawl's postgres data, model
+    # weights) is deliberately NOT staged this wave — multi-GB copies
+    # through multipass transfer aren't worth it — so the user must
+    # explicitly consent to that loss. (.firecrawl-state.json lives on
+    # the HOST data-dir in both modes and survives on its own.)
+    sidecar_fragments = _sidecar_service_fragments(doc)
+    if cfg.paths.data_dir_in_vm and sidecar_fragments:
+        lost = ", ".join(sorted(sidecar_fragments))
+        if not yes and not ui.confirm(
+            f"--data-dir-in-vm: sidecar services ({lost}) keep their state on "
+            f"the VM disk, which this rebuild destroys. Permanently lost:\n"
+            f"  - firecrawl's postgres data (scrape/job history)\n"
+            f"  - downloaded model weights (ollama models, llama-cpp GGUFs)\n"
+            f"The service definitions and digest pins are staged and restored, "
+            f"and the stacks re-upped after the rebuild — but postgres starts "
+            f"empty and every model must be re-pulled.\n"
+            f"Proceed?",
+            default=False,
+        ):
+            raise UserError(
+                "aborted: rebuild would destroy in-VM sidecar state "
+                f"({lost} — firecrawl postgres data, downloaded model "
+                "weights). Re-run and confirm (or pass --yes) to accept "
+                "the loss."
+            )
+
+    staging_dir = cfg.paths.host_data_dir / ".rebuild-staging"
+    staging_dir.mkdir(parents=True, exist_ok=True)
+
     with compose.acquire_lock(cfg.paths.host_data_dir):
         journal = Journal.find_resumable(
             cfg.paths.host_data_dir, "rebuild", cfg.vm.name
@@ -735,6 +779,17 @@ def rebuild(
         # single stdout object (the summary at the end) and narrates the
         # slow stages on stderr instead.
         if not journal.is_phase_done("staged_exports"):
+            stage_path = staging_dir / _SIDECAR_STAGE_FILENAME
+            if cfg.paths.data_dir_in_vm and sidecar_fragments:
+                ui.progress(
+                    "staging sidecar service definitions (fragments + digest "
+                    "pins survive; postgres data and model weights do not)..."
+                )
+                _stage_sidecar_fragments(stage_path, sidecar_fragments)
+            else:
+                # Drop stale staging from a prior rebuild so it can't be
+                # replayed into a run with no (or different) sidecars.
+                stage_path.unlink(missing_ok=True)
             for name, _ in agent_specs:
                 ui.progress(f"exporting {name!r} to {staging_dir}...")
                 export_cmd.export(name, to=staging_dir, config_path=config_path, emit=False)
@@ -771,6 +826,11 @@ def rebuild(
         cfg = cfg_mod.load(config_path)
 
         if not journal.is_phase_done("state_restored"):
+            if cfg.paths.data_dir_in_vm:
+                # The fresh VM's compose was seeded empty by init — put
+                # the staged sidecar fragments back so the re-up phase
+                # below finds (and pins) the same services as before.
+                _restore_staged_sidecar_fragments(cfg, staging_dir)
             for name, _ in agent_specs:
                 archives = sorted(staging_dir.glob(f"{name}-*.tar.zst"))
                 if not archives:
@@ -791,8 +851,35 @@ def rebuild(
                 compose_runner.up(cfg, svc)
             journal.advance("services_started")
 
-        journal.complete()
+    # Sidecar stacks (firecrawl, in-VM inference) also lived only in the
+    # old VM's Docker engine: their compose blocks, digest pins, and env
+    # wiring all survive on the host data-dir, but no container crosses
+    # to the fresh VM — the exact failure mode of the 2026-07 multipass →
+    # libvirt migration, where everything LOOKED restored while the
+    # firecrawl stack sat silently stranded. Runs OUTSIDE the rebuild
+    # lock: firecrawl_cmd.up / inference_cmd.up acquire `.agents.lock`
+    # themselves, and a second flock on the same file blocks even within
+    # one process (flock is per open-file-description).
+    if journal.is_phase_done("sidecars_started"):
+        sidecars: dict[str, Any] = {"skipped": True}
+    else:
+        sidecars = _reup_sidecar_stacks(cfg, config_path=config_path)
+        if "sidecars_started" in journal.phases:
+            # Journals written before this phase existed (a crashed
+            # rebuild resumed across a toolkit upgrade) don't declare
+            # it — Journal.advance refuses undeclared phases.
+            journal.advance("sidecars_started")
+    journal.complete()
 
+    lc = sidecars.get("llamacpp") or {"started": [], "failed": []}
+    sidecar_human = (
+        "(already re-upped by an earlier resumed run)"
+        if sidecars.get("skipped")
+        else (
+            f"firecrawl={sidecars['firecrawl']}, ollama={sidecars['ollama']}, "
+            f"llama-cpp models started={len(lc['started'])} failed={len(lc['failed'])}"
+        )
+    )
     ui.emit(
         {
             "vm": cfg.vm.name,
@@ -802,6 +889,7 @@ def rebuild(
             "disk_gb": target_disk,
             "ubuntu_release": target_release,
             "restored_agents": [n for n, _ in agent_specs],
+            "sidecars": sidecars,
             "staging_dir": str(staging_dir),
         },
         human=(
@@ -809,10 +897,167 @@ def rebuild(
             f"  cpus={target_cpus}, memory={target_memory}G, disk={target_disk}G, "
             f"ubuntu={target_release}\n"
             f"  agents restored: {', '.join(n for n, _ in agent_specs) or '(none)'}\n"
+            f"  sidecars: {sidecar_human}\n"
             f"  staging dir: {staging_dir}\n"
             f"  (safe to `rm -rf {staging_dir}` after `agents doctor` is green)"
         ),
     )
+
+
+def _reup_sidecar_stacks(cfg: AgentsConfig, *, config_path: Path) -> dict[str, Any]:
+    """Re-up the project-scoped sidecar stacks after a VM rebuild.
+
+    The rebuilt VM has a fresh Docker engine: the agent containers are
+    restored by the phases above, but firecrawl / ollama / llama-cpp
+    model services would otherwise stay absent until someone notices
+    scrapes failing connection-refused. ``firecrawl_cmd.up`` self-heals
+    a lost ``.firecrawl-state.json`` from the compose digest pins, so
+    this is safe even after a migration that dropped the state file (no
+    unintended upgrade).
+
+    Best-effort by design: each sidecar failure warns with the exact
+    manual command and moves on — the restored agents matter more than
+    the sidecars, and every recovery path stays available afterwards.
+
+    Returns the summary folded into rebuild's single stdout object:
+    ``{"firecrawl": "absent"|"running"|"failed", "ollama": ...,
+    "llamacpp": {"started": [...], "failed": [...]}}``.
+    """
+    from agents_cli import compose, firecrawl_cmd, inference_cmd
+
+    summary: dict[str, Any] = {
+        "firecrawl": "absent",
+        "ollama": "absent",
+        "llamacpp": {"started": [], "failed": []},
+    }
+    try:
+        doc = compose.read_compose_doc(cfg)
+        services = list((doc.get("services") or {}).keys())
+    except (RuntimeFailure, UserError):
+        services = []
+
+    if any(compose.is_firecrawl_service(s) for s in services):
+        ui.progress("re-starting the firecrawl stack in the fresh VM...")
+        try:
+            firecrawl_cmd.up(config_path=config_path, emit=False)
+            summary["firecrawl"] = "running"
+        except CliError as e:
+            summary["firecrawl"] = "failed"
+            ui.warn(
+                f"firecrawl did not come back up: {e}\n"
+                "The agents themselves are restored; bring the stack back "
+                "with `agents firecrawl up`."
+            )
+
+    # Gate on the flag OR compose presence: the flag can lag reality —
+    # `inference up ollama` persists ollama_enabled only after a
+    # successful compose up, so a process that died between the start
+    # and that final config save leaves a live compose block with the
+    # flag still false. Compose presence is equally authoritative, and
+    # a successful re-up self-heals the flag.
+    if cfg.inference.ollama_enabled or compose.OLLAMA_SERVICE_NAME in services:
+        ui.progress("re-starting the ollama inference engine in the fresh VM...")
+        try:
+            inference_cmd.up("ollama", config_path=config_path, emit=False)
+            summary["ollama"] = "running"
+        except CliError as e:
+            summary["ollama"] = "failed"
+            ui.warn(
+                f"ollama did not come back up: {e}\n"
+                "Bring it back with `agents inference up ollama`."
+            )
+
+    if any(s.startswith(compose.LLAMACPP_SERVICE_PREFIX) for s in services):
+        ui.progress("re-starting llama-cpp model services in the fresh VM...")
+        # Warns per failed service internally (with the `agents
+        # inference load` recovery command); never raises for a
+        # service that won't start.
+        summary["llamacpp"] = inference_cmd.reup_llamacpp_services(cfg)
+
+    return summary
+
+
+# Host-side staging file for sidecar compose fragments during a
+# --data-dir-in-vm rebuild (the compose file itself lives on the VM disk
+# in that mode and dies with it).
+_SIDECAR_STAGE_FILENAME = "sidecar-services.json"
+
+
+def _sidecar_service_fragments(doc: Any) -> dict[str, Any]:
+    """Extract the sidecar service blocks (firecrawl-*, ollama,
+    llama-cpp-*) from a compose doc, keyed by service name.
+    """
+    from agents_cli import compose
+
+    out: dict[str, Any] = {}
+    for name, svc in (doc.get("services") or {}).items():
+        if (
+            compose.is_firecrawl_service(name)
+            or name == compose.OLLAMA_SERVICE_NAME
+            or name.startswith(compose.LLAMACPP_SERVICE_PREFIX)
+        ):
+            out[name] = svc
+    return out
+
+
+def _stage_sidecar_fragments(stage_path: Path, fragments: dict[str, Any]) -> None:
+    """Write the sidecar service blocks to the host-side staging file so
+    a ``--data-dir-in-vm`` rebuild can restore them after the VM (and
+    with it the compose file) is destroyed and re-created.
+    """
+    stage_path.write_text(json.dumps(fragments, indent=2, default=str), encoding="utf-8")
+
+
+def _restore_staged_sidecar_fragments(cfg: AgentsConfig, staging_dir: Path) -> None:
+    """Re-insert staged sidecar service blocks into the (freshly seeded,
+    empty) compose file after a ``--data-dir-in-vm`` rebuild's init.
+
+    No-op when nothing was staged. Each fragment's image ref is
+    allowlist-validated before it re-enters compose (rule #5 — the
+    staging file sits on the host and could have been doctored while the
+    rebuild was interrupted); invalid entries are warned about and
+    skipped, leaving the re-up phase to surface the now-partial stack.
+    Idempotent on resume: fragments already present are left alone.
+    """
+    from agents_cli import compose
+
+    stage_path = staging_dir / _SIDECAR_STAGE_FILENAME
+    if not stage_path.exists():
+        return
+    try:
+        fragments: dict[str, Any] = json.loads(stage_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        ui.warn(
+            f"staged sidecar service definitions unreadable ({e}); skipping "
+            "their restore — re-add the sidecars manually (`agents firecrawl "
+            "up`, `agents inference up ollama`, `agents inference load ...`)."
+        )
+        return
+    doc = compose.read_compose_doc(cfg)
+    services = doc.setdefault("services", {})
+    restored: list[str] = []
+    for name, fragment in fragments.items():
+        image = fragment.get("image") if isinstance(fragment, dict) else None
+        if not isinstance(image, str) or not image:
+            ui.warn(f"skipping staged sidecar service {name!r}: no image ref")
+            continue
+        try:
+            compose.validate_image_ref(image)
+        except UserError as e:
+            ui.warn(f"skipping staged sidecar service {name!r}: {e}")
+            continue
+        if name not in services:
+            services[name] = fragment
+            restored.append(name)
+    if restored:
+        compose.write_compose_atomically(cfg, doc)
+        ui.progress(f"restored sidecar service definitions: {', '.join(restored)}")
+        ui.warn(
+            "sidecar service definitions were restored after the "
+            "data-dir-in-VM rebuild, but their in-VM state did not survive: "
+            "firecrawl's postgres starts empty and model weights must be "
+            "re-pulled (`agents model pull ...`)."
+        )
 
 
 # ---------- destroy ----------

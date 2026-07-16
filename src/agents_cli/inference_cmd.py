@@ -58,6 +58,7 @@ def up(
     *,
     upgrade: bool = False,
     config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH,
+    emit: bool = True,
 ) -> dict[str, Any]:
     """Start a local inference engine.
 
@@ -70,6 +71,10 @@ def up(
     because each model is a distinct service. This split keeps the CLI
     surface symmetric with Ollama while honouring llama-server's one-
     model-per-process design.
+
+    ``emit=False`` skips the final :func:`ui.emit` so composite callers
+    (``vm rebuild``) that own the command's single stdout object can
+    embed this flow; the payload is still returned.
     """
     if engine not in SUPPORTED_ENGINES:
         raise UserError(
@@ -81,8 +86,8 @@ def up(
 
     with compose.acquire_lock(cfg.paths.host_data_dir):
         if engine == "ollama":
-            return _up_ollama(cfg, upgrade=upgrade, config_path=config_path)
-        return _pin_llamacpp_image(cfg, upgrade=upgrade, config_path=config_path)
+            return _up_ollama(cfg, upgrade=upgrade, config_path=config_path, emit=emit)
+        return _pin_llamacpp_image(cfg, upgrade=upgrade, config_path=config_path, emit=emit)
 
 
 def down(
@@ -127,7 +132,9 @@ def status(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> dict[str, Any]
 # ---------- ollama ----------
 
 
-def _up_ollama(cfg: AgentsConfig, *, upgrade: bool, config_path: Path) -> dict[str, Any]:
+def _up_ollama(
+    cfg: AgentsConfig, *, upgrade: bool, config_path: Path, emit: bool = True
+) -> dict[str, Any]:
     image_digest = cfg.inference.ollama_image
     if not image_digest or upgrade:
         # resolve_digest allowlist-validates before returning (rule #5).
@@ -144,6 +151,11 @@ def _up_ollama(cfg: AgentsConfig, *, upgrade: bool, config_path: Path) -> dict[s
         compose.validate_image_ref(image_digest)
 
     _ensure_models_dir(cfg, "ollama")
+    # The ollama fragment also bind-mounts ./models/llama-cpp (the HF
+    # download bridge, see compose.LLAMACPP_DOWNLOAD_MOUNT). Pre-create
+    # it too so the toolkit owns it with correct ownership instead of
+    # Docker auto-creating it root-owned on first start.
+    _ensure_models_dir(cfg, "llama-cpp")
 
     doc = compose.read_compose_doc(cfg)
     services = doc.setdefault("services", {})
@@ -168,18 +180,19 @@ def _up_ollama(cfg: AgentsConfig, *, upgrade: bool, config_path: Path) -> dict[s
         "url_in_vm": f"http://{OLLAMA_SERVICE_NAME}:11434/v1",
         "url_host": f"http://127.0.0.1:{cfg.inference.ollama_port}/v1",
     }
-    ui.emit(
-        payload,
-        human=(
-            f"ollama: up\n"
-            f"  in-VM URL:  {payload['url_in_vm']}\n"
-            f"  host URL:   {payload['url_host']}\n"
-            f"  image:      {image_digest}\n"
-            f"  models dir: {cfg.paths.host_data_dir}/models/ollama/\n"
-            f"  next: `agents model pull ollama <model>` then "
-            f"`agents model use <agent> --engine ollama --model <model>`"
-        ),
-    )
+    if emit:
+        ui.emit(
+            payload,
+            human=(
+                f"ollama: up\n"
+                f"  in-VM URL:  {payload['url_in_vm']}\n"
+                f"  host URL:   {payload['url_host']}\n"
+                f"  image:      {image_digest}\n"
+                f"  models dir: {cfg.paths.host_data_dir}/models/ollama/\n"
+                f"  next: `agents model pull ollama <model>` then "
+                f"`agents model use <agent> --engine ollama --model <model>`"
+            ),
+        )
     return payload
 
 
@@ -258,7 +271,9 @@ def _ollama_list_models(cfg: AgentsConfig) -> list[dict[str, Any]]:
 # ---------- llama.cpp ----------
 
 
-def _pin_llamacpp_image(cfg: AgentsConfig, *, upgrade: bool, config_path: Path) -> dict[str, Any]:
+def _pin_llamacpp_image(
+    cfg: AgentsConfig, *, upgrade: bool, config_path: Path, emit: bool = True
+) -> dict[str, Any]:
     """Resolve and pin the llama-cpp image digest; doesn't start any
     service. Per-model llama-server services are spawned by
     ``up_llamacpp_model`` once a GGUF is on disk.
@@ -292,16 +307,17 @@ def _pin_llamacpp_image(cfg: AgentsConfig, *, upgrade: bool, config_path: Path) 
             "a llama-server for it."
         ),
     }
-    ui.emit(
-        payload,
-        human=(
-            f"llama-cpp: image pinned\n"
-            f"  image:      {digest}\n"
-            f"  models dir: {cfg.paths.host_data_dir}/models/llama-cpp/\n"
-            f"  next: download a GGUF, then\n"
-            f"        `agents model load llama-cpp <slug> --gguf <path-rel-to-models-dir>`"
-        ),
-    )
+    if emit:
+        ui.emit(
+            payload,
+            human=(
+                f"llama-cpp: image pinned\n"
+                f"  image:      {digest}\n"
+                f"  models dir: {cfg.paths.host_data_dir}/models/llama-cpp/\n"
+                f"  next: download a GGUF, then\n"
+                f"        `agents model load llama-cpp <slug> --gguf <path-rel-to-models-dir>`"
+            ),
+        )
     return payload
 
 
@@ -437,6 +453,106 @@ def down_llamacpp_model(
         human=f"llama-cpp[{slug}]: stopped",
     )
     return {"engine": "llama-cpp", "slug": slug, "stopped": True}
+
+
+def reup_llamacpp_services(cfg: AgentsConfig) -> dict[str, list[str]]:
+    """Bring every ``llama-cpp-*`` service already defined in compose
+    back up. Used by ``vm rebuild``: the per-model service blocks
+    (digest-pinned) survive on the host data-dir, but the containers
+    live only in the old VM's Docker engine, so a fresh VM starts with
+    none of them running.
+
+    No compose mutation and no lock — each service block is upped
+    verbatim, one ``compose up`` per service so a single broken model
+    doesn't block the rest. Best-effort: a model that fails to start is
+    warned about (with the manual recovery command) and skipped, never
+    raised — the caller is restoring a whole VM and the agents matter
+    more.
+
+    A zero exit from detached ``compose up`` only means "container
+    created" — llama-server exits immediately when its GGUF is missing
+    or corrupt (e.g. after a ``--data-dir-in-vm`` rebuild wiped the
+    models dir), leaving a stopped/restart-looping container behind a
+    successful-looking up. Each service is therefore probed for a
+    sustained ``running`` state before it's counted as started.
+
+    Returns ``{"started": [...], "failed": [...]}`` (service names).
+    """
+    doc = compose.read_compose_doc(cfg)
+    services = doc.get("services") or {}
+    started: list[str] = []
+    failed: list[str] = []
+    for svc_name in services:
+        if not svc_name.startswith(LLAMACPP_SERVICE_PREFIX):
+            continue
+        slug = svc_name[len(LLAMACPP_SERVICE_PREFIX) :]
+        gguf = _gguf_from_fragment(services.get(svc_name)) or "<file>"
+        recovery = f"agents inference load llama-cpp {slug} --gguf {gguf}"
+        try:
+            compose_runner.up(cfg, svc_name)
+        except RuntimeFailure as e:
+            failed.append(svc_name)
+            ui.warn(
+                f"{svc_name} did not come back up: {e}. Its compose block is "
+                f"intact; retry with `{recovery}`."
+            )
+            continue
+        if _wait_service_running(cfg, svc_name):
+            started.append(svc_name)
+        else:
+            failed.append(svc_name)
+            ui.warn(
+                f"{svc_name} was created but is not running — llama-server "
+                f"likely crashed on start (missing or corrupt GGUF after the "
+                f"rebuild?). Re-download the model into the models dir, then "
+                f"retry with `{recovery}`."
+            )
+    return {"started": started, "failed": failed}
+
+
+# Bounded probe for a re-upped service to prove it STAYS up: detached
+# `compose up` returns 0 once the container is created, even when the
+# process inside exits immediately.
+_REUP_PROBE_TIMEOUT_S = 10.0
+_REUP_PROBE_INTERVAL_S = 1.0
+
+
+def _wait_service_running(
+    cfg: AgentsConfig,
+    svc: str,
+    *,
+    timeout_s: float = _REUP_PROBE_TIMEOUT_S,
+    interval_s: float = _REUP_PROBE_INTERVAL_S,
+) -> bool:
+    """Poll :func:`_service_running` until the service reports running
+    (or healthy) or the window closes. Host-side module — plain
+    time.sleep is fine.
+    """
+    import time
+
+    deadline = time.monotonic() + timeout_s
+    while True:
+        if _service_running(cfg, svc):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(interval_s)
+
+
+def _gguf_from_fragment(svc: Any) -> str | None:
+    """Extract the GGUF path (relative to the models dir) from a
+    ``llama-cpp-*`` service block's ``command`` list, for recovery
+    hints. Returns ``None`` when the fragment doesn't carry one.
+    """
+    if not isinstance(svc, dict):
+        return None
+    command = svc.get("command")
+    if not isinstance(command, list):
+        return None
+    for i, token in enumerate(command):
+        if token == "-m" and i + 1 < len(command):
+            return str(command[i + 1]).removeprefix("/models/")
+    return None
 
 
 # ---------- helpers ----------
