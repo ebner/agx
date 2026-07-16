@@ -229,7 +229,7 @@ def test_list_includes_mode_column_per_acl_perms(
     # force them to look subuid-owned so the ACL path runs.
     from unittest.mock import MagicMock
 
-    mocker.patch.object(Path, "stat", lambda self: MagicMock(st_uid=100999))
+    mocker.patch.object(Path, "stat", lambda self, *a, **k: MagicMock(st_uid=100999))
 
     def fake_perms(p: Path, uid: int) -> str | None:
         # coder granted r-only, bob/.openclaw granted rwx, bob/workspace not granted.
@@ -253,7 +253,7 @@ def test_list_marks_owner_when_host_user_owns_path(
     """No ACL is needed when the user owns the dir — show 'owner' so
     the user isn't confused about whether they need to run grant."""
 
-    def fake_stat(self: Path) -> Any:
+    def fake_stat(self: Path, *args: Any, **kwargs: Any) -> Any:
         from unittest.mock import MagicMock
 
         # Pretend the dir is owned by uid 1000 (the host user).
@@ -281,7 +281,7 @@ def test_list_emits_plain_english_access_column(
     """
     from unittest.mock import MagicMock
 
-    mocker.patch.object(Path, "stat", lambda self: MagicMock(st_uid=100999))
+    mocker.patch.object(Path, "stat", lambda self, *a, **k: MagicMock(st_uid=100999))
 
     def fake_assess(p: Path, uid: int) -> str:
         # Three dirs → three different statuses.
@@ -309,7 +309,7 @@ def test_list_prints_remediation_hint_for_masked_state(
     """
     from unittest.mock import MagicMock
 
-    mocker.patch.object(Path, "stat", lambda self: MagicMock(st_uid=100999))
+    mocker.patch.object(Path, "stat", lambda self, *a, **k: MagicMock(st_uid=100999))
     mocker.patch("agents_cli.permissions.assess_host_access", return_value="masked")
     mocker.patch("agents_cli.permissions.get_user_acl_perms", return_value="rwx")
     warn_mock = mocker.patch("agents_cli.ui.warn")
@@ -324,7 +324,7 @@ def test_list_prints_remediation_hint_for_missing_state(
 ) -> None:
     from unittest.mock import MagicMock
 
-    mocker.patch.object(Path, "stat", lambda self: MagicMock(st_uid=100999))
+    mocker.patch.object(Path, "stat", lambda self, *a, **k: MagicMock(st_uid=100999))
     mocker.patch("agents_cli.permissions.assess_host_access", return_value="missing")
     mocker.patch("agents_cli.permissions.get_user_acl_perms", return_value=None)
     warn_mock = mocker.patch("agents_cli.ui.warn")
@@ -339,7 +339,7 @@ def test_list_omits_hint_when_everything_ok(
     """No noise below the table when there's nothing to fix."""
     from unittest.mock import MagicMock
 
-    mocker.patch.object(Path, "stat", lambda self: MagicMock(st_uid=100999))
+    mocker.patch.object(Path, "stat", lambda self, *a, **k: MagicMock(st_uid=100999))
     mocker.patch("agents_cli.permissions.assess_host_access", return_value="ok")
     mocker.patch("agents_cli.permissions.get_user_acl_perms", return_value="r-x")
     warn_mock = mocker.patch("agents_cli.ui.warn")
