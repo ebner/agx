@@ -311,6 +311,96 @@ def test_ollama_clear_with_yes_proceeds(mocker: Any, tmp_path: Path) -> None:
     save.assert_called_once()
 
 
+# ---------- vm migrate-data (item: wiring under the vm group) ----------
+
+
+def test_vm_migrate_data_is_wired_under_vm_group_and_emits_one_object(mocker: Any) -> None:
+    """Command exists under the vm group, ``--yes`` flows through as the
+    keyword the backend expects, and stdout carries exactly one JSON
+    object (the backend's own emit)."""
+    migrate = mocker.patch(
+        "agents_cli.migrate_cmd.migrate_data",
+        side_effect=lambda **kw: ui.emit({"migrated": True}),
+    )
+
+    result = invoke(mocker, ["--json", "vm", "migrate-data", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    payload = single_json_object(result)
+    assert payload == {"migrated": True}
+    assert migrate.call_args.kwargs["yes"] is True
+
+
+def test_vm_migrate_data_local_yes_flag_parses(mocker: Any) -> None:
+    migrate = mocker.patch("agents_cli.migrate_cmd.migrate_data")
+    result = invoke(mocker, ["vm", "migrate-data", "-y"])
+    assert result.exit_code == 0, result.output
+    assert migrate.call_args.kwargs["yes"] is True
+
+
+def test_vm_migrate_data_without_yes_passes_yes_false(mocker: Any) -> None:
+    migrate = mocker.patch("agents_cli.migrate_cmd.migrate_data")
+    result = invoke(mocker, ["vm", "migrate-data"])
+    assert result.exit_code == 0, result.output
+    assert migrate.call_args.kwargs["yes"] is False
+
+
+def test_vm_migrate_data_json_emits_one_object_with_doctor_summary(
+    mocker: Any, tmp_path: Path
+) -> None:
+    """End-to-end through the CLI with the REAL migrate_data: doctor runs
+    with emit=False (its table render would be a second top-level JSON
+    document on stdout), and its per-check summary rides inside the
+    single migration object instead."""
+    from agents_cli import config as cfg_mod
+    from agents_cli import migrate_cmd
+    from tests.unit.test_migrate_cmd import _make_cfg, _stub_happy_migration
+
+    cfg = _make_cfg(tmp_path)
+    config_path = tmp_path / "config.toml"
+    cfg_mod.save(cfg, config_path)
+    _stub_happy_migration(mocker, cfg)
+
+    # Re-target the real implementation at a throwaway config so the test
+    # never touches ~/.config/agents/ (same trick as the vm-init test).
+    real = migrate_cmd.migrate_data
+    mocker.patch(
+        "agents_cli.migrate_cmd.migrate_data",
+        side_effect=lambda **kw: real(**{**kw, "config_path": config_path}),
+    )
+
+    result = invoke(mocker, ["--json", "vm", "migrate-data", "--yes"], cfg=cfg)
+
+    assert result.exit_code == 0, result.output
+    payload = single_json_object(result)  # a leaked doctor table fails the parse
+    assert payload["migrated"] is True
+    assert payload["doctor"]["ran"] is True
+    assert payload["doctor"]["non_ok"] == [
+        {"check": "disk_space", "status": "warn", "detail": "14.0% free"}
+    ]
+
+
+def test_vm_migrate_data_maps_cli_error_exit_codes(mocker: Any) -> None:
+    """UserError → 1 and HealthCheckFailure → 3 pass through _run
+    untouched (the doctor-gate failure mode of the migration)."""
+    from agents_cli.errors import HealthCheckFailure, UserError
+
+    mocker.patch(
+        "agents_cli.migrate_cmd.migrate_data",
+        side_effect=UserError("data_dir_in_vm is already enabled"),
+    )
+    result = invoke(mocker, ["--json", "vm", "migrate-data", "--yes"])
+    assert result.exit_code == 1
+    assert "already enabled" in single_json_object(result)["error"]
+
+    mocker.patch(
+        "agents_cli.migrate_cmd.migrate_data",
+        side_effect=HealthCheckFailure("doctor found 2 failures"),
+    )
+    result = invoke(mocker, ["vm", "migrate-data", "--yes"])
+    assert result.exit_code == 3
+
+
 # ---------- mount add --rw (item: ui.confirm semantics, not click.Abort) ----------
 
 

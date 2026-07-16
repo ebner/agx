@@ -135,6 +135,9 @@ def test_upgrade_happy_path_runs_every_phase(with_coder: Path, mocker, cfg: Agen
     mocks["pull"].assert_called_once()
     mocks["inspect"].assert_called_once()
     mocks["compose_up"].assert_called_once()
+    # Doctor runs render-suppressed: upgrade owns this command's single
+    # stdout object; doctor's table/array must not stack a second one.
+    assert mocks["doctor"].call_args.kwargs.get("emit") is False
 
 
 def test_upgrade_writes_new_tag_to_compose(with_coder: Path, mocker, cfg: AgentsConfig) -> None:

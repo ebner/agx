@@ -147,7 +147,17 @@ def doctor(
     *,
     target: str | None = None,
     config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH,
+    emit: bool = True,
 ) -> DoctorReport:
+    """Run the health checks; render the report table unless ``emit=False``.
+
+    ``emit=False`` is for composite callers (``agents vm migrate-data``)
+    that own their command's single stdout object — the table renders to
+    stdout (``ui.table`` under ``--json``), which would violate the
+    one-object contract. The returned :class:`DoctorReport` carries every
+    check for the caller to fold into its own payload; a failing report
+    still raises :class:`HealthCheckFailure` either way.
+    """
     cfg = cfg_mod.load(config_path)
     report = DoctorReport()
 
@@ -177,7 +187,8 @@ def doctor(
             _check_hermes_codex_mount(cfg, svc, agent_name, report)
             _check_hermes_model_set(cfg, svc, agent_name, report)
 
-    _emit_doctor_table(report)
+    if emit:
+        _emit_doctor_table(report)
     if report.failed:
         raise HealthCheckFailure(
             f"{sum(1 for c in report.checks if c.status == 'fail')} doctor check(s) failed"

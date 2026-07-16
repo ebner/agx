@@ -193,3 +193,139 @@ your durable record of everything the old agent ever knew.
 If your migration is mostly mechanical and you find yourself doing the
 same steps repeatedly, raise an issue describing the actual pattern —
 that's the time to invest in the manifest format.
+
+---
+
+# Migrating the data dir into the VM (`agents vm migrate-data`)
+
+A different kind of migration: same agents, same runtime, but the agent
+state moves from the host-mounted data dir onto the VM's own disk —
+converting an existing deployment to what `agents vm init
+--data-dir-in-vm` would have set up from scratch.
+
+## When to use it
+
+The host-mount layout has two structural problems that no amount of
+`agents fix-perms` / `agents access grant` permanently fixes:
+
+- **The ACL treadmill.** The Hermes entrypoint chmods `/opt/data` on
+  every container start, which collapses the POSIX-ACL mask that
+  `agents access grant` set — so the host user keeps losing read access
+  to the agent's files (doctor's recurring `host_access` warning).
+- **The 9p/virtiofs root asymmetry.** Container-root cannot write to
+  the mounted share (container uid 0 maps to an unprivileged VM user,
+  and 9p enforces DAC at the VM level) — the class of bug behind
+  "agent silently stops replying" (`s6-log: fatal: unable to mkdir`).
+
+On top of that, SQLite WAL doesn't work over the 9p share, which is why
+`--data-dir-in-vm` is already the recommendation for Hermes'
+SQLite-heavy stores (kanban/sessions/insights). If you're hitting any of
+these on an existing deployment, run:
+
+```bash
+agents vm migrate-data          # add --yes for non-interactive
+```
+
+## What it does
+
+Phased and journaled (op `migrate-data`) — a crashed or failed run
+resumes from the last completed phase by re-running the command:
+
+1. Preflight: refuses on bare_metal (no VM), when `data_dir_in_vm` is
+   already enabled, when the VM isn't running, and when the VM disk
+   lacks headroom for the copy (data size + 20% margin, with the
+   numbers printed — grow via `agents vm resize --disk N` first).
+2. Safety exports: one archive per agent into `<data-dir>/backups/` —
+   your restore path (`agents import <name> <archive>`), and the last
+   host-visible state your backup tool picks up before the move.
+3. Confirms the plan (downtime: every agent and sidecar stops).
+4. Stops all services, then copies the entire data dir VM-side onto the
+   VM disk (a root `tar | tar` pipeline — compose file, `.env`, agent
+   dirs, firecrawl postgres, model weights, everything), so sidecars
+   survive with zero special-casing. Exclusions apply *before
+   traversal* (`tar --exclude`), never as a post-copy prune: host-only
+   entries stay host-side (`backups/`, `.upgrades/`, `.journal/`,
+   `.staging/`, `.rebuild-staging/`, `.agents.lock`), and on the
+   libvirt backend the VM's own state under the data dir (`.disks/` —
+   the running VM's qcow2! — plus `.images/`, `.seeds/`, `.ssh/`) is
+   never copied into itself. The disk-headroom preflight uses the same
+   exclusion list, so the qcow2 doesn't count against the estimate.
+5. Detaches the host mount and swaps the copy into
+   `<vm_agents_root>` — the same path `vm init --data-dir-in-vm` uses,
+   so absolute paths recorded elsewhere (e.g. the Codex-skill sandbox
+   volume `<vm_agents_root>/.codex`) stay valid.
+6. Flips `[paths] data_dir_in_vm = true` in `config.toml`, restarts all
+   services, and requires a green `agents doctor` (run render-suppressed
+   — its per-check summary is folded into the command's single JSON
+   payload). A red doctor exits 3, keeps the journal, and prints the
+   exact flip-back steps.
+
+If you roll back per those printed steps and later re-run the command,
+the leftover journal is detected as stale (its completed phases
+contradict the observed config/mount state), discarded with a warning,
+and the migration starts over from scratch — safe, because the host
+source is untouched and every phase is idempotent.
+
+## The verify-before-delete contract
+
+**The command never deletes, overwrites, or moves anything under the
+host data dir.** It only *reads* it (through the VM mount) and adds
+metadata (export archives, the journal). The success summary lists the
+host paths that are now superseded by the VM copy — each agent's
+bulk-state subdirs (`<agent>/.data` for Hermes, `<agent>/.openclaw` +
+`<agent>/workspace` for OpenClaw), `docker-compose.yml`, `firecrawl/`,
+`models/`. Archive or delete them **manually**, and only after the
+migrated deployment has run cleanly for a few days. Until then they are
+your instant rollback:
+
+```toml
+# ~/.config/agents/config.toml
+[paths]
+data_dir_in_vm = false
+```
+
+Rollback order matters — the container lifecycle must sandwich the
+remount:
+
+```bash
+agents stop <name>                  # 1. each agent — nothing may keep
+                                    #    writing the VM-local copy
+# 2. edit config.toml as above
+agents vm start                     # 3. re-adds + verifies the host mount
+agents upgrade <name> --recreate    # 4. each agent — force-recreate so the
+                                    #    bind mounts point at host data again
+```
+
+A plain `agents start` is **not** enough for step 4: on libvirt the
+remount is live (no VM reboot), and an existing container's bind mounts
+were materialized against the pre-rollback filesystem — it can keep
+writing the VM-local copy hidden beneath the reattached share.
+
+Keep (still live on the host after migration, never listed as
+deletable): `docker-compose.override.yml` — compose only merges the
+override while the **host** copy exists, so deleting it silently drops
+every `agents mount` volume from future compose calls;
+`<agent>/.mounts.json` — `agents mount` reads its manifest host-side in
+both modes (which is why agent dirs are listed via their bulk-state
+subdirs, never wholesale); `.codex/` (the toolkit-scoped Codex auth
+home — `agents codex login` writes there and syncs into the VM),
+`.env`, `.firecrawl-state.json`, `.memory-state/`, `backups/`,
+`.upgrades/`, `.journal/`, `.agents.lock`.
+
+## Afterwards
+
+- Live agent state is **no longer host-visible**, so your host backup
+  (duplicity) can't see it directly anymore. Install the export cron —
+  the archives it drops in `<data-dir>/backups/` are what duplicity
+  picks up:
+
+  ```bash
+  agents export-cron install --time 02:30,08:30,14:30,20:30
+  ```
+
+- `agents vm snapshot` now covers agent state too (the VM disk holds
+  it), and on libvirt snapshots no longer force a VM stop (the
+  virtiofs limitation only applied to host-mount mode).
+- If doctor flags `/opt/data` access for an agent after the migration,
+  `agents fix-perms <name>` realigns ownership — one-time, not the
+  host-mount treadmill.

@@ -350,7 +350,12 @@ def upgrade(
 
             if not journal.is_phase_done("doctor_passed"):
                 _step("doctor_passed", "running doctor health checks on the upgraded agent...")
-                ops.doctor(target=name, config_path=config_path)
+                # emit=False: upgrade owns this command's single stdout
+                # object — doctor's own table/array would stack a second
+                # JSON document under --json. On red it still raises
+                # HealthCheckFailure; the hint below points at the full
+                # report.
+                ops.doctor(target=name, config_path=config_path, emit=False)
                 journal.advance("doctor_passed")
 
             journal.complete()

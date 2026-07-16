@@ -244,6 +244,33 @@ def test_doctor_passes_on_healthy_setup(with_coder: Path, mocker) -> None:
     assert not report.failed
 
 
+def test_doctor_emit_false_suppresses_table_but_returns_full_report(
+    with_coder: Path, mocker, capsys
+) -> None:
+    """Composite callers (`agents vm migrate-data`) own their command's
+    single stdout object — with emit=False the table render (which goes
+    to stdout, as a JSON array under --json) is suppressed entirely,
+    while the returned report still carries every check for the caller
+    to fold into its own payload."""
+    _stub_minimal_doctor(mocker)
+    mocker.patch(
+        "agents_cli.compose_runner.ps",
+        return_value=_ok(json.dumps([{"Service": "hermes-coder", "State": "running"}])),
+    )
+    report = ops.doctor(config_path=with_coder, emit=False)
+    assert not report.failed
+    assert len(report.checks) > 0  # the report itself is intact
+    assert capsys.readouterr().out == ""  # nothing rendered to stdout
+
+
+def test_doctor_emit_false_still_raises_on_failure(with_coder: Path, mocker, capsys) -> None:
+    """Suppressing the render must not suppress the health verdict."""
+    _stub_minimal_doctor(mocker, vm_state="Stopped")
+    with pytest.raises(HealthCheckFailure):
+        ops.doctor(config_path=with_coder, emit=False)
+    assert capsys.readouterr().out == ""
+
+
 def test_doctor_memory_check_warns_under_1g_available(with_coder: Path, mocker) -> None:
     mocker.patch(
         "agents_cli.mp.info_vm",

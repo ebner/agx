@@ -25,6 +25,7 @@ from agents_cli import (
     firecrawl_cmd,
     fixperms_cmd,
     inference_cmd,
+    migrate_cmd,
     models_cmd,
     mounts_cmd,
     ollama_cmd,
@@ -371,6 +372,26 @@ def vm_rebuild(
         ubuntu_release=ubuntu_release,
         yes=yes,
     )
+
+
+@vm.command("migrate-data")
+@click.option("-y", "--yes", "yes_local", is_flag=True, help="Skip the downtime confirmation.")
+@click.pass_context
+def vm_migrate_data(ctx: click.Context, yes_local: bool) -> None:
+    """Move agent state from the host mount onto the VM disk, in place.
+
+    Converts an existing host-mount deployment to ``--data-dir-in-vm``:
+    per-agent safety exports to ``<data-dir>/backups/``, stop all
+    services, VM-side ``cp -a`` of the whole data dir onto the VM disk,
+    detach the host mount, flip the config, restart, and require a green
+    doctor. Phased + journaled — a crashed run resumes by re-running.
+
+    The host data dir is NEVER modified: it stays in place until you
+    manually archive/delete it after verifying the migration (the final
+    summary lists exactly which paths qualify).
+    """
+    yes = yes_local or ctx.obj.get("yes", False)
+    _run(migrate_cmd.migrate_data, yes=yes)
 
 
 @vm.command("shell")
