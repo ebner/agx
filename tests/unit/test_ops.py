@@ -212,7 +212,11 @@ def test_doctor_disk_space_thresholds_classify(
     assert report.checks[0].status == expected
 
 
-def test_doctor_port_conflict_detection(cfg: AgentsConfig) -> None:
+def test_doctor_port_conflict_detection(cfg: AgentsConfig, mocker) -> None:
+    # used_ports first asks the VM's `docker compose config` — stub the
+    # backend exec to fail so the check deterministically exercises the
+    # host-side doc-parse fallback (and never invokes a real multipass).
+    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_fail())
     doc = compose.load_compose(cfg.paths.host_data_dir / "docker-compose.yml")
     compose.add_service(doc, "hermes-a", {"ports": ["127.0.0.1:8642:8642"]})
     compose.add_service(doc, "hermes-b", {"ports": ["127.0.0.1:8642:8642"]})

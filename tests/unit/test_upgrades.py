@@ -817,7 +817,7 @@ def test_vm_snapshot_uses_monotonic_suffix_on_collision(
     snap_spy = mocker.patch("agents_cli.mp.snapshot", return_value=_ok())
     # Force the timestamp portion so we hit the collision deterministically.
     mocker.patch("agents_cli.upgrades._utc_stamp", return_value="20260512T120000Z")
-    name = upgrades._vm_snapshot(cfg, "coder")
+    name = upgrades._vm_snapshot(cfg, "coder", config_path=with_coder)
     assert name == f"{base_existing}-2"
     snap_spy.assert_called_once()
 
@@ -1198,7 +1198,7 @@ def test_vm_snapshot_waits_for_ssh_on_libvirt_after_start(
     # would loop forever on a non-mocked info_vm — short-circuit it.
     mocker.patch("agents_cli.vm._wait_for_vm_stopped")
 
-    upgrades._vm_snapshot(cfg, "coder")
+    upgrades._vm_snapshot(cfg, "coder", config_path=with_coder)
 
     wait_ssh.assert_called()
     assert wait_ssh.call_args.args[0] == cfg.vm.name
@@ -1260,7 +1260,7 @@ def test_vm_snapshot_suppresses_take_snapshot_emit(
     on stdout mid-upgrade."""
     take = mocker.patch("agents_cli.vm.take_snapshot", return_value="pre-upgrade-coder-x")
 
-    name = upgrades._vm_snapshot(cfg, "coder")
+    name = upgrades._vm_snapshot(cfg, "coder", config_path=with_coder)
 
     assert name == "pre-upgrade-coder-x"
     assert take.call_args.kwargs["emit"] is False

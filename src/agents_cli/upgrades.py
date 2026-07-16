@@ -292,7 +292,7 @@ def upgrade(
                     "VM snapshot (may stop + restart the VM — all agents pause briefly)...",
                 )
                 t0 = time.monotonic()
-                vm_snap = _vm_snapshot(cfg, name)
+                vm_snap = _vm_snapshot(cfg, name, config_path=config_path)
                 _step("vm_snapshot", f"VM snapshot: {vm_snap} ({_fmt_elapsed(t0)})")
                 journal.advance("vm_snapshot")
 
@@ -835,7 +835,7 @@ def _run_config_migrate(cfg: AgentsConfig, svc: str, agent_type: str) -> None:
         )
 
 
-def _vm_snapshot(cfg: AgentsConfig, name: str) -> str:
+def _vm_snapshot(cfg: AgentsConfig, name: str, *, config_path: Path) -> str:
     """Take a pre-upgrade VM snapshot.
 
     Delegates to :func:`vm_mod.take_snapshot` so we inherit its full
@@ -858,7 +858,19 @@ def _vm_snapshot(cfg: AgentsConfig, name: str) -> str:
     take_snapshot's own emit would land a second one mid-upgrade.
     """
     base_name = f"pre-upgrade-{name}-{_utc_stamp()}"
-    return vm_mod.take_snapshot(base_name, comment=f"agents upgrade {name}", yes=True, emit=False)
+    # config_path MUST be threaded through: take_snapshot defaults to
+    # DEFAULT_CONFIG_PATH, so omitting it makes the snapshot load a
+    # DIFFERENT config than the upgrade is operating on whenever the
+    # caller passed an alternate path — wrong VM name, wrong backend.
+    # (Surfaced in CI: the unit suite was silently reading the
+    # developer's real ~/.config/agents/config.toml through this call.)
+    return vm_mod.take_snapshot(
+        base_name,
+        comment=f"agents upgrade {name}",
+        yes=True,
+        emit=False,
+        config_path=config_path,
+    )
 
 
 def _latest_vm_snapshot(vm_name: str, agent_name: str) -> str | None:

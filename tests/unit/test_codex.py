@@ -297,13 +297,21 @@ def test_parse_expiry_garbage_returns_none() -> None:
 # ---------- status ----------
 
 
-def test_status_reports_missing_auth(cfg: AgentsConfig, saved_config: Path) -> None:
+def test_status_reports_missing_auth(cfg: AgentsConfig, saved_config: Path, mocker) -> None:
+    # status() probes the VM-side mount via mp.exec_in_vm - stub it so
+    # the test never invokes a real backend binary (CI has no multipass).
+    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_fail())
     info = codex.status(config_path=saved_config)
     assert info["auth_present"] is False
     assert info["expiry_warning"] is False
 
 
-def test_status_reports_expiry_warning_under_7_days(cfg: AgentsConfig, saved_config: Path) -> None:
+def test_status_reports_expiry_warning_under_7_days(
+    cfg: AgentsConfig, saved_config: Path, mocker
+) -> None:
+    # status() probes the VM-side mount via mp.exec_in_vm - stub it so
+    # the test never invokes a real backend binary (CI has no multipass).
+    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_fail())
     codex_home = cfg.paths.host_data_dir / ".codex"
     codex_home.mkdir()
     near_expiry = datetime.datetime.now(datetime.UTC) + datetime.timedelta(days=2)
@@ -316,7 +324,12 @@ def test_status_reports_expiry_warning_under_7_days(cfg: AgentsConfig, saved_con
     assert info["expires_in_days"] is not None and info["expires_in_days"] < 7
 
 
-def test_status_no_warning_when_far_from_expiry(cfg: AgentsConfig, saved_config: Path) -> None:
+def test_status_no_warning_when_far_from_expiry(
+    cfg: AgentsConfig, saved_config: Path, mocker
+) -> None:
+    # status() probes the VM-side mount via mp.exec_in_vm - stub it so
+    # the test never invokes a real backend binary (CI has no multipass).
+    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_fail())
     codex_home = cfg.paths.host_data_dir / ".codex"
     codex_home.mkdir()
     far = datetime.datetime.now(datetime.UTC) + datetime.timedelta(days=30)
