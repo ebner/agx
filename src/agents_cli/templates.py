@@ -246,9 +246,39 @@ HERMES_CONT_INIT_FIXPERMS: Final = r"""#!/command/with-contenv sh
 #      (The upstream run script's own later `chown -R "$log_dir"` is `|| true`,
 #      so it stays non-fatal once the leaf already exists hermes-owned.)
 #
+#   3. The WhatsApp bridge's node_modules. It lives on the container overlay
+#      fs, so every recreate wipes it — and even when it is reinstalled, the
+#      bridge's @whiskeysockets/baileys **git** dependency sometimes lands
+#      empty (ERR_MODULE_NOT_FOUND at runtime). When the bridge's
+#      package.json is present but node_modules — or the baileys package
+#      inside it — is missing/empty, self-heal with `npm ci`. Constraints
+#      encoded below:
+#        - npm runs AS the hermes uid via s6-setuidgid with the NUMERIC
+#          "$HUID:$HGID" — the exact ids the chown in (1) just applied to the
+#          overlay paths npm writes to (/opt/hermes/scripts/whatsapp-bridge,
+#          $HOME/.npm cache under /home/hermes); a name lookup could drift
+#          from those ids exactly the way the chown comment explains.
+#        - it is BACKGROUNDED: npm ci can take minutes, cont-init blocks
+#          every service start, and a slow heal must never stall boot. The
+#          orphaned job is reparented to the container's init and keeps
+#          running after this script exits.
+#        - all output appends to /opt/data/logs/toolkit-npm-ci.log, which is
+#          on the 9p mount — so the log must be opened AS hermes (same
+#          split-privilege rule as (2)); the redirection happens inside the
+#          setuidgid'd shell, never in the root-side wrapper.
+#        - a pid file under /tmp guards against a crash-looping container
+#          stacking concurrent installs. /tmp is the root-writable overlay:
+#          wiped on recreate (which also wipes node_modules and should
+#          re-arm the heal from scratch), preserved across in-place restarts
+#          (where a previous boot's install may still be running — the
+#          kill -0 liveness probe detects that; a stale pid from before a
+#          restart is dead and gets overwritten).
+#      Every failure path logs a line (as hermes) or falls back silently;
+#      none of them can affect the script's exit status.
+#
 # Idempotent. Ends with `exit 0`: a non-zero cont-init.d exit can abort
 # container init depending on S6_BEHAVIOUR_IF_STAGE2_FAILS, so the hook must
-# never let a best-effort chown/mkdir failure surface.
+# never let a best-effort chown/mkdir/npm failure surface.
 
 HUID="$(id -u hermes 2>/dev/null || true)"
 HGID="$(id -g hermes 2>/dev/null || true)"
@@ -262,6 +292,66 @@ if [ -n "$HUID" ] && [ -n "$HGID" ]; then
 fi
 
 /command/s6-setuidgid hermes mkdir -p /opt/data/logs/gateways/default 2>/dev/null
+
+# --- 3. WhatsApp-bridge self-heal (rationale in the header) -----------------
+BRIDGE=/opt/hermes/scripts/whatsapp-bridge
+BAILEYS="$BRIDGE/node_modules/@whiskeysockets/baileys"
+NPM_LOG=/opt/data/logs/toolkit-npm-ci.log
+NPM_LOCK=/tmp/toolkit-npm-ci.pid
+
+# Append one line to the heal log AS hermes — /opt/data is 9p-backed, so a
+# root-side open() for append would be denied (split-privilege rule).
+npm_ci_log() {
+    echo "[toolkit-npm-ci] $(date -u +%Y-%m-%dT%H:%M:%SZ) $1" \
+        | /command/s6-setuidgid "$HUID:$HGID" sh -c "cat >> $NPM_LOG" 2>/dev/null
+}
+
+# Heal is needed iff the bridge is installed (package.json present) but its
+# node_modules — or the baileys git-dep inside it — is missing or empty.
+bridge_needs_heal() {
+    [ -f "$BRIDGE/package.json" ] || return 1
+    [ -d "$BRIDGE/node_modules" ] || return 0
+    [ -d "$BAILEYS" ] || return 0
+    [ -z "$(ls -A "$BAILEYS" 2>/dev/null)" ]
+}
+
+if [ -n "$HUID" ] && [ -n "$HGID" ] && bridge_needs_heal; then
+    /command/s6-setuidgid "$HUID:$HGID" mkdir -p /opt/data/logs 2>/dev/null
+    if [ -f "$NPM_LOCK" ] && kill -0 "$(cat "$NPM_LOCK" 2>/dev/null)" 2>/dev/null; then
+        npm_ci_log "skip: a previous heal is still running (pid $(cat "$NPM_LOCK" 2>/dev/null))"
+    else
+        # The cont-init PATH is minimal and may miss the node install. Try the
+        # ambient PATH first (apt installs land at /usr/bin), then probe the
+        # locations node distributions ship to (/usr/local/bin for official
+        # tarball/docker-node layouts, plus less common prefixes).
+        NPM_BIN="$(command -v npm 2>/dev/null || true)"
+        if [ -z "$NPM_BIN" ]; then
+            for d in /usr/local/bin /usr/bin /opt/node/bin /usr/local/lib/nodejs/bin; do
+                if [ -x "$d/npm" ]; then NPM_BIN="$d/npm"; break; fi
+            done
+        fi
+        if [ -z "$NPM_BIN" ]; then
+            npm_ci_log "skip: npm not found (PATH, /usr/local/bin, /usr/bin) - cannot heal $BRIDGE"
+        else
+            NPM_DIR="$(dirname "$NPM_BIN")"
+            (
+                NPM_DIR="$NPM_DIR" BRIDGE="$BRIDGE" NPM_LOG="$NPM_LOG" \
+                    /command/s6-setuidgid "$HUID:$HGID" sh -c '
+                        exec >>"$NPM_LOG" 2>&1
+                        echo "[toolkit-npm-ci] $(date -u +%Y-%m-%dT%H:%M:%SZ) npm ci starting in $BRIDGE"
+                        export HOME="${HOME:-/home/hermes}"
+                        export PATH="$NPM_DIR:$PATH"
+                        cd "$BRIDGE" || exit 1
+                        npm ci
+                        echo "[toolkit-npm-ci] $(date -u +%Y-%m-%dT%H:%M:%SZ) npm ci exit=$?"
+                    '
+                rm -f "$NPM_LOCK"
+            ) >/dev/null 2>&1 &
+            echo $! > "$NPM_LOCK" 2>/dev/null || true
+            npm_ci_log "backgrounded npm ci (pid $!) in $BRIDGE, log: $NPM_LOG"
+        fi
+    fi
+fi
 
 exit 0
 """

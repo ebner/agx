@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import re
+import subprocess
+from pathlib import Path
+
 from agents_cli import templates
 from agents_cli.mp import parse_bootstrap_ok
 from agents_cli.templates import (
@@ -123,8 +127,6 @@ def test_scripts_vm_bootstrap_sh_matches_template_constant() -> None:
     """The on-disk scripts/vm-bootstrap.sh exists (for ops review) and must
     stay in sync with templates.VM_BOOTSTRAP_SCRIPT (the source the toolkit
     actually pipes into the VM)."""
-    from pathlib import Path
-
     repo_root = Path(__file__).resolve().parents[2]
     script_path = repo_root / "scripts" / "vm-bootstrap.sh"
     assert script_path.exists(), (
@@ -137,3 +139,103 @@ def test_scripts_vm_bootstrap_sh_matches_template_constant() -> None:
         "scripts/vm-bootstrap.sh has drifted from templates.VM_BOOTSTRAP_SCRIPT — "
         "regenerate from the template."
     )
+
+
+# ---------------------------------------------------------------------------
+# HERMES_CONT_INIT_FIXPERMS — the managed s6 cont-init.d hook, bind-mounted
+# read-only at /etc/cont-init.d/99-toolkit-fixperms in every Hermes container
+# (materialized by compose.ensure_cont_init_script; body-content assertions on
+# the perms half also live in test_compose.py's ensure_cont_init tests).
+# ---------------------------------------------------------------------------
+
+
+def test_cont_init_hook_shebang_and_managed_header() -> None:
+    s = templates.HERMES_CONT_INIT_FIXPERMS
+    assert s.startswith("#!/command/with-contenv sh")
+    assert "MANAGED BY THE `agents` HOST CLI. DO NOT EDIT." in s
+
+
+def test_cont_init_hook_keeps_perms_behaviour() -> None:
+    """The pre-existing split-privilege behaviors must survive the bridge-heal
+    addition: numeric-uid chown of the overlay install paths as root, the
+    gateway logdir pre-created as hermes, and the unconditional trailing
+    exit 0 (a non-zero cont-init exit can abort container init)."""
+    s = templates.HERMES_CONT_INIT_FIXPERMS
+    assert "id -u hermes" in s and "id -g hermes" in s
+    assert 'chown "$HUID:$HGID"' in s
+    assert "/opt/hermes/scripts" in s
+    assert "/command/s6-setuidgid hermes mkdir -p /opt/data/logs/gateways/default" in s
+    assert s.rstrip().endswith("exit 0")
+
+
+def test_cont_init_bridge_heal_guard_conditions() -> None:
+    """`npm ci` must be gated: bridge actually installed (package.json) AND
+    node_modules — or the baileys git-dep inside it — missing/empty. Never an
+    unconditional reinstall on every boot."""
+    s = templates.HERMES_CONT_INIT_FIXPERMS
+    assert '[ -f "$BRIDGE/package.json" ] || return 1' in s
+    assert "node_modules/@whiskeysockets/baileys" in s
+    # the "git dep reinstalls empty" failure mode: present-but-empty dir
+    assert '[ -z "$(ls -A "$BAILEYS" 2>/dev/null)" ]' in s
+    assert "bridge_needs_heal; then" in s
+
+
+def test_cont_init_npm_ci_runs_as_hermes_numeric_uid() -> None:
+    """npm writes to the overlay paths the preceding chown just set to
+    $HUID:$HGID, so it runs via s6-setuidgid with the same NUMERIC ids (name
+    lookup could drift, same rationale as the chown), by absolute /command
+    path (cont-init PATH lacks /command). The heal log lives on 9p-backed
+    /opt/data where container-root cannot write: both the logs-dir mkdir and
+    the log-file open must happen AS hermes — the append redirection sits
+    INSIDE the setuidgid'd shell, never on the root side."""
+    s = templates.HERMES_CONT_INIT_FIXPERMS
+    assert '/command/s6-setuidgid "$HUID:$HGID" sh -c' in s
+    assert '/command/s6-setuidgid "$HUID:$HGID" mkdir -p /opt/data/logs' in s
+    assert 'exec >>"$NPM_LOG" 2>&1' in s
+    assert "NPM_LOG=/opt/data/logs/toolkit-npm-ci.log" in s
+
+
+def test_cont_init_npm_ci_is_backgrounded_and_ordered() -> None:
+    """npm ci can take minutes; it must run inside a backgrounded subshell so
+    boot never blocks, and only after the chown block has fixed the overlay
+    ownership npm is about to write through."""
+    s = templates.HERMES_CONT_INIT_FIXPERMS
+    m = re.search(r"^\s*npm ci$", s, re.MULTILINE)
+    assert m is not None, "expected a bare `npm ci` invocation"
+    bg_close = s.index(") >/dev/null 2>&1 &")
+    assert s.index('chown "$HUID:$HGID"') < m.start(), "heal must follow the chown block"
+    assert m.start() < bg_close, "npm ci must live inside the backgrounded subshell"
+    # backgrounded, not the last word: the script still falls through to exit 0
+    assert bg_close < s.rindex("exit 0")
+
+
+def test_cont_init_npm_lock_under_tmp_with_liveness_probe() -> None:
+    """The double-run guard is a pid file on /tmp: root-writable overlay fs
+    (no 9p DAC in the way), wiped on recreate (which also wipes node_modules,
+    re-arming the heal), preserved across restarts where the previous boot's
+    install may still be running — hence the kill -0 liveness probe instead
+    of bare file existence."""
+    s = templates.HERMES_CONT_INIT_FIXPERMS
+    assert "NPM_LOCK=/tmp/toolkit-npm-ci.pid" in s
+    assert 'kill -0 "$(cat "$NPM_LOCK" 2>/dev/null)"' in s
+    assert 'rm -f "$NPM_LOCK"' in s  # released once the heal finishes
+
+
+def test_cont_init_npm_resolved_defensively() -> None:
+    """The cont-init PATH may not include the image's node bin dir; the hook
+    probes `command -v` plus the common install prefixes and logs a skip
+    (rather than failing boot) when npm truly is not there."""
+    s = templates.HERMES_CONT_INIT_FIXPERMS
+    assert "command -v npm" in s
+    assert "/usr/local/bin" in s and "/usr/bin" in s
+    assert "npm not found" in s
+
+
+def test_cont_init_hook_is_valid_posix_sh(tmp_path: Path) -> None:
+    """The hook is `#!/command/with-contenv sh` — POSIX sh, not bash. sh -n
+    catches bashisms and quoting errors before the template ships into a
+    container as a boot-critical cont-init script."""
+    hook = tmp_path / "99-toolkit-fixperms"
+    hook.write_text(templates.HERMES_CONT_INIT_FIXPERMS, encoding="utf-8")
+    res = subprocess.run(["sh", "-n", str(hook)], capture_output=True, text=True)
+    assert res.returncode == 0, f"sh -n rejected the hook:\n{res.stderr}"
