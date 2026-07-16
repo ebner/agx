@@ -50,6 +50,12 @@ disallow_untyped_decorators = false
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
-    "multipass: integration tests that require a real Multipass VM (opt-in via `pytest -m multipass`)",
+    "multipass: integration smoke tests against a live, healthy deployment (opt-in via `pytest -m multipass`; deselected by default via addopts)",
+    "libvirt: integration tests that additionally require the libvirt VM backend (prefer backend-agnostic tests)",
+    "slow: integration tests that recreate containers or move archives (minutes, not seconds)",
 ]
-addopts = "-ra --strict-markers"
+# `-m 'not multipass'` keeps bare `pytest` / `pytest tests/unit` from ever
+# running the integration suite (pytest runs marked tests by default —
+# markers alone don't gate). An explicit `pytest -m multipass` overrides
+# it (last -m wins) and selects only the integration tests.
+addopts = "-ra --strict-markers -m 'not multipass'"
