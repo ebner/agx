@@ -847,6 +847,67 @@ def test_upgrade_runs_hermes_config_migrate_after_recreate(
         "expected `hermes config migrate` to be exec'd after recreate; "
         f"observed exec_in_vm calls: {[c.args for c in exec_spy.call_args_list]}"
     )
+    # A clean migrate is followed by the `hermes config check`
+    # verification pass (upstream's documented way to surface options
+    # the non-interactive migrate couldn't prompt for).
+    check_calls = [
+        call
+        for call in exec_spy.call_args_list
+        if "hermes" in call.args and "config" in call.args and "check" in call.args
+    ]
+    assert check_calls, "expected `hermes config check` after a successful migrate"
+
+
+def test_upgrade_config_check_drift_warns_with_interactive_hint(
+    with_coder: Path, mocker, cfg: AgentsConfig
+) -> None:
+    """When ``hermes config check`` reports options the non-interactive
+    migrate left unset, the upgrade must surface them with the
+    interactive remedy — silently completing would leave new gateway
+    features dormant with nothing pointing at the cause.
+    """
+    _stub_happy_upgrade(mocker, cfg)
+
+    def runner(vm_name: str, *cmd: str, check: bool = True):
+        if "config" in cmd and "check" in cmd:
+            return MpResult(stdout="missing: gateway.new_option", stderr="", returncode=1)
+        return _ok()
+
+    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=runner)
+    warn_spy = mocker.spy(upgrades.ui, "warn")
+
+    outcome = upgrades.upgrade("coder", tag="v1.0.1", config_path=with_coder)
+
+    assert outcome.new_tag == "v1.0.1"  # warn, never abort
+    drift_warns = [c.args[0] for c in warn_spy.call_args_list if "config check" in c.args[0]]
+    assert drift_warns, "expected a drift warning from config check"
+    assert "gateway.new_option" in drift_warns[0]
+    assert "agents exec coder -- hermes config migrate" in drift_warns[0]
+
+
+def test_upgrade_config_check_skipped_when_migrate_failed(
+    with_coder: Path, mocker, cfg: AgentsConfig
+) -> None:
+    """An image old enough to lack ``config migrate`` lacks ``check``
+    too — after a failed migrate the check must be skipped so the user
+    gets one actionable warning, not two."""
+    _stub_happy_upgrade(mocker, cfg)
+
+    def runner(vm_name: str, *cmd: str, check: bool = True):
+        if "config" in cmd and "migrate" in cmd:
+            return MpResult(stdout="", stderr="unknown subcommand: migrate", returncode=2)
+        return _ok()
+
+    exec_spy = mocker.patch("agents_cli.mp.exec_in_vm", side_effect=runner)
+
+    upgrades.upgrade("coder", tag="v1.0.1", config_path=with_coder)
+
+    check_calls = [
+        call
+        for call in exec_spy.call_args_list
+        if "hermes" in call.args and "config" in call.args and "check" in call.args
+    ]
+    assert not check_calls
 
 
 def test_upgrade_skips_config_migrate_for_openclaw(

@@ -345,7 +345,7 @@ def upgrade(
                         CONFIG_MIGRATE_PHASE,
                         "running `hermes config migrate` in the container...",
                     )
-                _run_config_migrate(cfg, svc, agent_type)
+                _run_config_migrate(cfg, svc, agent_type, name=name)
                 journal.advance(CONFIG_MIGRATE_PHASE)
 
             if not journal.is_phase_done("doctor_passed"):
@@ -790,7 +790,7 @@ def _latest_host_snapshot(cfg: AgentsConfig, name: str) -> Path | None:
     return candidates[-1] if candidates else None
 
 
-def _run_config_migrate(cfg: AgentsConfig, svc: str, agent_type: str) -> None:
+def _run_config_migrate(cfg: AgentsConfig, svc: str, agent_type: str, *, name: str) -> None:
     """Run the in-container config-schema migration after recreate.
 
     Hermes: ``hermes config migrate``. Newer Hermes versions sometimes
@@ -805,6 +805,18 @@ def _run_config_migrate(cfg: AgentsConfig, svc: str, agent_type: str) -> None:
     toolkit deliberately stays out of its config surface (see
     CLAUDE.md's Hermes-vs-OpenClaw matrix). Any config migration on
     that side is the user's responsibility via ``openclaw configure``.
+
+    After a successful migrate, ``hermes config check`` runs as a
+    verification pass. Rationale (upstream "Updating & Uninstalling"
+    doc): the native ``hermes update`` flow prompts INTERACTIVELY for
+    each new config option, but this phase runs migrate with
+    ``no_tty`` — options that wanted an interactive answer may be left
+    unset with only their defaults. ``config check`` is upstream's
+    documented way to surface exactly that; when it reports drift we
+    warn with the interactive remedy (``agents exec <name> -- hermes
+    config migrate``, which allocates a TTY). The check is skipped
+    when migrate itself failed — an image old enough to lack
+    ``migrate`` lacks ``check`` too, and one warning is enough.
 
     Best-effort: a non-zero exit (e.g. older Hermes builds that lack
     the ``migrate`` subcommand, or the container not being healthy
@@ -830,8 +842,27 @@ def _run_config_migrate(cfg: AgentsConfig, svc: str, agent_type: str) -> None:
         ui.warn(
             f"hermes config migrate failed (rc={result.returncode}); upgrade continues. "
             f"stderr tail: {(result.stderr or '').strip().splitlines()[-3:] if result.stderr else '(empty)'}. "
-            "Run `agents exec <name> -- hermes config check` after the upgrade "
+            f"Run `agents exec {name} -- hermes config check` after the upgrade "
             "completes to inspect any drift."
+        )
+        return
+
+    check = mp.exec_in_vm(
+        cfg.vm.name,
+        *_compose_exec_in_vm_argv(cfg, svc, "hermes", "config", "check", no_tty=True),
+        check=False,
+    )
+    # rc!=0 is the drift signal (checkers report problems via exit
+    # status). Deliberately NOT substring-matching the output — with
+    # an undocumented format, probing for words like "missing" would
+    # false-positive on healthy text such as "no missing options".
+    if check.returncode != 0:
+        tail = "\n".join((check.stdout or check.stderr or "").strip().splitlines()[-6:])
+        ui.warn(
+            f"hermes config check reports options the non-interactive migrate "
+            f"could not fill:\n{tail}\n"
+            f"Run `agents exec {name} -- hermes config migrate` for the "
+            "interactive pass (it prompts for each new option)."
         )
 
 
