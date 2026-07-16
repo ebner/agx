@@ -13,6 +13,13 @@ jobs:
       matrix:
         python-version: ["3.11", "3.12"]
 
+    # UV_PYTHON pins every uv invocation to the matrix interpreter;
+    # --no-sync on each `uv run` stops it from re-syncing the venv to
+    # the base project (which would drop the dev extra — and with it
+    # ruff/mypy/pytest — right after the install step added them).
+    env:
+      UV_PYTHON: ${{ matrix.python-version }}
+
     steps:
       - uses: actions/checkout@v4
 
@@ -22,22 +29,22 @@ jobs:
           enable-cache: true
 
       - name: Install (locked, reproduces uv.lock exactly)
-        run: uv sync --locked --extra dev --python ${{ matrix.python-version }}
+        run: uv sync --locked --extra dev
 
       - name: Lint (ruff check)
-        run: uv run ruff check .
+        run: uv run --no-sync ruff check .
 
       - name: Format check (ruff format)
-        run: uv run ruff format --check .
+        run: uv run --no-sync ruff format --check .
 
       - name: Type check (mypy --strict)
-        run: uv run mypy --strict src/agents_cli
+        run: uv run --no-sync mypy --strict src/agents_cli
 
       # Integration tests (tests/integration/, marker `multipass`) are
       # deselected via addopts and must NEVER run in CI — they require a
       # live VM deployment. See CLAUDE.md's Testing section.
       - name: Test (pytest, unit only)
-        run: uv run pytest -q
+        run: uv run --no-sync pytest -q
 
       - name: Verify CLI entry point
-        run: uv run agents --version && uv run agents --help
+        run: uv run --no-sync agents --version && uv run --no-sync agents --help
