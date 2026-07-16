@@ -41,16 +41,6 @@ GITHUB_API: dict[str, str] = {
     "openclaw": "https://api.github.com/repos/openclaw/openclaw",
 }
 
-# Tags carrying these tokens are filtered out unless --include-prerelease.
-PRERELEASE_MARKERS: tuple[str, ...] = (
-    "beta",
-    "rc",
-    "pre",
-    "alpha",
-    "dev",
-    "snapshot",
-)
-
 FETCH_TIMEOUT_S: float = 5.0
 
 
@@ -196,13 +186,6 @@ def _fetch_first_tag(url: str) -> str | None:
             return None
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
         return None
-
-
-def is_prerelease(tag: str) -> bool:
-    """Public helper — used by callers that want to filter local tag
-    lists (e.g. the upgrade command's tag-bump fallback)."""
-    lower = tag.lower()
-    return any(m in lower for m in PRERELEASE_MARKERS)
 
 
 def _emit(payload: dict[str, Any]) -> None:

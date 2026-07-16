@@ -236,12 +236,19 @@ def up(
     # carries no healthcheck and `up -d` doesn't wait on health anyway.
     # Only a passing probe earns `running: True` and the agent wiring.
     failure_reason: str | None = None
+    ui.progress(f"starting firecrawl stack ({len(fragments)} services)...")
     try:
         compose_runner.up(cfg, *fragments.keys())
     except RuntimeFailure as e:
         failure_reason = f"compose up failed: {e}"
-    if failure_reason is None and not _wait_api_healthy(cfg):
-        failure_reason = f"firecrawl-api did not become healthy within {int(_HEALTH_TIMEOUT_S)}s"
+    if failure_reason is None:
+        ui.progress(
+            f"waiting for firecrawl-api to become healthy (up to {int(_HEALTH_TIMEOUT_S)}s)..."
+        )
+        if not _wait_api_healthy(cfg):
+            failure_reason = (
+                f"firecrawl-api did not become healthy within {int(_HEALTH_TIMEOUT_S)}s"
+            )
 
     if failure_reason is not None:
         # The degraded state (digest pins + flag) is already on disk from
@@ -539,6 +546,7 @@ def ensure_agent_wired(cfg: AgentsConfig, agent_name: str) -> None:
         return
     if read_state(cfg).get("degraded"):
         return
+    ui.progress(f"firecrawl detected — wiring FIRECRAWL_* env passthrough for {agent_name!r}...")
     _wire_agent(cfg, agent_name)
 
 
@@ -576,8 +584,17 @@ def _resolve_digests(cfg: AgentsConfig) -> dict[str, str]:
     references the digest form so the toolkit's "no ``:latest``" rule
     holds. Allowlist validation happens inside
     :func:`sidecar.resolve_digest`, before any ref is returned.
+
+    Narrated per image via :func:`ui.progress` — five pulls back to
+    back run for minutes on a first install, and a silent terminal
+    reads as a hang.
     """
-    return {role: sidecar.resolve_digest(cfg, floating) for role, floating in FLOATING_REFS.items()}
+    images: dict[str, str] = {}
+    total = len(FLOATING_REFS)
+    for i, (role, floating) in enumerate(FLOATING_REFS.items(), 1):
+        ui.progress(f"[{i}/{total}] pulling {floating} and resolving its digest...")
+        images[role] = sidecar.resolve_digest(cfg, floating)
+    return images
 
 
 def _ensure_project_env(cfg: AgentsConfig) -> None:

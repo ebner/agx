@@ -363,3 +363,25 @@ def test_refuses_without_yes_and_no_confirm(with_coder: Path, mocker: Any) -> No
 
     with pytest.raises(UserError, match="aborted by user"):
         fixperms_cmd.fix_perms("coder", yes=False, config_path=with_coder)
+
+
+# ---------- progress narration ----------
+
+
+def test_fix_perms_narrates_recreate_and_chown(
+    with_coder: Path, cfg: AgentsConfig, mocker: Any
+) -> None:
+    """fix-perms force-recreates the container and chown -R's /opt/data
+    (minutes on big data dirs) — each stage gets an always-on progress
+    line so the terminal never reads as hung."""
+    mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())
+    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_stub_in_vm("1000"))
+    spy = mocker.spy(fixperms_cmd.ui, "progress")
+
+    fixperms_cmd.fix_perms("coder", yes=True, config_path=with_coder)
+
+    lines = [c.args[0] for c in spy.call_args_list]
+    assert any("force-recreating hermes-coder" in ln for ln in lines)
+    assert any("chown -R" in ln and "/opt/data" in ln and "minutes" in ln for ln in lines)
+    assert any("install paths" in ln for ln in lines)

@@ -13,7 +13,9 @@ CLI surface:
   hidden when omitted, never printed back.
 - ``agents secret unset <agent> KEY``
 - ``agents secret list <agent>`` — names only.
-- ``agents secret clear <agent>`` — wipe the whole file.
+- ``agents secret clear <agent>`` — wipe the whole file (and, for
+  Hermes agents, drop each wiped key from ``terminal.env_passthrough``
+  — same cleanup ``unset`` does per key).
 
 Mutations hold ``<data-dir>/.agents.lock`` (same flock every other
 mutation uses), then restart the agent's container so the new env
@@ -141,12 +143,23 @@ def clear_secrets(
     config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH,
 ) -> None:
     cfg = cfg_mod.load(config_path)
-    svc, _agent_type = _resolve_service(cfg, agent_name)
+    svc, agent_type = _resolve_service(cfg, agent_name)
     if not yes and not ui.confirm(f"clear ALL secrets for {agent_name!r}?", default=False):
         raise UserError("aborted by user")
 
     with compose.acquire_lock(cfg.paths.host_data_dir):
+        # Capture the key names BEFORE wiping: `set` mirrors each key
+        # into terminal.env_passthrough (Hermes only), so `clear` must
+        # drop those entries too or they linger forever. Same mechanics
+        # and OpenClaw no-op posture as unset_secret; idempotent (a
+        # second clear finds no keys and touches nothing).
+        keys = sorted(_read_env(cfg, agent_name))
         _write_env(cfg, agent_name, {})
+        if agent_type == "hermes" and keys:
+            doc = hermes_config.read_doc(cfg, agent_name)
+            for key in keys:
+                hermes_config.remove_env_passthrough(doc, key)
+            hermes_config.write_atomically(cfg, agent_name, doc)
 
     compose_runner.up(cfg, svc)
     ui.emit(

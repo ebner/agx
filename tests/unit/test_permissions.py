@@ -402,3 +402,50 @@ def test_container_recipient_uses_subuid_mapping(mocker: Any) -> None:
     mocker.patch("agents_cli.permissions.compute_container_subuid", return_value=100999)
     r = permissions.container_recipient(1000, writable=True)
     assert r.to_spec() == "u:100999:rwX"
+
+
+def test_run_with_sudo_prints_each_argv_via_progress_before_confirm(mocker: Any) -> None:
+    """SECURITY-UX: the docstring, CLI help, and CLAUDE.md promise the
+    exact argvs are printed before sudo runs. That display must be
+    always-on (ui.progress), NOT --verbose-gated ui.info — a user can't
+    audit a sudo grant they never saw — and must land before the
+    confirmation prompt."""
+    mocker.patch("shutil.which", return_value="/usr/bin/sudo")
+    mocker.patch("subprocess.run", return_value=MagicMock(returncode=0))
+    progress_spy = mocker.spy(permissions.ui, "progress")
+    info_spy = mocker.spy(permissions.ui, "info")
+
+    progress_count_at_confirm: list[int] = []
+
+    def fake_confirm(prompt: str, *, default: bool = False) -> bool:
+        progress_count_at_confirm.append(progress_spy.call_count)
+        return True
+
+    mocker.patch("agents_cli.ui.confirm", side_effect=fake_confirm)
+
+    argvs = [
+        ["setfacl", "-R", "-m", "u:1000:rX,m::rwx", "/data/coder/.data"],
+        ["setfacl", "-d", "-m", "u:1000:rX,m::rwx", "/data/coder/.data"],
+    ]
+    permissions.run_with_sudo(argvs, yes=False)
+
+    lines = [c.args[0] for c in progress_spy.call_args_list]
+    for argv in argvs:
+        assert any("sudo " + " ".join(argv) in ln for ln in lines), f"argv not printed: {argv}"
+    # Header + both argv lines printed BEFORE the confirm ran.
+    assert progress_count_at_confirm == [3]
+    # Nothing about the command display goes through the verbose channel.
+    assert not any("setfacl" in c.args[0] for c in info_spy.call_args_list)
+
+
+def test_run_with_sudo_prints_argvs_with_yes_too(mocker: Any) -> None:
+    """--yes skips the confirmation but NOT the display — the audit
+    trail of what ran under sudo must always appear."""
+    mocker.patch("shutil.which", return_value="/usr/bin/sudo")
+    mocker.patch("subprocess.run", return_value=MagicMock(returncode=0))
+    progress_spy = mocker.spy(permissions.ui, "progress")
+
+    permissions.run_with_sudo([["setfacl", "-m", "u:1000:rwX", "/x"]], yes=True)
+
+    lines = [c.args[0] for c in progress_spy.call_args_list]
+    assert any("sudo setfacl -m u:1000:rwX /x" in ln for ln in lines)

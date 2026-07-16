@@ -417,3 +417,29 @@ def test_refresh_calls_status_for_silent_check(
     codex.refresh(config_path=saved_config)
     args, _ = run_spy.call_args
     assert args[0] == ["/usr/local/bin/codex", "auth", "status"]
+
+
+# ---------- progress narration ----------
+
+
+def test_skill_enable_narrates_build(with_coder: Path, mocker) -> None:
+    """The derived-sandbox docker build can run for minutes — narrate
+    start (with duration hint) and completion via always-on ui.progress."""
+    mocker.patch("agents_cli.compose_runner.restart", return_value=_ok())
+    spy = mocker.spy(codex.ui, "progress")
+
+    result = codex.skill_enable("coder", config_path=with_coder)
+
+    lines = [c.args[0] for c in spy.call_args_list]
+    assert any("building derived sandbox image" in ln and "minutes" in ln for ln in lines)
+    assert any(ln == f"built {result['derived_image']}" for ln in lines)
+
+
+def test_skill_enable_reenable_skips_build_narration(with_coder: Path, mocker) -> None:
+    """Idempotent re-enable doesn't rebuild — no build narration."""
+    mocker.patch("agents_cli.compose_runner.restart", return_value=_ok())
+    codex.skill_enable("coder", config_path=with_coder)
+
+    spy = mocker.spy(codex.ui, "progress")
+    codex.skill_enable("coder", config_path=with_coder)
+    assert not any("building" in c.args[0] for c in spy.call_args_list)

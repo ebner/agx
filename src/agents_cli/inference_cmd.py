@@ -131,6 +131,10 @@ def _up_ollama(cfg: AgentsConfig, *, upgrade: bool, config_path: Path) -> dict[s
     image_digest = cfg.inference.ollama_image
     if not image_digest or upgrade:
         # resolve_digest allowlist-validates before returning (rule #5).
+        ui.progress(
+            f"pulling {OLLAMA_IMAGE_BASE}:latest and resolving its digest "
+            f"(first pull can take minutes)..."
+        )
         image_digest = sidecar.resolve_digest(cfg, f"{OLLAMA_IMAGE_BASE}:latest")
         cfg.inference.ollama_image = image_digest
     else:
@@ -268,6 +272,10 @@ def _pin_llamacpp_image(cfg: AgentsConfig, *, upgrade: bool, config_path: Path) 
         # resolve_digest allowlist-validates before returning (rule #5).
         # The llama.cpp image is multi-arch (amd64/arm64/s390x); the
         # daemon picks the right manifest for the VM's arch.
+        ui.progress(
+            f"pulling {LLAMACPP_IMAGE_BASE}:server and resolving its digest "
+            f"(first pull can take minutes)..."
+        )
         digest = sidecar.resolve_digest(cfg, f"{LLAMACPP_IMAGE_BASE}:server")
         cfg.inference.llamacpp_image = digest
         cfg_mod.save(cfg, config_path)

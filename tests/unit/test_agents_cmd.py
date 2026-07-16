@@ -747,3 +747,88 @@ def test_rename_host_mode_stray_target_dir_fails_loudly(
     with pytest.raises(RuntimeFailure, match="already exists"):
         rename("coder", "writer", yes=True, config_path=saved_config)
     assert (cfg.paths.host_data_dir / "coder").is_dir()
+
+
+# ---------- progress narration ----------
+
+
+def _progress_lines(spy) -> list[str]:
+    return [c.args[0] for c in spy.call_args_list]
+
+
+def test_ensure_hermes_image_pulled_narrates_pull(cfg: AgentsConfig, mocker) -> None:
+    """A first-create pull is multi-GB; the narration must be always-on
+    (ui.progress, not --verbose-gated ui.info) with a duration hint,
+    plus a completion line."""
+    from agents_cli.agents_cmd import _ensure_hermes_image_pulled
+
+    mocker.patch(
+        "agents_cli.mp.exec_in_vm",
+        side_effect=_build_pull_runner(inspect_rc=1, pull_rc=0),
+    )
+    spy = mocker.spy(agents_cmd.ui, "progress")
+
+    _ensure_hermes_image_pulled(cfg, "v1.0.0")
+
+    lines = _progress_lines(spy)
+    assert any("pulling nousresearch/hermes-agent:v1.0.0" in ln and "minutes" in ln for ln in lines)
+    assert any(ln.startswith("pulled ") for ln in lines)
+
+
+def test_ensure_hermes_image_pulled_silent_when_cached(cfg: AgentsConfig, mocker) -> None:
+    """Image already local (inspect rc=0): nothing slow happens, so no
+    pull narration should appear."""
+    from agents_cli.agents_cmd import _ensure_hermes_image_pulled
+
+    mocker.patch(
+        "agents_cli.mp.exec_in_vm",
+        side_effect=_build_pull_runner(inspect_rc=0, pull_rc=0),
+    )
+    spy = mocker.spy(agents_cmd.ui, "progress")
+
+    _ensure_hermes_image_pulled(cfg, "v1.0.0")
+
+    assert not any("pull" in ln for ln in _progress_lines(spy))
+
+
+def test_create_narrates_long_steps(
+    cfg: AgentsConfig, saved_config: Path, stub_runners, mocker
+) -> None:
+    """create's slow sub-steps (compose up, ACL grant, install-path
+    chown) each get an always-on progress line."""
+    spy = mocker.spy(agents_cmd.ui, "progress")
+
+    create(name="coder", agent_type="hermes", config_path=saved_config)
+
+    lines = _progress_lines(spy)
+    assert any("granting host-user ACL" in ln for ln in lines)
+    assert any("starting container hermes-coder" in ln for ln in lines)
+    assert any("install paths" in ln for ln in lines)
+    # firecrawl isn't installed — the wiring no-op must stay silent.
+    assert not any("firecrawl" in ln for ln in lines)
+
+
+def test_reseat_narrates_rewrite_recreate_and_perms(
+    cfg: AgentsConfig, saved_config: Path, stub_runners, mocker
+) -> None:
+    """reseat runs for a while (fragment rewrite → force-recreate →
+    chown dance); each stage gets an always-on progress line."""
+    create(name="coder", agent_type="hermes", config_path=saved_config)
+
+    sim_runner = stub_runners["exec_in_vm"].side_effect
+
+    def runner(vm_name: str, *cmd: str, check: bool = True):
+        if "id" in cmd and "-u" in cmd and "hermes" in cmd:
+            return _ok("1000\n")
+        return sim_runner(vm_name, *cmd, check=check)
+
+    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=runner)
+    spy = mocker.spy(agents_cmd.ui, "progress")
+
+    agents_cmd.reseat("coder", yes=True, config_path=saved_config)
+
+    lines = _progress_lines(spy)
+    assert any("rewriting hermes-coder" in ln and "template" in ln for ln in lines)
+    assert any("force-recreating hermes-coder" in ln for ln in lines)
+    assert any("chown -R" in ln and "/opt/data" in ln for ln in lines)
+    assert any("install paths" in ln for ln in lines)

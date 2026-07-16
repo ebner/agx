@@ -400,3 +400,44 @@ def test_slugify_returns_fallback_for_empty_input() -> None:
     slug (which would yield `llama-cpp-` as a container name).
     """
     assert models_cmd._slugify("@@@!!!") == "model"
+
+
+# ---------- progress narration ----------
+
+
+def test_pull_ollama_narrates_without_verbose(
+    cfg: AgentsConfig, saved_config: Path, mocker: Any
+) -> None:
+    """The multi-GB duration hint used to go through --verbose-gated
+    ui.info, defeating its purpose. It must be always-on ui.progress,
+    with a completion line."""
+    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok())
+    mocker.patch("agents_cli.inference_cmd._service_running", return_value=True)
+    progress_spy = mocker.spy(models_cmd.ui, "progress")
+    info_spy = mocker.spy(models_cmd.ui, "info")
+
+    models_cmd.pull("ollama", "llama3.2:3b", config_path=saved_config)
+
+    lines = [c.args[0] for c in progress_spy.call_args_list]
+    assert any("pulling llama3.2:3b" in ln and "multi-GB" in ln for ln in lines)
+    assert any("pull complete" in ln for ln in lines)
+    # The hint must not rely on the --verbose-gated channel.
+    assert not any("multi-GB" in c.args[0] for c in info_spy.call_args_list)
+
+
+def test_pull_llamacpp_narrates_download(
+    cfg: AgentsConfig, saved_config: Path, mocker: Any
+) -> None:
+    captured: list[tuple[str, ...]] = []
+    mocker.patch(
+        "agents_cli.mp.exec_in_vm",
+        side_effect=_llamacpp_pull_runner(cfg, captured, mount_visible=True),
+    )
+    mocker.patch("agents_cli.inference_cmd._service_running", return_value=True)
+    spy = mocker.spy(models_cmd.ui, "progress")
+
+    models_cmd.pull("llama-cpp", "some/repo:file.gguf", config_path=saved_config)
+
+    lines = [c.args[0] for c in spy.call_args_list]
+    assert any("downloading file.gguf" in ln and "multi-GB" in ln for ln in lines)
+    assert any("download complete" in ln for ln in lines)

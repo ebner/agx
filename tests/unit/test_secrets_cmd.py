@@ -360,3 +360,57 @@ def test_remove_env_passthrough_handles_missing_terminal_block() -> None:
     doc = YAML().load("{}\n")
     # No-op; just must not raise.
     hermes_config.remove_env_passthrough(doc, "K")
+
+
+# ---------- clear: passthrough cleanup ----------
+
+
+def test_clear_removes_passthrough_keys_for_hermes(
+    with_coder: Path, cfg: AgentsConfig, mocker: Any
+) -> None:
+    """`set` mirrors each key into terminal.env_passthrough; `clear`
+    must drop those entries too (mirroring unset's mechanics) or they
+    linger forever. Unrelated user-managed entries survive."""
+    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    # A pre-existing user-managed entry that is NOT a toolkit secret.
+    doc = hermes_config.load(hermes_config.config_path(cfg, "coder"))
+    hermes_config.add_env_passthrough(doc, "TAVILY_API_KEY")
+    hermes_config.write_atomically(cfg, "coder", doc)
+
+    secrets_cmd.set_secret("coder", "A_KEY", "1", config_path=with_coder)
+    secrets_cmd.set_secret("coder", "B_KEY", "2", config_path=with_coder)
+    secrets_cmd.clear_secrets("coder", yes=True, config_path=with_coder)
+
+    doc = hermes_config.load(hermes_config.config_path(cfg, "coder"))
+    passthrough = doc.get("terminal", {}).get("env_passthrough", [])
+    assert "A_KEY" not in passthrough
+    assert "B_KEY" not in passthrough
+    assert "TAVILY_API_KEY" in passthrough
+
+
+def test_clear_is_idempotent(with_coder: Path, cfg: AgentsConfig, mocker: Any) -> None:
+    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    secrets_cmd.set_secret("coder", "A_KEY", "1", config_path=with_coder)
+    secrets_cmd.clear_secrets("coder", yes=True, config_path=with_coder)
+    # Second clear finds no keys — must not raise or touch config.
+    secrets_cmd.clear_secrets("coder", yes=True, config_path=with_coder)
+    assert secrets_cmd.list_secrets("coder", config_path=with_coder) == []
+
+
+def test_clear_openclaw_skips_passthrough_editing(
+    cfg: AgentsConfig, saved_config: Path, mocker: Any, vm_fs_mocks: dict[str, Any]
+) -> None:
+    """OpenClaw has no terminal.env_passthrough — clear wipes the env
+    file only and never touches a Hermes config (same posture as unset)."""
+    from agents_cli.agents_cmd import create as create_agent
+
+    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    create_agent(name="personal", agent_type="openclaw", config_path=saved_config)
+    secrets_cmd.set_secret("personal", "SOME_KEY", "v", config_path=saved_config)
+
+    read_doc_spy = mocker.spy(secrets_cmd.hermes_config, "read_doc")
+    secrets_cmd.clear_secrets("personal", yes=True, config_path=saved_config)
+
+    read_doc_spy.assert_not_called()
+    env = (cfg.paths.host_data_dir / "personal" / ".env").read_text(encoding="utf-8")
+    assert env == ""

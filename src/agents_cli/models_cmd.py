@@ -191,7 +191,7 @@ def use(
 
 def _pull_ollama(cfg: AgentsConfig, model: str) -> dict[str, Any]:
     _require_ollama_running(cfg)
-    ui.info(f"pulling {model} into ollama (may take a while; multi-GB)")
+    ui.progress(f"pulling {model} into ollama (multi-GB — may take a while)...")
     result = mp.exec_in_vm(
         cfg.vm.name,
         "docker",
@@ -204,6 +204,7 @@ def _pull_ollama(cfg: AgentsConfig, model: str) -> dict[str, Any]:
     )
     if result.returncode != 0:
         raise RuntimeFailure(f"`ollama pull {model}` failed: {result.stderr.strip()}")
+    ui.progress(f"pull complete: {model}")
     ui.emit(
         {"engine": "ollama", "model": model, "pulled": True},
         human=f"ollama: pulled {model}",
@@ -307,6 +308,7 @@ def _pull_llamacpp_gguf(cfg: AgentsConfig, model: str) -> dict[str, Any]:
 
     # Download via hf_hub into the bind-mounted dir the host sees as
     # <data-dir>/models/llama-cpp/ (probed above).
+    ui.progress(f"downloading {filename} from {repo} (multi-GB — may take a while)...")
     download = mp.exec_in_vm(
         cfg.vm.name,
         "docker",
@@ -322,6 +324,7 @@ def _pull_llamacpp_gguf(cfg: AgentsConfig, model: str) -> dict[str, Any]:
     )
     if download.returncode != 0:
         raise RuntimeFailure(f"hf_hub_download failed: {download.stderr.strip()}")
+    ui.progress(f"download complete: {filename}")
 
     ui.emit(
         {"engine": "llama-cpp", "repo": repo, "filename": filename, "pulled": True},

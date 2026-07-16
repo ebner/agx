@@ -121,6 +121,7 @@ def force_recreate(cfg: AgentsConfig, svc: str) -> None:
     "no such container" errors — the desired post-state is "service is
     up from scratch" regardless of starting state.
     """
+    ui.progress(f"force-recreating {svc}: stop, rm -f, compose up...")
     compose_runner.stop(cfg, svc)
     mp.exec_in_vm(cfg.vm.name, "docker", "rm", "-f", svc, check=False)
     result = compose_runner.up(cfg, svc)
@@ -146,6 +147,7 @@ def container_hermes_uid(cfg: AgentsConfig, svc: str) -> int:
 
 
 def chown_data_dir(cfg: AgentsConfig, svc: str, uid: int) -> None:
+    ui.progress(f"chown -R {uid}:{uid} /opt/data in {svc} (can take minutes on large data dirs)...")
     result = mp.exec_in_vm(
         cfg.vm.name,
         *_compose_exec_in_vm_argv(
@@ -200,6 +202,7 @@ def chown_hermes_install_paths(cfg: AgentsConfig, svc: str, uid: int) -> None:
     container (``agents create``'s service_up phase, ``agents
     fix-perms``, ``agents reseat``) calls this helper after start.
     """
+    ui.progress(f"chowning image-baked install paths in {svc} (hermes setup prerequisites)...")
     for path, prunes in HERMES_WRITABLE_PATHS:
         check = mp.exec_in_vm(
             cfg.vm.name,

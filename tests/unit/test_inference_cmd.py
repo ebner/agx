@@ -475,3 +475,69 @@ def test_up_ollama_failed_up_does_not_persist_enabled_flag(
     # The digest pin is also only persisted on success — the retry
     # re-resolves (cheap; the pull is already in the daemon cache).
     assert reloaded.inference.ollama_image == ""
+
+
+# ---------- progress narration ----------
+
+
+def test_up_ollama_narrates_pull(
+    cfg: AgentsConfig, saved_config: Path, mocker: Any, vm_fs: dict[str, Any]
+) -> None:
+    """First `inference up ollama` pulls a multi-GB image — narrate via
+    always-on ui.progress with a duration hint."""
+    digest = f"{OLLAMA_IMAGE_BASE}@sha256:" + "f" * 64
+    mocker.patch(
+        "agents_cli.mp.exec_in_vm",
+        side_effect=_layer_runner(
+            vm_fs,
+            {
+                ("docker", "pull"): _ok(),
+                ("docker", "image", "inspect"): _ok(stdout=digest + "\n"),
+            },
+        ),
+    )
+    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    spy = mocker.spy(inference_cmd.ui, "progress")
+
+    inference_cmd.up("ollama", config_path=saved_config)
+
+    lines = [c.args[0] for c in spy.call_args_list]
+    assert any("pulling" in ln and OLLAMA_IMAGE_BASE in ln and "minutes" in ln for ln in lines)
+
+
+def test_up_ollama_reuse_does_not_narrate_pull(
+    cfg: AgentsConfig, saved_config: Path, mocker: Any, vm_fs: dict[str, Any]
+) -> None:
+    """Reuse path pulls nothing — the narration must not promise a pull."""
+    cfg.inference.ollama_image = f"{OLLAMA_IMAGE_BASE}@sha256:" + "a" * 64
+    cfg_mod.save(cfg, saved_config)
+    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    spy = mocker.spy(inference_cmd.ui, "progress")
+
+    inference_cmd.up("ollama", config_path=saved_config)
+
+    assert not any("pulling" in c.args[0] for c in spy.call_args_list)
+
+
+def test_up_llamacpp_narrates_pull(
+    cfg: AgentsConfig, saved_config: Path, mocker: Any, vm_fs: dict[str, Any]
+) -> None:
+    from agents_cli.compose import LLAMACPP_IMAGE_BASE
+
+    digest = f"{LLAMACPP_IMAGE_BASE}@sha256:" + "e" * 64
+    mocker.patch(
+        "agents_cli.mp.exec_in_vm",
+        side_effect=_layer_runner(
+            vm_fs,
+            {
+                ("docker", "pull"): _ok(),
+                ("docker", "image", "inspect"): _ok(stdout=digest + "\n"),
+            },
+        ),
+    )
+    spy = mocker.spy(inference_cmd.ui, "progress")
+
+    inference_cmd.up("llama-cpp", config_path=saved_config)
+
+    lines = [c.args[0] for c in spy.call_args_list]
+    assert any("pulling" in ln and LLAMACPP_IMAGE_BASE in ln and "minutes" in ln for ln in lines)

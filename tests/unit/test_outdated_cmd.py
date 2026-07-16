@@ -96,13 +96,6 @@ def test_classify_unknown_when_current_blank() -> None:
     assert outdated_cmd._classify("", "v2026.5.7") == "unknown"
 
 
-def test_is_prerelease_detects_common_markers() -> None:
-    assert outdated_cmd.is_prerelease("v2026.5.14-beta.2")
-    assert outdated_cmd.is_prerelease("v1.0.0-rc1")
-    assert outdated_cmd.is_prerelease("0.5.0-alpha")
-    assert not outdated_cmd.is_prerelease("v2026.5.7")
-
-
 # ---------- check() end-to-end ----------
 
 

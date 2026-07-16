@@ -216,6 +216,7 @@ def create(
                     compose.ensure_cont_init_script(cfg)
                 _add_service_to_compose(cfg, name, agent_type, svc, port, tag)
             elif phase == "service_up":
+                ui.progress(f"starting container {svc}...")
                 compose_runner.up(cfg, svc)
                 if agent_type == "hermes":
                     # Auto-chown the image-baked paths Hermes' setup
@@ -295,6 +296,7 @@ def _create_data_dirs(cfg: AgentsConfig, name: str, agent_type: str) -> None:
     # variant pre-existing agents need.
     from agents_cli import access_cmd
 
+    ui.progress(f"granting host-user ACL on {name!r}'s data dir...")
     access_cmd.auto_grant_on_create(cfg, name, agent_type)
 
 
@@ -345,12 +347,14 @@ def _ensure_hermes_image_pulled(cfg: AgentsConfig, tag: str) -> None:
     inspect = mp.exec_in_vm(cfg.vm.name, "docker", "image", "inspect", image_ref, check=False)
     if inspect.returncode == 0:
         return
+    ui.progress(f"pulling {image_ref} (multi-GB on first create — can take minutes)...")
     pull = mp.exec_in_vm(cfg.vm.name, "docker", "pull", image_ref, check=False)
     if pull.returncode != 0:
         raise UserError(
             f"could not pull {image_ref} (rc={pull.returncode}): "
             f"{pull.stderr.strip() or pull.stdout.strip()}"
         )
+    ui.progress(f"pulled {image_ref}")
 
 
 def _run_agent_setup(cfg: AgentsConfig, svc: str, agent_type: str) -> None:
@@ -755,6 +759,7 @@ def reseat(
         if preserved_depends_on is not None:
             new_fragment["depends_on"] = preserved_depends_on
 
+        ui.progress(f"rewriting {svc}'s compose service block from the current template...")
         services[svc] = new_fragment
         compose.write_compose_atomically(cfg, doc)
 

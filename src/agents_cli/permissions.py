@@ -275,11 +275,15 @@ def run_with_sudo(argvs: Sequence[Sequence[str]], *, yes: bool) -> None:
     """Run argvs prefixed with ``sudo``. Use when the target path is
     owned by a subuid (the agent's data dir).
 
-    Prints the exact commands the user is about to authorize. With
-    ``yes=True`` skips the interactive confirmation — same semantics
-    as the toolkit's other ``--yes`` flags. With ``yes=False`` (the
-    default), confirms once before invoking sudo (which then runs all
-    argvs in sequence with the same cached credential).
+    Prints the exact commands the user is about to authorize — always,
+    via :func:`ui.progress` (not the ``--verbose``-gated ``ui.info``),
+    because the CLI help and docs promise the argv display and a user
+    can't audit a sudo grant they never saw. The argvs carry no secrets
+    (paths + uids only). With ``yes=True`` skips the interactive
+    confirmation — same semantics as the toolkit's other ``--yes``
+    flags. With ``yes=False`` (the default), confirms once before
+    invoking sudo (which then runs all argvs in sequence with the same
+    cached credential).
     """
     if not argvs:
         return
@@ -289,9 +293,9 @@ def run_with_sudo(argvs: Sequence[Sequence[str]], *, yes: bool) -> None:
             "Run the commands manually after logging in as root:\n  "
             + "\n  ".join("sudo " + " ".join(a) for a in argvs)
         )
-    ui.info("The toolkit will run (sudo will prompt for your password if not cached):")
+    ui.progress("The toolkit will run (sudo will prompt for your password if not cached):")
     for argv in argvs:
-        ui.info("  sudo " + " ".join(argv))
+        ui.progress("  sudo " + " ".join(argv))
     if not yes and not ui.confirm("apply now?", default=True):
         raise UserError("aborted by user")
     for idx, argv in enumerate(argvs):

@@ -913,3 +913,64 @@ def test_queue_stats_handles_rabbitmq_unavailable(cfg: AgentsConfig, mocker: Any
     assert stats["rabbitmq"] == []
     # Bull still gets a slot per queue even when redis returns 0.
     assert len(stats["bull"]) == 4
+
+
+# ---------- progress narration ----------
+
+
+def test_up_narrates_pulls_compose_up_and_health_wait(
+    with_coder: Path, cfg: AgentsConfig, mocker: Any, vm_fs_mocks: dict[str, Any]
+) -> None:
+    """First `firecrawl up` runs five multi-GB pulls plus a bounded
+    health probe — each stage gets an always-on progress line so the
+    terminal never reads as hung."""
+    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+    spy = mocker.spy(firecrawl_cmd.ui, "progress")
+
+    firecrawl_cmd.up(config_path=with_coder)
+
+    lines = [c.args[0] for c in spy.call_args_list]
+    # One numbered pull line per image role.
+    for i in range(1, 6):
+        assert any(ln.startswith(f"[{i}/5] pulling") for ln in lines), f"no [{i}/5] pull line"
+    assert any("starting firecrawl stack" in ln for ln in lines)
+    assert any("waiting for firecrawl-api" in ln and "60s" in ln for ln in lines)
+
+
+def test_up_reuses_pins_without_pull_narration(
+    with_coder: Path, cfg: AgentsConfig, mocker: Any, vm_fs_mocks: dict[str, Any]
+) -> None:
+    """Re-running `up` with pins on file resolves nothing — no pull
+    narration should promise work that won't happen."""
+    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+    firecrawl_cmd.up(config_path=with_coder)
+
+    spy = mocker.spy(firecrawl_cmd.ui, "progress")
+    firecrawl_cmd.up(config_path=with_coder)
+    assert not any("pulling" in c.args[0] for c in spy.call_args_list)
+
+
+def test_ensure_agent_wired_narrates_when_installed(cfg: AgentsConfig, mocker: Any) -> None:
+    """The `agents create` hook silently edits the new agent's
+    config.yaml when firecrawl is up — narrate so the user learns the
+    wiring happened."""
+    mocker.patch("agents_cli.firecrawl_cmd.is_installed", return_value=True)
+    mocker.patch("agents_cli.firecrawl_cmd.read_state", return_value={})
+    wire = mocker.patch("agents_cli.firecrawl_cmd._wire_agent")
+    spy = mocker.spy(firecrawl_cmd.ui, "progress")
+
+    firecrawl_cmd.ensure_agent_wired(cfg, "coder")
+
+    wire.assert_called_once()
+    assert any("wiring" in c.args[0] and "coder" in c.args[0] for c in spy.call_args_list)
+
+
+def test_ensure_agent_wired_silent_when_not_installed(cfg: AgentsConfig, mocker: Any) -> None:
+    """No-op paths (not installed / degraded) must stay silent — a
+    "wiring firecrawl" line for work that never happens is misleading."""
+    mocker.patch("agents_cli.firecrawl_cmd.is_installed", return_value=False)
+    spy = mocker.spy(firecrawl_cmd.ui, "progress")
+    firecrawl_cmd.ensure_agent_wired(cfg, "coder")
+    spy.assert_not_called()

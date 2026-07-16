@@ -109,6 +109,7 @@ def _sync_host_codex_to_vm(cfg: AgentsConfig) -> None:
     if not host_dir.exists() or not any(host_dir.iterdir()):
         return
 
+    ui.progress("syncing toolkit Codex auth into the VM...")
     with tempfile.NamedTemporaryFile(
         prefix="codex-sync-",
         suffix=".tar",
@@ -474,6 +475,9 @@ def _build_sandbox_image_in_vm(cfg: AgentsConfig, image_tag: str, base_image: st
     try:
         host_temp.write_text(dockerfile_content, encoding="utf-8")
         mp.transfer_to_vm(host_temp, cfg.vm.name, vm_dockerfile)
+        ui.progress(
+            f"building derived sandbox image {image_tag} from {base_image} — can take minutes..."
+        )
         result = mp.exec_in_vm(
             cfg.vm.name,
             "docker",
@@ -487,6 +491,7 @@ def _build_sandbox_image_in_vm(cfg: AgentsConfig, image_tag: str, base_image: st
         )
         if result.returncode != 0:
             raise RuntimeFailure(f"docker build failed for {image_tag}: {result.stderr.strip()}")
+        ui.progress(f"built {image_tag}")
     finally:
         host_temp.unlink(missing_ok=True)
         mp.exec_in_vm(cfg.vm.name, "rm", "-f", vm_dockerfile, check=False)
