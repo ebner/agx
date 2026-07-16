@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "agents-cli"
 version = "0.1.0"
-description = "Host-side CLI for managing AI agents (Hermes, OpenClaw) in a Multipass VM"
+description = "Host-side CLI for managing AI agents (Hermes, OpenClaw) in rootless-Docker containers behind a pluggable backend: Multipass VM, libvirt VM, or bare-metal"
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.11"

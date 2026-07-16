@@ -15,13 +15,32 @@ The toolkit assumes:
 - The user is the only legitimate principal.
 - Network egress from the agent is needed and not blocked.
 
-## Trust boundaries (outer to inner)
+## The outer boundary depends on the backend
+
+`agents vm init --backend …` picks how much isolation sits between a
+compromised agent and the host. The inner layers (rootless Docker →
+per-agent container → nested sandbox) are identical across backends;
+only the outer boundary changes:
+
+| Backend | Outer trust boundary | Notes |
+|---|---|---|
+| `multipass` (default) | **The VM.** A whole Ubuntu instance isolated by the platform hypervisor (KVM/qemu on Linux; Multipass's native driver on macOS/Windows). | Cross-platform default. Container break-out ends inside the VM. |
+| `libvirt` | **The VM.** Same guarantee as multipass — Ubuntu guest under KVM/qemu. | Linux-only, experimental. Exists for GPU passthrough (vfio-pci hostdev attach). |
+| `bare_metal` | **The host itself — there is no VM.** A compromised agent that escapes its container reaches the host directly. | Linux-only, opt-in. `vm init` warns explicitly: *"the VM trust boundary is forfeited … Only use this on single-user dev workstations where the host is already trusted."* Rootless Docker (never rootful — the toolkit refuses a rootful socket) is the only remaining isolation layer. |
+
+The defense-in-depth rationale in the rest of this document leans on
+the VM to absorb skill-marketplace malware and runtime CVEs; bare-metal
+forfeits that deliberately. Choose it only where the host would be in
+the blast radius anyway (single-user dev workstation, dedicated LLM
+box).
+
+## Trust boundaries (outer to inner, VM backends)
 
 | Boundary | What's outside | What's inside |
 |---|---|---|
 | **Host process** | Anything else on the user's host (browser, email, IDE). | The host CLI itself. |
-| **Multipass VM** | The host. | A whole Ubuntu instance, isolated by KVM/qemu. |
-| **Rootless Docker** | VM root. | The `ubuntu` user's daemon. A compromised container cannot escalate to VM root. |
+| **VM (multipass or libvirt)** | The host. | A whole Ubuntu instance, isolated by KVM/qemu (or the platform hypervisor). Absent on `bare_metal`. |
+| **Rootless Docker** | VM root (host root on `bare_metal`). | The unprivileged user's daemon. A compromised container cannot escalate to root. |
 | **Per-agent container** | The rootless daemon. | A single agent runtime. |
 | **Nested sandbox** | The Hermes runtime. | One ephemeral container spawned per Hermes session for tool calls. |
 
@@ -34,7 +53,7 @@ For Hermes' nested-sandbox feature to work, the rootless Docker socket (`/run/us
 **Bounded by:**
 
 - Rootless Docker. No path to root on host.
-- VM is the outer trust boundary; container break-out ends inside the VM.
+- On the VM backends, the VM is the outer trust boundary; container break-out ends inside the VM. On `bare_metal`, rootless Docker is the last line — see the backend table above.
 - A user who doesn't want nested sandboxing can set `terminal.backend: local` in Hermes config. The toolkit's `hermes_config` round-trip preserves that choice across upgrades.
 
 ### 2. Host data-dir mounted into VM
@@ -48,7 +67,7 @@ For Hermes' nested-sandbox feature to work, the rootless Docker socket (`/run/us
 
 ### 3. Codex auth mount
 
-`<data-dir>/.codex/auth.json` is mounted read-only into the Hermes container at `/home/hermes/.codex` (for setup-time import) and, when `agents codex skill-enable` is invoked, into the Hermes nested sandbox at `/root/.codex:ro`.
+`<data-dir>/.codex/auth.json` is mounted read-only into the Hermes container at `/home/hermes/.codex` (for setup-time import) and, when `agents codex skill-enable` is invoked, into the Hermes nested sandbox at `/codex:ro`. The derived sandbox image bakes in `ENV CODEX_HOME=/codex`, so the Codex CLI reads auth from there regardless of which user the sandbox image runs as (root, `pn`, `node`, …) — see [codex-integration.md](codex-integration.md).
 
 **Mitigations:**
 
@@ -58,7 +77,7 @@ For Hermes' nested-sandbox feature to work, the rootless Docker socket (`/run/us
 
 ### 4. Image source
 
-The CLI refuses any image whose `(registry, repo)` doesn't match `nousresearch/hermes-agent` or `openclaw/openclaw`. Registry-prefixed lookalikes (e.g. `ghcr.io/evil/nousresearch/hermes-agent`) are rejected by the parsed-tuple match. `hermes-agent.org` is rejected anywhere.
+The CLI refuses any image whose `(registry, repo)` isn't on the explicit allowlist in `compose.py`: the agent runtimes (`nousresearch/hermes-agent`, `openclaw/openclaw`), the OpenViking memory sidecar (`volcengine/openviking`), the self-hosted Firecrawl stack (`ghcr.io/firecrawl/firecrawl`, `ghcr.io/firecrawl/playwright-service`, `ghcr.io/firecrawl/nuq-postgres`, plus `redis` and `rabbitmq`), and the in-VM inference engines (`ollama/ollama`, `ghcr.io/ggml-org/llama.cpp`). Registry-prefixed lookalikes (e.g. `ghcr.io/evil/nousresearch/hermes-agent`) are rejected by the parsed-tuple match; `repo:tag` and `repo@sha256:…` digest-pin forms are both validated. `hermes-agent.org` is rejected anywhere. New sibling services require explicit allowlist additions.
 
 ### 5. Dashboard binding
 

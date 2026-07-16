@@ -4,7 +4,7 @@ This walks the full lifecycle for one Hermes agent and one OpenClaw agent: creat
 
 ## 1. The model
 
-One toolkit-managed *agent* = one Docker container = one Hermes (or OpenClaw) installation with its own `$HERMES_HOME` bind-mounted at `<data-dir>/<name>/.data/`. The host CLI never talks to the in-VM Docker daemon directly — it shells out to `multipass`.
+One toolkit-managed *agent* = one Docker container = one Hermes (or OpenClaw) installation with its own `$HERMES_HOME` bind-mounted at `<data-dir>/<name>/.data/`. The host CLI never talks to the in-VM Docker daemon directly — it goes through the configured VM backend (`multipass` by default; `libvirt` drives the VM via `virsh` + ssh/scp; `bare_metal` skips the VM entirely — see the [runbook](runbook.md)). This tutorial assumes the multipass default.
 
 ```
 host                       Multipass VM                     container
@@ -308,13 +308,18 @@ agents export --all
 agents export-cron install --time 02:30
 ```
 
+Heads-up on retention: the default backups dir is a rolling window — each export prunes the agent's archives down to the newest `[export_cron].keep_last` (default 14). Long-term history is your host backup's job; see the [runbook's retention section](runbook.md#backup-retention).
+
 ### 4.8 Upgrade
 
 ```bash
-agents upgrade coder --tag v1.2.4
+agents outdated                  # who's behind upstream? (read-only)
+agents upgrade coder             # bring coder to the latest upstream release
+agents upgrade coder --tag v1.2.4   # or pin an explicit tag
+agents upgrade coder --recreate  # force-refresh at the current pin (no version change)
 ```
 
-This takes both a multipass VM snapshot and a host-side `.tar.zst` of the agent's state before touching anything, then pulls, recreates, and runs `agents doctor`. If doctor fails, the toolkit auto-rolls-back. To roll back manually later:
+Bare `agents upgrade <name>` implicitly resolves the latest upstream tag from GitHub Releases (like `apt upgrade`) and no-ops — no snapshots, no downtime — when the agent is already there. When there is work to do, it takes both a VM snapshot and a host-side `.tar.zst` of the agent's state before touching anything, then pulls, recreates, runs `hermes config migrate`, and runs `agents doctor`. If doctor fails, the toolkit auto-rolls-back. An interrupted upgrade resumes on re-run from its journal, targeting the tags recorded when it began. To roll back manually later:
 
 ```bash
 agents rollback coder --yes

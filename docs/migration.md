@@ -40,8 +40,15 @@ agents outdated
 agents doctor
 
 # Capture the current Hermes data dir for posterity
-agents export coder              # → <data-dir>/backups/coder-<utc>.tar
+agents export coder              # → <data-dir>/backups/coder-<utc>.tar.zst
 ```
+
+Retention caveat: the default `backups/` dir is a rolling window —
+exports prune each agent's archives down to the newest
+`[export_cron].keep_last` (default 14). If `export-cron` keeps running
+during a multi-day soak, the step-0 archive can age out before cutover
+finishes. Export with `--to <dir>` (custom destinations are never
+pruned) or copy the archive somewhere durable.
 
 ### 1. Archive transcripts for context-seeding
 
@@ -165,7 +172,7 @@ agents stop coder
 # once coder2's app token is the only active subscriber.
 
 # After a week of soak, remove the old agent's container + data dir
-agents remove coder              # confirms; offers --export-first
+agents remove coder --export-first   # bags a final archive, confirms, removes
 ```
 
 The export archive from step 0 and the transcripts from step 1 are

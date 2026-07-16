@@ -34,8 +34,25 @@ agents export coder              # archive into <data-dir>/backups/
 ## Upgrades
 
 ```bash
-# Upgrade one agent. Auto-rollback on doctor failure.
+# Who's behind upstream? Read-only, no lock, safe any time.
+agents outdated                        # every agent: current / outdated / unknown
+agents outdated coder
+agents outdated --include-prerelease   # compare against beta/rc tags too
+
+# Bring one agent to the latest upstream release. Bare `upgrade`
+# implicitly resolves the newest tag from GitHub Releases (same
+# convention as `apt upgrade` / `brew upgrade`) and no-ops — no
+# snapshots, no downtime — when the agent is already there.
+agents upgrade coder
+
+# Pin an explicit tag instead (skips the upstream check). Auto-rollback
+# on doctor failure.
 agents upgrade coder --tag v1.2.4
+
+# Force-refresh at the current pin (no version change): full
+# snapshot + recreate + doctor cycle. Picks up env-file edits,
+# recovers a wedged container.
+agents upgrade coder --recreate
 
 # Upgrade everything; canary first
 agents upgrade --all --canary coder
@@ -49,7 +66,16 @@ agents rollback coder --snapshot coder-20260512T120000Z.tar.zst
 agents rollback coder --snapshot pre-upgrade-coder-20260512T120000Z
 ```
 
+Semantics worth knowing:
+
+- **Bare `agents upgrade <name>` needs network** (GitHub Releases API). It *refuses* — rather than silently no-oping — when the latest tag can't be resolved; pass `--tag <T>` to pin explicitly or `--recreate` to refresh at the current pin. `--latest` is the explicit spelling of the same default behavior.
+- **No-op short-circuit**: when the target tag equals the current pin (and `--recreate` isn't set), the command reports "already at X — nothing to do" and exits without snapshots or downtime.
+- **Successful upgrades re-baseline `defaults.<type>_image_tag`** in `~/.config/agents/config.toml`, so future `agents create` starts on the tag the upgrade just proved out. A failed-and-rolled-back upgrade never re-baselines.
+- **Interrupted upgrades resume faithfully.** The journal records the original old→new tags at begin time; re-running `agents upgrade <name>` completes *that* upgrade (skipping done phases) instead of re-resolving latest — a release that appeared upstream mid-crash can't silently retarget the resume.
+
 `agents upgrade` takes two snapshots before touching anything: a host-data `.tar.zst` at `<data-dir>/.upgrades/<name>-<utc>.tar.zst` and a multipass VM snapshot `pre-upgrade-<name>-<utc>`. Both are listed in the upgrade outcome JSON / human output. Legacy `.tar.gz` archives from pre-v0.1.1 versions still work for rollback.
+
+`agents doctor` also reports each agent's version: the `<agent>.version` check shows the running tag and warns when the compose pin and the live container's image diverge (e.g. a hand-edited compose file without a restart) — the fix is `agents restart <name>`.
 
 ## Recovery from a crashed operation
 
@@ -58,9 +84,15 @@ The CLI writes a phase journal under `<data-dir>/.journal/<op>-<name>-<utc>.json
 | op | phases (in order) |
 |---|---|
 | create | `data_dir_created` → `compose_updated` → `service_up` → `setup_done` (optional) |
-| remove | `container_stopped` → `compose_updated` → `data_dir_deleted` |
-| rename | `compose_updated` → `dir_renamed` → `container_recreated` |
-| upgrade | `host_data_snapshot` → `vm_snapshot` → `tag_pinned` → `pulled` → `recreated` → `doctor_passed` |
+| remove | `mounts_torn_down` → `container_stopped` → `compose_updated` → `data_dir_deleted` |
+| rename | `dir_renamed` → `compose_updated` → `container_recreated` |
+| upgrade | `host_data_snapshot` → `vm_snapshot` → `tag_pinned` → `pulled` → `recreated` → `config_migrated` → `doctor_passed` |
+
+Upgrade journals additionally record the old and new tags at begin
+time, so a resumed upgrade completes the original target instead of
+re-resolving "latest" (see the Upgrades section above). The
+`config_migrated` phase runs `hermes config migrate` inside the
+container (silent no-op for OpenClaw).
 
 `agents doctor` warns about any journal older than 24 hours. To clear a stuck journal once you've manually reconciled state, simply delete the file from `<data-dir>/.journal/`.
 
@@ -180,7 +212,16 @@ alert on warn+ exit codes. Currently checks:
 - `vm_reachable`, `mount_round_trip`, `user_docker_service`,
   `port_conflicts`, `data_dir_exists`, `codex_auth`, journals,
   per-agent container + docker-socket + hermes-doctor + codex-mount +
-  data-dir-access.
+  data-dir-access + version (compose-pin vs running-image drift) +
+  host_access (foreign-uid data dir with no host ACL).
+- `firecrawl_running` — warns when firecrawl is defined in compose and
+  agents are still wired to it but the containers aren't running (the
+  state a VM rebuild/migration leaves behind). A stack that's stopped
+  *and* unwired reads as a deliberate `agents firecrawl down` and
+  stays quiet.
+- `inference_ollama` / `inference_llamacpp` health probes and the
+  `arm64_emulation` check fire when the respective stacks are
+  installed.
 - `disk_space` — warn < 15% free, fail < 5%.
 - `vm_memory` — warn < 1 GiB available, fail < 256 MiB. Reads
   `MemAvailable` from `/proc/meminfo` (kernel's reclaim-aware
@@ -232,26 +273,42 @@ agents firecrawl destroy --yes     # nuke everything including postgres data
 
 What `up` does:
 
-1. Pulls each upstream floating tag (linux-amd64, latest, alpine,
-   3-management).
-2. Captures the resolved digest via `docker image inspect` and writes
-   it to `<data-dir>/.firecrawl-state.json`. The compose file only
+1. On first run (or with `--upgrade`): pulls each upstream floating
+   tag (linux-amd64, latest, alpine, 3-management) and captures the
+   resolved digest via `docker image inspect`. The compose file only
    ever references images by `@sha256:…` so the toolkit's "no
-   `:latest` outside canary" rule still holds.
-3. Generates the 5-service stack (`firecrawl-api`,
-   `firecrawl-playwright`, `firecrawl-redis`, `firecrawl-rabbitmq`,
-   `firecrawl-postgres`) and writes it into the project compose file
-   via the atomic flock-protected path.
-4. Populates `<data-dir>/.env` with `FIRECRAWL_API_KEY` (a generated
+   `:latest` outside canary" rule still holds. Subsequent `up`
+   invocations reuse the digests already in
+   `<data-dir>/.firecrawl-state.json` — no re-resolution. If the state
+   file is missing but the compose blocks survive (post-VM-migration),
+   the pins are reconstructed from the compose digests instead of
+   re-resolved.
+2. Populates `<data-dir>/.env` with `FIRECRAWL_API_KEY` (a generated
    `fc-self-hosted-...` placeholder — firecrawl-py insists on a
    non-empty key even when the server has auth disabled),
    `FIRECRAWL_API_URL=http://firecrawl-api:3002`, `BULL_AUTH_KEY`,
    `POSTGRES_PASSWORD`.
-5. Adds `FIRECRAWL_API_KEY` and `FIRECRAWL_API_URL` to every existing
-   Hermes agent's `terminal.env_passthrough` so the LLM's
+3. Generates the 5-service stack (`firecrawl-api`,
+   `firecrawl-playwright`, `firecrawl-redis`, `firecrawl-rabbitmq`,
+   `firecrawl-postgres`) and writes it into the project compose file
+   via the atomic flock-protected path.
+4. Persists the digest pins to `<data-dir>/.firecrawl-state.json`
+   (with a `degraded` marker) *before* starting anything, so a failed
+   start can't make the retry re-resolve floating tags — that would be
+   an unintended upgrade.
+5. `docker compose up -d` the five services (compose `depends_on`
+   healthchecks gate the api on rabbitmq + postgres being ready),
+   then probes `firecrawl-api` until it answers (bounded wait — the
+   api itself carries no healthcheck and `up -d` wouldn't wait on one
+   anyway).
+6. Only once the api is observably serving: clears the `degraded`
+   marker and adds `FIRECRAWL_API_KEY` / `FIRECRAWL_API_URL` to every
+   existing Hermes agent's `terminal.env_passthrough` so the LLM's
    shell-based diagnostics also see the config.
-6. `docker compose up -d` the five services. Healthchecks gate the
-   api on rabbitmq + postgres being ready.
+
+If the stack never comes up healthy, `up` exits 2 with the digests
+still pinned; re-running `agents firecrawl up` retries with the same
+pins and no agents are wired to a dead stack in the meantime.
 
 Agents created **after** `firecrawl up`: `agents create` checks
 firecrawl state during the `service_up` phase and adds the
@@ -517,16 +574,39 @@ A reasonable cadence:
 | Heavy SQLite write (kanban, sessions, insights) | `02:30,08:30,14:30,20:30` | ≤6 h. Each archive is a few MB; disk cost is trivial. |
 | You really care | `*/2` (every two hours, hand-installed) | The toolkit's HH:MM cron syntax doesn't express step intervals; use `crontab -e` and add `0 */2 * * * /usr/local/bin/agents --yes export --all` with the `# agents toolkit — managed export-cron entry` marker omitted (the toolkit won't manage it, but it won't trip over it either). |
 
-`agents export` shells out to `tar --zstd` for the agent's per-agent data dir. For Hermes, this captures `state.db`, `kanban.db`, sessions, skills, SOUL.md, config.yaml. Under `--data-dir-in-vm` the tar runs inside the VM (where the data lives on ext4), then the archive is `multipass transfer`-ed out to the host. tar isn't aware of SQLite WAL mid-flight, so each individual run is *near-consistent* rather than guaranteed crash-consistent — if a write is in progress at the exact moment tar copies the file, the captured `.db` may be missing the corresponding WAL entries. SQLite's recovery on next open handles most such cases, and frequent backups give you many fallback points.
+`agents export` runs `tar --zstd` over the agent's per-agent data dir **inside the VM** in both modes, then transfers the archive out to `<data-dir>/backups/`. For Hermes, this captures `state.db`, `kanban.db`, sessions, skills, SOUL.md, config.yaml. Under `--data-dir-in-vm` that's where the data lives anyway (ext4); in host-mount mode the tar runs VM-side as root because the agent's files are owned by a rootless-Docker subuid under mode 700 — a host-side walk can't read them and would silently produce archives containing only directory stubs. tar isn't aware of SQLite WAL mid-flight, so each individual run is *near-consistent* rather than guaranteed crash-consistent — if a write is in progress at the exact moment tar copies the file, the captured `.db` may be missing the corresponding WAL entries. SQLite's recovery on next open handles most such cases, and frequent backups give you many fallback points.
 
 For strict crash consistency on a specific agent, stop it first: `agents stop coder && agents export coder && agents start coder` — but that's rarely necessary in practice given how cheap the multi-archive approach is.
 
 ### Backup retention
 
-`agents export` only writes new archives — it never deletes old ones. Either:
+**`agents export` auto-prunes.** After every successful export to the
+default `<data-dir>/backups/` directory, the toolkit deletes that
+agent's oldest archives, keeping only the newest `keep_last`
+(default **14**). Only files matching the toolkit's own naming pattern
+(`<agent>-<utc>.tar.zst`, plus the legacy `.tar.gz` form) are pruning
+candidates — user files, other agents' archives, and the
+`.export-cron.log` are left alone. Archives written to a custom
+`--to <path>` destination are **never** pruned; custom destinations
+are user-managed.
 
-- Let your host backup tool (duplicity etc.) prune `<data-dir>/backups/` per its own retention policy.
-- Or add a separate cron entry like `find <data-dir>/backups -name '*.tar.zst' -mtime +14 -delete` to drop archives older than 14 days. The toolkit deliberately doesn't manage retention — that's the user's policy call.
+Tune the window in `~/.config/agents/config.toml`:
+
+```toml
+[export_cron]
+keep_last = 14    # ~3.5 days at the 4x/day schedule, 14 days at nightly
+```
+
+Set `keep_last = 0` to disable pruning entirely — unbounded history
+accumulates and cleanup becomes your job.
+
+**Duplicity interaction:** because the local window rolls, archives
+pruned locally will also age out of the *remote* per duplicity's own
+retention policy (`remove-older-than` and friends). The local
+`keep_last` window is in-flight protection between off-host backup
+runs; duplicity (or whatever host backup you run) is the long-history
+layer. Verify your duplicity retention settings independently — do
+not assume the toolkit keeps history for you.
 
 ## Rebuilding the VM (disk shrink, Ubuntu bump, wedged-VM recovery)
 
@@ -554,6 +634,7 @@ Phases (each idempotent, journaled at `<data-dir>/.journal/rebuild-<vm>-<utc>.js
 | `vm_initted` | fresh `agents vm init` with the (overridden or kept) sizing |
 | `state_restored` | `agents import` each agent from its staging archive |
 | `services_started` | `docker compose up -d` each service |
+| `sidecars_started` | re-up the project-scoped sidecar stacks (firecrawl, ollama, llama-cpp model services) — their containers lived only in the old VM's engine. Best-effort: a sidecar that fails to come back warns with the manual command and never fails the rebuild |
 
 If something crashes mid-rebuild, re-running `agents vm rebuild` picks up where the journal left off. The staging dir is left in place after success so you can inspect; safe to `rm -rf <data-dir>/.rebuild-staging/` once `agents doctor` is green.
 
@@ -596,6 +677,10 @@ llama.cpp is one-model-per-process by design, so each loaded model becomes its o
 ```bash
 # Pin the llama.cpp image (no service started yet)
 agents inference up llama-cpp
+
+# GGUF pulls use the running ollama container as the download host
+# (it has Python for huggingface_hub) — start it first if it isn't up
+agents inference up ollama
 
 # Download a GGUF from HuggingFace into <data-dir>/models/llama-cpp/
 agents model pull llama-cpp bartowski/Llama-3.2-3B-Instruct-GGUF:Llama-3.2-3B-Instruct-Q4_K_M.gguf
@@ -848,6 +933,20 @@ Not automated. If you want to switch backends on an existing deployment:
 4. `agents import <name> <archive>` for each archived agent.
 
 The host data dir is backend-agnostic; only the VM provisioning changes.
+
+**Sidecar stacks don't cross the migration.** Firecrawl (and in-VM
+inference) containers live only in the *old* VM's Docker engine; the
+compose blocks, project `.env`, postgres data, and per-agent wiring all
+survive in the data dir, but the containers themselves don't — wired
+agents' scrape calls fail connection-refused until you re-run
+`agents firecrawl up` (and `agents inference up …`) in the new VM.
+`agents doctor`'s `firecrawl_running` check flags exactly this state.
+`up` reuses the digests pinned in `.firecrawl-state.json`; if the
+state file was lost in the move, `up` reconstructs the pins from the
+`@sha256:…` digests still in the compose `firecrawl-*` service blocks
+rather than re-resolving upstream floating tags — a plain `up` never
+turns into an unintended upgrade. (`agents vm rebuild` automates all
+of this via its `sidecars_started` phase.)
 
 ### Known limitations
 

@@ -1,8 +1,12 @@
 # `agents` — multi-agent VM toolkit
 
-Host-side CLI for managing AI agents (Hermes Agent from Nous Research, OpenClaw) inside a single Multipass VM with rootless Docker.
+Host-side CLI for managing AI agents (Hermes Agent from Nous Research, OpenClaw) as rootless-Docker containers behind a pluggable isolation backend:
 
-Defense in depth: outer isolation = VM, inner isolation = one container per agent, host calls only `multipass`.
+- **`multipass`** (default, cross-platform) — a single Multipass VM; the host shells out only to `multipass`.
+- **`libvirt`** (Linux-only, experimental) — a KVM/qemu VM driven via `virt-install`/`virsh` + ssh/scp; enables GPU passthrough.
+- **`bare_metal`** (Linux-only, opt-in) — no VM at all; containers run on the host's rootless Docker. Forfeits the VM trust boundary — single-user dev workstations only.
+
+Defense in depth (VM backends): outer isolation = VM, inner isolation = one rootless container per agent. Pick the backend at `agents vm init --backend …`; see [docs/threat-model.md](docs/threat-model.md) for what each trades away and [docs/runbook.md](docs/runbook.md) for the libvirt / bare-metal setup guides.
 
 ## Quickstart
 
@@ -53,6 +57,33 @@ agents exec coder -- hermes shell
 
 For the full lifecycle — Hermes profiles vs. personalities vs. skills, connecting to Slack / WhatsApp / Mattermost / Matrix, and the OpenClaw flow — see [docs/tutorial.md](docs/tutorial.md). The [runbook](docs/runbook.md) is the cheat-sheet.
 
+## Command overview
+
+| Command | What it does | Docs |
+|---|---|---|
+| `agents vm init/start/stop/status/shell/resize/rebuild/snapshot/restore/destroy` | Runtime lifecycle for the selected backend (`--backend multipass\|libvirt\|bare_metal`) | [runbook](docs/runbook.md) |
+| `agents create/list/remove/rename` | Agent CRUD (`remove --export-first` bags a final archive) | [tutorial](docs/tutorial.md) |
+| `agents start/stop/restart/logs/exec/setup` | Day-2 container ops | [runbook](docs/runbook.md) |
+| `agents doctor [name]` | Layered health checks: VM, mount, docker, per-agent probes, version pin-drift | [runbook](docs/runbook.md) |
+| `agents outdated [name]` | Which agents are behind upstream (GitHub Releases) | [runbook](docs/runbook.md) |
+| `agents upgrade [name]` / `rollback` / `pull` | Bare `upgrade` implicitly targets the latest upstream tag; `--tag` pins, `--recreate` force-refreshes; two-snapshot rollback safety | [runbook](docs/runbook.md) |
+| `agents reseat <name>` | Rewrite an agent's compose block from the current template after toolkit upgrades | [runbook](docs/runbook.md) |
+| `agents fix-perms <name>` | Remediate the recurring `/opt/data` permission-drift bug (Hermes) | [runbook](docs/runbook.md) |
+| `agents export/import` / `export-cron` | Archives into `<data-dir>/backups/` + host-cron scheduling; auto-prunes to `keep_last` | [runbook](docs/runbook.md) |
+| `agents secret set/unset/list/clear` | Per-agent API keys via compose `env_file:` | [runbook](docs/runbook.md) |
+| `agents mount add/remove/list` | Share specific host folders with an agent (override-file volumes + ACLs) | [runbook](docs/runbook.md) |
+| `agents access grant/revoke/list` | Host-user ACLs on the agent's subuid-owned data dir | [runbook](docs/runbook.md) |
+| `agents codex login/refresh/status/skill-enable/skill-disable` | Toolkit-scoped Codex auth + the Codex coding skill | [codex-integration](docs/codex-integration.md) |
+| `agents memory list/enable/disable/status` | Managed memory backends for Hermes | [runbook](docs/runbook.md) |
+| `agents ollama configure/status/clear` | Point the toolkit at an **external** Ollama / OpenAI-compatible endpoint | [runbook](docs/runbook.md) |
+| `agents inference up/down/status/load/unload` | **In-VM** local inference (Ollama, llama.cpp) as sibling services | [runbook](docs/runbook.md) |
+| `agents model pull/list/rm/use` | Local model lifecycle + wiring an agent to an engine | [runbook](docs/runbook.md) |
+| `agents firecrawl up/down/status/logs/destroy` | Project-scoped self-hosted Firecrawl stack, digest-pinned | [runbook](docs/runbook.md) |
+| `agents conversations status/export` | Session stats + Markdown transcript export (Hermes) | [migration](docs/migration.md) |
+| `agents config` | Print the resolved toolkit config | — |
+
+Every command supports `--json` (machine-readable output) and `--yes` (skip confirmations); exit codes are 0 success / 1 user error / 2 runtime failure / 3 health-check failure.
+
 ## What lives where
 
 | Path | Role |
@@ -67,7 +98,8 @@ For the full lifecycle — Hermes profiles vs. personalities vs. skills, connect
 | `<data-dir>/<name>/.openviking/` | OpenViking sidecar's per-agent data (when `agents memory enable openviking <name>`). |
 | `<data-dir>/.codex/` | Toolkit-scoped Codex auth (separate from your personal `~/.codex/`). |
 | `<data-dir>/.memory-state/` | Per-agent record of which memory backend the toolkit enabled. |
-| `<data-dir>/backups/` | Output of `agents export`. Host backup (e.g. duplicity) picks this up. |
+| `<data-dir>/models/` | Local model weights for `agents inference` / `agents model` (Ollama blobs, llama.cpp GGUFs). |
+| `<data-dir>/backups/` | Output of `agents export`. Host backup (e.g. duplicity) picks this up. Pruned to the newest `keep_last` archives per agent. |
 | `~/.config/agents/config.toml` | CLI config — VM name, sizes, pinned image tags, captured VM runtime fields. |
 
 ## Codex paths
@@ -101,13 +133,13 @@ The toolkit does NOT run Ollama for you — you point it at one you already run 
 
 ## Backups
 
-The toolkit does not implement an internal backup engine. Pick a `<data-dir>` your existing host backup (duplicity, restic, borg, etc.) already covers, and you're done. `agents export <name>` produces a clean `hermes backup` archive in `<data-dir>/backups/` when you want a crash-consistent point-in-time.
+The toolkit does not implement an internal backup engine. Pick a `<data-dir>` your existing host backup (duplicity, restic, borg, etc.) already covers, and you're done. `agents export <name>` produces a clean archive in `<data-dir>/backups/` when you want a crash-consistent point-in-time. Note: the default backups dir is a **rolling window** — each export prunes that agent's archives down to the newest `[export_cron].keep_last` (default 14; `0` disables). Long-term history is your host backup's job — check its retention settings. See the [runbook's retention section](docs/runbook.md#backup-retention).
 
 ## Threat model
 
 See [docs/threat-model.md](docs/threat-model.md). Short version:
 
-- Outer trust boundary: the Multipass VM.
+- Outer trust boundary: the VM (multipass or libvirt backends). Under `--backend bare_metal` there is no VM — the host is the boundary, which is why bare-metal is opt-in for single-user workstations only.
 - Inner trust boundary: one Docker container per agent, rootless.
 - Hermes mounts the rootless Docker socket so it can spawn its nested sandbox — bounded by the rootless `ubuntu` user, not root.
 - Dashboards bind 127.0.0.1 only.
