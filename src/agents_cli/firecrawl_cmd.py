@@ -361,9 +361,9 @@ def up(
         ui.warn(
             "Agents created before the firecrawl interpolation entries "
             "landed in the compose fragment don't have firecrawl env in "
-            "their container yet. Hermes: `agents reseat <name>`. OpenClaw "
-            "has no reseat path — recreate via remove + create, or hand-edit "
-            "the compose service block.\nAffected:\n  " + "\n  ".join(stale)
+            "their container yet. Run `agents reseat <name>` (works for "
+            "both Hermes and OpenClaw) to regenerate the service block."
+            "\nAffected:\n  " + "\n  ".join(stale)
         )
     return payload
 
@@ -777,11 +777,10 @@ def _agents_with_stale_fragment(cfg: AgentsConfig) -> list[str]:
     were originally created before the firecrawl wiring landed in
     their respective service fragment templates.
 
-    Hermes agents are remediated with ``agents reseat <name>`` (which
-    rewrites the service block from the current template, preserving
-    port/tag/env_file/depends_on additions); OpenClaw doesn't have a
-    reseat path yet, so its stale agents need ``agents remove`` +
-    ``agents create`` or a manual compose edit.
+    Stale agents of either type are remediated with ``agents reseat
+    <name>``, which rewrites the service block from the current
+    template, preserving port/tag/env_file/depends_on/extra-volume
+    additions.
 
     Auto-reseating from within ``firecrawl up`` would force-recreate
     the agent's container and interrupt its gateway — too disruptive

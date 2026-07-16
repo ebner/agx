@@ -271,9 +271,8 @@ def test_up_flags_stale_openclaw_fragments(
 ) -> None:
     """An OpenClaw agent created before this auto-wire change has an
     environment block missing the firecrawl entries. ``firecrawl up``
-    must surface it as stale (alongside any Hermes stale agents) so
-    the user knows to recreate it — there's no ``agents reseat`` for
-    OpenClaw yet.
+    must surface it as stale (alongside any Hermes stale agents) and
+    point the user at ``agents reseat`` — which covers OpenClaw too.
     """
     mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
     create(name="personal", agent_type="openclaw", config_path=saved_config)
@@ -286,10 +285,15 @@ def test_up_flags_stale_openclaw_fragments(
     compose.write_compose_atomically(cfg, doc)
 
     mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+    warn_spy = mocker.spy(firecrawl_cmd.ui, "warn")
     payload = firecrawl_cmd.up(config_path=saved_config)
 
     assert "personal" in payload["stale_agents"]
     assert "personal" not in payload["wired_agents"]
+    stale_warnings = [c.args[0] for c in warn_spy.call_args_list if "personal" in c.args[0]]
+    assert stale_warnings, "expected a stale-fragment warning naming the agent"
+    assert any("agents reseat" in w for w in stale_warnings)
+    assert not any("no reseat path" in w for w in stale_warnings)
 
 
 def test_up_is_idempotent_does_not_regenerate_digests(

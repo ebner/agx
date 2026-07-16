@@ -271,7 +271,7 @@ def test_reseat_runs_chown_chmod_for_hermes(
     assert "10000:10000" in " ".join(chown_calls[0].args)
 
 
-# ---------- non-Hermes path ----------
+# ---------- OpenClaw path ----------
 
 
 @pytest.fixture
@@ -281,6 +281,79 @@ def with_personal_openclaw(
     mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
     create(name="personal", agent_type="openclaw", config_path=saved_config)
     return saved_config
+
+
+@pytest.fixture
+def with_personal_stale_customized(with_personal_openclaw: Path, cfg: AgentsConfig) -> Path:
+    """Simulate an OpenClaw agent created before the firecrawl env entries
+    landed in the fragment template, that the user ALSO customized: pinned
+    an older tag, moved the published port, added a second env_file entry,
+    a depends_on addition, and a hand mount in the main compose.
+    """
+    doc = compose.read_compose_doc(cfg)
+    svc = doc["services"]["openclaw-personal"]
+    env = svc.get("environment") or {}
+    env.pop("FIRECRAWL_API_KEY", None)
+    env.pop("FIRECRAWL_BASE_URL", None)
+    svc["image"] = "openclaw/openclaw:0.0.9"
+    svc["ports"] = ["127.0.0.1:19999:18789"]
+    svc["env_file"] = ["./personal/.env", "./shared.env"]
+    svc["depends_on"] = ["some-sidecar"]
+    svc["volumes"] = [*svc["volumes"], "/home/ubuntu/notes:/home/node/notes:ro"]
+    compose.write_compose_atomically(cfg, doc)
+    return with_personal_openclaw
+
+
+def test_reseat_openclaw_preserves_customizations_and_gains_new_keys(
+    with_personal_stale_customized: Path, cfg: AgentsConfig, mocker: Any
+) -> None:
+    """The golden OpenClaw scenario: a stale, customized block is rebuilt
+    from the current template — gaining the fragment's new keys (the
+    firecrawl env interpolation entries) — while every user knob (port,
+    pinned tag, extra env_file, depends_on addition, extra volume)
+    survives, and stock entries are not duplicated.
+    """
+    mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())
+    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+
+    agents_cmd.reseat("personal", yes=True, config_path=with_personal_stale_customized)
+
+    doc = compose.read_compose_doc(cfg)
+    svc = doc["services"]["openclaw-personal"]
+    # Gains the current fragment's firecrawl interpolation entries.
+    assert svc["environment"]["FIRECRAWL_API_KEY"] == "${FIRECRAWL_API_KEY:-}"
+    assert svc["environment"]["FIRECRAWL_BASE_URL"] == "${FIRECRAWL_API_URL:-}"
+    # Preserves the user knobs.
+    assert svc["image"] == "openclaw/openclaw:0.0.9"
+    assert svc["ports"] == ["127.0.0.1:19999:18789"]
+    assert svc["env_file"] == ["./personal/.env", "./shared.env"]
+    assert "some-sidecar" in svc["depends_on"]
+    volumes = list(svc["volumes"])
+    assert "/home/ubuntu/notes:/home/node/notes:ro" in volumes
+    # Stock volumes stay, exactly once each.
+    assert "./personal/.openclaw:/home/node/.openclaw" in volumes
+    assert "./personal/workspace:/home/node/.openclaw/workspace" in volumes
+    assert len(volumes) == 3
+
+
+def test_reseat_openclaw_stock_is_clean_template_rewrite(
+    with_personal_openclaw: Path, cfg: AgentsConfig, mocker: Any
+) -> None:
+    """An uncustomized OpenClaw agent reseats to exactly what the current
+    template would produce — no leftovers, no additions.
+    """
+    mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())
+    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+
+    pre = compose.read_compose_doc(cfg)
+    port = agents_cmd._extract_host_port(pre["services"]["openclaw-personal"])
+
+    agents_cmd.reseat("personal", yes=True, config_path=with_personal_openclaw)
+
+    doc = compose.read_compose_doc(cfg)
+    assert doc["services"]["openclaw-personal"] == compose.openclaw_service_fragment(
+        name="personal", port=port, image_tag="0.1.0"
+    )
 
 
 def test_reseat_openclaw_skips_chown_chmod(
@@ -297,6 +370,52 @@ def test_reseat_openclaw_skips_chown_chmod(
 
     assert not any("chown" in c.args and "/opt/data" in c.args for c in in_vm_spy.call_args_list)
     assert not any("chmod" in c.args and "/opt/data" in c.args for c in in_vm_spy.call_args_list)
+
+
+def test_reseat_openclaw_skips_cont_init_hook(
+    with_personal_openclaw: Path, cfg: AgentsConfig, mocker: Any
+) -> None:
+    """The s6 cont-init perms hook is Hermes-only: OpenClaw reseat must
+    neither materialize the script nor mount it into the container.
+    """
+    mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())
+    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    cont_init_spy = mocker.spy(compose, "ensure_cont_init_script")
+
+    agents_cmd.reseat("personal", yes=True, config_path=with_personal_openclaw)
+
+    assert not cont_init_spy.called
+    doc = compose.read_compose_doc(cfg)
+    volumes = doc["services"]["openclaw-personal"]["volumes"]
+    assert not any("cont-init" in v for v in volumes)
+
+
+def test_reseat_openclaw_aborts_without_yes(
+    with_personal_openclaw: Path, cfg: AgentsConfig, mocker: Any
+) -> None:
+    """Same confirmation semantics as the Hermes path: no --yes and a
+    declined prompt means no compose mutation and no recreate.
+    """
+    mocker.patch("agents_cli.ui.confirm", return_value=False)
+    pre = compose.read_compose_doc(cfg)["services"]["openclaw-personal"]
+
+    with pytest.raises(UserError, match="aborted by user"):
+        agents_cmd.reseat("personal", yes=False, config_path=with_personal_openclaw)
+
+    post = compose.read_compose_doc(cfg)["services"]["openclaw-personal"]
+    assert pre == post
+
+
+def test_reseat_openclaw_yes_skips_confirmation(
+    with_personal_openclaw: Path, cfg: AgentsConfig, mocker: Any
+) -> None:
+    mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())
+    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    confirm_spy = mocker.patch("agents_cli.ui.confirm", return_value=False)
+
+    agents_cmd.reseat("personal", yes=True, config_path=with_personal_openclaw)
+
+    assert not confirm_spy.called
 
 
 # ---------- refusal cases ----------
@@ -349,3 +468,139 @@ def test_extract_image_tag_works() -> None:
 def test_extract_image_tag_refuses_no_colon() -> None:
     with pytest.raises(UserError, match="no parseable image tag"):
         agents_cmd._extract_image_tag({"image": "nousresearch/hermes-agent"})
+
+
+# ---------- preserve classifier ----------
+
+
+def test_reseat_preserves_extra_user_volume_hermes(
+    with_coder_stale_fragment: Path,
+    cfg: AgentsConfig,
+    mocker: Any,
+    vm_fs_mocks: dict[str, Any],
+) -> None:
+    """A hand-added volume in the main compose survives Hermes reseat too
+    (same classifier as OpenClaw); stock volumes are not duplicated.
+    """
+    mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())
+    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_stub_in_vm(vm_fs_mocks, "1000"))
+
+    doc = compose.read_compose_doc(cfg)
+    svc = doc["services"]["hermes-coder"]
+    port = agents_cmd._extract_host_port(svc)
+    svc["volumes"] = [*svc["volumes"], "/home/ubuntu/notes:/home/hermes/notes:ro"]
+    compose.write_compose_atomically(cfg, doc)
+
+    agents_cmd.reseat("coder", yes=True, config_path=with_coder_stale_fragment)
+
+    doc = compose.read_compose_doc(cfg)
+    volumes = list(doc["services"]["hermes-coder"]["volumes"])
+    stock_volumes = compose.hermes_service_fragment(
+        name="coder", cfg=cfg, port=port, image_tag="v1.0.0"
+    )["volumes"]
+    assert volumes == [*stock_volumes, "/home/ubuntu/notes:/home/hermes/notes:ro"]
+
+
+def test_carry_user_additions_supersedes_reshaped_stock_volume() -> None:
+    """A template-era variant of a stock volume (same container target,
+    different source) is superseded by the fresh stock entry — never
+    duplicated, since docker refuses duplicate mount targets. The user's
+    own mounts (targets the stock fragment doesn't claim) survive.
+    """
+    new_fragment: dict[str, object] = {
+        "volumes": ["./coder/.data:/opt/data", "./.toolkit/x:/etc/cont-init.d/99:ro"]
+    }
+    existing: dict[str, object] = {
+        "volumes": [
+            "./coder/old-data:/opt/data",  # reshaped stock entry: stale form loses
+            "/home/ubuntu/notes:/notes:ro",  # user addition: preserved
+        ]
+    }
+
+    agents_cmd._carry_user_additions(new_fragment, existing)
+
+    assert new_fragment["volumes"] == [
+        "./coder/.data:/opt/data",
+        "./.toolkit/x:/etc/cont-init.d/99:ro",
+        "/home/ubuntu/notes:/notes:ro",
+    ]
+
+
+def test_carry_user_additions_dedups_ports_by_host_port() -> None:
+    """A bind-address drift of the stock port entry doesn't produce a
+    second binding on the same host port; genuinely extra published
+    ports survive.
+    """
+    new_fragment: dict[str, object] = {"ports": ["127.0.0.1:8642:8642"]}
+    existing: dict[str, object] = {"ports": ["0.0.0.0:8642:8642", "127.0.0.1:9000:9000"]}
+
+    agents_cmd._carry_user_additions(new_fragment, existing)
+
+    assert new_fragment["ports"] == ["127.0.0.1:8642:8642", "127.0.0.1:9000:9000"]
+
+
+def test_carry_user_additions_keeps_udp_twin_of_stock_tcp_port() -> None:
+    """Port identity is (host port, protocol): TCP and UDP can publish
+    the same numeric host port simultaneously, so a user's UDP twin of
+    the stock TCP port is an addition and survives. An explicit ``/tcp``
+    variant of the stock entry still dedupes to the stock form.
+    """
+    new_fragment: dict[str, object] = {"ports": ["127.0.0.1:8642:8642"]}
+    existing: dict[str, object] = {
+        "ports": [
+            "0.0.0.0:8642:8642/tcp",  # same protocol as stock: stock wins
+            "127.0.0.1:8642:9000/udp",  # UDP twin: preserved
+        ]
+    }
+
+    agents_cmd._carry_user_additions(new_fragment, existing)
+
+    assert new_fragment["ports"] == ["127.0.0.1:8642:8642", "127.0.0.1:8642:9000/udp"]
+
+
+def test_reseat_preserves_udp_twin_of_stock_port(
+    with_coder_stale_fragment: Path,
+    cfg: AgentsConfig,
+    mocker: Any,
+    vm_fs_mocks: dict[str, Any],
+) -> None:
+    """Full-flow regression: an existing block carrying both the stock
+    TCP publication and a user UDP publication on the same host port
+    keeps both after reseat, each exactly once.
+    """
+    mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())
+    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_stub_in_vm(vm_fs_mocks, "1000"))
+
+    doc = compose.read_compose_doc(cfg)
+    svc = doc["services"]["hermes-coder"]
+    port = agents_cmd._extract_host_port(svc)
+    udp_entry = f"127.0.0.1:{port}:9000/udp"
+    svc["ports"] = [*svc["ports"], udp_entry]
+    compose.write_compose_atomically(cfg, doc)
+
+    agents_cmd.reseat("coder", yes=True, config_path=with_coder_stale_fragment)
+
+    doc = compose.read_compose_doc(cfg)
+    assert list(doc["services"]["hermes-coder"]["ports"]) == [
+        f"127.0.0.1:{port}:8642",
+        udp_entry,
+    ]
+
+
+def test_carry_user_additions_preserves_unrecognized_shapes_wholesale() -> None:
+    """Shapes the classifier can't additively diff (dict-form depends_on,
+    string-form env_file) are preserved untouched — when in doubt,
+    preserve.
+    """
+    new_fragment: dict[str, object] = {"env_file": ["./coder/.env"]}
+    existing: dict[str, object] = {
+        "depends_on": {"openviking-coder": {"condition": "service_started"}},
+        "env_file": "./custom.env",
+    }
+
+    agents_cmd._carry_user_additions(new_fragment, existing)
+
+    assert new_fragment["depends_on"] == {"openviking-coder": {"condition": "service_started"}}
+    assert new_fragment["env_file"] == "./custom.env"

@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import re
 import shutil
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 from agents_cli import compose, compose_runner, mp, ui
@@ -705,13 +705,16 @@ def reseat(
     env var is added, a volume entry changes), but agents created before
     the change keep their stale service block forever. ``reseat`` rewrites
     just that block to match what ``agents create`` would produce today —
-    preserving the port, image tag, env_file additions (per-agent secrets
-    file), and depends_on additions (e.g. an OpenViking sidecar) so the
-    user doesn't lose those.
+    preserving the published host port(s), the pinned image tag, env_file
+    additions (per-agent secrets file), depends_on additions (e.g. an
+    OpenViking sidecar), and any volumes the stock fragment doesn't claim,
+    so the user doesn't lose those. Works for both agent types.
 
-    For Hermes agents, also runs the ``fix-perms`` chown/chmod dance after
-    the recreate, since a fragment that didn't include ``HERMES_UID`` will
-    have left ``/opt/data`` owned by uid 10000.
+    For Hermes agents, also materializes the cont-init perms hook and runs
+    the ``fix-perms`` chown/chmod dance after the recreate, since a
+    fragment that didn't include ``HERMES_UID`` will have left
+    ``/opt/data`` owned by uid 10000. OpenClaw skips those Hermes-only
+    steps (no cont-init hook, no install-path chown, no HERMES_UID dance).
 
     Force-recreates the container so the new fragment takes effect on the
     next entrypoint pass.
@@ -742,9 +745,11 @@ def reseat(
         # Pull out the values worth preserving from the existing entry.
         port = _extract_host_port(existing)
         tag = _extract_image_tag(existing)
-        preserved_env_file = existing.get("env_file")
-        preserved_depends_on = existing.get("depends_on")
 
+        # Built with the preserved name/port/tag, the fresh fragment
+        # doubles as the diff baseline: its entries are exactly what a
+        # stock block would carry today, so anything in the existing
+        # block beyond it is a user/toolkit addition worth keeping.
         if agent_type == "hermes":
             new_fragment: dict[str, object] = compose.hermes_service_fragment(
                 name=name, cfg=cfg, port=port, image_tag=tag
@@ -752,12 +757,7 @@ def reseat(
         else:
             new_fragment = compose.openclaw_service_fragment(name=name, port=port, image_tag=tag)
 
-        # Re-attach the additions the user/toolkit layered on top of the
-        # base fragment (secrets file, sidecar depends_on, etc).
-        if preserved_env_file is not None:
-            new_fragment["env_file"] = preserved_env_file
-        if preserved_depends_on is not None:
-            new_fragment["depends_on"] = preserved_depends_on
+        _carry_user_additions(new_fragment, existing)
 
         ui.progress(f"rewriting {svc}'s compose service block from the current template...")
         services[svc] = new_fragment
@@ -830,6 +830,88 @@ def _extract_image_tag(service: dict[str, object]) -> str:
     if not isinstance(image, str) or ":" not in image:
         raise UserError(f"existing service has no parseable image tag (got {image!r})")
     return image.rsplit(":", 1)[1]
+
+
+def _carry_user_additions(new_fragment: dict[str, object], existing: dict[str, object]) -> None:
+    """Re-attach additions the user/toolkit layered onto the stock block:
+    extra env_file entries (secrets multi-file setups), depends_on
+    additions (sidecars), extra published ports, and hand-added volumes.
+
+    ``new_fragment`` — freshly built from the current template — is the
+    diff baseline; existing entries the stock list doesn't claim are
+    classified as additions and appended (when in doubt, preserve).
+    Ports diff by host port and volumes by container target, so a
+    template evolution that reshapes a stock entry (new source path, new
+    mount options) supersedes the stale variant instead of producing a
+    duplicate binding compose would refuse.
+    """
+    _merge_list_additions(new_fragment, existing, "env_file")
+    _merge_list_additions(new_fragment, existing, "depends_on")
+    _merge_list_additions(new_fragment, existing, "ports", entry_identity=_port_identity)
+    _merge_list_additions(new_fragment, existing, "volumes", entry_identity=_volume_identity)
+
+
+def _merge_list_additions(
+    new_fragment: dict[str, object],
+    existing: dict[str, object],
+    key: str,
+    entry_identity: Callable[[object], object] = lambda entry: entry,
+) -> None:
+    """Merge ``existing[key]``'s additions into ``new_fragment[key]``.
+
+    Stock entries come first and win for any shared identity; existing
+    entries whose identity the stock list doesn't claim are appended in
+    their original order. Shapes the classifier can't diff (string-form
+    env_file, dict-form depends_on) are preserved wholesale rather than
+    dropped.
+    """
+    old = existing.get(key)
+    if old is None:
+        return
+    stock = new_fragment.get(key)
+    if not isinstance(old, list) or not (stock is None or isinstance(stock, list)):
+        new_fragment[key] = old
+        return
+    stock_list: list[object] = list(stock) if isinstance(stock, list) else []
+    # A list (not a set) so unhashable long-form entries still compare.
+    stock_ids = [entry_identity(entry) for entry in stock_list]
+    additions = [entry for entry in old if entry_identity(entry) not in stock_ids]
+    if stock_list or additions:
+        new_fragment[key] = stock_list + additions
+
+
+def _port_identity(entry: object) -> object:
+    """Identity of a ``ports:`` entry — ``(host port, protocol)``. Two
+    published entries collide iff they claim the same host port on the
+    same protocol, regardless of bind address (``127.0.0.1:8642:8642``
+    vs ``8642:8642``). TCP and UDP can publish the same numeric host
+    port simultaneously, so a user's UDP twin of the stock TCP port
+    (``127.0.0.1:8642:9000/udp``) is an addition, not a duplicate.
+    """
+    if isinstance(entry, str):
+        spec, _, proto = entry.partition("/")
+        parts = spec.split(":")
+        if len(parts) >= 2:
+            return (parts[-2], proto or "tcp")
+    return entry
+
+
+def _volume_identity(entry: object) -> object:
+    """Identity of a ``volumes:`` entry — its container-side target.
+    Docker refuses duplicate mount targets, so when a template evolution
+    reshapes a stock entry, the fresh form must supersede the stale one
+    rather than sit next to it.
+    """
+    if isinstance(entry, str):
+        parts = entry.split(":")
+        # "src:target" / "src:target:opts" — or a bare anonymous-volume
+        # target with no colon at all.
+        return parts[1] if len(parts) >= 2 else parts[0]
+    if isinstance(entry, dict):
+        target = entry.get("target")
+        if target is not None:
+            return target
+    return entry
 
 
 # ---------- shared journal walker ----------
