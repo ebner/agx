@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import sys
 import textwrap
@@ -597,14 +598,33 @@ def _check_agent_version(
     running_image = inspect.stdout.strip()
     running_tag = running_image.split(":", 1)[1] if ":" in running_image else "?"
 
+    # Hermes carries a dual versioning scheme: the image tags / GitHub
+    # release tags are calver (v2026.7.7.2) while the app itself also
+    # has a semver identity (v0.18.2). `hermes --version` prints both —
+    # "Hermes Agent v0.18.2 (2026.7.7.2) · upstream 9de9c25f" — so
+    # surface the semver alongside the tag. Best-effort: any exec or
+    # parse failure (older image, container mid-restart) just omits it.
+    semver = ""
+    if agent_type == "hermes":
+        ver = mp.exec_in_vm(
+            cfg.vm.name,
+            *_compose_exec_in_vm_argv(cfg, svc, "hermes", "--version", no_tty=True),
+            check=False,
+        )
+        if ver.returncode == 0:
+            m = re.search(r"Hermes Agent (v\d+\.\d+(?:\.\d+)?)\s*\(", ver.stdout)
+            if m:
+                semver = m.group(1)
+    suffix = f" (app {semver})" if semver else ""
+
     if running_tag == pinned_tag:
-        report.add(f"{agent_name}.version", "ok", running_tag)
+        report.add(f"{agent_name}.version", "ok", f"{running_tag}{suffix}")
     else:
         report.add(
             f"{agent_name}.version",
             "warn",
             (
-                f"container running {running_tag} but compose pins {pinned_tag} — "
+                f"container running {running_tag}{suffix} but compose pins {pinned_tag} — "
                 f"run `agents restart {agent_name}` to apply the pinned version"
             ),
         )

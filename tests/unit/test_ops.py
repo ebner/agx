@@ -922,6 +922,83 @@ def test_doctor_version_check_reports_tag_when_running(
     assert check.detail == "v1.0.0"
 
 
+def test_doctor_version_check_shows_hermes_semver_alongside_tag(
+    with_coder: Path, cfg: AgentsConfig, mocker
+) -> None:
+    """Hermes has a dual versioning scheme — calver image tags
+    (v2026.7.7.2) and an app semver (v0.18.2). `hermes --version`
+    prints both; the doctor detail surfaces the semver next to the
+    tag so the user can correlate with upstream release notes."""
+    _stub_minimal_doctor(mocker)
+    mocker.patch(
+        "agents_cli.compose_runner.ps",
+        return_value=_ok(json.dumps([{"Service": "hermes-coder", "State": "running"}])),
+    )
+
+    def runner(vm_name: str, *cmd: str, check: bool = True):
+        joined = " ".join(cmd)
+        if "is-active" in joined:
+            return _ok("active\n")
+        if "stat" in cmd and "/opt/data" in cmd:
+            return _ok("755 1000\n")
+        if cmd[:2] == ("cat", "/proc/meminfo"):
+            return _ok("MemTotal: 8388608 kB\nMemAvailable: 4194304 kB\n")
+        if cmd[:1] == ("nproc",):
+            return _ok("4\n")
+        if cmd[:2] == ("cat", "/proc/loadavg"):
+            return _ok("0.42 0.31 0.25 1/123 4567\n")
+        if cmd[:3] == ("docker", "inspect", "hermes-coder") and "{{.Config.Image}}" in cmd:
+            return _ok("nousresearch/hermes-agent:v1.0.0\n")
+        if "hermes" in cmd and "--version" in cmd:
+            return _ok("Hermes Agent v0.18.2 (2026.7.7.2) · upstream 9de9c25f\n")
+        return _ok("ok\n")
+
+    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=runner)
+
+    report = ops.doctor(config_path=with_coder)
+    [check] = [c for c in report.checks if c.name == "coder.version"]
+    assert check.status == "ok"
+    assert check.detail == "v1.0.0 (app v0.18.2)"
+
+
+def test_doctor_version_check_omits_semver_when_probe_fails(
+    with_coder: Path, cfg: AgentsConfig, mocker
+) -> None:
+    """Older images (or a container mid-restart) may not answer
+    `hermes --version` — the detail must degrade to the plain tag,
+    never block or garble the check."""
+    _stub_minimal_doctor(mocker)
+    mocker.patch(
+        "agents_cli.compose_runner.ps",
+        return_value=_ok(json.dumps([{"Service": "hermes-coder", "State": "running"}])),
+    )
+
+    def runner(vm_name: str, *cmd: str, check: bool = True):
+        joined = " ".join(cmd)
+        if "is-active" in joined:
+            return _ok("active\n")
+        if "stat" in cmd and "/opt/data" in cmd:
+            return _ok("755 1000\n")
+        if cmd[:2] == ("cat", "/proc/meminfo"):
+            return _ok("MemTotal: 8388608 kB\nMemAvailable: 4194304 kB\n")
+        if cmd[:1] == ("nproc",):
+            return _ok("4\n")
+        if cmd[:2] == ("cat", "/proc/loadavg"):
+            return _ok("0.42 0.31 0.25 1/123 4567\n")
+        if cmd[:3] == ("docker", "inspect", "hermes-coder") and "{{.Config.Image}}" in cmd:
+            return _ok("nousresearch/hermes-agent:v1.0.0\n")
+        if "hermes" in cmd and "--version" in cmd:
+            return _fail("no such option: --version")
+        return _ok("ok\n")
+
+    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=runner)
+
+    report = ops.doctor(config_path=with_coder)
+    [check] = [c for c in report.checks if c.name == "coder.version"]
+    assert check.status == "ok"
+    assert check.detail == "v1.0.0"
+
+
 def test_doctor_version_check_warns_on_pin_vs_runtime_drift(
     with_coder: Path, cfg: AgentsConfig, mocker
 ) -> None:
