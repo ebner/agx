@@ -579,6 +579,9 @@ def test_rollback_locks_stops_restores_and_recreates_in_order(
         destructive=True,
         yes=True,
         config_path=with_coder,
+        # emit=False: rollback owns the command's single stdout object;
+        # the restore helper must not land a second one mid-rollback.
+        emit=False,
     )
     # The raw un-orchestrated VM calls must be gone.
     raw_stop.assert_not_called()
@@ -1215,3 +1218,47 @@ def test_pull_with_name_pulls_one(with_coder: Path, mocker) -> None:
     upgrades.pull("coder", config_path=with_coder)
     args, _ = spy.call_args
     assert "hermes-coder" in args
+
+
+def test_pull_all_narrates_start_and_end(with_coder: Path, mocker) -> None:
+    """Image pulls run for minutes on a cold cache; a silent terminal
+    reads as a hang. Both paths narrate start + completion via
+    ui.progress (stderr) while stdout keeps its single result object."""
+    mocker.patch("agents_cli.compose_runner.pull", return_value=_ok())
+    progress = mocker.patch("agents_cli.ui.progress")
+    emit = mocker.patch("agents_cli.ui.emit")
+
+    upgrades.pull(config_path=with_coder)
+
+    lines = [c.args[0] for c in progress.call_args_list]
+    assert any("pulling images for all services" in ln for ln in lines)
+    assert any("pull complete" in ln for ln in lines)
+    emit.assert_called_once()
+
+
+def test_pull_single_agent_narrates_start_and_end(with_coder: Path, mocker) -> None:
+    mocker.patch("agents_cli.compose_runner.pull", return_value=_ok())
+    progress = mocker.patch("agents_cli.ui.progress")
+    emit = mocker.patch("agents_cli.ui.emit")
+
+    upgrades.pull("coder", config_path=with_coder)
+
+    lines = [c.args[0] for c in progress.call_args_list]
+    assert any(ln.startswith("pulling hermes-coder") for ln in lines)
+    assert any(ln.startswith("pulled hermes-coder") for ln in lines)
+    emit.assert_called_once()
+
+
+def test_vm_snapshot_suppresses_take_snapshot_emit(
+    with_coder: Path, mocker, cfg: AgentsConfig
+) -> None:
+    """The upgrade state machine narrates the snapshot phase itself via
+    ui.progress; take_snapshot's own emit would put a second JSON object
+    on stdout mid-upgrade."""
+    take = mocker.patch("agents_cli.vm.take_snapshot", return_value="pre-upgrade-coder-x")
+
+    name = upgrades._vm_snapshot(cfg, "coder")
+
+    assert name == "pre-upgrade-coder-x"
+    assert take.call_args.kwargs["emit"] is False
+    assert take.call_args.kwargs["yes"] is True

@@ -41,6 +41,7 @@ def init(
     backend: str = "multipass",
     gpu: list[str] | None = None,
     config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH,
+    emit: bool = True,
 ) -> None:
     """Idempotently provision the agents VM.
 
@@ -59,6 +60,11 @@ def init(
     IDs to pass through on libvirt — ``["auto"]`` triggers vendor-
     aware autodetect (NVIDIA / AMD / Intel) and fills the config with
     every GPU bound to vfio-pci.
+
+    ``emit=False`` suppresses the final "ready" :func:`ui.emit` for
+    composite callers (``vm rebuild``) that own the command's single
+    stdout object; stage narration still goes to stderr via
+    ``ui.progress``.
     """
     cfg = _load_or_default_config(config_path)
 
@@ -141,10 +147,9 @@ def init(
     cfg_mod.save(cfg, config_path)
 
     if backend != "bare_metal" and not _vm_exists(cfg.vm.name):
-        ui.emit(
-            {"action": "vm_launch", "vm": cfg.vm.name, "image": image},
-            human=f"launching VM {cfg.vm.name!r} ({image}) — this can take a few minutes...",
-        )
+        # Narration, not a result: stdout carries exactly one object per
+        # command (the final "ready" payload below).
+        ui.progress(f"launching VM {cfg.vm.name!r} ({image}) — this can take a few minutes...")
         try:
             mp.launch(
                 cfg.vm.name,
@@ -190,6 +195,10 @@ def init(
 
         status, boot_stdout, boot_stderr = bm.verify_bootstrap(cfg.paths.host_data_dir)
     else:
+        ui.progress(
+            "provisioning rootless Docker in the VM — several minutes on first run, "
+            "seconds when already bootstrapped..."
+        )
         status, boot_stdout, boot_stderr = _run_bootstrap(cfg.vm.name)
     if not status.is_ok():
         # Dump the captured streams so the user sees what actually failed.
@@ -257,17 +266,18 @@ def init(
             f"  hermes image: nousresearch/hermes-agent:{cfg.defaults.hermes_image_tag}\n"
             f"  openclaw image: openclaw/openclaw:{cfg.defaults.openclaw_image_tag}"
         )
-    ui.emit(
-        {
-            "vm": cfg.vm.name,
-            "backend": backend,
-            "data_dir": str(cfg.paths.host_data_dir),
-            "docker_socket": cfg.vm_runtime.docker_socket_path,
-            "hermes_image_tag": cfg.defaults.hermes_image_tag,
-            "openclaw_image_tag": cfg.defaults.openclaw_image_tag,
-        },
-        human=human_ready,
-    )
+    if emit:
+        ui.emit(
+            {
+                "vm": cfg.vm.name,
+                "backend": backend,
+                "data_dir": str(cfg.paths.host_data_dir),
+                "docker_socket": cfg.vm_runtime.docker_socket_path,
+                "hermes_image_tag": cfg.defaults.hermes_image_tag,
+                "openclaw_image_tag": cfg.defaults.openclaw_image_tag,
+            },
+            human=human_ready,
+        )
 
 
 # ---------- start / stop / shell / status ----------
@@ -444,6 +454,7 @@ def take_snapshot(
     comment: str | None = None,
     yes: bool = False,
     config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH,
+    emit: bool = True,
 ) -> str:
     """Take a VM snapshot.
 
@@ -455,7 +466,10 @@ def take_snapshot(
     inside get a clean shutdown via the libvirt ACPI signal +
     restart afterwards.
 
-    ``yes=True`` skips the confirmation prompt.
+    ``yes=True`` skips the confirmation prompt. ``emit=False``
+    suppresses the final :func:`ui.emit` — used by ``agents upgrade``,
+    which already narrates its snapshot phase via ``ui.progress`` and
+    must keep stdout to exactly one object of its own.
     """
     cfg = cfg_mod.load(config_path)
     if cfg.vm.backend == "bare_metal":
@@ -510,7 +524,8 @@ def take_snapshot(
 
                 libvirt_mod.wait_for_ssh(cfg.vm.name, wait_cloud_init=False)
 
-    ui.emit({"vm": cfg.vm.name, "snapshot": full_name}, human=f"snapshot: {full_name}")
+    if emit:
+        ui.emit({"vm": cfg.vm.name, "snapshot": full_name}, human=f"snapshot: {full_name}")
     return full_name
 
 
@@ -541,6 +556,7 @@ def restore_snapshot(
     destructive: bool = False,
     yes: bool = False,
     config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH,
+    emit: bool = True,
 ) -> None:
     """Revert the VM to a prior snapshot.
 
@@ -551,7 +567,9 @@ def restore_snapshot(
     again (matching multipass-restore semantics).
 
     ``yes=True`` skips the confirmation prompt. ``destructive=True``
-    bypasses multipass's safety check (no-op on libvirt).
+    bypasses multipass's safety check (no-op on libvirt). ``emit=False``
+    suppresses the final :func:`ui.emit` — used by ``agents rollback``,
+    which narrates via ``ui.progress`` and emits its own single object.
     """
     cfg = cfg_mod.load(config_path)
     if cfg.vm.backend == "bare_metal":
@@ -599,7 +617,8 @@ def restore_snapshot(
 
                 libvirt_mod.wait_for_ssh(cfg.vm.name, wait_cloud_init=False)
 
-    ui.emit({"vm": cfg.vm.name, "restored": snapshot_id}, human=f"restored: {snapshot_id}")
+    if emit:
+        ui.emit({"vm": cfg.vm.name, "restored": snapshot_id}, human=f"restored: {snapshot_id}")
 
 
 def list_snapshots(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> list[str]:
@@ -712,13 +731,18 @@ def rebuild(
             cfg.paths.host_data_dir, "rebuild", cfg.vm.name
         ) or Journal.begin(cfg.paths.host_data_dir, "rebuild", cfg.vm.name, REBUILD_PHASES)
 
+        # Sub-operations run with emit=False: rebuild owns this command's
+        # single stdout object (the summary at the end) and narrates the
+        # slow stages on stderr instead.
         if not journal.is_phase_done("staged_exports"):
             for name, _ in agent_specs:
-                export_cmd.export(name, to=staging_dir, config_path=config_path)
+                ui.progress(f"exporting {name!r} to {staging_dir}...")
+                export_cmd.export(name, to=staging_dir, config_path=config_path, emit=False)
             journal.advance("staged_exports")
 
         if not journal.is_phase_done("vm_destroyed"):
             if _vm_exists(cfg.vm.name):
+                ui.progress(f"destroying VM {cfg.vm.name!r} (host data-dir stays untouched)...")
                 mp.delete_vm(cfg.vm.name, purge=True)
             journal.advance("vm_destroyed")
 
@@ -728,6 +752,7 @@ def rebuild(
             # are carried over explicitly: init() defaults to multipass and
             # writes cfg.vm.backend unconditionally, so omitting them would
             # silently migrate a libvirt user to multipass and drop GPUs.
+            ui.progress("re-initializing the VM (launch + bootstrap — takes minutes)...")
             init(
                 data_dir=cfg.paths.host_data_dir,
                 data_dir_in_vm=cfg.paths.data_dir_in_vm,
@@ -738,6 +763,7 @@ def rebuild(
                 backend=cfg.vm.backend,
                 gpu=list(cfg.vm.gpu_passthrough) or None,
                 config_path=config_path,
+                emit=False,
             )
             journal.advance("vm_initted")
 
@@ -752,7 +778,8 @@ def rebuild(
                         f"no export archive found for agent {name!r} in {staging_dir}"
                     )
                 # Use the most recent one.
-                export_cmd.import_archive(name, archives[-1], config_path=config_path)
+                ui.progress(f"importing {name!r} from {archives[-1].name}...")
+                export_cmd.import_archive(name, archives[-1], config_path=config_path, emit=False)
             journal.advance("state_restored")
 
         if not journal.is_phase_done("services_started"):
@@ -760,6 +787,7 @@ def rebuild(
             # single broken agent doesn't take the rest down.
             for name, agent_type in agent_specs:
                 svc = agents_cmd.service_name(name, agent_type)
+                ui.progress(f"starting {svc}...")
                 compose_runner.up(cfg, svc)
             journal.advance("services_started")
 
@@ -906,7 +934,12 @@ def _ensure_mount(cfg: AgentsConfig) -> None:
     requires_stop = cfg.vm.backend == "multipass"
     was_running = _vm_running(cfg.vm.name)
     if was_running and requires_stop:
+        ui.progress(
+            f"stopping {cfg.vm.name!r} to add the data-dir mount "
+            f"(native mounts need the VM stopped)..."
+        )
         mp.stop_vm(cfg.vm.name)
+    ui.progress(f"mounting {cfg.paths.host_data_dir} -> {cfg.paths.vm_agents_root} (in VM)...")
     mp.mount(
         cfg.paths.host_data_dir,
         cfg.vm.name,
@@ -918,6 +951,7 @@ def _ensure_mount(cfg: AgentsConfig) -> None:
         # multipass-only branch (requires_stop): mp.start_vm blocks until
         # the VM is reachable again. libvirt never stops for a mount
         # (virtiofs attaches --live --config), so no SSH re-wait is needed.
+        ui.progress(f"restarting {cfg.vm.name!r}...")
         mp.start_vm(cfg.vm.name)
 
 
@@ -993,6 +1027,7 @@ def _seed_data_dir(cfg: AgentsConfig) -> None:
       still holds the toolkit's lock + journals (host-filesystem
       primitives), so we create the minimal local layout for those.
     """
+    ui.progress("seeding data-dir (compose file, .env, skeleton dirs)...")
     # Always: minimal host scaffolding for the lock and journals.
     (cfg.paths.host_data_dir / ".journal").mkdir(exist_ok=True)
 

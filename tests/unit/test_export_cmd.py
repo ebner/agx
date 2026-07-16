@@ -223,6 +223,79 @@ def test_export_all_iterates_every_agent(cfg: AgentsConfig, saved_config: Path, 
     assert names == ["coder", "personal"]
 
 
+# ---------- emit discipline (one stdout object per command) ----------
+
+
+def test_export_emit_false_returns_path_without_emitting(
+    with_coder: Path, cfg: AgentsConfig, mocker
+) -> None:
+    """Composite commands (rebuild, remove --export-first, destroy's
+    export offer) embed an export but own the command's single stdout
+    object — the impl must do the work and return the path silently."""
+    emit = mocker.patch("agents_cli.ui.emit")
+
+    archive = export_cmd.export("coder", config_path=with_coder, emit=False)
+
+    assert archive.exists()
+    emit.assert_not_called()
+
+
+def test_export_emits_by_default(with_coder: Path, mocker) -> None:
+    emit = mocker.patch("agents_cli.ui.emit")
+    export_cmd.export("coder", config_path=with_coder)
+    emit.assert_called_once()
+
+
+def test_import_archive_emit_false_suppresses_object(
+    with_coder: Path, cfg: AgentsConfig, mocker
+) -> None:
+    archive = export_cmd.export("coder", config_path=with_coder, emit=False)
+    emit = mocker.patch("agents_cli.ui.emit")
+
+    export_cmd.import_archive("coder", archive, yes=True, config_path=with_coder, emit=False)
+
+    emit.assert_not_called()
+    # The extraction itself still happened.
+    assert (cfg.paths.host_data_dir / "coder" / ".data" / "state.db").exists()
+
+
+def test_export_all_emits_single_summary_and_narrates_per_agent(
+    cfg: AgentsConfig, saved_config: Path, mocker
+) -> None:
+    from tests.conftest import install_vm_fs_simulation
+
+    install_vm_fs_simulation(mocker, cfg)
+    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    create(name="coder", agent_type="hermes", config_path=saved_config)
+    create(name="personal", agent_type="openclaw", config_path=saved_config)
+    emit = mocker.patch("agents_cli.ui.emit")
+    progress = mocker.patch("agents_cli.ui.progress")
+
+    archives = export_cmd.export_all(config_path=saved_config)
+
+    assert len(archives) == 2
+    emit.assert_called_once()  # ONE summary object, not one per agent
+    payload = emit.call_args.args[0]
+    assert payload["count"] == 2
+    narration = [c.args[0] for c in progress.call_args_list]
+    assert sum(1 for ln in narration if ln.startswith("exported ")) == 2
+
+
+def test_export_all_emit_false_is_fully_silent_on_stdout(
+    cfg: AgentsConfig, saved_config: Path, mocker
+) -> None:
+    from tests.conftest import install_vm_fs_simulation
+
+    install_vm_fs_simulation(mocker, cfg)
+    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    create(name="coder", agent_type="hermes", config_path=saved_config)
+    emit = mocker.patch("agents_cli.ui.emit")
+
+    export_cmd.export_all(config_path=saved_config, emit=False)
+
+    emit.assert_not_called()
+
+
 # ---------- import ----------
 
 

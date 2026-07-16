@@ -71,14 +71,23 @@ def pull(
 ) -> None:
     cfg = cfg_mod.load(config_path)
     if name is None:
+        # Multi-minute operation on fresh image caches — narrate so a
+        # silent terminal doesn't read as a hang (same rationale as the
+        # upgrade phases).
+        ui.progress("pulling images for all services (large images take minutes)...")
+        t0 = time.monotonic()
         compose_runner.pull(cfg)
+        ui.progress(f"pull complete ({_fmt_elapsed(t0)})")
         ui.emit({"pulled": "all"}, human="pulled all images")
         return
     agent_type = _detect_type_from_compose(cfg, name)
     if agent_type is None:
         raise UserError(f"agent {name!r} not in compose")
     svc = _service_name_for(name, agent_type)
+    ui.progress(f"pulling {svc} (large images take minutes)...")
+    t0 = time.monotonic()
     compose_runner.pull(cfg, svc)
+    ui.progress(f"pulled {svc} ({_fmt_elapsed(t0)})")
     ui.emit({"pulled": svc}, human=f"pulled {svc}")
 
 
@@ -554,8 +563,12 @@ def rollback(
                 # mp.restore call this replaces never checked its result),
                 # and restart + SSH wait. ``yes=True`` — the user already
                 # confirmed the rollback above.
+                # ``emit=False``: rollback narrates via ui.progress and
+                # emits its own single stdout object at the end — the
+                # restore helper's "restored: ..." emit would be a
+                # second object mid-command.
                 vm_mod.restore_snapshot(
-                    vm_snap_name, destructive=True, yes=True, config_path=config_path
+                    vm_snap_name, destructive=True, yes=True, config_path=config_path, emit=False
                 )
                 ui.progress("VM restored and restarted")
         except Exception as restore_err:
@@ -835,9 +848,12 @@ def _vm_snapshot(cfg: AgentsConfig, name: str) -> str:
     ``yes=True`` because ``agents upgrade`` is the caller — the
     user already opted in to downtime by running ``upgrade``; an
     additional snapshot-stop confirmation here would be redundant.
+    ``emit=False`` because upgrade already narrates this phase via
+    ``ui.progress`` and owns the command's single stdout object —
+    take_snapshot's own emit would land a second one mid-upgrade.
     """
     base_name = f"pre-upgrade-{name}-{_utc_stamp()}"
-    return vm_mod.take_snapshot(base_name, comment=f"agents upgrade {name}", yes=True)
+    return vm_mod.take_snapshot(base_name, comment=f"agents upgrade {name}", yes=True, emit=False)
 
 
 def _latest_vm_snapshot(vm_name: str, agent_name: str) -> str | None:

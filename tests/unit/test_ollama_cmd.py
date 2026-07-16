@@ -150,13 +150,43 @@ def test_clear_removes_config_and_env_secret(
 ) -> None:
     mocker.patch("agents_cli.ollama_cmd._probe_reachability", return_value=[])
     ollama_cmd.configure(url="http://10.20.30.1:11434", api_key="x", config_path=saved_config)
-    ollama_cmd.clear(config_path=saved_config)
+    ollama_cmd.clear(yes=True, config_path=saved_config)
 
     reloaded = cfg_mod.load(saved_config)
     assert reloaded.ollama.url == ""
     assert reloaded.ollama.api_key_env == ""
     env_text = (cfg.paths.host_data_dir / ".env").read_text(encoding="utf-8")
     assert "OLLAMA_API_KEY" not in env_text
+
+
+def test_clear_requires_confirmation(cfg: AgentsConfig, saved_config: Path, mocker: Any) -> None:
+    """clear wipes the stored API key + [ollama] block — destructive, so
+    it must confirm (default False) like the sibling wipe commands."""
+    mocker.patch("agents_cli.ollama_cmd._probe_reachability", return_value=[])
+    ollama_cmd.configure(url="http://10.20.30.1:11434", api_key="x", config_path=saved_config)
+    confirm = mocker.patch("agents_cli.ui.confirm", return_value=False)
+
+    with pytest.raises(UserError, match="aborted"):
+        ollama_cmd.clear(config_path=saved_config)
+
+    confirm.assert_called_once()
+    assert confirm.call_args.kwargs.get("default") is False
+    # Nothing was wiped.
+    reloaded = cfg_mod.load(saved_config)
+    assert reloaded.ollama.url == "http://10.20.30.1:11434"
+    env_text = (cfg.paths.host_data_dir / ".env").read_text(encoding="utf-8")
+    assert "OLLAMA_API_KEY=x" in env_text
+
+
+def test_clear_proceeds_when_confirmed(cfg: AgentsConfig, saved_config: Path, mocker: Any) -> None:
+    mocker.patch("agents_cli.ollama_cmd._probe_reachability", return_value=[])
+    ollama_cmd.configure(url="http://10.20.30.1:11434", api_key="x", config_path=saved_config)
+    mocker.patch("agents_cli.ui.confirm", return_value=True)
+
+    ollama_cmd.clear(config_path=saved_config)
+
+    reloaded = cfg_mod.load(saved_config)
+    assert reloaded.ollama.url == ""
 
 
 def test_status_says_not_configured(saved_config: Path, mocker: Any) -> None:
@@ -328,7 +358,7 @@ def test_clear_holds_mutation_lock_around_env_write(
         "agents_cli.sidecar.write_project_env",
         side_effect=lambda *a, **k: events.append("env:write"),
     )
-    ollama_cmd.clear(config_path=saved_config)
+    ollama_cmd.clear(yes=True, config_path=saved_config)
 
     assert events == ["lock:enter", "env:write", "lock:exit"]
 

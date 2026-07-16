@@ -86,6 +86,18 @@ def test_progress_is_not_gated_on_verbose() -> None:
     assert "hidden" not in result.stderr
 
 
+def test_echo_human_writes_plain_line_to_stdout() -> None:
+    """echo_human exists so renderers with custom layouts (doctor's
+    wrapped table) don't call click.echo directly outside ui.py."""
+
+    def body(ctx: click.Context) -> None:
+        ui.echo_human("plain layout line")
+
+    result = _invoke({"json": False, "yes": False, "verbose": False}, body)
+    assert "plain layout line" in result.stdout
+    assert result.stderr == ""
+
+
 def test_confirm_with_yes_flag_returns_true_without_prompting() -> None:
     captured = []
 
@@ -134,6 +146,24 @@ def test_handle_cli_errors_user_error_returns_1() -> None:
     _invoke({"json": False, "yes": False, "verbose": False}, body)
 
 
+def test_handle_cli_errors_click_usage_error_returns_1() -> None:
+    """click hardwires UsageError to exit 2 in standalone mode; the
+    toolkit's contract says user error = 1. cli.main routes click's
+    exceptions here so the mapping is applied."""
+
+    def body(ctx: click.Context) -> None:
+        assert ui.handle_cli_errors(click.UsageError("missing argument")) == 1
+
+    _invoke({"json": False, "yes": False, "verbose": False}, body)
+
+
+def test_handle_cli_errors_generic_click_exception_returns_1() -> None:
+    def body(ctx: click.Context) -> None:
+        assert ui.handle_cli_errors(click.ClickException("nope")) == 1
+
+    _invoke({"json": False, "yes": False, "verbose": False}, body)
+
+
 def test_handle_cli_errors_runtime_returns_2() -> None:
     def body(ctx: click.Context) -> None:
         assert ui.handle_cli_errors(RuntimeFailure("vm down")) == 2
@@ -158,5 +188,16 @@ def test_handle_cli_errors_unknown_returns_2() -> None:
 def test_handle_cli_errors_keyboard_interrupt_returns_130() -> None:
     def body(ctx: click.Context) -> None:
         assert ui.handle_cli_errors(KeyboardInterrupt()) == 130
+
+    _invoke({"json": False, "yes": False, "verbose": False}, body)
+
+
+def test_handle_cli_errors_click_abort_returns_130() -> None:
+    """click converts Ctrl-C/EOF at prompts into Abort — same user
+    action as KeyboardInterrupt, same interrupt exit code, NOT the
+    generic exit-2 runtime failure (Abort subclasses RuntimeError)."""
+
+    def body(ctx: click.Context) -> None:
+        assert ui.handle_cli_errors(click.Abort()) == 130
 
     _invoke({"json": False, "yes": False, "verbose": False}, body)

@@ -59,7 +59,106 @@ def _run(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> None:
         sys.exit(ui.handle_cli_errors(e))
 
 
-@click.group(context_settings={"help_option_names": ["-h", "--help"]})
+class _RootGroup(click.Group):
+    """Root group that runs click in non-standalone mode.
+
+    Why: click's standalone mode hardwires ``UsageError`` (bad flags,
+    missing arguments — both its own parse errors and the explicit
+    ``raise click.UsageError`` calls in command bodies below) to exit
+    code 2, but this toolkit's contract (errors.py) defines user error
+    = 1 and reserves 2 for runtime failures. Forcing
+    ``standalone_mode=False`` makes click *raise* those exceptions out
+    of ``super().main()`` instead of printing + ``sys.exit(2)``, so we
+    can route them through :func:`ui.handle_cli_errors` — the single
+    place the exit-code mapping lives.
+
+    Preserved behaviors:
+
+    - ``--help`` / ``--version`` raise ``click.exceptions.Exit(0)``,
+      which non-standalone ``main`` returns as ``0`` — the console-
+      script wrapper (``sys.exit(main())``) and CliRunner both read
+      that as success.
+    - Successful commands return ``None`` (every callback funnels
+      through :func:`_run`) → exit 0.
+    - ``KeyboardInterrupt``/``EOFError`` during parse or prompts are
+      converted to ``Abort`` by click before leaving ``main`` — mapped
+      back to the interrupt exit code (130) here. Interrupts inside
+      command bodies already exit 130 via ``_run``.
+    - ``CliError`` subclasses raised in command bodies never reach
+      this handler: ``_run`` translates them to ``sys.exit(code)``,
+      and ``SystemExit`` passes straight through non-standalone click.
+    """
+
+    def main(self, *args: Any, **kwargs: Any) -> Any:
+        kwargs["standalone_mode"] = False
+        # Capture the raw argv up front: root-level parse errors can fire
+        # before click records any root flag, and the fallback flag scan
+        # below needs the original tokens.
+        raw_args = args[0] if args else kwargs.get("args")
+        argv = list(raw_args) if raw_args is not None else sys.argv[1:]
+        try:
+            return super().main(*args, **kwargs)
+        except click.ClickException as e:
+            # By the time the exception reaches here the context stack
+            # has been unwound, so ui.is_json() would report False even
+            # for a --json run. Click attaches the failing context to
+            # its parse errors (UsageError.ctx) — re-push it so the
+            # error object honors the root flags. When the failure
+            # precedes the root callback (`--json --bogus`, `--json
+            # bogus`, bare `--json`), ctx.obj was never populated;
+            # rebuild it from what click parsed (or the argv itself) so
+            # --json is still honored. Body-raised UsageErrors without
+            # a ctx degrade to the human form.
+            ectx = e.ctx if isinstance(e, click.UsageError) else None
+            if ectx is not None:
+                if ectx.obj is None:
+                    ectx.obj = _root_flags_for_error(ectx, argv)
+                with ectx:
+                    sys.exit(ui.handle_cli_errors(e))
+            sys.exit(ui.handle_cli_errors(e))
+        except click.exceptions.Abort as e:
+            # Ctrl-C/EOF during click-level parsing or prompts (click
+            # converts both to Abort before they leave main). Prompt
+            # aborts inside command bodies take the same mapping via
+            # _run -> handle_cli_errors.
+            sys.exit(ui.handle_cli_errors(e))
+
+
+def _root_flags_for_error(ectx: click.Context, argv: list[str]) -> dict[str, bool]:
+    """Reconstruct the root ``--json``/``--yes``/``--verbose`` flags for
+    an error path where the root callback never ran, so the error emit
+    can still honor ``--json``.
+
+    Preference order: the root context's already-parsed params — click
+    populates ``ctx.params`` even when the callback hasn't run (e.g.
+    bare ``agents --json`` failing on "Missing command.") — then a
+    conservative literal scan of the argv tokens *before* the first
+    non-option token (root options only), for parses that abort before
+    any param lands (e.g. ``agents --json --bogus``).
+    """
+    root = ectx
+    while root.parent is not None:
+        root = root.parent
+    if root.params:
+        return {
+            "json": bool(root.params.get("json_output")),
+            "yes": bool(root.params.get("assume_yes")),
+            "verbose": bool(root.params.get("verbose")),
+        }
+    flags = {"json": False, "yes": False, "verbose": False}
+    for token in argv:
+        if not token.startswith("-"):
+            break  # root options end at the subcommand name
+        if token == "--json":
+            flags["json"] = True
+        elif token == "--yes":
+            flags["yes"] = True
+        elif token in ("-v", "--verbose"):
+            flags["verbose"] = True
+    return flags
+
+
+@click.group(cls=_RootGroup, context_settings={"help_option_names": ["-h", "--help"]})
 @click.version_option(__version__, "-V", "--version")
 @click.option("--json", "json_output", is_flag=True, help="Emit machine-readable JSON output.")
 @click.option("--yes", "assume_yes", is_flag=True, help="Skip confirmation prompts.")
@@ -350,7 +449,9 @@ def vm_destroy(ctx: click.Context, export_first: bool, yes_local: bool) -> None:
                 default=False,
             )
         if do_export:
-            export_cmd.export_all()
+            # emit=False: destroy owns this command's single stdout
+            # object; export_all narrates per-agent via ui.progress.
+            export_cmd.export_all(emit=False)
         vm_mod.destroy(yes=yes)
 
     _run(body)
@@ -432,7 +533,10 @@ def agents_remove(
                 raise UserError("aborted by user")
             effective_yes = True
         if export_first:
-            export_cmd.export(name)
+            # emit=False: remove's own emit is this command's single
+            # stdout object; surface the archive path as narration.
+            archive = export_cmd.export(name, emit=False)
+            ui.progress(f"exported {name!r} -> {archive}")
         agents_cmd.remove(
             name,
             yes=effective_yes,
@@ -935,9 +1039,12 @@ def ollama_status() -> None:
 
 
 @ollama_group.command("clear")
-def ollama_clear() -> None:
+@click.option("-y", "--yes", "yes_local", is_flag=True, help="Skip confirmation.")
+@click.pass_context
+def ollama_clear(ctx: click.Context, yes_local: bool) -> None:
     """Drop the Ollama configuration and any stored API key."""
-    _run(ollama_cmd.clear)
+    yes = yes_local or ctx.obj.get("yes", False)
+    _run(ollama_cmd.clear, yes=yes)
 
 
 # ---------- memory ----------
@@ -1210,9 +1317,18 @@ def secret_set(agent: str, key: str, value: str | None) -> None:
         agents secret set coder FIRECRAWL_API_KEY      # hidden prompt
         agents secret set coder FIRECRAWL_API_KEY fc-x # value as arg
     """
-    if value is None:
-        value = click.prompt(f"value for {key}", hide_input=True, confirmation_prompt=False)
-    _run(secrets_cmd.set_secret, agent, key, value)
+
+    def body() -> None:
+        secret = value
+        if secret is None:
+            # A hidden prompt under --json would hang any machine
+            # consumer waiting for the single stdout object.
+            if ui.is_json():
+                raise UserError("secret value required: pass it as an argument in --json mode")
+            secret = click.prompt(f"value for {key}", hide_input=True, confirmation_prompt=False)
+        secrets_cmd.set_secret(agent, key, secret)
+
+    _run(body)
 
 
 @secret_group.command("unset")
@@ -1295,27 +1411,33 @@ def mount_add(
 ) -> None:
     """Add a host folder to ``agent``'s container."""
     yes = yes_local or ctx.obj.get("yes", False)
-    if (
-        writable
-        and not yes
-        and not click.confirm(
-            f"--rw lets the agent (and any prompt-injected commands) modify files at "
-            f"{host_path}. A compromised agent could overwrite or exfiltrate them. "
-            f"Continue?",
-            default=False,
+
+    def body() -> None:
+        # ui.confirm (not raw click.confirm) so --json without --yes
+        # refuses cleanly instead of hanging, and the decline maps to
+        # the toolkit's user-error exit (1) rather than click.Abort.
+        if (
+            writable
+            and not yes
+            and not ui.confirm(
+                f"--rw lets the agent (and any prompt-injected commands) modify files at "
+                f"{host_path}. A compromised agent could overwrite or exfiltrate them. "
+                f"Continue?",
+                default=False,
+            )
+        ):
+            raise UserError("aborted by user")
+        mounts_cmd.add(
+            agent=agent,
+            host=host_path,
+            container=container_path,
+            readonly=not writable,
+            target=target,
+            restart=restart,
+            config_path=cfg_mod.DEFAULT_CONFIG_PATH,
         )
-    ):
-        raise click.Abort()
-    _run(
-        mounts_cmd.add,
-        agent=agent,
-        host=host_path,
-        container=container_path,
-        readonly=not writable,
-        target=target,
-        restart=restart,
-        config_path=cfg_mod.DEFAULT_CONFIG_PATH,
-    )
+
+    _run(body)
 
 
 @mount_group.command("remove")

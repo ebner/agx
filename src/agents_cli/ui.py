@@ -92,6 +92,18 @@ def progress(message: str) -> None:
         click.echo(message, err=True)
 
 
+def echo_human(line: str) -> None:
+    """Always-on human-facing stdout line for renderers that build their
+    own layout (e.g. doctor's terminal-width-wrapped table).
+
+    Callers gate on :func:`is_json` themselves and use :func:`table` /
+    :func:`emit` for the machine form — this helper exists so no module
+    outside ``ui`` calls ``click.echo`` directly, keeping every output
+    path auditable in one place.
+    """
+    click.echo(line)
+
+
 def confirm(prompt: str, *, default: bool = False) -> bool:
     """Prompt for yes/no. Bypassed by --yes. In --json mode without --yes, refuses."""
     if is_yes():
@@ -129,14 +141,27 @@ def handle_cli_errors(exc: BaseException) -> int:
     if isinstance(exc, CliError):
         emit({"error": str(exc), "kind": type(exc).__name__}, human=f"error: {exc}")
         return exc.exit_code
-    if isinstance(exc, click.UsageError):
-        # Click usage errors are always the user's fault → exit 1.
+    if isinstance(exc, click.ClickException):
+        # Click-raised errors (UsageError from bad flags/missing args,
+        # BadParameter, FileError, ...) are always the user's fault →
+        # exit 1 per errors.py — NOT click's standalone-mode default of
+        # 2 for usage errors, which collides with our runtime-failure
+        # code. cli.main runs the group in non-standalone mode and
+        # routes these here precisely so the mapping lives in one place.
         emit(
-            {"error": exc.format_message(), "kind": "UsageError"},
+            {"error": exc.format_message(), "kind": type(exc).__name__},
             human=f"error: {exc.format_message()}",
         )
         return 1
-    if isinstance(exc, KeyboardInterrupt):
+    if isinstance(exc, KeyboardInterrupt | click.Abort):
+        # click converts Ctrl-C / EOF at its own prompts (click.prompt,
+        # click.confirm) into Abort before the prompt call returns — so
+        # an interrupted prompt inside a _run-wrapped command body
+        # (secret set, mount add --rw, ollama clear) arrives here as
+        # Abort, never reaching cli._RootGroup's Abort handler. Same
+        # user action, same exit code. Abort subclasses RuntimeError,
+        # so without this branch it would fall through to the generic
+        # "unexpected error" exit-2 path below.
         emit({"error": "interrupted"}, human="interrupted")
         return 130
 

@@ -148,9 +148,19 @@ def status(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> dict[str, Any]
     return info
 
 
-def clear(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> None:
-    """Drop the ``[ollama]`` block from config and remove the stored API key."""
+def clear(*, yes: bool = False, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> None:
+    """Drop the ``[ollama]`` block from config and remove the stored API key.
+
+    Destructive (wipes the stored token — the user has to dig it out of
+    their provider again), so it confirms like the sibling wipe commands
+    (``secret clear``, ``firecrawl destroy``) unless ``yes=True``.
+    """
     cfg = cfg_mod.load(config_path)
+    if not yes and not ui.confirm(
+        "clear the [ollama] configuration and remove the stored API key?",
+        default=False,
+    ):
+        raise UserError("aborted by user")
     prior_env = cfg.ollama.api_key_env
     cfg.ollama = OllamaConfig()
     cfg_mod.save(cfg, config_path)

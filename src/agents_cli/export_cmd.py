@@ -67,7 +67,16 @@ def export(
     *,
     to: Path | None = None,
     config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH,
+    emit: bool = True,
 ) -> Path:
+    """Archive one agent's data dir; returns the archive path.
+
+    ``emit=False`` skips the final :func:`ui.emit` so composite
+    commands (``vm rebuild``, ``vm destroy --export-first``, ``remove
+    --export-first``) can embed an export while still writing exactly
+    one JSON object to stdout themselves. Those callers narrate via
+    ``ui.progress`` instead.
+    """
     validate_name(name)
     cfg = cfg_mod.load(config_path)
     agent_type = _detect_type_from_compose(cfg, name)
@@ -169,13 +178,14 @@ def export(
     }
     if pruned:
         payload["pruned"] = [str(p) for p in pruned]
-    ui.emit(
-        payload,
-        human=(
-            f"exported {name!r} -> {out}"
-            + (f"\n  pruned {len(pruned)} older archive(s)" if pruned else "")
-        ),
-    )
+    if emit:
+        ui.emit(
+            payload,
+            human=(
+                f"exported {name!r} -> {out}"
+                + (f"\n  pruned {len(pruned)} older archive(s)" if pruned else "")
+            ),
+        )
     return out
 
 
@@ -219,7 +229,13 @@ def export_all(
     *,
     to: Path | None = None,
     config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH,
+    emit: bool = True,
 ) -> list[Path]:
+    """Export every agent in compose. One final :func:`ui.emit` summary
+    (unless ``emit=False`` — used by the ``vm destroy`` export offer);
+    per-agent completion is narrated via ``ui.progress`` on stderr so
+    ``--json`` stdout stays a single object.
+    """
     cfg = cfg_mod.load(config_path)
     doc = compose.read_compose_doc(cfg)
     archives: list[Path] = []
@@ -227,7 +243,19 @@ def export_all(
         for at in AGENT_TYPES:
             prefix = f"{at}-"
             if svc.startswith(prefix):
-                archives.append(export(svc[len(prefix) :], to=to, config_path=config_path))
+                name = svc[len(prefix) :]
+                archive = export(name, to=to, config_path=config_path, emit=False)
+                ui.progress(f"exported {name!r} -> {archive}")
+                archives.append(archive)
+    if emit:
+        ui.emit(
+            {"exported": [str(p) for p in archives], "count": len(archives)},
+            human=(
+                "\n".join(f"exported -> {p}" for p in archives)
+                if archives
+                else "no agents to export"
+            ),
+        )
     return archives
 
 
@@ -254,7 +282,13 @@ def import_archive(
     *,
     yes: bool = False,
     config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH,
+    emit: bool = True,
 ) -> None:
+    """Extract an export archive into the agent's data dir.
+
+    ``emit=False`` suppresses the final :func:`ui.emit` for composite
+    callers (``vm rebuild``) that own the command's single stdout object.
+    """
     validate_name(name)
     cfg = cfg_mod.load(config_path)
     if not archive_path.exists():
@@ -285,10 +319,11 @@ def import_archive(
             cfg.vm.name,
             f"set -eu\ncd {cfg.paths.vm_agents_root} && tar -xf {vm_tmp} && rm -f {vm_tmp}\n",
         )
-        ui.emit(
-            {"name": name, "archive": str(archive_path)},
-            human=f"imported {archive_path} into {cfg.paths.vm_agents_root}/{name} (in VM)",
-        )
+        if emit:
+            ui.emit(
+                {"name": name, "archive": str(archive_path)},
+                human=f"imported {archive_path} into {cfg.paths.vm_agents_root}/{name} (in VM)",
+            )
         return
 
     target = cfg.paths.host_data_dir / name
@@ -325,10 +360,11 @@ def import_archive(
         ),
     )
     _surface_imported_mounts_metadata(cfg, name)
-    ui.emit(
-        {"name": name, "archive": str(archive_path)},
-        human=f"imported {archive_path} into {target}",
-    )
+    if emit:
+        ui.emit(
+            {"name": name, "archive": str(archive_path)},
+            human=f"imported {archive_path} into {target}",
+        )
 
 
 def _surface_imported_mounts_metadata(cfg: AgentsConfig, name: str) -> None:

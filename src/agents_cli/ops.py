@@ -9,8 +9,6 @@ import textwrap
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import click
-
 from agents_cli import compose, compose_runner, mp, ui
 from agents_cli import config as cfg_mod
 from agents_cli.agents_cmd import (
@@ -1129,8 +1127,8 @@ def _emit_doctor_table(report: DoctorReport) -> None:
         first = f"{check:<{check_w}}{sep}{status:<{status_w}}{sep}{wrapped[0]}"
         return [first, *(f"{indent}{cont}" for cont in wrapped[1:])]
 
-    click.echo(f"{'check':<{check_w}}{sep}{'status':<{status_w}}{sep}{'detail':<{detail_w}}")
-    click.echo(f"{'-' * check_w}{sep}{'-' * status_w}{sep}{'-' * detail_w}")
+    ui.echo_human(f"{'check':<{check_w}}{sep}{'status':<{status_w}}{sep}{'detail':<{detail_w}}")
+    ui.echo_human(f"{'-' * check_w}{sep}{'-' * status_w}{sep}{'-' * detail_w}")
     for r in rows:
         for line in row_lines(r["check"], r["status"], r["detail"]):
-            click.echo(line)
+            ui.echo_human(line)

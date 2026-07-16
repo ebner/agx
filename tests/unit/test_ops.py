@@ -479,6 +479,39 @@ def os_terminal_size(cols: int) -> os.terminal_size:
     return os.terminal_size((cols, 24))
 
 
+def test_doctor_table_human_path_goes_through_ui_echo_human(mocker) -> None:
+    """ops.py must not call click.echo directly — every output line goes
+    through ui.py so --json/--yes stay auditable in one module. The
+    human table renderer uses the ui.echo_human helper for its custom
+    wrapped layout."""
+    echo = mocker.patch("agents_cli.ui.echo_human")
+    report = ops.DoctorReport()
+    report.add("check_a", "ok", "fine")
+    report.add("check_b", "fail", "broken")
+
+    ops._emit_doctor_table(report)
+
+    lines = [c.args[0] for c in echo.call_args_list]
+    assert any("check_a" in ln for ln in lines)
+    assert any("check_b" in ln for ln in lines)
+    assert any(ln.startswith("check") for ln in lines)  # header line
+
+
+def test_doctor_table_json_path_skips_echo_human(mocker) -> None:
+    """Under --json the table goes through ui.table (single JSON array);
+    the human renderer must not add stray lines around it."""
+    mocker.patch("agents_cli.ui.is_json", return_value=True)
+    echo = mocker.patch("agents_cli.ui.echo_human")
+    table = mocker.patch("agents_cli.ui.table")
+    report = ops.DoctorReport()
+    report.add("check_a", "ok")
+
+    ops._emit_doctor_table(report)
+
+    echo.assert_not_called()
+    table.assert_called_once()
+
+
 def test_doctor_flags_data_dir_eacces(with_coder: Path, mocker) -> None:
     """Reproduce the canonical `agents exec` permission failure: stat
     /opt/data returns EACCES because the dir is owned by uid 10000 and

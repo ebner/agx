@@ -318,6 +318,35 @@ def test_init_dumps_bootstrap_output_on_failure(mocker, tmp_path: Path) -> None:
     assert "bootstrap stdout" in msg
 
 
+def test_init_emits_exactly_one_object_and_narrates_stages(mocker, tmp_path: Path) -> None:
+    """Item: one JSON object on stdout per command. The launch line is
+    narration (ui.progress, stderr) — only the final "ready" payload is
+    emitted. The genuinely slow phases (bootstrap, mount, seed) narrate."""
+    _stub_all_mp(mocker)
+    emit = mocker.patch("agents_cli.ui.emit")
+    progress = mocker.patch("agents_cli.ui.progress")
+
+    vm.init(data_dir=tmp_path / "data", config_path=_saved_config(tmp_path))
+
+    emit.assert_called_once()
+    payload = emit.call_args.args[0]
+    assert payload["vm"] == "agents"
+    lines = [c.args[0] for c in progress.call_args_list]
+    assert any("launching VM" in ln for ln in lines)
+    assert any("provisioning rootless Docker" in ln for ln in lines)
+    assert any(ln.startswith("mounting ") for ln in lines)
+    assert any("seeding data-dir" in ln for ln in lines)
+
+
+def test_init_emit_false_suppresses_final_object(mocker, tmp_path: Path) -> None:
+    """vm rebuild embeds init and owns the command's single stdout
+    object — init's "ready" payload must be suppressible."""
+    _stub_all_mp(mocker)
+    emit = mocker.patch("agents_cli.ui.emit")
+    vm.init(data_dir=tmp_path / "data", config_path=_saved_config(tmp_path), emit=False)
+    emit.assert_not_called()
+
+
 def test_init_hints_at_ubuntu_release_when_net_fails_on_non_24_04(mocker, tmp_path: Path) -> None:
     bad = (
         "BOOTSTRAP_OK uidmap=ok dbus=ok lingering=ok docker_host=fail daemon=fail "
@@ -658,6 +687,27 @@ def test_take_snapshot_multipass_runs_on_live_vm(mocker, tmp_path: Path) -> None
     mocks["start"].assert_not_called()
 
 
+def test_take_snapshot_emit_false_suppresses_stdout_object(mocker, tmp_path: Path) -> None:
+    """upgrades._vm_snapshot narrates the phase itself; take_snapshot's
+    own emit would land a second JSON object mid-upgrade."""
+    config_path = _saved_snapshot_config(tmp_path)
+    _stub_snapshot_mp(mocker)
+    emit = mocker.patch("agents_cli.ui.emit")
+
+    name = vm.take_snapshot("pre-upgrade", emit=False, config_path=config_path)
+
+    assert name == "pre-upgrade"
+    emit.assert_not_called()
+
+
+def test_take_snapshot_emits_by_default(mocker, tmp_path: Path) -> None:
+    config_path = _saved_snapshot_config(tmp_path)
+    _stub_snapshot_mp(mocker)
+    emit = mocker.patch("agents_cli.ui.emit")
+    vm.take_snapshot("pre-upgrade", config_path=config_path)
+    emit.assert_called_once()
+
+
 def test_take_snapshot_raises_on_nonzero_rc(mocker, tmp_path: Path) -> None:
     config_path = _saved_snapshot_config(tmp_path)
     _stub_snapshot_mp(mocker, snapshot_rc=1)
@@ -712,6 +762,27 @@ def test_restore_snapshot_multipass_succeeds_on_rc0(mocker, tmp_path: Path) -> N
     mocks["start"].assert_not_called()
 
 
+def test_restore_snapshot_emit_false_suppresses_stdout_object(mocker, tmp_path: Path) -> None:
+    """upgrades.rollback delegates the VM restore here while owning the
+    command's single stdout object — the "restored: ..." emit must be
+    suppressible."""
+    config_path = _saved_snapshot_config(tmp_path)
+    _stub_snapshot_mp(mocker)
+    emit = mocker.patch("agents_cli.ui.emit")
+
+    vm.restore_snapshot("pre-upgrade", emit=False, config_path=config_path)
+
+    emit.assert_not_called()
+
+
+def test_restore_snapshot_emits_by_default(mocker, tmp_path: Path) -> None:
+    config_path = _saved_snapshot_config(tmp_path)
+    _stub_snapshot_mp(mocker)
+    emit = mocker.patch("agents_cli.ui.emit")
+    vm.restore_snapshot("pre-upgrade", config_path=config_path)
+    emit.assert_called_once()
+
+
 def test_restore_snapshot_raises_on_nonzero_rc(mocker, tmp_path: Path) -> None:
     """libvirt's restore uses check=False and can hand back rc=1; the CLI
     must not report 'restored' on a failed revert."""
@@ -758,6 +829,36 @@ def test_restore_snapshot_refused_on_bare_metal(mocker, tmp_path: Path) -> None:
     with pytest.raises(UserError, match="bare_metal"):
         vm.restore_snapshot("pre-upgrade", config_path=config_path)
     mocks["restore"].assert_not_called()
+
+
+def test_rebuild_emits_one_object_and_narrates_stages(mocker, tmp_path: Path) -> None:
+    """rebuild owns its command's single stdout object: every embedded
+    sub-op (export, init, import) runs with emit=False and the stages
+    are narrated via ui.progress on stderr instead."""
+    cfg = _make_config(tmp_path)
+    config_path = _saved_config(tmp_path)
+    cfg_mod.save(cfg, config_path)
+    mocks = _stub_rebuild(mocker, cfg, {"hermes-coder": "hermes"})
+    staging = cfg.paths.host_data_dir / ".rebuild-staging"
+    staging.mkdir(parents=True, exist_ok=True)
+    (staging / "coder-stamp.tar.zst").write_bytes(b"")
+    emit = mocker.patch("agents_cli.ui.emit")
+    progress = mocker.patch("agents_cli.ui.progress")
+
+    vm.rebuild(yes=True, config_path=config_path)
+
+    emit.assert_called_once()
+    assert emit.call_args.args[0]["rebuilt"] is True
+    lines = [c.args[0] for c in progress.call_args_list]
+    assert any("exporting 'coder'" in ln for ln in lines)
+    assert any("destroying VM" in ln for ln in lines)
+    assert any("re-initializing the VM" in ln for ln in lines)
+    assert any("importing 'coder'" in ln for ln in lines)
+    assert any("starting hermes-coder" in ln for ln in lines)
+    # Every embedded sub-op ran in non-emitting mode.
+    assert mocks["export"].call_args.kwargs["emit"] is False
+    assert mocks["init"].call_args.kwargs["emit"] is False
+    assert mocks["import_archive"].call_args.kwargs["emit"] is False
 
 
 def test_rebuild_resumes_from_journal(mocker, tmp_path: Path) -> None:
