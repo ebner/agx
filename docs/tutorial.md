@@ -18,7 +18,7 @@ Hermes uses three terms that all sound related but aren't. Get this straight up 
 
 | Concept | What it is | Where it lives | How you change it |
 |---|---|---|---|
-| **Profile** | An isolated Hermes instance — its own `$HERMES_HOME` with its own auth, sessions, skills, config | `$HERMES_HOME/profiles/<name>/` inside the container | `hermes profile {list,create --clone,use,delete,rename,export,import}` |
+| **Profile** | A state-isolated Hermes instance — its own `$HERMES_HOME` with its own auth, sessions, skills, config, memories, cron jobs. Isolates *state*, not *privileges* — see §6 | `$HERMES_HOME/profiles/<name>/` inside the container | `hermes profile {list,create --clone,use,delete,rename,export,import,install}` |
 | **Personality** | The agent's persistent voice / identity — slot #1 of the system prompt | `$HERMES_HOME/SOUL.md` | Edit `SOUL.md` directly, or `hermes setup --section agent` |
 | **Skill** | A folder of procedural knowledge an agent loads on demand (Anthropic's open Agent-Skills format) | `$HERMES_HOME/skills/<skill-id>/SKILL.md` | `hermes skills {browse,install,update,uninstall}` |
 
@@ -26,7 +26,7 @@ Also: `/personality <name>` inside an interactive Hermes session is a **temporar
 
 ## 3. How many agents do you actually need?
 
-**Rule of thumb: one container = one agent = one Hermes installation = one bot identity.** Profiles are a within-container tool for *throwaway* second `$HERMES_HOME`s (sandbox, A/B, scratch) — they don't unlock more bots, more dashboards, or auto-routing, and any of those needs another container.
+**Rule of thumb: one container = one agent = one Hermes installation = one bot identity.** Upstream Hermes positions profiles as full production agents, and its own default Docker topology is one container hosting many profile gateways. This toolkit deliberately doesn't follow that default: the container is the isolation boundary profiles don't provide (upstream is explicit that profiles do not sandbox the agent), and the toolkit's management surface targets one Hermes home per container. Here, profiles are a within-container tool for *interactive* second `$HERMES_HOME`s (scratch personas, A/B tests, state-contained experiments — see §6) — in this toolkit they don't (yet) unlock managed extra bots or dashboards (GH #6), auto-routing doesn't exist natively, and any of those wants another container for now.
 
 Your instinct will be "one agent per topic" — *finance*, *family*, *health*, etc. Resist it. Start small and earn the splits.
 
@@ -56,16 +56,21 @@ If none of those apply, you probably don't need a second container.
 
 ### Earn a Hermes-internal profile when…
 
-…you want a *cheap, disposable* second `$HERMES_HOME` inside one container. Real use cases:
+…you want a *cheap, state-isolated* second `$HERMES_HOME` inside one container, used **interactively** (not gateway-exposed — see §6). Real use cases:
 
 1. **Scratch persona.** `hermes profile create scratch --clone default` → experiment → `hermes profile delete scratch`. Faster than `agents create`/`agents remove`.
-2. **Sandbox a risky change.** Clone to `experiment`, test a new `SOUL.md` or a flaky skill, then promote (`hermes profile use experiment`) or discard.
+2. **Contain an experiment's state.** Clone to `experiment`, test a new `SOUL.md`, a rewritten config, or an unfamiliar skill without polluting your main profile's config, sessions, or memories — then promote (`hermes profile use experiment`) or discard. This contains *state*, not *privileges*: the experiment still runs with the same filesystem access as the default profile.
 3. **A/B test personalities** without container churn.
-4. **Shared VM with another human.** Each person gets their own profile so sessions, skills, and auth don't cross-pollute. (Rare in personal use.)
+4. **Try a profile distribution.** `hermes profile install <git-url>` installs a packaged agent (personality + skills + cron jobs + config, distributed as a git repo) as a new profile — evaluate it in isolation before adopting its pieces into your main profile.
+5. **Shared VM with another human.** Each person gets their own profile so sessions, skills, and auth don't cross-pollute. (Rare in personal use.)
 
 ### What profiles are NOT for
 
-**Profiles are not a way to multiplex one Mattermost (or Slack/Discord) bot across personas.** Each profile that runs a gateway runs its own gateway process bound to its own bot token; two profiles cannot share a bot. The Hermes docs are explicit:
+**Profiles are not a security boundary.** The Hermes docs are explicit: "Profiles do not sandbox the agent." Every profile in a container has the same filesystem access, and tool subprocesses share the real `HOME` across profiles by default (opt into stricter separation per profile with `terminal.home_mode: profile` in that profile's `config.yaml`). If a persona handles data that must survive another persona's compromised skill, that's a second container (criterion 5 above), full stop.
+
+**Profiles are not (yet) this toolkit's way to run more bots.** Upstream supports it — in the official image each profile's gateway is a first-class s6-supervised service, and upstream's default topology is one container running all profile gateways side by side. The mechanics work in this toolkit's containers too (spike-verified — see §6), but gateway-exposed secondary profiles fall outside everything the toolkit manages, and each one needs its own bot token anyway — at which point a second toolkit agent buys real isolation for the same token cost. Toolkit support for the "pod" pattern (same-trust personas sharing one container) is tracked in GH #6.
+
+**Profiles are not a way to multiplex one Mattermost (or Slack/Discord) bot across personas.** Each profile that runs a gateway binds its own bot token; two profiles cannot share a bot. The Hermes docs are explicit:
 
 > Each profile runs its own gateway as a separate process with its own bot token. If two profiles accidentally share a token, the second gateway will be blocked with a clear error naming the conflicting profile.
 
@@ -79,7 +84,7 @@ So "one container, three profiles, one Mattermost bot routing per channel" — t
 
 - **A. Cheap default.** One `home` container, one Mattermost bot, skills added on demand. Start here unless you have a reason not to.
 - **B. Privacy split.** Two containers: `home` (finance + family on the family Mattermost) and `health` (separate container, possibly a different LLM, possibly not even on Mattermost — answers via the local dashboard or a private bot). Earned by criteria 1 and 5.
-- **C. Profile as sandbox.** One `home` container in production. When you want to try a "stricter financial advisor" voice: `hermes profile create stricter-fin --clone default`, iterate, decide, then either `profile use` it or delete. Profiles shine here precisely because they're disposable.
+- **C. Profile as scratch experiment.** One `home` container in production. When you want to try a "stricter financial advisor" voice: `hermes profile create stricter-fin --clone default`, iterate interactively, decide, then either `profile use` it or delete. Profiles shine here precisely because they're disposable.
 - **D. Three containers.** Only if each meaningfully differs. The cost is three Mattermost bot users (Hermes won't let two share one), three ports, three sets of upgrade decisions. Rare for personal use.
 
 The rest of this tutorial assumes the default — one toolkit agent named `coder` — but the commands apply identically whether you have one agent or several.
@@ -352,10 +357,10 @@ The toolkit does **not** mount Codex auth into OpenClaw — OpenClaw's plugin ma
 
 ## 6. Working with Hermes profiles inside one container
 
-Profiles are most useful as **disposable second `$HERMES_HOME`s** for sandboxing, A/B-testing personalities, or cheap experimentation — see §3 for when this earns its keep and when it doesn't.
+Upstream Hermes treats profiles as full production agents — each one a complete `$HERMES_HOME` with its own `config.yaml`, `.env`, `SOUL.md`, sessions, memories, skills, and cron jobs. Within this toolkit, use them freely for **interactive** work: scratch personas, A/B tests, state-contained experiments, trying profile distributions (see §3 for when each earns its keep). Keep gateways on the default profile only — the last subsection below explains why.
 
 ```bash
-# create a profile that clones the default's auth + skills, then diverges
+# create a profile that clones the default's config, .env, SOUL.md and skills, then diverges
 agents exec coder hermes profile create scratch --clone default
 
 # use it
@@ -370,20 +375,27 @@ agents exec coder hermes profile export reviewer -o /opt/data/reviewer.zip
 agents exec coder hermes profile delete reviewer
 ```
 
-Profile data lives at `<data-dir>/coder/.data/profiles/<profile-name>/` on the host, so `agents export coder` and your host backup cover all profiles inside that container.
+Worth knowing before you lean on them:
 
-### Profile + gateway: one bot token per profile
+- **Backups cover profiles automatically.** Profile data lives at `<data-dir>/coder/.data/profiles/<profile-name>/` on the host, so `agents export coder` and your host backup cover all profiles inside that container.
+- **Two clone flavors.** `--clone` copies config, `.env`, `SOUL.md`, and skills. `--clone-all` additionally copies memories, cron jobs, and plugins — but never per-profile history (`state.db`, `backups/`, `checkpoints/`), which can reach tens of GB. Because `--clone` copies `.env`, a cloned profile inherits the default's bot token — harmless, since Hermes refuses to start a second gateway on a token already in use.
+- **The toolkit manages the default profile only.** `agents secret set` (the `terminal.env_passthrough` half), `agents model use`, `agents ollama configure`, `agents conversations`, `agents memory`, the dashboard `0.0.0.0` refusal, and doctor's per-agent Hermes probes all read/write the *default* profile's `config.yaml` and `state.db`. Secondary profiles are yours to manage by hand via `agents exec <agent> hermes -p <profile> …` — the toolkit neither sees nor validates them.
+- **No privilege isolation between profiles.** Same container, same uid, same filesystem access; tool subprocesses share the real `HOME` across profiles by default (`terminal.home_mode: profile` opts a profile's tools into `$HERMES_HOME/home` instead). The container is the security boundary, not the profile.
+- **`hermes update` upgrades all profiles at once.** Profiles share the installation, so there's no per-profile version pinning or canarying — that's a per-container property (§3 criterion 3).
 
-The gateway model is strict: each profile that runs a gateway runs its own gateway process with its own bot token. From the Hermes docs:
+### Profile + gateway: works mechanically, but the toolkit doesn't manage it yet
 
-> Each profile runs its own gateway as a separate process with its own bot token. Each profile gets its own service name. They run independently. If two profiles accidentally share a token, the second gateway will be blocked with a clear error naming the conflicting profile.
+Upstream supports concurrent per-profile gateways — in the official image each profile's gateway is a dynamically registered, s6-supervised service (each bound to its own bot token, enforced), and upstream's default topology is one container running all of them.
 
-Practical consequences:
+A 2026-07 spike (Hermes v2026.7.7.2, libvirt backend, virtiofs-mounted data dir) verified the mechanics work in this toolkit's containers too: `hermes profile create` registers the s6 slot live and pre-creates the gateway log dir (`/opt/data/logs/gateways/<profile>/`) as the `hermes` user — defusing the rootless root-`mkdir`-on-shared-mount class that bit the default gateway — the profile gateway and its cron scheduler run supervised, and the running set auto-resumes after container restarts and recreates via each profile's `gateway_state.json`. Toolkit-level support (log-dir hardening for restored data dirs, doctor checks, profile-aware config/secrets/conversations, dashboard publishing) is tracked in GH #6.
 
-- You start each profile's gateway independently: `agents exec coder hermes -p reviewer gateway start`.
-- Each profile needs its own Slack/Mattermost/Discord bot account (or bot token within an account that supports multiple). You can't have profile A and profile B both reply as the same bot on the same workspace.
-- At that point ask yourself: if I'm paying for a second bot user anyway, is a profile actually cheaper than a second toolkit agent? Often the answer is no — separate toolkit agents give you separate upgrade cadence, separate logs, separate resource limits, and isolation between domains, at the cost of a bit more disk.
-- Profiles win when the second persona is **not gateway-exposed at all** — purely interactive via `hermes -p <profile> chat` or via the dashboard. Those are the use cases in §3.
+Until that lands, treat a gateway-exposed secondary profile as **unmanaged**:
+
+1. **One bot token per gateway, enforced.** Each profile needs its own Slack/Mattermost/Discord bot account. If you're provisioning a second bot anyway, a profile saves you almost nothing over a second toolkit agent.
+2. **It's outside the toolkit's management surface.** No doctor checks, no `agents conversations`, no secrets/`env_passthrough` wiring, no config validation (including the `0.0.0.0` dashboard refusal) for secondary profiles — failures are yours to notice.
+3. **The dashboard isn't reachable.** The compose fragment publishes only the default profile's dashboard port to the host loopback; a secondary profile's dashboard binds a port nothing forwards.
+
+If a second gateway-exposed persona is worth a bot token, it's usually worth a container: `agents create <name> --type hermes` buys doctor coverage, independent upgrade/rollback, resource caps, and a real isolation boundary. The sweet spot for profile gateways is a **pod**: several same-trust-domain personas sharing one container, with containers still separating trust domains (GH #6).
 
 ## 7. Common questions
 
