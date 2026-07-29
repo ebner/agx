@@ -125,6 +125,72 @@ When to run it: after upgrading the toolkit, if `agents doctor` flags
 something or if `agents exec <name> …` starts misbehaving. Safe to
 run any time — preserves all stateful agent data.
 
+## Hermes ignores WhatsApp group messages after an upgrade
+
+Symptom: the agent answers WhatsApp DMs normally and can still *send*
+into group chats (cron notifications etc.), but never reacts to
+anything written in a group. Nothing appears in any log at INFO —
+`gateway.log` simply has no `inbound message ... @g.us` lines anymore.
+
+Cause: Hermes v2026.7.1 shipped "fail-closed external-surface
+defaults": every platform gained `dm_policy` / `group_policy` knobs
+defaulting to `"pairing"`. DMs have a pairing handshake under that
+default, and allowlisted senders keep working. Groups do **not** —
+`_is_group_allowed` in `gateway/platforms/whatsapp_common.py` is a
+hard `return False` under `pairing` (no group pairing flow exists).
+A deployment with env-only WhatsApp config (no explicit
+`group_policy`) silently loses all group ingress at the first upgrade
+past v2026.7.1. We hit this 2026-07: groups last answered June 8
+(pre-upgrade quiet period), upgrade to v2026.7.7.2 on July 10, noticed
+July 29.
+
+Diagnosis, in dependency order (each step rules out a layer):
+
+1. `grep 'g.us' <data>/logs/gateway.log` inside the container — if
+   inbound group lines stop at some date, the gateway never sees them.
+2. Bridge-level receipt: check mtimes of
+   `/opt/data/whatsapp/session/sender-key-<groupjid>--*.json`. Fresh
+   mtimes at the moment someone messaged the group prove Baileys
+   receives AND decrypts group traffic — the drop is above the bridge.
+3. Live policy: read the running bridge's env
+   (`tr '\0' '\n' < /proc/<bridge-pid>/environ | grep WHATSAPP`).
+   No `WHATSAPP_GROUP_POLICY` → the adapter is on the `pairing`
+   default → groups are dropped in `_is_group_allowed`, silently.
+
+Remediation: add BOTH lines to the agent's Hermes env file
+(`/opt/data/.env` in-container, next to the other `WHATSAPP_*` keys),
+then restart the gateway:
+
+```
+WHATSAPP_GROUP_POLICY=open
+WHATSAPP_ALLOW_ALL_USERS=true
+```
+
+The second line is a **boot interlock opt-in**, not an access grant:
+since the same hardening wave, the gateway refuses to start at all
+("open policy without allow-all opt-in") when any policy is `open`
+without it — setting only the first line takes the whole gateway down
+(all platforms, crash-loop under s6). The flag is read only by that
+startup guard and by the open-DM opt-in (irrelevant while `dm_policy`
+stays `pairing`); the bridge never reads it. Real access control is
+unchanged: the bridge's `WHATSAPP_ALLOWED_USERS` phone allowlist
+(LID-aware via the session dir's `lid-mapping-*.json`) still gates
+every sender, in groups and DMs alike.
+
+Why not the tighter `group_policy: allowlist` with specific group
+JIDs: the runtime reads `group_allow_from` only from the gateway
+platform-config block (`config.extra`), which env-only deployments
+don't have. The `WHATSAPP_GROUP_ALLOWED_USERS` env var is written by
+the setup wizard but never read back by the runtime (upstream bug as
+of v2026.7.x). If you need per-group restriction, that config block
+has to exist first.
+
+General lesson: upstream security waves can flip *defaults* under an
+env-only config, and this class of change produces no error — the
+feature just stops. After every `agents upgrade`, exercise each
+connected platform's inbound path (a test message per platform,
+groups included), not just "the agent responds somewhere".
+
 ## /opt/data permission drift (and how `agents fix-perms` resolves it)
 
 Symptom: `agents exec coder hermes <anything>` crashes on import with
