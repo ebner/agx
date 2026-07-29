@@ -762,7 +762,7 @@ _PROFILE_GATEWAY_PROBE = (
     'main=$(/command/s6-svstat "/run/service/gateway-$n" 2>&1 | tr -d "\\n"); '
     'logsvc=$(/command/s6-svstat "/run/service/gateway-$n/log" 2>&1 | tr -d "\\n"); '
     'state=$(tr -d "\\n\\r\\t" < "$s" 2>/dev/null); '
-    "printf '%s\\t%s\\t%s\\t%s\\n' \"$n\" \"$main\" \"$logsvc\" \"$state\"; "
+    'printf \'%s\\t%s\\t%s\\t%s\\n\' "$n" "$main" "$logsvc" "$state"; '
     "done"
 )
 
