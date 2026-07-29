@@ -245,6 +245,12 @@ HERMES_CONT_INIT_FIXPERMS: Final = r"""#!/command/with-contenv sh
 #      root-side mkdir no-ops and s6-log (which runs as hermes) can write.
 #      (The upstream run script's own later `chown -R "$log_dir"` is `|| true`,
 #      so it stays non-fatal once the leaf already exists hermes-owned.)
+#      Same treatment for every secondary profile's gateway log dir (GH #6):
+#      `hermes profile create` pre-creates it as hermes, but a restored or
+#      imported data dir (or a hand-deleted logs tree) arrives without it,
+#      and s6-log is NOT verified to create a missing leaf itself. The glob
+#      is a no-op when no profiles exist; a profile created after boot gets
+#      its dir from profile-create directly.
 #
 #   3. The WhatsApp bridge's node_modules. It lives on the container overlay
 #      fs, so every recreate wipes it — and even when it is reinstalled, the
@@ -292,6 +298,12 @@ if [ -n "$HUID" ] && [ -n "$HGID" ]; then
 fi
 
 /command/s6-setuidgid hermes mkdir -p /opt/data/logs/gateways/default 2>/dev/null
+
+for _profile_dir in /opt/data/profiles/*/; do
+    [ -d "$_profile_dir" ] || continue
+    /command/s6-setuidgid hermes mkdir -p \
+        "/opt/data/logs/gateways/$(basename "$_profile_dir")" 2>/dev/null
+done
 
 # --- 3. WhatsApp-bridge self-heal (rationale in the header) -----------------
 BRIDGE=/opt/hermes/scripts/whatsapp-bridge

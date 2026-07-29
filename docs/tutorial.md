@@ -68,7 +68,7 @@ If none of those apply, you probably don't need a second container.
 
 **Profiles are not a security boundary.** The Hermes docs are explicit: "Profiles do not sandbox the agent." Every profile in a container has the same filesystem access, and tool subprocesses share the real `HOME` across profiles by default (opt into stricter separation per profile with `terminal.home_mode: profile` in that profile's `config.yaml`). If a persona handles data that must survive another persona's compromised skill, that's a second container (criterion 5 above), full stop.
 
-**Profiles are not (yet) this toolkit's way to run more bots.** Upstream supports it — in the official image each profile's gateway is a first-class s6-supervised service, and upstream's default topology is one container running all profile gateways side by side. The mechanics work in this toolkit's containers too (spike-verified — see §6), but gateway-exposed secondary profiles fall outside everything the toolkit manages, and each one needs its own bot token anyway — at which point a second toolkit agent buys real isolation for the same token cost. Toolkit support for the "pod" pattern (same-trust personas sharing one container) is tracked in GH #6.
+**Profiles are not (yet) this toolkit's way to run more bots.** Upstream supports it — in the official image each profile's gateway is a first-class s6-supervised service, and upstream's default topology is one container running all profile gateways side by side. The mechanics work in this toolkit's containers (spike-verified, with tier-1 guardrails landed: boot-time log-dir pre-create + a doctor watch — see §6), but secondary profiles' *configuration* stays outside the toolkit, and each gateway needs its own bot token anyway — at which point a second toolkit agent buys real isolation for the same token cost. Profile-aware management (tier 2) is tracked in GH #6.
 
 **Profiles are not a way to multiplex one Mattermost (or Slack/Discord) bot across personas.** Each profile that runs a gateway binds its own bot token; two profiles cannot share a bot. The Hermes docs are explicit:
 
@@ -383,19 +383,24 @@ Worth knowing before you lean on them:
 - **No privilege isolation between profiles.** Same container, same uid, same filesystem access; tool subprocesses share the real `HOME` across profiles by default (`terminal.home_mode: profile` opts a profile's tools into `$HERMES_HOME/home` instead). The container is the security boundary, not the profile.
 - **`hermes update` upgrades all profiles at once.** Profiles share the installation, so there's no per-profile version pinning or canarying — that's a per-container property (§3 criterion 3).
 
-### Profile + gateway: works mechanically, but the toolkit doesn't manage it yet
+### Profile + gateway: works, with tier-1 toolkit guardrails
 
 Upstream supports concurrent per-profile gateways — in the official image each profile's gateway is a dynamically registered, s6-supervised service (each bound to its own bot token, enforced), and upstream's default topology is one container running all of them.
 
-A 2026-07 spike (Hermes v2026.7.7.2, libvirt backend, virtiofs-mounted data dir) verified the mechanics work in this toolkit's containers too: `hermes profile create` registers the s6 slot live and pre-creates the gateway log dir (`/opt/data/logs/gateways/<profile>/`) as the `hermes` user — defusing the rootless root-`mkdir`-on-shared-mount class that bit the default gateway — the profile gateway and its cron scheduler run supervised, and the running set auto-resumes after container restarts and recreates via each profile's `gateway_state.json`. Toolkit-level support (log-dir hardening for restored data dirs, doctor checks, profile-aware config/secrets/conversations, dashboard publishing) is tracked in GH #6.
+A 2026-07 spike (Hermes v2026.7.7.2, libvirt backend, virtiofs-mounted data dir) verified the mechanics work in this toolkit's containers too: `hermes profile create` registers the s6 slot live and pre-creates the gateway log dir (`/opt/data/logs/gateways/<profile>/`) as the `hermes` user — defusing the rootless root-`mkdir`-on-shared-mount class that bit the default gateway — the profile gateway and its cron scheduler run supervised, and the running set auto-resumes after container restarts and recreates via each profile's `gateway_state.json`.
 
-Until that lands, treat a gateway-exposed secondary profile as **unmanaged**:
+The toolkit backs this with two guardrails (GH #6 tier 1):
+
+- The cont-init hook pre-creates **every existing profile's** gateway log dir on each container boot, not just the default's. This covers restored or imported data dirs, which arrive without the log tree and would otherwise hot-loop the log service. Restart the agent after restoring an archive (or after creating a profile you plan to gateway-expose) so the hook runs.
+- `agents doctor` warns when a profile whose `gateway_state.json` wants `running` has its s6 service down or its log service flapping, with the remediation in the message.
+
+Still, a gateway-exposed secondary profile remains **mostly unmanaged** (GH #6 tier 2):
 
 1. **One bot token per gateway, enforced.** Each profile needs its own Slack/Mattermost/Discord bot account. If you're provisioning a second bot anyway, a profile saves you almost nothing over a second toolkit agent.
-2. **It's outside the toolkit's management surface.** No doctor checks, no `agents conversations`, no secrets/`env_passthrough` wiring, no config validation (including the `0.0.0.0` dashboard refusal) for secondary profiles — failures are yours to notice.
+2. **Config stays outside the toolkit.** No `agents conversations`, no secrets/`env_passthrough` wiring, no config validation (including the `0.0.0.0` dashboard refusal) for secondary profiles — you manage them by hand via `agents exec <agent> hermes -p <profile> …`.
 3. **The dashboard isn't reachable.** The compose fragment publishes only the default profile's dashboard port to the host loopback; a secondary profile's dashboard binds a port nothing forwards.
 
-If a second gateway-exposed persona is worth a bot token, it's usually worth a container: `agents create <name> --type hermes` buys doctor coverage, independent upgrade/rollback, resource caps, and a real isolation boundary. The sweet spot for profile gateways is a **pod**: several same-trust-domain personas sharing one container, with containers still separating trust domains (GH #6).
+If a second gateway-exposed persona is worth a bot token, it's usually worth a container: `agents create <name> --type hermes` buys full doctor coverage, independent upgrade/rollback, resource caps, and a real isolation boundary. The sweet spot for profile gateways is a **pod**: several same-trust-domain personas sharing one container, with containers still separating trust domains.
 
 ## 7. Common questions
 

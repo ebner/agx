@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -150,6 +151,35 @@ def test_ensure_cont_init_script_writes_executable_hook(cfg: AgentsConfig) -> No
     # A non-zero cont-init.d exit can abort container init (depending on
     # S6_BEHAVIOUR_IF_STAGE2_FAILS), so the hook must always end by succeeding.
     assert body.rstrip().endswith("exit 0")
+
+
+def test_cont_init_script_precreates_profile_gateway_log_dirs(cfg: AgentsConfig) -> None:
+    # GH #6 tier 1: beyond the default gateway's log dir, the hook globs
+    # /opt/data/profiles/*/ and pre-creates each profile's leaf under
+    # /opt/data/logs/gateways/ AS hermes — a restored/imported data dir
+    # arrives without it, the image's log `run` script can only mkdir it
+    # as root (which the 9p/virtiofs mount refuses), and s6-log is not
+    # verified to create a missing leaf itself.
+    ensure_cont_init_script(cfg)
+    body = (cfg.paths.host_data_dir / CONT_INIT_REL).read_text(encoding="utf-8")
+    assert "/opt/data/profiles/*/" in body
+    assert '"/opt/data/logs/gateways/$(basename "$_profile_dir")"' in body
+    # The per-profile mkdir must run AS hermes too (split-privilege contract).
+    profile_block = body.split("/opt/data/profiles/*/", 1)[1]
+    assert "/command/s6-setuidgid hermes mkdir -p" in profile_block
+
+
+def test_cont_init_script_is_valid_posix_sh(cfg: AgentsConfig) -> None:
+    # The hook is a shell template assembled in Python — a quoting slip
+    # would only surface as a container boot failure. `sh -n` parses
+    # without executing.
+    ensure_cont_init_script(cfg)
+    proc = subprocess.run(
+        ["sh", "-n", str(cfg.paths.host_data_dir / CONT_INIT_REL)],
+        capture_output=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr.decode()
 
 
 def test_ensure_cont_init_script_is_idempotent(cfg: AgentsConfig) -> None:

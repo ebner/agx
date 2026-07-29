@@ -187,6 +187,7 @@ def doctor(
             _check_hermes_doctor(cfg, svc, agent_name, report)
             _check_hermes_codex_mount(cfg, svc, agent_name, report)
             _check_hermes_model_set(cfg, svc, agent_name, report)
+            _check_profile_gateways(cfg, svc, agent_name, report)
 
     if emit:
         _emit_doctor_table(report)
@@ -745,6 +746,113 @@ def _check_hermes_doctor(
             "fail",
             result.stderr.strip() or result.stdout.strip(),
         )
+
+
+# One in-container pass over every secondary Hermes profile: emit one
+# "<name>\t<svstat main>\t<svstat log>\t<gateway_state.json>" line per
+# profile that has a gateway_state.json. Quiet no-op (rc 0, no output)
+# when /opt/data/profiles doesn't exist. Runs as container-root:
+# s6-svstat reads the supervise/ control dir, which the runtime uid
+# can't. Tabs/newlines are stripped from the JSON so the line count and
+# the field count stay stable.
+_PROFILE_GATEWAY_PROBE = (
+    "for d in /opt/data/profiles/*/; do "
+    's="$d/gateway_state.json"; [ -f "$s" ] || continue; '
+    'n=$(basename "$d"); '
+    'main=$(/command/s6-svstat "/run/service/gateway-$n" 2>&1 | tr -d "\\n"); '
+    'logsvc=$(/command/s6-svstat "/run/service/gateway-$n/log" 2>&1 | tr -d "\\n"); '
+    'state=$(tr -d "\\n\\r\\t" < "$s" 2>/dev/null); '
+    "printf '%s\\t%s\\t%s\\t%s\\n' \"$n\" \"$main\" \"$logsvc\" \"$state\"; "
+    "done"
+)
+
+_SVSTAT_SECONDS_RE = re.compile(r"(\d+) seconds")
+
+
+def _svstat_seconds(stat: str) -> int | None:
+    m = _SVSTAT_SECONDS_RE.search(stat)
+    return int(m.group(1)) if m else None
+
+
+def _check_profile_gateways(
+    cfg: AgentsConfig, svc: str, agent_name: str, report: DoctorReport
+) -> None:
+    """Warn when a secondary Hermes profile's gateway should be running
+    but its s6 service is down or flapping (GH #6 tier 1).
+
+    Profile gateways are hand-managed (``hermes -p <name> gateway
+    start``) and otherwise invisible to the toolkit — this check is the
+    only toolkit-side eye on them. "Should be running" comes from the
+    profile's ``gateway_state.json`` (``desired_state``; upstream's boot
+    reconciler uses the same record, and only an explicit ``gateway
+    stop`` writes ``stopped``). A log service that is down or keeps
+    restarting is the missing-log-dir hot-loop class: the s6-log leaf
+    under ``/opt/data/logs/gateways/<profile>`` can't be created by the
+    image's root-side mkdir on a 9p/virtiofs mount, and a restored or
+    imported data dir arrives without it. A container restart re-runs
+    the cont-init hook, which pre-creates the leaf for every existing
+    profile.
+
+    Adds no check at all for the common cases doctor already covers or
+    that carry no signal: container not up, no secondary profiles, or a
+    state file that isn't valid JSON.
+    """
+    result = mp.exec_in_vm(
+        cfg.vm.name,
+        *_compose_exec_in_vm_argv(
+            cfg, svc, "sh", "-c", _PROFILE_GATEWAY_PROBE, no_tty=True, as_root=True
+        ),
+        check=False,
+    )
+    if result.returncode != 0:
+        err = (result.stderr or "").lower()
+        if "is not running" in err or "no such" in err:
+            return  # container not up — container_running already reports it
+        report.add(
+            f"{agent_name}.profile_gateways",
+            "warn",
+            f"probe failed: {(result.stderr or '').strip() or 'rc=' + str(result.returncode)}",
+        )
+        return
+    lines = [ln for ln in result.stdout.splitlines() if ln.strip()]
+    if not lines:
+        return  # no secondary profiles — the common case
+    healthy: list[str] = []
+    problems: list[str] = []
+    for line in lines:
+        parts = line.split("\t")
+        if len(parts) != 4:
+            continue
+        name, main_stat, log_stat, raw_state = parts
+        try:
+            state = json.loads(raw_state)
+        except ValueError:
+            continue
+        if not isinstance(state, dict):
+            continue
+        desired = state.get("desired_state") or state.get("gateway_state")
+        if desired != "running":
+            healthy.append(f"{name}: stopped (deliberate)")
+            continue
+        if not main_stat.startswith("up "):
+            problems.append(
+                f"{name}: wants running but s6 reports {main_stat!r} — "
+                f"`agents exec {agent_name} hermes -p {name} gateway start`"
+            )
+            continue
+        log_secs = _svstat_seconds(log_stat)
+        if not log_stat.startswith("up ") or (log_secs is not None and log_secs <= 5):
+            problems.append(
+                f"{name}: gateway up but its log service reports {log_stat!r} — "
+                f"possibly the missing-log-dir hot-loop; `agents restart {agent_name}` "
+                "re-runs the cont-init pre-create"
+            )
+            continue
+        healthy.append(f"{name}: up")
+    if problems:
+        report.add(f"{agent_name}.profile_gateways", "warn", "; ".join(problems))
+    elif healthy:
+        report.add(f"{agent_name}.profile_gateways", "ok", "; ".join(healthy))
 
 
 def _check_codex_auth(cfg: AgentsConfig, report: DoctorReport) -> None:

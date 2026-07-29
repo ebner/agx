@@ -238,6 +238,103 @@ def test_doctor_target_missing_raises(saved_config: Path, mocker) -> None:
         ops.doctor(target="ghost", config_path=saved_config)
 
 
+# ---------- doctor: profile gateways (GH #6 tier 1) ----------
+
+
+def _profile_line(name: str, main: str, log: str, state: dict) -> str:
+    return f"{name}\t{main}\t{log}\t{json.dumps(state)}"
+
+
+def _run_profile_check(cfg, mocker, result: MpResult):
+    from agents_cli.ops import DoctorReport, _check_profile_gateways
+
+    mocker.patch("agents_cli.mp.exec_in_vm", return_value=result)
+    report = DoctorReport()
+    _check_profile_gateways(cfg, "hermes-coder", "coder", report)
+    return report
+
+
+def test_profile_gateways_quiet_without_profiles(cfg, mocker) -> None:
+    # No secondary profiles (the common case) → the check adds nothing,
+    # keeping doctor output stable for single-profile agents.
+    report = _run_profile_check(cfg, mocker, _ok(""))
+    assert report.checks == []
+
+
+def test_profile_gateways_quiet_when_container_down(cfg, mocker) -> None:
+    # container_running already reports a down container; this check
+    # must not pile on.
+    result = MpResult(stdout="", stderr='service "hermes-coder" is not running', returncode=1)
+    report = _run_profile_check(cfg, mocker, result)
+    assert report.checks == []
+
+
+def test_profile_gateways_ok_when_supervised_and_up(cfg, mocker) -> None:
+    line = _profile_line(
+        "spike",
+        "up (pid 336) 4242 seconds",
+        "up (pid 289) 4242 seconds",
+        {"desired_state": "running", "gateway_state": "running"},
+    )
+    report = _run_profile_check(cfg, mocker, _ok(line + "\n"))
+    assert [c.status for c in report.checks] == ["ok"]
+    assert "spike: up" in report.checks[0].detail
+
+
+def test_profile_gateways_warns_when_wanted_but_down(cfg, mocker) -> None:
+    line = _profile_line(
+        "spike",
+        "down (exitcode 0) 12 seconds, normally up, want up",
+        "up (pid 289) 4242 seconds",
+        {"desired_state": "running"},
+    )
+    report = _run_profile_check(cfg, mocker, _ok(line + "\n"))
+    assert [c.status for c in report.checks] == ["warn"]
+    assert "hermes -p spike gateway start" in report.checks[0].detail
+
+
+def test_profile_gateways_warns_on_flapping_log_service(cfg, mocker) -> None:
+    # The missing-log-dir class: gateway main service is up but s6-log
+    # keeps dying — uptime of a few seconds at probe time.
+    line = _profile_line(
+        "spike",
+        "up (pid 336) 4242 seconds",
+        "up (pid 999) 2 seconds",
+        {"desired_state": "running"},
+    )
+    report = _run_profile_check(cfg, mocker, _ok(line + "\n"))
+    assert [c.status for c in report.checks] == ["warn"]
+    assert "log service" in report.checks[0].detail
+    assert "agents restart coder" in report.checks[0].detail
+
+
+def test_profile_gateways_stays_ok_for_deliberate_stop(cfg, mocker) -> None:
+    # `hermes gateway stop` records desired_state=stopped — a down
+    # service then carries no signal.
+    line = _profile_line(
+        "spike",
+        "down (exitcode 0) 99999 seconds, normally up",
+        "up (pid 289) 99999 seconds",
+        {"desired_state": "stopped", "gateway_state": "stopped"},
+    )
+    report = _run_profile_check(cfg, mocker, _ok(line + "\n"))
+    assert [c.status for c in report.checks] == ["ok"]
+    assert "stopped (deliberate)" in report.checks[0].detail
+
+
+def test_profile_gateways_ignores_garbage_state_files(cfg, mocker) -> None:
+    # Unparseable or non-object state files carry no assertable signal;
+    # the check must not crash or false-alarm on them.
+    lines = "\n".join(
+        [
+            "spike\tup (pid 1) 10 seconds\tup (pid 2) 10 seconds\tnot-json",
+            'other\tup (pid 3) 10 seconds\tup (pid 4) 10 seconds\t"just-a-string"',
+        ]
+    )
+    report = _run_profile_check(cfg, mocker, _ok(lines + "\n"))
+    assert report.checks == []
+
+
 def test_doctor_passes_on_healthy_setup(with_coder: Path, mocker) -> None:
     _stub_minimal_doctor(mocker)
     mocker.patch(
