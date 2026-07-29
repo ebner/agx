@@ -18,7 +18,7 @@ import shutil
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
-from agents_cli import compose, compose_runner, mp, ui
+from agents_cli import compose, compose_runner, mp, permissions, ui
 from agents_cli import config as cfg_mod
 from agents_cli.compose import HERMES_IMAGE_BASE, OPENCLAW_IMAGE_BASE
 from agents_cli.config import AgentsConfig
@@ -300,7 +300,7 @@ def _create_data_dirs(cfg: AgentsConfig, name: str, agent_type: str) -> None:
     access_cmd.auto_grant_on_create(cfg, name, agent_type)
 
 
-def _delete_data_dir(cfg: AgentsConfig, name: str) -> None:
+def _delete_data_dir(cfg: AgentsConfig, name: str, *, yes: bool = False) -> None:
     if cfg.paths.data_dir_in_vm:
         mp.exec_in_vm(
             cfg.vm.name,
@@ -311,8 +311,33 @@ def _delete_data_dir(cfg: AgentsConfig, name: str) -> None:
         )
         return
     target = cfg.paths.host_data_dir / name
-    if target.exists():
+    if not target.exists():
+        return
+    try:
         shutil.rmtree(target)
+    except PermissionError:
+        # The agent entrypoint chmods subuid-owned paths (``.data`` to
+        # 700, auth files to 600), which resets each object's POSIX-ACL
+        # *mask* to ``---`` — the host-user entry auto_grant_on_create
+        # installed stays present but reads ``#effective:---``, so the
+        # host user can't traverse or delete the tree. Repair with sudo
+        # (apply_acl_argv always forces ``m::rwx`` back open), then
+        # retry the delete. Deletion only needs w+x on directories, so
+        # defaults are pointless on a tree that's about to go away.
+        recipient = permissions.host_user_recipient(cfg.host.uid, writable=True)
+        argvs = permissions.apply_acl_argv(
+            target, recipients=[recipient], recurse=True, defaults=False
+        )
+        try:
+            permissions.run_with_sudo(argvs, yes=yes)
+            shutil.rmtree(target)
+        except (UserError, RuntimeFailure, PermissionError) as exc:
+            raise RuntimeFailure(
+                f"could not delete {target} ({exc}). The removal journal stays "
+                f"resumable: delete the directory manually with "
+                f"`sudo rm -rf {target}` and re-run `agents remove {name}` to "
+                "finish."
+            ) from exc
 
 
 def _add_service_to_compose(
@@ -443,7 +468,17 @@ def remove(
 
     agent_type = agent_type or _detect_type_from_compose(cfg, name)
     if agent_type is None:
-        raise UserError(f"agent {name!r} not found in compose")
+        # A prior removal may have died AFTER ``compose_updated`` (the
+        # compose entry is gone) but BEFORE ``data_dir_deleted``.
+        # Refusing with "not found" here would strand the open journal
+        # forever; consult it before giving up. The pre-meta fallback
+        # type is safe: a missing compose entry proves the
+        # container-facing phases already completed, so from here the
+        # type only labels the final emit.
+        stranded = Journal.find_resumable(cfg.paths.host_data_dir, "remove", name)
+        if stranded is None:
+            raise UserError(f"agent {name!r} not found in compose")
+        agent_type = str(stranded.meta.get("agent_type") or AGENT_TYPES[0])
     svc = service_name(name, agent_type)
 
     if not yes and not ui.confirm(
@@ -453,7 +488,7 @@ def remove(
 
     with compose.acquire_lock(cfg.paths.host_data_dir):
         journal = Journal.find_resumable(cfg.paths.host_data_dir, "remove", name) or Journal.begin(
-            cfg.paths.host_data_dir, "remove", name, REMOVE_PHASES
+            cfg.paths.host_data_dir, "remove", name, REMOVE_PHASES, meta={"agent_type": agent_type}
         )
 
         for phase in _phases_to_run(journal):
@@ -483,7 +518,7 @@ def remove(
                 journal.advance(phase)
             elif phase == "data_dir_deleted":
                 if delete_data:
-                    _delete_data_dir(cfg, name)
+                    _delete_data_dir(cfg, name, yes=yes)
                 journal.advance(phase)
 
         journal.complete()

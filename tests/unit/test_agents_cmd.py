@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 import pytest
@@ -392,6 +393,102 @@ def test_remove_aborts_without_confirmation(
     mocker.patch("agents_cli.ui.confirm", return_value=False)
     with pytest.raises(UserError, match="aborted"):
         remove("coder", config_path=saved_config)
+
+
+def test_remove_resumes_after_crash_between_compose_update_and_data_delete(
+    cfg: AgentsConfig, saved_config: Path, stub_runners, mocker
+) -> None:
+    """A removal that dies after ``compose_updated`` leaves the agent
+    undetectable in compose. Re-running must resume from the journal
+    (recovering the type from its meta), not refuse with "not found"."""
+    create(name="coder", agent_type="hermes", config_path=saved_config)
+    boom = mocker.patch(
+        "agents_cli.agents_cmd._delete_data_dir",
+        side_effect=RuntimeFailure("disk on fire"),
+    )
+    with pytest.raises(RuntimeFailure, match="disk on fire"):
+        remove("coder", yes=True, config_path=saved_config)
+    doc = compose.load_compose(cfg.paths.host_data_dir / "docker-compose.yml")
+    assert "hermes-coder" not in (doc.get("services") or {})
+    j = Journal.find_resumable(cfg.paths.host_data_dir, "remove", "coder")
+    assert j is not None
+    assert j.meta["agent_type"] == "hermes"
+    mocker.stop(boom)
+    remove("coder", yes=True, config_path=saved_config)
+    assert not (cfg.paths.host_data_dir / "coder").exists()
+    assert Journal.find_resumable(cfg.paths.host_data_dir, "remove", "coder") is None
+
+
+def test_remove_resume_tolerates_pre_meta_journal(
+    cfg: AgentsConfig, saved_config: Path, stub_runners
+) -> None:
+    """Journals written before remove recorded ``agent_type`` in meta
+    must still resume — the fallback type is only cosmetic because a
+    missing compose entry proves the container phases completed."""
+    create(name="coder", agent_type="hermes", config_path=saved_config)
+    j = Journal.begin(cfg.paths.host_data_dir, "remove", "coder", agents_cmd.REMOVE_PHASES)
+    for phase in ["mounts_torn_down", "container_stopped", "compose_updated"]:
+        j.advance(phase)
+    doc = compose.load_compose(cfg.paths.host_data_dir / "docker-compose.yml")
+    compose.remove_service(doc, "hermes-coder")
+    (cfg.paths.host_data_dir / "docker-compose.yml").write_text(
+        compose.dump_compose(doc), encoding="utf-8"
+    )
+    remove("coder", yes=True, config_path=saved_config)
+    assert not (cfg.paths.host_data_dir / "coder").exists()
+    assert Journal.find_resumable(cfg.paths.host_data_dir, "remove", "coder") is None
+
+
+def test_remove_repairs_acl_mask_and_retries_on_permission_error(
+    cfg: AgentsConfig, saved_config: Path, stub_runners, mocker
+) -> None:
+    """PermissionError from rmtree (the entrypoint's chmod clobbered the
+    ACL mask) triggers a sudo setfacl repair — with the ``m::rwx`` mask
+    reset — and a retry."""
+    create(name="coder", agent_type="hermes", config_path=saved_config)
+    target = cfg.paths.host_data_dir / "coder"
+    real_rmtree = shutil.rmtree
+    state = {"denied": False}
+
+    def flaky_rmtree(path, *args, **kwargs):
+        if Path(path) == target and not state["denied"]:
+            state["denied"] = True
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_rmtree(path, *args, **kwargs)
+
+    mocker.patch("agents_cli.agents_cmd.shutil.rmtree", side_effect=flaky_rmtree)
+    sudo = mocker.patch("agents_cli.agents_cmd.permissions.run_with_sudo")
+    remove("coder", yes=True, config_path=saved_config)
+    assert not target.exists()
+    sudo.assert_called_once()
+    joined = [" ".join(argv) for argv in sudo.call_args.args[0]]
+    assert any("setfacl" in c and "m::rwx" in c and str(target) in c for c in joined)
+    assert sudo.call_args.kwargs == {"yes": True}
+
+
+def test_remove_acl_repair_failure_keeps_journal_and_hints_manual_cleanup(
+    cfg: AgentsConfig, saved_config: Path, stub_runners, mocker
+) -> None:
+    """If the sudo repair is declined or fails, remove surfaces the
+    manual ``sudo rm -rf`` remediation and leaves the journal resumable."""
+    create(name="coder", agent_type="hermes", config_path=saved_config)
+    target = cfg.paths.host_data_dir / "coder"
+    real_rmtree = shutil.rmtree
+
+    def denying_rmtree(path, *args, **kwargs):
+        if Path(path) == target:
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_rmtree(path, *args, **kwargs)
+
+    mocker.patch("agents_cli.agents_cmd.shutil.rmtree", side_effect=denying_rmtree)
+    mocker.patch(
+        "agents_cli.agents_cmd.permissions.run_with_sudo",
+        side_effect=UserError("aborted by user"),
+    )
+    with pytest.raises(RuntimeFailure, match="sudo rm -rf"):
+        remove("coder", yes=True, config_path=saved_config)
+    assert target.exists()
+    assert Journal.find_resumable(cfg.paths.host_data_dir, "remove", "coder") is not None
 
 
 # ---------- rename ----------
