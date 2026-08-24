@@ -150,6 +150,12 @@ def _stub_minimal_doctor(mocker, vm_state: str = "Running") -> None:
         # snapshot (8 GiB total, 4 GiB available).
         if cmd[:2] == ("cat", "/proc/meminfo"):
             return _ok("MemTotal: 8388608 kB\nMemAvailable: 4194304 kB\n")
+        # `df -Pk /` for the vm_disk check — return a half-full root fs.
+        if cmd[:2] == ("df", "-Pk"):
+            return _ok(
+                "Filesystem 1024-blocks Used Available Capacity Mounted on\n"
+                "/dev/vda1 60000000 30000000 30000000 50% /\n"
+            )
         # `nproc` for the vm_load check.
         if cmd[:1] == ("nproc",):
             return _ok("4\n")
@@ -210,6 +216,40 @@ def test_doctor_disk_space_thresholds_classify(
     report = DoctorReport()
     _check_disk_space(cfg, report)
     assert report.checks[0].status == expected
+
+
+@pytest.mark.parametrize(
+    "avail_kb,total_kb,expected",
+    [
+        (30_000_000, 60_000_000, "ok"),  # 50% — comfortable
+        (6_000_000, 60_000_000, "warn"),  # 10% — under 15% threshold
+        (0, 60_000_000, "fail"),  # 0% — the full-VM-disk outage class
+    ],
+)
+def test_doctor_vm_disk_thresholds_classify(
+    cfg: AgentsConfig, mocker, avail_kb: int, total_kb: int, expected: str
+) -> None:
+    from agents_cli.ops import DoctorReport, _check_vm_disk
+
+    mocker.patch(
+        "agents_cli.mp.exec_in_vm",
+        return_value=_ok(
+            "Filesystem 1024-blocks Used Available Capacity Mounted on\n"
+            f"/dev/vda1 {total_kb} {total_kb - avail_kb} {avail_kb} 50% /\n"
+        ),
+    )
+    report = DoctorReport()
+    _check_vm_disk(cfg, report)
+    assert report.checks[0].status == expected
+
+
+def test_doctor_vm_disk_degrades_to_warn_on_unparseable_df(cfg: AgentsConfig, mocker) -> None:
+    from agents_cli.ops import DoctorReport, _check_vm_disk
+
+    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok("garbage\n"))
+    report = DoctorReport()
+    _check_vm_disk(cfg, report)
+    assert report.checks[0].status == "warn"
 
 
 def test_doctor_port_conflict_detection(cfg: AgentsConfig, mocker) -> None:

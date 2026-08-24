@@ -167,6 +167,7 @@ def doctor(
         _check_mount_round_trip(cfg, report)
         _check_user_docker_service(cfg, report)
         _check_disk_space(cfg, report)
+        _check_vm_disk(cfg, report)
         _check_vm_memory(cfg, report)
         _check_vm_load(cfg, report)
         _check_journals(cfg, report)
@@ -338,6 +339,55 @@ def _check_disk_space(cfg: AgentsConfig, report: DoctorReport) -> None:
         report.add("disk_space", "warn", detail)
     else:
         report.add("disk_space", "ok", detail)
+
+
+def _check_vm_disk(cfg: AgentsConfig, report: DoctorReport) -> None:
+    """Free space on the root filesystem holding the Docker engine + images.
+
+    Complements ``disk_space`` (host data dir): under the VM backends the
+    OS, Docker engine, and image cache live on the VM's root disk, which
+    ``shutil.disk_usage`` on the host can't see. A full VM disk breaks
+    agents obscurely — container overlay-fs writes fail, so Hermes can't
+    persist session storage and s6 log services hot-loop — long before
+    anything host-side notices. Repeated ``agents upgrade`` runs are the
+    usual growth driver: each pull leaves the superseded image tag behind.
+    """
+    result = mp.exec_in_vm(cfg.vm.name, "df", "-Pk", "/", check=False)
+    if result.returncode != 0:
+        report.add("vm_disk", "warn", "could not run `df -Pk /`")
+        return
+    lines = result.stdout.strip().splitlines()
+    fields = lines[1].split() if len(lines) >= 2 else []
+    try:
+        total_kb, avail_kb = int(fields[1]), int(fields[3])
+    except (IndexError, ValueError):
+        report.add("vm_disk", "warn", f"unparseable df output: {result.stdout!r}")
+        return
+    if total_kb <= 0:
+        report.add("vm_disk", "warn", f"df reports zero-size root fs: {result.stdout!r}")
+        return
+    free_pct = avail_kb / total_kb * 100
+    where = "host root fs" if cfg.vm.backend == "bare_metal" else "VM root disk"
+    detail = (
+        f"{free_pct:.1f}% free on {where} "
+        f"({avail_kb / 1024 / 1024:.1f} of {total_kb / 1024 / 1024:.1f} GiB available)"
+    )
+    if free_pct < 5:
+        report.add(
+            "vm_disk",
+            "fail",
+            f"{detail}; superseded agent image tags from past upgrades are the"
+            " usual culprit — `docker rmi` the old tags",
+        )
+    elif free_pct < 15:
+        report.add(
+            "vm_disk",
+            "warn",
+            f"{detail}; superseded agent image tags from past upgrades are the"
+            " usual culprit — `docker rmi` the old tags",
+        )
+    else:
+        report.add("vm_disk", "ok", detail)
 
 
 def _check_vm_memory(cfg: AgentsConfig, report: DoctorReport) -> None:
