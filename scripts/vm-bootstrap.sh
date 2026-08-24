@@ -121,6 +121,31 @@ if ! as_ubuntu 'command -v dockerd-rootless-setuptool.sh >/dev/null 2>&1'; then
         || echo "[bootstrap] get.docker.com/rootless install warned"
 fi
 
+# Rootless Docker ships with NO container-log rotation: the json-file
+# driver grows unbounded, and one chatty container can fill the VM disk
+# (firecrawl-postgres wrote 2.8 GB in 5 days; disk-full wedged rabbitmq
+# and killed web search — 2026-08 outage class). Write the rotation
+# defaults BEFORE the daemon's first start so every container created on
+# this VM inherits them. Never clobber an existing daemon.json (user
+# customization); on re-runs against an existing VM the file is left
+# alone, and a freshly written one takes effect for containers created
+# after the next daemon restart. Containers created before this step
+# keep unbounded logs until their next recreate (reseat/upgrade).
+echo "[bootstrap] step 3b2: default container-log rotation (daemon.json)"
+if ! sudo test -f /home/ubuntu/.config/docker/daemon.json; then
+    as_ubuntu 'mkdir -p ~/.config/docker'
+    sudo tee /home/ubuntu/.config/docker/daemon.json >/dev/null <<'DAEMONJSON'
+{
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "50m",
+    "max-file": "3"
+  }
+}
+DAEMONJSON
+    sudo chown ubuntu:ubuntu /home/ubuntu/.config/docker/daemon.json
+fi
+
 echo "[bootstrap] step 3c: setuptool install (clean stale state only if daemon is broken)"
 # The uninstall + rm -rf below wipe every container and the whole image
 # cache. They exist to clear stale state left by a previously FAILED
