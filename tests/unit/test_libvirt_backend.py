@@ -167,6 +167,21 @@ def test_snapshot_creates_internal_revertible_snapshot(libvirt: Any, mocker: Any
     assert "--description" in argv
 
 
+def test_delete_snapshot_argv(libvirt: Any, mocker: Any) -> None:
+    run_mock = _mock_subprocess(mocker)
+    libvirt.delete_snapshot("agents", "pre-upgrade-coder-20260512T000000Z")
+    argv = run_mock.call_args.args[0]
+    assert argv[:3] == ["virsh", "-c", "qemu:///system"]
+    assert argv[3:] == ["snapshot-delete", "agents", "pre-upgrade-coder-20260512T000000Z"]
+
+
+def test_delete_snapshot_refuses_empty_name(libvirt: Any, mocker: Any) -> None:
+    run_mock = _mock_subprocess(mocker)
+    result = libvirt.delete_snapshot("agents", "")
+    assert result.returncode != 0
+    run_mock.assert_not_called()
+
+
 def test_restore_requires_dot_separated_id(libvirt: Any, mocker: Any) -> None:
     """Multipass uses ``<vm>.<name>``; toolkit callers pass the same.
     Refuse anything else cleanly rather than calling virsh with

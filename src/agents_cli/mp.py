@@ -37,6 +37,7 @@ __all__ = [
     "MULTIPASS_BIN",
     "BootstrapStatus",
     "MpResult",
+    "delete_snapshot",
     "delete_vm",
     "exec_bash",
     "exec_in_vm",
@@ -211,6 +212,10 @@ def set_config(key: str, value: str | int) -> MpResult:
 
 def delete_vm(vm: str, *, purge: bool = False) -> MpResult:
     return _b().delete_vm(vm, purge=purge)
+
+
+def delete_snapshot(vm: str, name: str) -> MpResult:
+    return _b().delete_snapshot(vm, name)
 
 
 def snapshot(vm: str, name: str, *, comment: str | None = None) -> MpResult:

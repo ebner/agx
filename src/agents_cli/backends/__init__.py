@@ -185,6 +185,8 @@ class VmBackend(Protocol):
 
     def restore(self, snapshot_id: str, *, destructive: bool = False) -> MpResult: ...
 
+    def delete_snapshot(self, vm: str, name: str) -> MpResult: ...
+
 
 def get_backend_module(backend_name: str) -> object:
     """Resolve a backend name to its module object.

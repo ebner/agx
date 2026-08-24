@@ -31,6 +31,7 @@ from agents_cli import (
     ollama_cmd,
     ops,
     outdated_cmd,
+    prune_cmd,
     secrets_cmd,
     ui,
     upgrades,
@@ -873,6 +874,30 @@ def agents_rollback(
         snapshot_id=snapshot_id,
         yes=yes_local or ctx.obj.get("yes", False),
     )
+
+
+@main.command("prune")
+@click.argument("name", required=False)
+@click.option(
+    "--keep",
+    type=click.IntRange(min=0),
+    default=None,
+    help=(
+        "Upgrade generations to keep per agent (host tarball + VM snapshot + "
+        "image tag each). Default: [upgrades].keep_generations from config, "
+        "or 2. 0 deletes every upgrade artifact — no rollback afterwards."
+    ),
+)
+@click.option("--dry-run", is_flag=True, help="Show what would be deleted; delete nothing.")
+@click.option("-y", "--yes", "yes_local", is_flag=True, help="Skip the confirmation prompt.")
+def agents_prune(name: str | None, keep: int | None, dry_run: bool, yes_local: bool) -> None:
+    """Delete old upgrade artifacts (tarballs, VM snapshots, image tags).
+
+    Runs automatically after every successful ``agents upgrade`` (see
+    ``[upgrades].keep_generations``); this command is the manual sweep
+    for history that predates that hook, or for a custom ``--keep``.
+    """
+    _run(prune_cmd.prune, name, keep=keep, dry_run=dry_run, yes=yes_local)
 
 
 # ---------- export / import ----------

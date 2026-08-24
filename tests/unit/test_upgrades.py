@@ -147,6 +147,42 @@ def test_upgrade_writes_new_tag_to_compose(with_coder: Path, mocker, cfg: Agents
     assert doc["services"]["hermes-coder"]["image"].endswith(":v9.9.9")
 
 
+def test_upgrade_runs_auto_prune_after_success(with_coder: Path, mocker, cfg: AgentsConfig) -> None:
+    _stub_happy_upgrade(mocker, cfg)
+    spy = mocker.patch("agents_cli.prune_cmd.auto_prune_after_upgrade", return_value=None)
+    upgrades.upgrade("coder", tag="v1.0.1", config_path=with_coder)
+    spy.assert_called_once()
+    assert spy.call_args.args[1] == "coder"
+
+
+def test_upgrade_auto_prune_failure_is_non_fatal(
+    with_coder: Path, mocker, cfg: AgentsConfig
+) -> None:
+    """A prune hiccup after journal.complete() must neither fail the
+    upgrade nor route it into the compose-tag revert handler."""
+    _stub_happy_upgrade(mocker, cfg)
+    mocker.patch(
+        "agents_cli.prune_cmd.auto_prune_after_upgrade",
+        side_effect=RuntimeError("virsh went away"),
+    )
+    outcome = upgrades.upgrade("coder", tag="v1.0.1", config_path=with_coder)
+    assert outcome.new_tag == "v1.0.1"
+    doc = compose.load_compose(cfg.paths.host_data_dir / "docker-compose.yml")
+    assert doc["services"]["hermes-coder"]["image"].endswith(":v1.0.1")
+    assert Journal.find_resumable(cfg.paths.host_data_dir, "upgrade", "coder") is None
+
+
+def test_upgrade_skips_auto_prune_when_disabled(
+    with_coder: Path, mocker, cfg: AgentsConfig
+) -> None:
+    cfg.upgrades.keep_generations = 0
+    cfg_mod.save(cfg, with_coder)
+    _stub_happy_upgrade(mocker, cfg)
+    spy = mocker.patch("agents_cli.prune_cmd.auto_prune_after_upgrade")
+    upgrades.upgrade("coder", tag="v1.0.1", config_path=with_coder)
+    spy.assert_not_called()
+
+
 def test_upgrade_completes_journal_on_success(with_coder: Path, mocker, cfg: AgentsConfig) -> None:
     _stub_happy_upgrade(mocker, cfg)
     upgrades.upgrade("coder", tag="v1.0.1", config_path=with_coder)

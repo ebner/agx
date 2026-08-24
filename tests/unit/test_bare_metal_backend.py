@@ -191,6 +191,14 @@ def test_restore_refuses_with_helpful_hint(bare_metal: Any) -> None:
         bare_metal.restore("agents.pre-upgrade")
 
 
+def test_delete_snapshot_degrades_with_nonzero_rc(bare_metal: Any) -> None:
+    """Non-zero MpResult, NOT a raise: `agents prune` treats snapshot
+    deletion as best-effort and must keep going on bare-metal."""
+    result = bare_metal.delete_snapshot("agents", "pre-upgrade-x")
+    assert result.returncode != 0
+    assert "unavailable" in result.stderr
+
+
 # ---------- non-Linux refusal ----------
 
 

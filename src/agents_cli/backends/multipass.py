@@ -254,3 +254,18 @@ def restore(snapshot_id: str, *, destructive: bool = False) -> MpResult:
     if destructive:
         args.append("--destructive")
     return mp(*args)
+
+
+def delete_snapshot(vm: str, name: str) -> MpResult:
+    """Permanently delete one snapshot (``--purge`` skips the recycle bin).
+
+    The dotted ``<vm>.<name>`` form is load-bearing: ``multipass delete
+    --purge <vm>`` with no snapshot part would destroy the whole VM, so
+    an empty name is refused here rather than passed through.
+    """
+    if not name:
+        return MpResult(stdout="", stderr="refusing to delete: empty snapshot name", returncode=1)
+    # check=False: callers (prune) treat deletion as best-effort and
+    # inspect the MpResult — a raise here would abort the rest of a
+    # cleanup pass on the first undeletable snapshot.
+    return mp("delete", "--purge", f"{vm}.{name}", check=False)

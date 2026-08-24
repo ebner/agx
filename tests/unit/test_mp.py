@@ -145,6 +145,31 @@ def test_delete_with_purge(mocker) -> None:
     assert args[0] == ["multipass", "delete", "agents", "--purge"]
 
 
+def test_delete_snapshot_argv_uses_dotted_form(mocker) -> None:
+    mocker.patch("subprocess.run", return_value=_stub_run())
+    mp.delete_snapshot("agents", "pre-upgrade-coder-20260512")
+    args, _ = subprocess.run.call_args
+    assert args[0] == ["multipass", "delete", "--purge", "agents.pre-upgrade-coder-20260512"]
+
+
+def test_delete_snapshot_failure_returns_result_instead_of_raising(mocker) -> None:
+    """Prune treats snapshot deletion as best-effort and inspects the
+    MpResult — a check=True raise on the first undeletable snapshot
+    would abort the rest of the cleanup pass (codex review 2026-08-24)."""
+    mocker.patch("subprocess.run", return_value=_stub_run(returncode=1, stderr=b"not found"))
+    result = mp.delete_snapshot("agents", "ghost-snap")
+    assert result.returncode == 1
+
+
+def test_delete_snapshot_refuses_empty_name(mocker) -> None:
+    """`multipass delete --purge agents` (no snapshot part) would destroy
+    the VM — an empty name must never reach the binary."""
+    run = mocker.patch("subprocess.run", return_value=_stub_run())
+    result = mp.delete_snapshot("agents", "")
+    assert result.returncode != 0
+    run.assert_not_called()
+
+
 def test_find_with_show_unsupported(mocker) -> None:
     mocker.patch("subprocess.run", return_value=_stub_run())
     mp.find(show_unsupported=True)

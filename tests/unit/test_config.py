@@ -113,6 +113,25 @@ def test_export_cron_time_validation() -> None:
         ExportCronConfig(time="02:30,2:30")
 
 
+def test_upgrades_keep_generations_round_trip(tmp_path: Path) -> None:
+    p = tmp_path / "config.toml"
+    p.write_text(
+        f'[paths]\nhost_data_dir = "{tmp_path / "data"}"\n\n[upgrades]\nkeep_generations = 5\n',
+        encoding="utf-8",
+    )
+    c = load(p)
+    assert c.upgrades.keep_generations == 5
+    c.upgrades.keep_generations = 0
+    save(c, p)
+    assert load(p).upgrades.keep_generations == 0
+
+
+def test_upgrades_section_defaults_when_absent(tmp_path: Path) -> None:
+    p = tmp_path / "config.toml"
+    p.write_text(f'[paths]\nhost_data_dir = "{tmp_path / "data"}"\n', encoding="utf-8")
+    assert load(p).upgrades.keep_generations == 2
+
+
 def test_round_trip_preserves_comments(tmp_path: Path) -> None:
     p = tmp_path / "config.toml"
     initial = (

@@ -848,6 +848,19 @@ def restore(snapshot_id: str, *, destructive: bool = False) -> MpResult:
     return _virsh(*args, check=False)
 
 
+def delete_snapshot(vm: str, name: str) -> MpResult:
+    """Delete one internal qcow2 snapshot (data + metadata).
+
+    Works on a running domain: qemu removes internal snapshots live via
+    the monitor (``delvm``), so no stop/start dance is needed — unlike
+    ``snapshot`` creation, which virtiofs blocks on a running VM.
+    """
+    _require_linux_host()
+    if not name:
+        return MpResult(stdout="", stderr="refusing to delete: empty snapshot name", returncode=1)
+    return _virsh("snapshot-delete", vm, name, check=False)
+
+
 # ---------- GPU passthrough ----------
 
 GPU_VENDORS: Final = {

@@ -275,6 +275,15 @@ def restore(snapshot_id: str, *, destructive: bool = False) -> MpResult:
     )
 
 
+def delete_snapshot(vm: str, name: str) -> MpResult:
+    """No snapshots exist on bare-metal, so there is never anything to
+    delete. Returns a non-zero MpResult (not a raise) so best-effort
+    callers like ``agents prune`` degrade quietly instead of aborting."""
+    return MpResult(
+        stdout="", stderr="snapshots are unavailable on the bare_metal backend", returncode=1
+    )
+
+
 # ---------- bootstrap verification ----------
 
 

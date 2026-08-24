@@ -280,6 +280,21 @@ class ExportCronConfig(BaseModel):
         return v
 
 
+class UpgradesConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # Post-upgrade retention. After every successful ``agents upgrade``
+    # the toolkit keeps only the newest ``keep_generations`` upgrade
+    # artifacts per agent — host tarball under ``.upgrades/``,
+    # ``pre-upgrade-*`` VM snapshot, and superseded image tags — and
+    # deletes the rest. Rationale: `agents rollback` only ever uses the
+    # latest generation, and unbounded accumulation filled a 58 GB VM
+    # disk to 100% in ~3 months of routine upgrades (2026-08 outage).
+    # 0 disables the automatic prune; `agents prune` remains available
+    # for manual cleanup either way.
+    keep_generations: int = Field(default=2, ge=0)
+
+
 class AgentsConfig(BaseModel):
     """Top-level toolkit config."""
 
@@ -293,6 +308,7 @@ class AgentsConfig(BaseModel):
     ollama: OllamaConfig = Field(default_factory=OllamaConfig)
     inference: InferenceConfig = Field(default_factory=InferenceConfig)
     export_cron: ExportCronConfig = Field(default_factory=ExportCronConfig)
+    upgrades: UpgradesConfig = Field(default_factory=UpgradesConfig)
 
 
 def load(path: Path = DEFAULT_CONFIG_PATH) -> AgentsConfig:

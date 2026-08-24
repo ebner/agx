@@ -26,6 +26,12 @@ import tarfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    # Runtime import stays lazy (inside upgrade()) — prune_cmd imports
+    # this module for the archive/snapshot name patterns.
+    from agents_cli import prune_cmd as prune_cmd_mod
 
 from agents_cli import archive as archive_mod
 from agents_cli import compose, compose_runner, mp, ops, ui
@@ -272,6 +278,7 @@ def upgrade(
 
         host_snap: Path | None = None
         vm_snap: str | None = None
+        pruned: prune_cmd_mod.PruneResult | None = None
         try:
             if not no_snapshot and not journal.is_phase_done("host_data_snapshot"):
                 _step(
@@ -359,6 +366,25 @@ def upgrade(
                 journal.advance("doctor_passed")
 
             journal.complete()
+
+            # Post-upgrade retention (best-effort, inside the lock we
+            # already hold — auto_prune_after_upgrade must NOT re-acquire
+            # it). Fully swallowed on error: a prune hiccup must never
+            # route a landed upgrade into the revert handler below.
+            if cfg.upgrades.keep_generations > 0:
+                from agents_cli import prune_cmd
+
+                try:
+                    pruned = prune_cmd.auto_prune_after_upgrade(cfg, name)
+                except Exception as prune_err:
+                    ui.warn(f"post-upgrade prune failed (non-fatal): {prune_err}")
+                else:
+                    if pruned is not None and pruned.failed:
+                        for item in pruned.failed:
+                            ui.warn(
+                                f"prune: could not delete {item['kind']} "
+                                f"{item['ref']}: {item['error']}"
+                            )
         except Exception as failure:
             ui.warn(f"upgrade failed: {failure}; reverting compose tag")
             # The revert itself talks to the VM (compose write via
@@ -401,6 +427,12 @@ def upgrade(
     # handler on an upgrade that already succeeded.
     _persist_default_tag(cfg, agent_type, resolved_latest, config_path)
 
+    pruned_counts = (
+        f"{len(pruned.archives)} tarball(s), {len(pruned.snapshots)} snapshot(s), "
+        f"{len(pruned.images)} image tag(s)"
+        if pruned is not None
+        else None
+    )
     ui.emit(
         {
             "name": name,
@@ -408,11 +440,13 @@ def upgrade(
             "new_tag": new_tag,
             "host_snapshot": str(host_snap) if host_snap else None,
             "vm_snapshot": vm_snap,
+            "pruned": pruned.payload() if pruned is not None else None,
         },
         human=(
             f"upgraded {name!r}: {old_tag} -> {new_tag}\n"
             f"  host snapshot: {host_snap or '(skipped)'}\n"
-            f"  vm snapshot: {vm_snap or '(skipped)'}"
+            f"  vm snapshot: {vm_snap or '(skipped)'}\n"
+            f"  pruned: {pruned_counts or '(disabled)'}"
         ),
     )
     return UpgradeOutcome(
