@@ -1364,7 +1364,9 @@ def model_rm(ctx: click.Context, engine: str, model: str, yes_local: bool) -> No
 
 @model_group.command("use")
 @click.argument("agent")
-@click.option("--engine", required=True, type=click.Choice(["ollama", "llama-cpp"]))
+@click.option(
+    "--engine", required=True, type=click.Choice(["ollama", "llama-cpp", "external-ollama"])
+)
 @click.option("--model", required=True, help="Model name as known by the engine.")
 @click.option(
     "--aux",
@@ -1372,15 +1374,30 @@ def model_rm(ctx: click.Context, engine: str, model: str, yes_local: bool) -> No
     type=click.Choice(["compression", "vision", "all"]),
     help="Also route the named auxiliary task(s) to this engine.",
 )
-def model_use(agent: str, engine: str, model: str, aux: str | None) -> None:
-    """Wire a Hermes agent's main model to a local inference engine.
+@click.option(
+    "--context-length",
+    type=click.IntRange(min=1024),
+    default=None,
+    help=(
+        "Effective context window to declare to Hermes (model.context_length + a "
+        "per-model custom_providers entry, so /model switches stay correct). "
+        "REQUIRED for external-ollama: pass the server's OLLAMA_CONTEXT_LENGTH cap "
+        "— it can't be probed remotely, and the model's native window is usually larger."
+    ),
+)
+def model_use(
+    agent: str, engine: str, model: str, aux: str | None, context_length: int | None
+) -> None:
+    """Wire a Hermes agent's main model to an inference engine.
 
     Writes the structured ``model:`` block in the agent's config.yaml
-    (provider=custom + base_url + api_key), pointing at the in-VM
-    DNS name of the engine. With ``--aux``, also reroutes auxiliary
-    tasks (compression/vision/all) to the same endpoint.
+    (provider=custom + base_url + api_key). In-VM engines resolve via
+    Docker DNS; ``external-ollama`` targets the ``[ollama]`` config
+    block's URL (e.g. GPU inference on the host). With ``--aux``, also
+    reroutes auxiliary tasks (compression/vision/all) to the same
+    endpoint.
     """
-    _run(models_cmd.use, agent, engine=engine, model=model, aux=aux)
+    _run(models_cmd.use, agent, engine=engine, model=model, aux=aux, context_length=context_length)
 
 
 # ---------- secrets ----------

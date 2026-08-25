@@ -37,6 +37,11 @@ from agents_cli.errors import RuntimeFailure, UserError
 
 SUPPORTED_ENGINES: tuple[str, ...] = ("ollama", "llama-cpp")
 SUPPORTED_AUX: tuple[str, ...] = ("compression", "vision", "all")
+# `model use` additionally accepts the EXTERNAL Ollama endpoint from the
+# `[ollama]` config block (the toolkit does not run that instance — it's
+# typically GPU inference on the host). pull/rm stay in-VM-only: the
+# toolkit never mutates an external server's model store.
+USE_ENGINES: tuple[str, ...] = (*SUPPORTED_ENGINES, "external-ollama")
 
 
 def pull(
@@ -103,14 +108,29 @@ def use(
     engine: str,
     model: str,
     aux: str | None = None,
+    context_length: int | None = None,
     config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH,
 ) -> dict[str, Any]:
-    """Wire a Hermes agent's ``model:`` block to point at an in-VM
-    inference engine.
+    """Wire a Hermes agent's ``model:`` block to an inference engine.
+
+    Engines: the in-VM pair (``ollama`` / ``llama-cpp``) plus
+    ``external-ollama``, which targets the ``[ollama]`` config block's
+    URL (typically GPU inference on the host — the toolkit does not run
+    that instance, so ``agents model pull/rm`` don't apply to it).
 
     Writes the structured ``model:`` form (``{default, provider,
     base_url, api_key}``) — same shape the ``hermes model`` wizard
     produces, so the doctor's model_set check stays happy.
+
+    ``context_length`` writes BOTH ``model.context_length`` (startup
+    resolution) and a per-model ``custom_providers`` entry keyed by the
+    endpoint's base_url — the latter is what Hermes' ``/model`` switch
+    and display paths consult, so mid-session model swaps keep the
+    correct window too. REQUIRED for external-ollama: the server's
+    ``OLLAMA_CONTEXT_LENGTH`` cap cannot be probed remotely, and
+    Ollama's ``/api/show`` reports the model's NATIVE window — without
+    the override Hermes compresses far too late while the server
+    silently truncates the prompt.
 
     ``aux`` is optional: ``"compression"`` / ``"vision"`` / ``"all"``
     routes the named auxiliary tasks to the same engine. Useful when
@@ -120,11 +140,33 @@ def use(
     For OpenClaw, refuses — its config schema differs and the toolkit
     stays out of its plugin lifecycle.
     """
-    if engine not in SUPPORTED_ENGINES:
-        raise UserError(f"unknown engine {engine!r}; supported: {', '.join(SUPPORTED_ENGINES)}")
+    if engine not in USE_ENGINES:
+        raise UserError(f"unknown engine {engine!r}; supported: {', '.join(USE_ENGINES)}")
     if aux is not None and aux not in SUPPORTED_AUX:
         raise UserError(f"--aux must be one of {', '.join(SUPPORTED_AUX)}")
     cfg = cfg_mod.load(config_path)
+
+    if engine == "external-ollama":
+        if not cfg.ollama.url:
+            raise UserError(
+                "no external Ollama endpoint configured — run "
+                "`agents ollama configure --url http://<host>:11434` first"
+            )
+        if context_length is None:
+            raise UserError(
+                "--context-length is required with --engine external-ollama: the server's "
+                "OLLAMA_CONTEXT_LENGTH cap can't be probed remotely, and Ollama's /api/show "
+                "reports the model's NATIVE window — Hermes would compress too late while "
+                "the server silently truncates. Pass the server's configured cap "
+                "(e.g. --context-length 131072)."
+            )
+        base_url = cfg.ollama.url.rstrip("/")
+        if not base_url.endswith("/v1"):
+            base_url += "/v1"
+        api_key = "ollama"
+    else:
+        base_url, api_key = _url_for(engine, model), _api_key_for(engine)
+
     agent_type = _detect_type_from_compose(cfg, agent_name)
     if agent_type is None:
         raise UserError(f"agent {agent_name!r} not in compose")
@@ -132,10 +174,8 @@ def use(
         raise UserError(
             f"`agents model use` is Hermes-only — {agent_name!r} is type {agent_type!r}. "
             f"For OpenClaw, run `openclaw configure` and set the provider's base_url "
-            f"to {_url_for(engine, model)} manually."
+            f"to {base_url} manually."
         )
-
-    base_url, api_key = _url_for(engine, model), _api_key_for(engine)
 
     with compose.acquire_lock(cfg.paths.host_data_dir):
         doc = hermes_config.read_doc(cfg, agent_name)
@@ -147,6 +187,9 @@ def use(
             "base_url": base_url,
             "api_key": api_key,
         }
+        if context_length is not None:
+            doc["model"]["context_length"] = context_length
+            _upsert_provider_model_context(doc, engine, base_url, api_key, model, context_length)
         # Auxiliary routing — only the requested ones; never touch the
         # others. This preserves user-set vision/compression that the
         # user explicitly configured against a cloud endpoint.
@@ -161,12 +204,14 @@ def use(
                 target["model"] = model
         hermes_config.write_atomically(cfg, agent_name, doc)
 
+    aux_routed = list(("compression", "vision") if aux == "all" else ((aux,) if aux else ()))
     payload = {
         "agent": agent_name,
         "engine": engine,
         "model": model,
+        "context_length": context_length,
         "base_url": base_url,
-        "aux_routed": list(("compression", "vision") if aux == "all" else ((aux,) if aux else ())),
+        "aux_routed": aux_routed,
     }
     ui.emit(
         payload,
@@ -176,14 +221,52 @@ def use(
             f"  model:   {model}\n"
             f"  url:     {base_url}\n"
             + (
-                f"  aux:     {', '.join(payload['aux_routed'])} routed to same endpoint\n"
-                if payload["aux_routed"]
+                f"  aux:     {', '.join(aux_routed)} routed to same endpoint\n"
+                if aux_routed
                 else ""
             )
             + f"  next: `agents restart {agent_name}` for in-flight sessions to pick this up"
         ),
     )
     return payload
+
+
+def _upsert_provider_model_context(
+    doc: Any,
+    engine: str,
+    base_url: str,
+    api_key: str,
+    model: str,
+    context_length: int,
+) -> None:
+    """Record the per-model context window under ``custom_providers``.
+
+    Hermes matches these entries by normalized base_url (provider name is
+    cosmetic), and this is the lookup its ``/model`` switch + display
+    paths use — ``model.context_length`` alone only covers the default
+    model at startup. Upsert semantics: reuse an existing entry for the
+    same endpoint (whatever the user named it), never drop its other
+    models, only set/overwrite this model's context_length.
+    """
+    entries = doc.setdefault("custom_providers", [])
+    entry = next(
+        (
+            e
+            for e in entries
+            if isinstance(e, dict)
+            and str(e.get("base_url", "")).rstrip("/") == base_url.rstrip("/")
+        ),
+        None,
+    )
+    if entry is None:
+        entry = {"name": engine, "base_url": base_url, "api_key": api_key}
+        entries.append(entry)
+    models_map = entry.setdefault("models", {})
+    existing = models_map.get(model)
+    if isinstance(existing, dict):
+        existing["context_length"] = context_length
+    else:
+        models_map[model] = {"context_length": context_length}
 
 
 # ---------- ollama internals ----------

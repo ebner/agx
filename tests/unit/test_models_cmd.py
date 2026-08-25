@@ -332,6 +332,139 @@ def test_use_with_aux_compression_only_leaves_vision_alone(
     assert doc["auxiliary"]["vision"]["model"] == "gemini-vision"
 
 
+def _configure_external_ollama(config_path: Path) -> None:
+    from agents_cli import config as cfg_mod
+
+    c = cfg_mod.load(config_path)
+    c.ollama.url = "http://192.168.122.1:11434"
+    cfg_mod.save(c, config_path)
+
+
+def _seed_agent_config(cfg: AgentsConfig) -> None:
+    p = hermes_config.config_path(cfg, "coder")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("model: ''\n", encoding="utf-8")
+
+
+def test_use_external_ollama_requires_configured_url(
+    with_coder: Path, cfg: AgentsConfig, mocker: Any
+) -> None:
+    with pytest.raises(UserError, match="ollama configure"):
+        models_cmd.use(
+            "coder",
+            engine="external-ollama",
+            model="qwen3.8:27b",
+            context_length=131072,
+            config_path=with_coder,
+        )
+
+
+def test_use_external_ollama_requires_context_length(
+    with_coder: Path, cfg: AgentsConfig, mocker: Any
+) -> None:
+    """The server-side OLLAMA_CONTEXT_LENGTH cap can't be probed and the
+    /api/show native window over-reports — refusing without an explicit
+    value prevents the silent-truncation class."""
+    _configure_external_ollama(with_coder)
+    with pytest.raises(UserError, match="context-length"):
+        models_cmd.use(
+            "coder",
+            engine="external-ollama",
+            model="qwen3.8:27b",
+            config_path=with_coder,
+        )
+
+
+def test_use_external_ollama_writes_model_block_and_provider_entry(
+    with_coder: Path, cfg: AgentsConfig, mocker: Any
+) -> None:
+    _configure_external_ollama(with_coder)
+    _seed_agent_config(cfg)
+
+    models_cmd.use(
+        "coder",
+        engine="external-ollama",
+        model="qwen3.8:27b",
+        context_length=131072,
+        config_path=with_coder,
+    )
+
+    doc = hermes_config.read_doc(cfg, "coder")
+    assert doc["model"] == {
+        "default": "qwen3.8:27b",
+        "provider": "custom",
+        "base_url": "http://192.168.122.1:11434/v1",
+        "api_key": "ollama",
+        "context_length": 131072,
+    }
+    [entry] = doc["custom_providers"]
+    assert entry["base_url"] == "http://192.168.122.1:11434/v1"
+    assert entry["models"]["qwen3.8:27b"]["context_length"] == 131072
+
+
+def test_use_external_ollama_upserts_into_existing_provider_entry(
+    with_coder: Path, cfg: AgentsConfig, mocker: Any
+) -> None:
+    """A pre-existing entry for the same endpoint (whatever its name) is
+    reused — other models' metadata survives, only this model's
+    context_length is set."""
+    _configure_external_ollama(with_coder)
+    p = hermes_config.config_path(cfg, "coder")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(
+        "model: ''\n"
+        "custom_providers:\n"
+        "  - name: local-ollama\n"
+        "    base_url: http://192.168.122.1:11434/v1\n"
+        "    api_key: ollama\n"
+        "    models:\n"
+        '      "qwen3.8:27b": {context_length: 131072}\n',
+        encoding="utf-8",
+    )
+
+    models_cmd.use(
+        "coder",
+        engine="external-ollama",
+        model="gemma4:26b",
+        context_length=65536,
+        config_path=with_coder,
+    )
+
+    doc = hermes_config.read_doc(cfg, "coder")
+    [entry] = doc["custom_providers"]
+    assert entry["name"] == "local-ollama"  # reused, not duplicated
+    assert entry["models"]["qwen3.8:27b"]["context_length"] == 131072  # untouched
+    assert entry["models"]["gemma4:26b"]["context_length"] == 65536
+
+
+def test_use_in_vm_engine_with_context_length_writes_provider_entry(
+    with_coder: Path, cfg: AgentsConfig, mocker: Any
+) -> None:
+    _seed_agent_config(cfg)
+    models_cmd.use(
+        "coder",
+        engine="ollama",
+        model="llama3.2:3b",
+        context_length=32768,
+        config_path=with_coder,
+    )
+    doc = hermes_config.read_doc(cfg, "coder")
+    assert doc["model"]["context_length"] == 32768
+    [entry] = doc["custom_providers"]
+    assert entry["base_url"] == f"http://{OLLAMA_SERVICE_NAME}:11434/v1"
+    assert entry["models"]["llama3.2:3b"]["context_length"] == 32768
+
+
+def test_use_without_context_length_writes_no_provider_entry(
+    with_coder: Path, cfg: AgentsConfig, mocker: Any
+) -> None:
+    _seed_agent_config(cfg)
+    models_cmd.use("coder", engine="ollama", model="llama3.2:3b", config_path=with_coder)
+    doc = hermes_config.read_doc(cfg, "coder")
+    assert "context_length" not in doc["model"]
+    assert "custom_providers" not in doc
+
+
 def test_use_refuses_openclaw_with_helpful_hint(
     with_openclaw: Path, cfg: AgentsConfig, mocker: Any
 ) -> None:
