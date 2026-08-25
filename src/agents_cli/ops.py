@@ -176,6 +176,7 @@ def doctor(
         _check_arm64_emulation(cfg, report)
         _check_firecrawl_running(cfg, report)
         _check_inference_health(cfg, report)
+        _check_tailscale(cfg, report)
     else:
         report.add("data_dir_exists", "fail", f"{cfg.paths.host_data_dir} missing")
 
@@ -1141,6 +1142,35 @@ def _check_arm64_emulation(cfg: AgentsConfig, report: DoctorReport) -> None:
         + "; ".join(firecrawl_cmd.ARM64_EMULATED_IMAGES)
         + ". Works but is slower; swap via docker-compose.override.yml if it bites.",
     )
+
+
+def _check_tailscale(cfg: AgentsConfig, report: DoctorReport) -> None:
+    """Warn when toolkit-managed tailscale isn't connected.
+
+    Gated on the state file: a deployment that never ran `agents
+    tailscale up` gets no check at all (opt-in feature, like firecrawl).
+    Skips on bare_metal, where the command family refuses anyway.
+    """
+    from agents_cli import tailscale_cmd
+
+    if cfg.vm.backend not in ("multipass", "libvirt") or not tailscale_cmd.is_installed(cfg):
+        return
+    vm_state = tailscale_cmd._vm_status(cfg)
+    if not vm_state.get("installed"):
+        report.add(
+            "tailscale",
+            "warn",
+            "state file present but tailscale binary missing in the VM (rebuilt VM?) — "
+            "re-run `agents tailscale up`",
+        )
+        return
+    backend_state = vm_state.get("backend_state", "")
+    if backend_state == "Running":
+        ips = ", ".join(vm_state.get("ips", []))
+        report.add("tailscale", "ok", f"Running ({ips})")
+    else:
+        detail = vm_state.get("error") or f"backend_state={backend_state or 'unknown'}"
+        report.add("tailscale", "warn", f"{detail} — `agents tailscale up` to (re)connect")
 
 
 def _check_firecrawl_running(cfg: AgentsConfig, report: DoctorReport) -> None:

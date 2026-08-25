@@ -33,6 +33,7 @@ from agents_cli import (
     outdated_cmd,
     prune_cmd,
     secrets_cmd,
+    tailscale_cmd,
     ui,
     upgrades,
 )
@@ -1152,6 +1153,51 @@ def memory_disable(agent: str) -> None:
 def memory_status(agent: str | None) -> None:
     """Show memory state per agent (or for a single agent if NAME is given)."""
     _run(memory_mod.status, agent)
+
+
+# ---------- tailscale ----------
+
+
+@main.group("tailscale")
+def tailscale_group() -> None:
+    """Tailnet access to the VM (tailscaled as a VM-OS systemd service)."""
+
+
+@tailscale_group.command("up")
+@click.option(
+    "--auth-key",
+    default=None,
+    help=(
+        "Tailscale auth key (from the admin console) for non-interactive join. "
+        "Without it, the login URL is printed for browser authentication."
+    ),
+)
+@click.option(
+    "--hostname",
+    default=None,
+    help="Tailnet hostname for the VM (default: the VM name).",
+)
+def tailscale_up(auth_key: str | None, hostname: str | None) -> None:
+    """Install tailscale in the VM (idempotent) and join the tailnet."""
+    _run(tailscale_cmd.up, auth_key=auth_key, hostname=hostname)
+
+
+@tailscale_group.command("down")
+def tailscale_down() -> None:
+    """Disconnect the VM from the tailnet (tailscaled stays installed)."""
+    _run(tailscale_cmd.down)
+
+
+@tailscale_group.command("status")
+def tailscale_status() -> None:
+    """Show tailnet connection state, IPs, and reachable published ports."""
+    _run(tailscale_cmd.status)
+
+
+@tailscale_group.command("upgrade")
+def tailscale_upgrade() -> None:
+    """Upgrade the tailscale package inside the VM."""
+    _run(tailscale_cmd.upgrade)
 
 
 # ---------- firecrawl ----------
