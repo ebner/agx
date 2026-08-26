@@ -31,6 +31,7 @@ from agents_cli import (
     ollama_cmd,
     ops,
     outdated_cmd,
+    profile_cmd,
     prune_cmd,
     secrets_cmd,
     tailscale_cmd,
@@ -690,7 +691,12 @@ def conversations_group() -> None:
     default=20,
     help="Max active sessions to render in the human table (JSON is unbounded).",
 )
-def conversations_status(name: str, limit: int) -> None:
+@click.option(
+    "--profile",
+    default=None,
+    help="Target a named Hermes profile (its own HERMES_HOME under profiles/<name>/).",
+)
+def conversations_status(name: str, limit: int, profile: str | None) -> None:
     """Show active/open/total conversation counts for a Hermes agent.
 
     Reads ``/opt/data/state.db`` inside the container and reports how
@@ -698,7 +704,7 @@ def conversations_status(name: str, limit: int) -> None:
     window — i.e. still "hot" in the gateway's context cache.
     Per-platform breakdown plus a top-N active list. Read-only.
     """
-    _run(conversations_cmd.status, name, limit=limit)
+    _run(conversations_cmd.status, name, limit=limit, profile=profile)
 
 
 @conversations_group.command("export")
@@ -710,7 +716,12 @@ def conversations_status(name: str, limit: int) -> None:
     required=True,
     help="Output directory; one Markdown file per session lands here.",
 )
-def conversations_export(name: str, to_dir: Path) -> None:
+@click.option(
+    "--profile",
+    default=None,
+    help="Target a named Hermes profile (its own HERMES_HOME under profiles/<name>/).",
+)
+def conversations_export(name: str, to_dir: Path, profile: str | None) -> None:
     """Export every session as a Markdown transcript.
 
     One ``<session_id>.md`` per session, with metadata header + per-
@@ -718,7 +729,7 @@ def conversations_export(name: str, to_dir: Path) -> None:
     for migration (Hermes→OpenClaw) and long-term archival. See
     ``docs/migration.md`` for the runbook.
     """
-    _run(conversations_cmd.export, name, to_dir=to_dir)
+    _run(conversations_cmd.export, name, to_dir=to_dir, profile=profile)
 
 
 @main.command("fix-perms")
@@ -1133,19 +1144,36 @@ def memory_list() -> None:
     default=None,
     help="Override the pinned image tag for sibling-service backends (openviking).",
 )
-def memory_enable(plugin: str, agent: str, embedder: str, llm: str, image_tag: str | None) -> None:
-    """Enable a memory backend for an agent."""
+@click.option(
+    "--profile",
+    default=None,
+    help="Target a named Hermes profile (its own HERMES_HOME under profiles/<name>/).",
+)
+def memory_enable(
+    plugin: str,
+    agent: str,
+    embedder: str,
+    llm: str,
+    image_tag: str | None,
+    profile: str | None,
+) -> None:
+    """Enable a memory backend for an agent (optionally a named profile)."""
     opts: dict[str, Any] = {"embedder": embedder, "llm": llm}
     if image_tag is not None:
         opts["image_tag"] = image_tag
-    _run(memory_mod.enable, plugin, agent, **opts)
+    _run(memory_mod.enable, plugin, agent, profile=profile, **opts)
 
 
 @memory_group.command("disable")
 @click.argument("agent")
-def memory_disable(agent: str) -> None:
+@click.option(
+    "--profile",
+    default=None,
+    help="Target a named Hermes profile (its own HERMES_HOME under profiles/<name>/).",
+)
+def memory_disable(agent: str, profile: str | None) -> None:
     """Disable the currently-enabled memory backend for an agent."""
-    _run(memory_mod.disable, agent)
+    _run(memory_mod.disable, agent, profile=profile)
 
 
 @memory_group.command("status")
@@ -1153,6 +1181,26 @@ def memory_disable(agent: str) -> None:
 def memory_status(agent: str | None) -> None:
     """Show memory state per agent (or for a single agent if NAME is given)."""
     _run(memory_mod.status, agent)
+
+
+# ---------- profiles ----------
+
+
+@main.group("profile")
+def profile_group() -> None:
+    """Inspect a Hermes agent's profiles (Hermes owns create/delete)."""
+
+
+@profile_group.command("list")
+@click.argument("agent")
+def profile_list(agent: str) -> None:
+    """List profiles with config/session presence and gateway state.
+
+    Profile names listed here are what every ``--profile`` flag targets
+    (secret, conversations, model use, memory). Create/delete profiles
+    inside the container: ``agents exec <agent> hermes profile create <p>``.
+    """
+    _run(profile_cmd.list_profiles, agent)
 
 
 # ---------- tailscale ----------
@@ -1386,7 +1434,12 @@ def model_rm(ctx: click.Context, engine: str, model: str, yes_local: bool) -> No
     ),
 )
 def model_use(
-    agent: str, engine: str, model: str, aux: str | None, context_length: int | None
+    agent: str,
+    engine: str,
+    model: str,
+    aux: str | None,
+    context_length: int | None,
+    profile: str | None,
 ) -> None:
     """Wire a Hermes agent's main model to an inference engine.
 
@@ -1418,7 +1471,12 @@ def secret_group() -> None:
 @click.argument("agent")
 @click.argument("key")
 @click.argument("value", required=False)
-def secret_set(agent: str, key: str, value: str | None) -> None:
+@click.option(
+    "--profile",
+    default=None,
+    help="Target a named Hermes profile (its own HERMES_HOME under profiles/<name>/).",
+)
+def secret_set(agent: str, key: str, value: str | None, profile: str | None) -> None:
     """Set a secret. Value is prompted hidden when omitted.
 
     Examples:
@@ -1435,7 +1493,7 @@ def secret_set(agent: str, key: str, value: str | None) -> None:
             if ui.is_json():
                 raise UserError("secret value required: pass it as an argument in --json mode")
             secret = click.prompt(f"value for {key}", hide_input=True, confirmation_prompt=False)
-        secrets_cmd.set_secret(agent, key, secret)
+        secrets_cmd.set_secret(agent, key, secret, profile=profile)
 
     _run(body)
 
@@ -1443,9 +1501,14 @@ def secret_set(agent: str, key: str, value: str | None) -> None:
 @secret_group.command("unset")
 @click.argument("agent")
 @click.argument("key")
-def secret_unset(agent: str, key: str) -> None:
+@click.option(
+    "--profile",
+    default=None,
+    help="Target a named Hermes profile (its own HERMES_HOME under profiles/<name>/).",
+)
+def secret_unset(agent: str, key: str, profile: str | None) -> None:
     """Remove a secret from the per-agent .env."""
-    _run(secrets_cmd.unset_secret, agent, key)
+    _run(secrets_cmd.unset_secret, agent, key, profile=profile)
 
 
 @secret_group.command("list")
@@ -1458,11 +1521,16 @@ def secret_list(agent: str) -> None:
 @secret_group.command("clear")
 @click.argument("agent")
 @click.option("-y", "--yes", "yes_local", is_flag=True, help="Skip confirmation.")
+@click.option(
+    "--profile",
+    default=None,
+    help="Target a named Hermes profile (its own HERMES_HOME under profiles/<name>/).",
+)
 @click.pass_context
-def secret_clear(ctx: click.Context, agent: str, yes_local: bool) -> None:
+def secret_clear(ctx: click.Context, agent: str, yes_local: bool, profile: str | None) -> None:
     """Wipe ALL secrets for an agent."""
     yes = yes_local or ctx.obj.get("yes", False)
-    _run(secrets_cmd.clear_secrets, agent, yes=yes)
+    _run(secrets_cmd.clear_secrets, agent, yes=yes, profile=profile)
 
 
 # ---------- mounts ----------

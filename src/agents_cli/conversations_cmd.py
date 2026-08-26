@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any
 
 from agents_cli import config as cfg_mod
-from agents_cli import mp, ui
+from agents_cli import hermes_config, mp, ui
 from agents_cli.agents_cmd import _detect_type_from_compose
 from agents_cli.agents_cmd import service_name as _service_name_for
 from agents_cli.config import AgentsConfig
@@ -56,16 +56,17 @@ _SAFE_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 # Kept as a single string so we can pass it through ``python3 -c`` via
 # argv without staging a temp file — the script is read-only and tiny.
 _QUERY_SCRIPT = """\
-import json, sqlite3, time
+import json, os, sqlite3, time
+home = os.environ.get("H_HOME", "/opt/data")
 try:
     import yaml
-    cfg = yaml.safe_load(open("/opt/data/config.yaml")) or {}
+    cfg = yaml.safe_load(open(home + "/config.yaml")) or {}
     fresh = int((cfg.get("agent") or {}).get(
         "gateway_auto_continue_freshness", 3600))
 except Exception:
     fresh = 3600
 now = time.time()
-c = sqlite3.connect("/opt/data/state.db")
+c = sqlite3.connect(home + "/state.db")
 c.row_factory = sqlite3.Row
 rows = list(c.execute('''
   select s.id, s.source, s.title, s.message_count,
@@ -107,8 +108,8 @@ print(json.dumps(out))
 
 
 _EXPORT_SCRIPT = """\
-import json, sqlite3
-c = sqlite3.connect("/opt/data/state.db")
+import json, os, sqlite3
+c = sqlite3.connect(os.environ.get("H_HOME", "/opt/data") + "/state.db")
 c.row_factory = sqlite3.Row
 sessions = []
 for s in c.execute('''
@@ -132,6 +133,7 @@ def status(
     name: str,
     *,
     limit: int = 20,
+    profile: str | None = None,
     config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH,
 ) -> dict[str, Any]:
     cfg = cfg_mod.load(config_path)
@@ -144,28 +146,43 @@ def status(
             f"{agent_type!r}. OpenClaw has its own session storage; "
             f"out of scope."
         )
+    profile = hermes_config.normalize_profile(profile)
     svc = _service_name_for(name, agent_type)
 
-    payload = _query(cfg, svc)
+    payload = _query(cfg, svc, profile=profile)
     payload["agent"] = name
+    if profile is not None:
+        payload["profile"] = profile
     _emit(payload, limit=limit)
     return payload
 
 
-def _query(cfg: AgentsConfig, svc: str) -> dict[str, Any]:
-    return _query_with_script(cfg, svc, _QUERY_SCRIPT)
+def _query(cfg: AgentsConfig, svc: str, profile: str | None = None) -> dict[str, Any]:
+    return _query_with_script(cfg, svc, _QUERY_SCRIPT, profile=profile)
 
 
-def _query_with_script(cfg: AgentsConfig, svc: str, script: str) -> dict[str, Any]:
+def _query_with_script(
+    cfg: AgentsConfig, svc: str, script: str, profile: str | None = None
+) -> dict[str, Any]:
+    # A named profile is a full HERMES_HOME under /opt/data/profiles/<p>
+    # with its own state.db + config.yaml; the scripts read H_HOME.
+    env = {"H_HOME": hermes_config.profile_home(profile)}
     result = mp.exec_in_vm(
         cfg.vm.name,
-        *_compose_exec_in_vm_argv(cfg, svc, "python3", "-c", script, no_tty=True, as_root=True),
+        *_compose_exec_in_vm_argv(
+            cfg, svc, "python3", "-c", script, no_tty=True, as_root=True, env=env
+        ),
         check=False,
     )
     if result.returncode != 0:
         err = (result.stderr or "").lower()
         if "is not running" in err or "no such" in err:
             raise UserError(f"container for {svc!r} is not running")
+        if profile is not None and ("unable to open database" in err or "no such file" in err):
+            raise UserError(
+                f"profile {profile!r} has no state.db yet — does it exist? "
+                f"(list with `agents profile list`)"
+            )
         raise RuntimeFailure(
             f"state.db query failed (rc={result.returncode}): "
             f"{(result.stderr or '').strip() or 'no stderr'}"
@@ -183,6 +200,7 @@ def export(
     name: str,
     *,
     to_dir: Path,
+    profile: str | None = None,
     config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH,
 ) -> dict[str, Any]:
     """Write one Markdown transcript per session to ``to_dir``.
@@ -205,9 +223,10 @@ def export(
             f"conversations export is Hermes-only — {name!r} is type "
             f"{agent_type!r}. OpenClaw uses a different session schema."
         )
+    profile = hermes_config.normalize_profile(profile)
     svc = _service_name_for(name, agent_type)
 
-    data = _query_with_script(cfg, svc, _EXPORT_SCRIPT)
+    data = _query_with_script(cfg, svc, _EXPORT_SCRIPT, profile=profile)
     sessions = data.get("sessions") or []
 
     to_dir.mkdir(parents=True, exist_ok=True)

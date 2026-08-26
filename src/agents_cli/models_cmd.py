@@ -109,6 +109,7 @@ def use(
     model: str,
     aux: str | None = None,
     context_length: int | None = None,
+    profile: str | None = None,
     config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH,
 ) -> dict[str, Any]:
     """Wire a Hermes agent's ``model:`` block to an inference engine.
@@ -144,6 +145,7 @@ def use(
         raise UserError(f"unknown engine {engine!r}; supported: {', '.join(USE_ENGINES)}")
     if aux is not None and aux not in SUPPORTED_AUX:
         raise UserError(f"--aux must be one of {', '.join(SUPPORTED_AUX)}")
+    profile = hermes_config.normalize_profile(profile)
     cfg = cfg_mod.load(config_path)
 
     if engine == "external-ollama":
@@ -178,7 +180,7 @@ def use(
         )
 
     with compose.acquire_lock(cfg.paths.host_data_dir):
-        doc = hermes_config.read_doc(cfg, agent_name)
+        doc = hermes_config.read_doc(cfg, agent_name, profile)
         # Structured `model:` form. Overwrites any prior value
         # (including the bare-string form Hermes also accepts).
         doc["model"] = {
@@ -202,7 +204,7 @@ def use(
                 target["base_url"] = base_url
                 target["api_key"] = api_key
                 target["model"] = model
-        hermes_config.write_atomically(cfg, agent_name, doc)
+        hermes_config.write_atomically(cfg, agent_name, doc, profile)
 
     aux_routed = list(("compression", "vision") if aux == "all" else ((aux,) if aux else ()))
     payload = {
@@ -211,6 +213,7 @@ def use(
         "model": model,
         "context_length": context_length,
         "base_url": base_url,
+        "profile": profile,
         "aux_routed": aux_routed,
     }
     ui.emit(

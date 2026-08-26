@@ -49,6 +49,7 @@ def enable(
     cfg: AgentsConfig,
     agent_name: str,
     *,
+    profile: str | None = None,
     embedder: str = "auto",
     llm: str = "auto",
     **_opts: Any,
@@ -67,24 +68,25 @@ def enable(
         cfg, embedder=embedder, llm=llm
     )
 
-    doc = hermes_config.read_doc(cfg, agent_name)
+    doc = hermes_config.read_doc(cfg, agent_name, profile)
 
     memory = doc.setdefault("memory", {})
     memory["provider"] = NAME
 
     plugins = doc.setdefault("plugins", {})
     mem0_block = plugins.setdefault("mem0", {})
+    vector_path = f"{hermes_config.profile_home(profile)}/mem0_qdrant"
     mem0_block["vector_store"] = {
         "provider": "qdrant",
         "config": {
-            "path": DEFAULT_VECTOR_PATH,
+            "path": vector_path,
             "collection_name": DEFAULT_COLLECTION,
         },
     }
     mem0_block["embedder"] = embed_block
     mem0_block["llm"] = llm_block
 
-    hermes_config.write_atomically(cfg, agent_name, doc)
+    hermes_config.write_atomically(cfg, agent_name, doc, profile)
 
     write_state(
         cfg,
@@ -93,7 +95,7 @@ def enable(
             "plugin": NAME,
             "embedder_provider": provider_used["embedder"],
             "llm_provider": provider_used["llm"],
-            "vector_path": DEFAULT_VECTOR_PATH,
+            "vector_path": vector_path,
         },
     )
 
@@ -113,8 +115,8 @@ def enable(
     }
 
 
-def disable(cfg: AgentsConfig, agent_name: str) -> None:
-    doc = hermes_config.read_doc(cfg, agent_name)
+def disable(cfg: AgentsConfig, agent_name: str, profile: str | None = None) -> None:
+    doc = hermes_config.read_doc(cfg, agent_name, profile)
 
     memory = doc.get("memory")
     if isinstance(memory, dict) and memory.get("provider") == NAME:
@@ -128,8 +130,8 @@ def disable(cfg: AgentsConfig, agent_name: str) -> None:
         if not plugins:
             doc.pop("plugins", None)
 
-    hermes_config.write_atomically(cfg, agent_name, doc)
-    clear_state(cfg, agent_name)
+    hermes_config.write_atomically(cfg, agent_name, doc, profile)
+    clear_state(cfg, agent_name, profile)
 
     svc = _service_name_for(agent_name, "hermes")
     # Same as enable: compose config didn't change, so restart (not a
@@ -138,8 +140,8 @@ def disable(cfg: AgentsConfig, agent_name: str) -> None:
     compose_runner.restart(cfg, svc)
 
 
-def status(cfg: AgentsConfig, agent_name: str) -> dict[str, Any]:
-    state = read_state(cfg, agent_name) or {}
+def status(cfg: AgentsConfig, agent_name: str, profile: str | None = None) -> dict[str, Any]:
+    state = read_state(cfg, agent_name, profile) or {}
     return {
         "vector_path": state.get("vector_path", DEFAULT_VECTOR_PATH),
         "embedder_provider": state.get("embedder_provider", "?"),

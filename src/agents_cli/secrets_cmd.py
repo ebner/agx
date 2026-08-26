@@ -72,6 +72,7 @@ def set_secret(
     key: str,
     value: str,
     *,
+    profile: str | None = None,
     config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH,
 ) -> None:
     _validate_key(key)
@@ -79,14 +80,19 @@ def set_secret(
         raise UserError("secret value must not contain newlines")
     cfg = cfg_mod.load(config_path)
     svc, agent_type = _resolve_service(cfg, agent_name)
+    profile = _require_hermes_for_profile(agent_type, profile)
 
     with compose.acquire_lock(cfg.paths.host_data_dir):
+        # The .env half is container-wide: env_file values become container
+        # env, which every profile's gateway shares. Only the
+        # terminal.env_passthrough half is per-profile (each profile's
+        # config.yaml filters its own sandbox subprocesses) — GH #6 tier 2.
         env = _read_env(cfg, agent_name)
         env[key] = value
         _write_env(cfg, agent_name, env)
         _ensure_env_file_in_compose(cfg, agent_name, svc)
         if agent_type == "hermes":
-            _ensure_env_passthrough(cfg, agent_name, key)
+            _ensure_env_passthrough(cfg, agent_name, key, profile=profile)
 
     compose_runner.up(cfg, svc)
     ui.emit(
@@ -99,11 +105,13 @@ def unset_secret(
     agent_name: str,
     key: str,
     *,
+    profile: str | None = None,
     config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH,
 ) -> None:
     _validate_key(key)
     cfg = cfg_mod.load(config_path)
     svc, agent_type = _resolve_service(cfg, agent_name)
+    profile = _require_hermes_for_profile(agent_type, profile)
 
     with compose.acquire_lock(cfg.paths.host_data_dir):
         env = _read_env(cfg, agent_name)
@@ -112,7 +120,7 @@ def unset_secret(
         del env[key]
         _write_env(cfg, agent_name, env)
         if agent_type == "hermes":
-            _drop_env_passthrough(cfg, agent_name, key)
+            _drop_env_passthrough(cfg, agent_name, key, profile=profile)
 
     compose_runner.up(cfg, svc)
     ui.emit(
@@ -140,10 +148,12 @@ def clear_secrets(
     agent_name: str,
     *,
     yes: bool = False,
+    profile: str | None = None,
     config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH,
 ) -> None:
     cfg = cfg_mod.load(config_path)
     svc, agent_type = _resolve_service(cfg, agent_name)
+    profile = _require_hermes_for_profile(agent_type, profile)
     if not yes and not ui.confirm(f"clear ALL secrets for {agent_name!r}?", default=False):
         raise UserError("aborted by user")
 
@@ -156,10 +166,13 @@ def clear_secrets(
         keys = sorted(_read_env(cfg, agent_name))
         _write_env(cfg, agent_name, {})
         if agent_type == "hermes" and keys:
-            doc = hermes_config.read_doc(cfg, agent_name)
+            # Sweeps the targeted profile's passthrough list only; with
+            # multiple profiles, run clear once per profile (the .env
+            # wipe itself is container-wide and idempotent).
+            doc = hermes_config.read_doc(cfg, agent_name, profile)
             for key in keys:
                 hermes_config.remove_env_passthrough(doc, key)
-            hermes_config.write_atomically(cfg, agent_name, doc)
+            hermes_config.write_atomically(cfg, agent_name, doc, profile)
 
     compose_runner.up(cfg, svc)
     ui.emit(
@@ -260,7 +273,9 @@ def _render_env_file(env: dict[str, str]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _ensure_env_passthrough(cfg: AgentsConfig, agent_name: str, key: str) -> None:
+def _ensure_env_passthrough(
+    cfg: AgentsConfig, agent_name: str, key: str, profile: str | None = None
+) -> None:
     """Add ``key`` to the agent's ``terminal.env_passthrough`` so it
     actually reaches Hermes' sandboxed shell / execute_code subprocesses.
 
@@ -269,15 +284,27 @@ def _ensure_env_passthrough(cfg: AgentsConfig, agent_name: str, key: str) -> Non
     every subprocess Hermes spawns — meaning the LLM's own shell-based
     diagnostics report "not set" even though the integration works.
     """
-    doc = hermes_config.read_doc(cfg, agent_name)
+    doc = hermes_config.read_doc(cfg, agent_name, profile)
     hermes_config.add_env_passthrough(doc, key)
-    hermes_config.write_atomically(cfg, agent_name, doc)
+    hermes_config.write_atomically(cfg, agent_name, doc, profile)
 
 
-def _drop_env_passthrough(cfg: AgentsConfig, agent_name: str, key: str) -> None:
-    doc = hermes_config.read_doc(cfg, agent_name)
+def _drop_env_passthrough(
+    cfg: AgentsConfig, agent_name: str, key: str, profile: str | None = None
+) -> None:
+    doc = hermes_config.read_doc(cfg, agent_name, profile)
     hermes_config.remove_env_passthrough(doc, key)
-    hermes_config.write_atomically(cfg, agent_name, doc)
+    hermes_config.write_atomically(cfg, agent_name, doc, profile)
+
+
+def _require_hermes_for_profile(agent_type: str, profile: str | None) -> str | None:
+    """Normalize + gate the --profile flag: Hermes-only, since the profile
+    dimension only exists for the env_passthrough half (OpenClaw has no
+    sandbox env filter and no profiles in this sense)."""
+    normalized = hermes_config.normalize_profile(profile)
+    if normalized is not None and agent_type != "hermes":
+        raise UserError("--profile is Hermes-only (OpenClaw has no profile config surface)")
+    return normalized
 
 
 def _ensure_env_file_in_compose(cfg: AgentsConfig, agent_name: str, svc_name: str) -> None:

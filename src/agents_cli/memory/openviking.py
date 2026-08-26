@@ -47,9 +47,11 @@ def enable(
     cfg: AgentsConfig,
     agent_name: str,
     *,
+    profile: str | None = None,
     image_tag: str = DEFAULT_IMAGE_TAG,
     **_opts: Any,
 ) -> dict[str, Any]:
+    _refuse_profile(profile)
     if not cfg.ollama.is_configured():
         raise UserError(
             "openviking needs an Ollama / OpenAI-compatible endpoint for "
@@ -118,7 +120,8 @@ def enable(
     }
 
 
-def disable(cfg: AgentsConfig, agent_name: str) -> None:
+def disable(cfg: AgentsConfig, agent_name: str, profile: str | None = None) -> None:
+    _refuse_profile(profile)
     state = read_state(cfg, agent_name) or {}
     sidecar_svc = state.get("sidecar_service", f"openviking-{agent_name}")
 
@@ -160,7 +163,8 @@ def disable(cfg: AgentsConfig, agent_name: str) -> None:
     compose_runner.up(cfg, hermes_svc)
 
 
-def status(cfg: AgentsConfig, agent_name: str) -> dict[str, Any]:
+def status(cfg: AgentsConfig, agent_name: str, profile: str | None = None) -> dict[str, Any]:
+    _refuse_profile(profile)
     state = read_state(cfg, agent_name) or {}
     return {
         "sidecar_service": state.get("sidecar_service", f"openviking-{agent_name}"),
@@ -172,3 +176,19 @@ def status(cfg: AgentsConfig, agent_name: str) -> dict[str, Any]:
 
 def _vfix(url: str) -> str:
     return url.rstrip("/") + ("" if url.rstrip("/").endswith("/v1") else "/v1")
+
+
+def _refuse_profile(profile: str | None) -> None:
+    """OpenViking runs as ONE sibling docker service per agent (container
+    name, port, and data dir are all agent-scoped) — per-profile
+    instances would need distinct service names and ports, which the
+    fragment layer doesn't model yet. Refuse rather than silently wire
+    two profiles to one shared memory service."""
+    from agents_cli.hermes_config import normalize_profile
+
+    if normalize_profile(profile) is not None:
+        raise UserError(
+            "openviking does not support per-profile enablement yet — its sibling "
+            "service is agent-scoped. Use `holographic` or `mem0` for profile-level "
+            "memory, or a dedicated agent for this persona."
+        )

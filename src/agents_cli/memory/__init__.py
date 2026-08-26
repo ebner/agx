@@ -60,23 +60,33 @@ class MemoryPlugin(Protocol):
 
     name: str
 
-    def enable(self, cfg: AgentsConfig, agent_name: str, **opts: Any) -> dict[str, Any]: ...
+    def enable(
+        self, cfg: AgentsConfig, agent_name: str, profile: str | None = None, **opts: Any
+    ) -> dict[str, Any]: ...
 
-    def disable(self, cfg: AgentsConfig, agent_name: str) -> None: ...
+    def disable(self, cfg: AgentsConfig, agent_name: str, profile: str | None = None) -> None: ...
 
-    def status(self, cfg: AgentsConfig, agent_name: str) -> dict[str, Any]: ...
+    def status(
+        self, cfg: AgentsConfig, agent_name: str, profile: str | None = None
+    ) -> dict[str, Any]: ...
 
 
-def state_path(cfg: AgentsConfig, agent_name: str) -> Path:
+def state_path(cfg: AgentsConfig, agent_name: str, profile: str | None = None) -> Path:
     """Where the toolkit records which memory backend is enabled for an
     agent. Sits under the host data-dir so it works in both modes (the
     per-agent data dir doesn't exist on the host under ``--data-dir-in-vm``).
+    Named profiles get their own record (``<agent>@<profile>.json``) —
+    memory enablement is per-HERMES_HOME (GH #6 tier 2).
     """
-    return cfg.paths.host_data_dir / ".memory-state" / f"{agent_name}.json"
+    profile = hermes_config.normalize_profile(profile)
+    stem = agent_name if profile is None else f"{agent_name}@{profile}"
+    return cfg.paths.host_data_dir / ".memory-state" / f"{stem}.json"
 
 
-def read_state(cfg: AgentsConfig, agent_name: str) -> dict[str, Any] | None:
-    p = state_path(cfg, agent_name)
+def read_state(
+    cfg: AgentsConfig, agent_name: str, profile: str | None = None
+) -> dict[str, Any] | None:
+    p = state_path(cfg, agent_name, profile)
     if not p.exists():
         return None
     try:
@@ -86,14 +96,16 @@ def read_state(cfg: AgentsConfig, agent_name: str) -> dict[str, Any] | None:
         return None
 
 
-def write_state(cfg: AgentsConfig, agent_name: str, payload: dict[str, Any]) -> None:
-    p = state_path(cfg, agent_name)
+def write_state(
+    cfg: AgentsConfig, agent_name: str, payload: dict[str, Any], profile: str | None = None
+) -> None:
+    p = state_path(cfg, agent_name, profile)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
 
-def clear_state(cfg: AgentsConfig, agent_name: str) -> None:
-    p = state_path(cfg, agent_name)
+def clear_state(cfg: AgentsConfig, agent_name: str, profile: str | None = None) -> None:
+    p = state_path(cfg, agent_name, profile)
     p.unlink(missing_ok=True)
 
 
@@ -151,17 +163,20 @@ def enable(
     plugin_name: str,
     agent_name: str,
     *,
+    profile: str | None = None,
     config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH,
     **opts: Any,
 ) -> dict[str, Any]:
     cfg = cfg_mod.load(config_path)
     _require_hermes(cfg, agent_name)
+    profile = hermes_config.normalize_profile(profile)
     plugin = _get_plugin(plugin_name)
     with compose.acquire_lock(cfg.paths.host_data_dir):
-        result: dict[str, Any] = plugin.enable(cfg, agent_name, **opts)
+        result: dict[str, Any] = plugin.enable(cfg, agent_name, profile=profile, **opts)
     ui.emit(
-        {"plugin": plugin_name, "agent": agent_name, **result},
-        human=f"memory[{plugin_name}] enabled for {agent_name!r}",
+        {"plugin": plugin_name, "agent": agent_name, "profile": profile, **result},
+        human=f"memory[{plugin_name}] enabled for {agent_name!r}"
+        + (f" (profile {profile!r})" if profile else ""),
     )
     return result
 
@@ -169,19 +184,23 @@ def enable(
 def disable(
     agent_name: str,
     *,
+    profile: str | None = None,
     config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH,
 ) -> None:
     cfg = cfg_mod.load(config_path)
     _require_hermes(cfg, agent_name)
-    state = read_state(cfg, agent_name)
+    profile = hermes_config.normalize_profile(profile)
+    state = read_state(cfg, agent_name, profile)
     if state is None:
-        raise UserError(f"no memory backend enabled for {agent_name!r}; nothing to disable")
+        target = agent_name if profile is None else f"{agent_name} (profile {profile!r})"
+        raise UserError(f"no memory backend enabled for {target}; nothing to disable")
     plugin = _get_plugin(state["plugin"])
     with compose.acquire_lock(cfg.paths.host_data_dir):
-        plugin.disable(cfg, agent_name)
+        plugin.disable(cfg, agent_name, profile=profile)
     ui.emit(
-        {"plugin": state["plugin"], "agent": agent_name, "status": "disabled"},
-        human=f"memory[{state['plugin']}] disabled for {agent_name!r}",
+        {"plugin": state["plugin"], "agent": agent_name, "profile": profile, "status": "disabled"},
+        human=f"memory[{state['plugin']}] disabled for {agent_name!r}"
+        + (f" (profile {profile!r})" if profile else ""),
     )
 
 

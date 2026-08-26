@@ -38,7 +38,9 @@ DEFAULT_DB_PATH = "/opt/data/memory_store.db"
 DEFAULT_HRR_DIM = 1024
 
 
-def enable(cfg: AgentsConfig, agent_name: str, **_opts: Any) -> dict[str, Any]:
+def enable(
+    cfg: AgentsConfig, agent_name: str, profile: str | None = None, **_opts: Any
+) -> dict[str, Any]:
     """Flip ``memory.provider`` to ``holographic`` in the agent's config.yaml
     and write the matching ``plugins.hermes-memory-store`` block.
 
@@ -49,24 +51,30 @@ def enable(cfg: AgentsConfig, agent_name: str, **_opts: Any) -> dict[str, Any]:
     already-running container when only config.yaml changed — the
     gateway would silently keep the old provider.
     """
-    doc = hermes_config.read_doc(cfg, agent_name)
+    doc = hermes_config.read_doc(cfg, agent_name, profile)
+
+    # Each profile is its own HERMES_HOME — the memory store MUST live
+    # inside it, or two profiles would share one DB (the cross-write
+    # memory-drift hazard upstream explicitly warns about).
+    db_path = f"{hermes_config.profile_home(profile)}/memory_store.db"
 
     memory = doc.setdefault("memory", {})
     memory["provider"] = NAME
 
     plugins = doc.setdefault("plugins", {})
     block = plugins.setdefault("hermes-memory-store", {})
-    block.setdefault("db_path", DEFAULT_DB_PATH)
+    block.setdefault("db_path", db_path)
     block.setdefault("auto_extract", False)
     block.setdefault("default_trust", 0.5)
     block.setdefault("hrr_dim", DEFAULT_HRR_DIM)
 
-    hermes_config.write_atomically(cfg, agent_name, doc)
+    hermes_config.write_atomically(cfg, agent_name, doc, profile)
 
     write_state(
         cfg,
         agent_name,
-        {"plugin": NAME, "db_path": DEFAULT_DB_PATH, "hrr_dim": DEFAULT_HRR_DIM},
+        {"plugin": NAME, "db_path": db_path, "hrr_dim": DEFAULT_HRR_DIM},
+        profile,
     )
 
     svc = _service_name_for(agent_name, "hermes")
@@ -79,13 +87,13 @@ def enable(cfg: AgentsConfig, agent_name: str, **_opts: Any) -> dict[str, Any]:
     compose_runner.restart(cfg, svc)
 
     return {
-        "db_path": DEFAULT_DB_PATH,
+        "db_path": db_path,
         "hrr_dim": DEFAULT_HRR_DIM,
         "warnings": _warn_if_sqlite_on_9p(cfg),
     }
 
 
-def disable(cfg: AgentsConfig, agent_name: str) -> None:
+def disable(cfg: AgentsConfig, agent_name: str, profile: str | None = None) -> None:
     """Restore the agent to built-in memory and clear our state pointer.
 
     Leaves ``$HERMES_HOME/memory_store.db`` in place — the user may want
@@ -95,7 +103,7 @@ def disable(cfg: AgentsConfig, agent_name: str) -> None:
     container if absent; ``restart`` forces the config.yaml re-read that
     a no-op ``up`` wouldn't trigger.
     """
-    doc = hermes_config.read_doc(cfg, agent_name)
+    doc = hermes_config.read_doc(cfg, agent_name, profile)
 
     memory = doc.get("memory")
     if isinstance(memory, dict) and memory.get("provider") == NAME:
@@ -109,8 +117,8 @@ def disable(cfg: AgentsConfig, agent_name: str) -> None:
         if not plugins:
             doc.pop("plugins", None)
 
-    hermes_config.write_atomically(cfg, agent_name, doc)
-    clear_state(cfg, agent_name)
+    hermes_config.write_atomically(cfg, agent_name, doc, profile)
+    clear_state(cfg, agent_name, profile)
 
     svc = _service_name_for(agent_name, "hermes")
     # Same as enable: compose config didn't change, so restart (not a
@@ -120,8 +128,8 @@ def disable(cfg: AgentsConfig, agent_name: str) -> None:
     compose_runner.restart(cfg, svc)
 
 
-def status(cfg: AgentsConfig, agent_name: str) -> dict[str, Any]:
-    state = read_state(cfg, agent_name)
+def status(cfg: AgentsConfig, agent_name: str, profile: str | None = None) -> dict[str, Any]:
+    state = read_state(cfg, agent_name, profile)
     out: dict[str, Any] = {
         "db_path": (state or {}).get("db_path", DEFAULT_DB_PATH),
         "hrr_dim": (state or {}).get("hrr_dim", DEFAULT_HRR_DIM),

@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import io
 import os
+import re
 import uuid
 from pathlib import Path
 from typing import Any
@@ -41,6 +42,42 @@ from agents_cli.errors import UserError
 
 ALLOWED_DASHBOARD_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
+# Hermes stores named profiles lowercase under ``$HERMES_HOME/profiles/<id>/``,
+# each a full HERMES_HOME of its own (config.yaml, .env, state.db, ...).
+# The toolkit addresses them with a ``profile`` parameter threaded through
+# this module (GH #6 tier 2); ``None`` and ``"default"`` both mean the
+# container's primary home at ``/opt/data``. The pattern is deliberately
+# strict — these names are interpolated into container paths, so anything
+# outside it (slashes, dots-only, uppercase) is refused rather than
+# normalized.
+_PROFILE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+
+
+def normalize_profile(profile: str | None) -> str | None:
+    """``None``/``"default"``/empty → None (primary home); else validate.
+
+    Raises :class:`UserError` on names that could escape the profiles
+    dir or that Hermes itself would refuse.
+    """
+    if profile is None:
+        return None
+    p = profile.strip().lower()
+    if p in ("", "default"):
+        return None
+    if not _PROFILE_NAME_RE.fullmatch(p) or ".." in p:
+        raise UserError(
+            f"invalid profile name {profile!r} — expected lowercase "
+            f"letters/digits/dot/dash/underscore (Hermes stores profiles "
+            f"lowercase under profiles/<id>/)"
+        )
+    return p
+
+
+def profile_home(profile: str | None = None) -> str:
+    """In-container HERMES_HOME for the given profile."""
+    p = normalize_profile(profile)
+    return "/opt/data" if p is None else f"/opt/data/profiles/{p}"
+
 
 def _yaml() -> YAML:
     y = YAML()
@@ -50,30 +87,36 @@ def _yaml() -> YAML:
     return y
 
 
-def config_path(cfg: AgentsConfig, agent_name: str) -> Path:
+def config_path(cfg: AgentsConfig, agent_name: str, profile: str | None = None) -> Path:
     """The host-side path of a Hermes agent's config.yaml (visible through
     the mount in host-mount mode; only exists in the VM under
-    ``--data-dir-in-vm``).
+    ``--data-dir-in-vm``). ``profile`` targets a named profile's config.
     """
-    return cfg.paths.host_data_dir / agent_name / ".data" / "config.yaml"
+    base = cfg.paths.host_data_dir / agent_name / ".data"
+    p = normalize_profile(profile)
+    if p is not None:
+        base = base / "profiles" / p
+    return base / "config.yaml"
 
 
-def vm_config_path(cfg: AgentsConfig, agent_name: str) -> str:
+def vm_config_path(cfg: AgentsConfig, agent_name: str, profile: str | None = None) -> str:
     """VM-host-side path of an agent's config.yaml (the bind-mount source).
 
     Used by ``read_doc`` in ``--data-dir-in-vm`` mode to pull the file
     out via ``multipass transfer``. Writes don't go through this path
     anymore — see :func:`write_atomically`.
     """
-    return f"{cfg.paths.vm_agents_root}/{agent_name}/.data/config.yaml"
+    p = normalize_profile(profile)
+    mid = "" if p is None else f"profiles/{p}/"
+    return f"{cfg.paths.vm_agents_root}/{agent_name}/.data/{mid}config.yaml"
 
 
-def container_config_path() -> str:
+def container_config_path(profile: str | None = None) -> str:
     """In-container path of the agent's config.yaml — what processes
     inside the container see at ``$HERMES_HOME/config.yaml``. Used by
     write paths that go through ``docker compose exec``.
     """
-    return "/opt/data/config.yaml"
+    return f"{profile_home(profile)}/config.yaml"
 
 
 def load(path: Path) -> Any:
@@ -84,7 +127,7 @@ def load(path: Path) -> Any:
     return y.load(path.read_text(encoding="utf-8"))
 
 
-def read_doc(cfg: AgentsConfig, agent_name: str) -> Any:
+def read_doc(cfg: AgentsConfig, agent_name: str, profile: str | None = None) -> Any:
     """Read the agent's config.yaml via ``docker compose exec cat``.
 
     Routed through the container regardless of ``data_dir_in_vm``
@@ -115,7 +158,7 @@ def read_doc(cfg: AgentsConfig, agent_name: str) -> Any:
     svc = f"hermes-{agent_name}"
     result = mp.exec_in_vm(
         cfg.vm.name,
-        *_compose_exec_in_vm_argv(cfg, svc, "cat", container_config_path(), no_tty=True),
+        *_compose_exec_in_vm_argv(cfg, svc, "cat", container_config_path(profile), no_tty=True),
         check=False,
     )
     if result.returncode != 0:
@@ -136,7 +179,9 @@ def dump(doc: Any) -> str:
     return buf.getvalue()
 
 
-def write_atomically(cfg: AgentsConfig, agent_name: str, doc: Any) -> None:
+def write_atomically(
+    cfg: AgentsConfig, agent_name: str, doc: Any, profile: str | None = None
+) -> None:
     """Atomic write via ``docker compose exec`` inside the running container.
 
     Writes the new content to a staged path inside ``/opt/data`` via
@@ -169,7 +214,7 @@ def write_atomically(cfg: AgentsConfig, agent_name: str, doc: Any) -> None:
 
     pid = os.getpid()
     suffix = uuid.uuid4().hex[:8]
-    target = container_config_path()
+    target = container_config_path(profile)
     stage = f"{target}.{pid}.{suffix}.new"
     svc = f"hermes-{agent_name}"
     content = dump(doc).encode("utf-8")
@@ -189,13 +234,19 @@ def write_atomically(cfg: AgentsConfig, agent_name: str, doc: Any) -> None:
                 f"{svc!r} is not running. Start it with "
                 f"`agents start {agent_name}` first."
             )
+        p = normalize_profile(profile)
+        if p is not None and ("no such file" in err or "directory" in err):
+            raise UserError(
+                f"profile {p!r} does not exist in agent {agent_name!r} — "
+                f"create it first with `agents exec {agent_name} hermes profile create {p}`"
+            )
         raise UserError(
             f"failed to stage {agent_name}'s config.yaml inside {svc!r}: "
             f"{(write.stderr or '').strip() or 'rc=' + str(write.returncode)}"
         )
 
     try:
-        _validate_in_container(cfg, agent_name, stage)
+        _validate_in_container(cfg, agent_name, stage, profile=profile)
         mv_argv = _compose_exec_in_vm_argv(cfg, svc, "mv", stage, target, no_tty=True)
         mp.exec_in_vm(cfg.vm.name, *mv_argv)
     except Exception:
@@ -204,7 +255,9 @@ def write_atomically(cfg: AgentsConfig, agent_name: str, doc: Any) -> None:
         raise
 
 
-def _validate_in_container(cfg: AgentsConfig, agent_name: str, vm_path: str) -> None:
+def _validate_in_container(
+    cfg: AgentsConfig, agent_name: str, vm_path: str, profile: str | None = None
+) -> None:
     """Best-effort validation of the staged config file inside the container.
 
     Hermes' CLI evolved here — older versions had ``hermes config
@@ -218,7 +271,14 @@ def _validate_in_container(cfg: AgentsConfig, agent_name: str, vm_path: str) -> 
     from agents_cli.ops import _compose_exec_in_vm_argv
 
     svc = f"hermes-{agent_name}"
-    container_stage = f"/opt/data/{Path(vm_path).name}"
+    home = profile_home(profile)
+    container_stage = f"{home}/{Path(vm_path).name}"
+    # For a named profile, point HERMES_HOME at the profile's own home so
+    # validation resolves .env / includes against the profile being
+    # edited — the same mechanism Hermes' generated profile aliases use.
+    env = {"HERMES_CONFIG": container_stage}
+    if normalize_profile(profile) is not None:
+        env["HERMES_HOME"] = home
 
     for sub in ("check", "validate"):
         result = mp.exec_in_vm(
@@ -230,7 +290,7 @@ def _validate_in_container(cfg: AgentsConfig, agent_name: str, vm_path: str) -> 
                 "config",
                 sub,
                 no_tty=True,
-                env={"HERMES_CONFIG": container_stage},
+                env=env,
             ),
             check=False,
         )

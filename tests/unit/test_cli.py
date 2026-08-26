@@ -188,14 +188,14 @@ def test_secret_set_with_value_argument_works_under_json(mocker: Any) -> None:
     set_secret = mocker.patch("agents_cli.secrets_cmd.set_secret")
     result = invoke(mocker, ["--json", "secret", "set", "coder", "API_KEY", "sk-x"])
     assert result.exit_code == 0
-    set_secret.assert_called_once_with("coder", "API_KEY", "sk-x")
+    set_secret.assert_called_once_with("coder", "API_KEY", "sk-x", profile=None)
 
 
 def test_secret_set_human_mode_prompts_hidden_when_value_omitted(mocker: Any) -> None:
     set_secret = mocker.patch("agents_cli.secrets_cmd.set_secret")
     result = invoke(mocker, ["secret", "set", "coder", "API_KEY"], input="sk-typed\n")
     assert result.exit_code == 0
-    set_secret.assert_called_once_with("coder", "API_KEY", "sk-typed")
+    set_secret.assert_called_once_with("coder", "API_KEY", "sk-typed", profile=None)
     # Hidden prompt: the typed value never appears in the output.
     assert "sk-typed" not in result.output
 

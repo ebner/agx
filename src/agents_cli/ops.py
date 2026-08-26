@@ -190,6 +190,7 @@ def doctor(
             _check_hermes_codex_mount(cfg, svc, agent_name, report)
             _check_hermes_model_set(cfg, svc, agent_name, report)
             _check_profile_gateways(cfg, svc, agent_name, report)
+            _check_profile_dashboard_bindings(cfg, svc, agent_name, report)
 
     if emit:
         _emit_doctor_table(report)
@@ -823,6 +824,75 @@ _SVSTAT_SECONDS_RE = re.compile(r"(\d+) seconds")
 def _svstat_seconds(stat: str) -> int | None:
     m = _SVSTAT_SECONDS_RE.search(stat)
     return int(m.group(1)) if m else None
+
+
+# Scans every profile home (default + named) for a dashboard.address
+# outside the loopback set. Toolkit writes are refused at write time
+# (hermes_config.validate_dashboard_binding), but hand edits inside the
+# container and imported profile distributions bypass that — and a
+# non-loopback bind in ANY profile is reachable from sibling containers
+# on the compose network even without a published port (GH #6 tier 2).
+_PROFILE_DASHBOARD_PROBE = """\
+import glob, json
+try:
+    import yaml
+except Exception:
+    print(json.dumps({"error": "no yaml"}))
+    raise SystemExit(0)
+rows = []
+paths = ["/opt/data/config.yaml"] + sorted(glob.glob("/opt/data/profiles/*/config.yaml"))
+for path in paths:
+    name = "default" if path == "/opt/data/config.yaml" else path.split("/")[-2]
+    try:
+        doc = yaml.safe_load(open(path)) or {}
+    except Exception:
+        continue
+    addr = ((doc.get("dashboard") or {}).get("address"))
+    if addr is not None:
+        rows.append({"profile": name, "address": str(addr)})
+print(json.dumps({"rows": rows}))
+"""
+
+
+def _check_profile_dashboard_bindings(
+    cfg: AgentsConfig, svc: str, agent_name: str, report: DoctorReport
+) -> None:
+    """Warn when any profile's config binds the dashboard off-loopback.
+
+    Complements the write-time refusal in ``hermes_config`` — that guard
+    only covers toolkit-driven writes to the profile being edited; this
+    check sweeps every profile home in the container, catching hand
+    edits and imported profile distributions.
+    """
+    result = mp.exec_in_vm(
+        cfg.vm.name,
+        *_compose_exec_in_vm_argv(
+            cfg, svc, "python3", "-c", _PROFILE_DASHBOARD_PROBE, no_tty=True, as_root=True
+        ),
+        check=False,
+    )
+    if result.returncode != 0:
+        return  # container down — container_running already reports it
+    try:
+        data = json.loads(result.stdout)
+    except ValueError:
+        return
+    if not isinstance(data, dict):
+        return
+    offenders = [
+        r
+        for r in data.get("rows", [])
+        if isinstance(r, dict) and r.get("address") not in ("127.0.0.1", "localhost", "::1")
+    ]
+    if offenders:
+        detail = ", ".join(f"{r['profile']}={r['address']!r}" for r in offenders)
+        report.add(
+            f"{agent_name}.profile_dashboards",
+            "warn",
+            f"non-loopback dashboard.address in profile config(s): {detail} — "
+            f"reachable from sibling containers on the compose network; "
+            f"bind 127.0.0.1 and publish via the override file instead",
+        )
 
 
 def _check_profile_gateways(
