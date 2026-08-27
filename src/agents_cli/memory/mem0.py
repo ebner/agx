@@ -97,6 +97,7 @@ def enable(
             "llm_provider": provider_used["llm"],
             "vector_path": vector_path,
         },
+        profile,
     )
 
     svc = _service_name_for(agent_name, "hermes")

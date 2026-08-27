@@ -66,7 +66,7 @@ try:
 except Exception:
     fresh = 3600
 now = time.time()
-c = sqlite3.connect(home + "/state.db")
+c = sqlite3.connect("file:" + home + "/state.db?mode=ro", uri=True)
 c.row_factory = sqlite3.Row
 rows = list(c.execute('''
   select s.id, s.source, s.title, s.message_count,
@@ -109,7 +109,9 @@ print(json.dumps(out))
 
 _EXPORT_SCRIPT = """\
 import json, os, sqlite3
-c = sqlite3.connect(os.environ.get("H_HOME", "/opt/data") + "/state.db")
+c = sqlite3.connect(
+    "file:" + os.environ.get("H_HOME", "/opt/data") + "/state.db?mode=ro", uri=True
+)
 c.row_factory = sqlite3.Row
 sessions = []
 for s in c.execute('''

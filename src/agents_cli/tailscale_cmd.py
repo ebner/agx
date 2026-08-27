@@ -152,13 +152,38 @@ def up(
         version = install.stdout.strip().splitlines()[-1] if install.stdout.strip() else ""
 
         ui.progress(f"joining tailnet as {ts_hostname!r}...")
-        argv = ["sudo", "tailscale", "up", f"--hostname={ts_hostname}", "--timeout=30s"]
         if auth_key:
-            argv.append(f"--auth-key={auth_key}")
-        result = mp.exec_in_vm(cfg.vm.name, *argv, check=False)
+            # The key is a reusable credential — keep it out of the argv,
+            # which both backends echo verbatim under --verbose. It rides
+            # stdin into a bash read instead.
+            script = (
+                f'read -r TS_KEY && sudo tailscale up "--hostname={ts_hostname}" '
+                f'--timeout=30s --auth-key="$TS_KEY"'
+            )
+            result = mp.exec_in_vm_with_stdin(
+                cfg.vm.name,
+                "bash",
+                "-c",
+                script,
+                input_bytes=(auth_key + "\n").encode("utf-8"),
+                check=False,
+            )
+        else:
+            result = mp.exec_in_vm(
+                cfg.vm.name,
+                "sudo",
+                "tailscale",
+                "up",
+                f"--hostname={ts_hostname}",
+                "--timeout=30s",
+                check=False,
+            )
 
         status = _vm_status(cfg)
-        if status.get("backend_state") == "Running":
+        # rc gate: a VM that was ALREADY connected reports Running even
+        # when this invocation failed (bad hostname, rejected auth key) —
+        # Running alone must not mask a failed change request.
+        if result.returncode == 0 and status.get("backend_state") == "Running":
             write_state(
                 cfg,
                 {"hostname": ts_hostname, "version": status.get("version") or version},

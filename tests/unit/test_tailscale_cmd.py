@@ -108,18 +108,41 @@ def test_up_installs_joins_and_writes_state(
     assert state["version"] == "1.86.2"
 
 
-def test_up_passes_auth_key_and_custom_hostname(
+def test_up_auth_key_rides_stdin_never_argv(
     cfg: AgentsConfig, saved_config: Path, mocker: Any
 ) -> None:
+    """The auth key is a reusable credential and both backends echo the
+    exec argv under --verbose — it must travel via stdin, not argv
+    (codex review 2026-08-27)."""
     mocker.patch("agents_cli.mp.exec_bash", return_value=_ok("1.86.2\n"))
-    execs = mocker.patch(
-        "agents_cli.mp.exec_in_vm",
-        side_effect=[_ok(), _ok(_status_json("Running"))],
-    )
+    stdin_exec = mocker.patch("agents_cli.mp.exec_in_vm_with_stdin", return_value=_ok())
+    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok(_status_json("Running")))
     tailscale_cmd.up(auth_key="tskey-abc", hostname="agents-lab", config_path=saved_config)
-    up_argv = execs.call_args_list[0].args
-    assert "--auth-key=tskey-abc" in up_argv
-    assert "--hostname=agents-lab" in up_argv
+    call = stdin_exec.call_args
+    assert all("tskey-abc" not in str(a) for a in call.args)
+    assert call.kwargs["input_bytes"] == b"tskey-abc\n"
+    assert any("--hostname=agents-lab" in str(a) for a in call.args)
+
+
+def test_up_failed_rc_not_masked_by_already_running(
+    cfg: AgentsConfig, saved_config: Path, mocker: Any
+) -> None:
+    """An already-connected VM reports Running even when THIS `tailscale
+    up` failed (bad hostname/key) — rc must gate the success path."""
+    import pytest as _pytest
+
+    from agents_cli.errors import RuntimeFailure as _RF
+
+    mocker.patch("agents_cli.mp.exec_bash", return_value=_ok("1.86.2\n"))
+    mocker.patch(
+        "agents_cli.mp.exec_in_vm",
+        side_effect=[
+            _fail(stderr="backend error: invalid hostname"),
+            _ok(_status_json("Running")),
+        ],
+    )
+    with _pytest.raises(_RF):
+        tailscale_cmd.up(hostname="Bad_Host", config_path=saved_config)
 
 
 def test_up_without_auth_emits_login_url(

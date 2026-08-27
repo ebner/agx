@@ -406,6 +406,44 @@ def test_login_device_auth_appends_flag(mocker, saved_config: Path, cfg: AgentsC
     assert args[0] == ["/usr/local/bin/codex", "login", "--device-auth"]
 
 
+def test_login_relaxes_bridge_permissions(mocker, saved_config: Path, cfg: AgentsConfig) -> None:
+    """codex CLI writes auth.json mode 600 — unreadable by the container's
+    runtime user through the ro import-bridge mount (host ACLs don't
+    propagate through virtiofs/9p; mode bits do). Login must chmod the
+    file other-readable and the dir traversable, or `hermes auth add
+    openai-codex` silently finds nothing and falls back to a fresh
+    device login (2026-08-27)."""
+    home = cfg.paths.host_data_dir / ".codex"
+    home.mkdir(mode=0o700)
+    auth = home / "auth.json"
+    auth.touch(mode=0o600)
+    mocker.patch("shutil.which", return_value="/usr/local/bin/codex")
+    mocker.patch("subprocess.run", return_value=type("R", (), {"returncode": 0})())
+
+    codex.login(config_path=saved_config)
+
+    assert (auth.stat().st_mode & 0o777) == 0o644
+    assert (home.stat().st_mode & 0o777) == 0o755
+
+
+def test_refresh_rerelaxes_bridge_permissions(
+    mocker, saved_config: Path, cfg: AgentsConfig
+) -> None:
+    """The silent refresh rewrites auth.json (recreated mode 600 by the
+    codex CLI) — refresh must re-apply the bridge grant or the next
+    rotation silently re-breaks imports."""
+    home = cfg.paths.host_data_dir / ".codex"
+    home.mkdir(mode=0o755)
+    auth = home / "auth.json"
+    auth.touch(mode=0o600)
+    mocker.patch("shutil.which", return_value="/usr/local/bin/codex")
+    mocker.patch("subprocess.run", return_value=type("R", (), {"returncode": 0})())
+
+    codex.refresh(config_path=saved_config)
+
+    assert (auth.stat().st_mode & 0o777) == 0o644
+
+
 def test_login_raises_when_codex_missing(mocker, saved_config: Path) -> None:
     mocker.patch("shutil.which", return_value=None)
     with pytest.raises(UserError, match="codex CLI not found"):

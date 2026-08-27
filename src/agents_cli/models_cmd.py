@@ -165,7 +165,11 @@ def use(
         base_url = cfg.ollama.url.rstrip("/")
         if not base_url.endswith("/v1"):
             base_url += "/v1"
-        api_key = "ollama"
+        # An authenticated endpoint stores its token in the PROJECT .env
+        # under the name in [ollama].api_key_env (config.toml never holds
+        # the secret). Writing the dummy key against such an endpoint
+        # would 401 every request.
+        api_key = _external_ollama_api_key(cfg)
     else:
         base_url, api_key = _url_for(engine, model), _api_key_for(engine)
 
@@ -572,6 +576,29 @@ def _url_for(engine: str, model: str) -> str:
         return f"http://{OLLAMA_SERVICE_NAME}:11434/v1"
     slug = _slugify(model)
     return f"http://{LLAMACPP_SERVICE_PREFIX}{slug}:8080/v1"
+
+
+def _external_ollama_api_key(cfg: AgentsConfig) -> str:
+    env_name = (cfg.ollama.api_key_env or "").strip()
+    if not env_name:
+        # Unauthenticated endpoint: any non-empty key satisfies the
+        # OpenAI client library; the server ignores it.
+        return "ollama"
+    env_path = cfg.paths.host_data_dir / ".env"
+    if env_path.exists():
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            key, sep, value = line.partition("=")
+            if sep and key.strip() == env_name and value.strip():
+                return value.strip()
+    import os
+
+    value = os.environ.get(env_name, "").strip()
+    if value:
+        return value
+    raise UserError(
+        f"[ollama].api_key_env is set to {env_name!r} but no value was found in the "
+        f"project .env or the environment — re-run `agents ollama configure --api-key ...`"
+    )
 
 
 def _api_key_for(engine: str) -> str:

@@ -326,3 +326,137 @@ def test_profile_list_refuses_openclaw(cfg: AgentsConfig, saved_config: Path, mo
     create(name="claw", agent_type="openclaw", config_path=saved_config)
     with pytest.raises(UserError, match="Hermes-only"):
         profile_cmd.list_profiles("claw", config_path=saved_config)
+
+
+# ---------- codex-review regression tests (2026-08-27) ----------
+
+
+def test_cli_model_use_reaches_backend_with_profile(mocker: Any) -> None:
+    """P1 regression: the --profile click option fell off model_use while
+    the callback signature gained the parameter — EVERY `agents model
+    use` invocation TypeError'd before reaching the backend. Invoking
+    through the real command tree catches decorator/signature drift the
+    direct-call tests can't see."""
+    from tests.unit.test_cli import invoke
+
+    use = mocker.patch("agents_cli.models_cmd.use")
+    result = invoke(
+        mocker,
+        ["model", "use", "coder", "--engine", "ollama", "--model", "m", "--profile", "work"],
+    )
+    assert result.exit_code == 0, result.output
+    assert use.call_args.kwargs["profile"] == "work"
+
+    use.reset_mock()
+    result = invoke(mocker, ["model", "use", "coder", "--engine", "ollama", "--model", "m"])
+    assert result.exit_code == 0, result.output
+    assert use.call_args.kwargs["profile"] is None
+
+
+def test_cli_prune_honors_root_yes(mocker: Any) -> None:
+    """P2 regression: `agents --yes prune` prompted anyway (callback
+    ignored the root context), hanging automation."""
+    from tests.unit.test_cli import invoke
+
+    prune = mocker.patch("agents_cli.prune_cmd.prune")
+    result = invoke(mocker, ["--yes", "prune"])
+    assert result.exit_code == 0, result.output
+    assert prune.call_args.kwargs["yes"] is True
+
+
+def test_conversation_scripts_open_sqlite_read_only() -> None:
+    """P1 regression: sqlite3.connect on a bare path CREATES a missing
+    state.db — as container root, breaking Hermes' own init for fresh
+    profiles and violating the command's read-only contract."""
+    assert "mode=ro" in conversations_cmd._QUERY_SCRIPT
+    assert "mode=ro" in conversations_cmd._EXPORT_SCRIPT
+
+
+def test_holographic_profile_overrides_cloned_default_db_path(
+    with_coder: Path, cfg: AgentsConfig, mocker: Any
+) -> None:
+    """P1 regression: a profile created with `--clone default` inherits
+    the DEFAULT profile's db_path; setdefault kept it, silently sharing
+    one memory DB across profiles."""
+    from agents_cli import memory as memory_mod
+
+    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agents_cli.compose_runner.restart", return_value=_ok())
+    _seed_profile(
+        cfg,
+        "work",
+        "memory:\n  provider: holographic\n"
+        "plugins:\n  hermes-memory-store:\n    db_path: /opt/data/memory_store.db\n",
+    )
+
+    memory_mod.enable("holographic", "coder", profile="work", config_path=with_coder)
+
+    prof = hermes_config.load(hermes_config.config_path(cfg, "coder", "work"))
+    assert (
+        prof["plugins"]["hermes-memory-store"]["db_path"]
+        == "/opt/data/profiles/work/memory_store.db"
+    )
+
+
+def test_secret_set_profile_restarts_gateway(
+    with_coder: Path, cfg: AgentsConfig, mocker: Any
+) -> None:
+    """P2 regression: a profile-only passthrough edit changes config.yaml
+    but not compose inputs — `up` no-ops and the running gateway kept
+    filtering the var until an unrelated restart."""
+    restart = mocker.patch("agents_cli.compose_runner.restart", return_value=_ok())
+    _seed_default(cfg, "terminal:\n  env_passthrough: []\n")
+    _seed_profile(cfg, "work", "terminal:\n  env_passthrough: []\n")
+
+    secrets_cmd.set_secret("coder", "K1", "v", profile="work", config_path=with_coder)
+    restart.assert_called_once()
+
+    restart.reset_mock()
+    secrets_cmd.set_secret("coder", "K2", "v", config_path=with_coder)
+    restart.assert_not_called()  # default-profile sets flow through env_file recreate
+
+
+def test_clear_sweeps_every_profile_passthrough(
+    with_coder: Path, cfg: AgentsConfig, mocker: Any
+) -> None:
+    """P2 regression: clear wiped the .env key inventory but swept only
+    one profile's passthrough list — remaining profiles could never be
+    cleaned and would re-expose a future value under the same key."""
+    _seed_default(cfg, "terminal:\n  env_passthrough: [MY_KEY]\n")
+    _seed_profile(cfg, "work", "terminal:\n  env_passthrough: [MY_KEY]\n")
+    (cfg.paths.host_data_dir / "coder" / ".env").write_text("MY_KEY=v\n", encoding="utf-8")
+    mocker.patch("agents_cli.secrets_cmd._list_profile_names", return_value=["work"])
+
+    secrets_cmd.clear_secrets("coder", yes=True, config_path=with_coder)
+
+    default = hermes_config.load(hermes_config.config_path(cfg, "coder"))
+    prof = hermes_config.load(hermes_config.config_path(cfg, "coder", "work"))
+    assert "MY_KEY" not in default["terminal"]["env_passthrough"]
+    assert "MY_KEY" not in prof["terminal"]["env_passthrough"]
+
+
+def test_external_ollama_api_key_env_resolution(tmp_path: Path) -> None:
+    """P2 regression: authenticated external endpoints ([ollama].api_key_env)
+    got the literal dummy key — every Hermes request would 401."""
+    from agents_cli.config import OllamaConfig
+    from agents_cli.models_cmd import _external_ollama_api_key
+
+    data_dir = tmp_path / "d"
+    data_dir.mkdir()
+    c = AgentsConfig(
+        paths=PathsConfig(host_data_dir=str(data_dir)),
+        host=HostConfig(uid=1000, gid=1000),
+        vm_runtime=VmRuntimeConfig(
+            docker_socket_path="/run/user/1000/docker.sock", ubuntu_uid=1000, ubuntu_gid=1000
+        ),
+        ollama=OllamaConfig(url="http://10.0.0.1:11434", api_key_env="OLLAMA_API_KEY"),
+    )
+    (data_dir / ".env").write_text("OLLAMA_API_KEY=sk-real\n", encoding="utf-8")
+    assert _external_ollama_api_key(c) == "sk-real"
+
+    (data_dir / ".env").write_text("", encoding="utf-8")
+    with pytest.raises(UserError, match="api_key_env"):
+        _external_ollama_api_key(c)
+
+    c.ollama.api_key_env = ""
+    assert _external_ollama_api_key(c) == "ollama"

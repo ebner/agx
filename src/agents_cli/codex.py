@@ -85,11 +85,43 @@ def login(
     result = subprocess.run(argv, env=env, check=False)
     if result.returncode != 0:
         raise RuntimeFailure(f"codex login failed (rc={result.returncode})")
+    _grant_bridge_read(cfg)
     # Under --data-dir-in-vm the containers mount <vm_agents_root>/.codex,
     # not the host. Sync the freshly-written auth into the VM.
     if cfg.paths.data_dir_in_vm:
         _sync_host_codex_to_vm(cfg)
     ui.emit({"auth": "ok", "codex_home": env["CODEX_HOME"]}, human="codex auth ok")
+
+
+def _grant_bridge_read(cfg: AgentsConfig) -> None:
+    """Make the freshly-written toolkit Codex auth readable through the
+    per-agent import-bridge mounts.
+
+    The Codex CLI writes ``auth.json`` mode 600 owned by the host user.
+    Inside a Hermes container the host user maps to container ROOT while
+    the runtime ``hermes`` user (uid 1000) maps to the subuid range — so
+    a 600 file is unreadable exactly where it's needed. Host-side ACLs
+    are NOT the fix: virtiofs/9p evaluate DAC at the VM level and do not
+    propagate host ACLs (verified live 2026-08-27 — the import silently
+    found nothing and `hermes auth add openai-codex` fell through to a
+    fresh device-code login). Mode bits DO propagate: other-read on the
+    file + traverse on the dir is the only lever, and it is no broader
+    than the group/other-readable per-agent ``.env`` files the toolkit
+    already writes — the deployment model is a single-user host.
+    """
+    home = _codex_home(cfg)
+    try:
+        if home.is_dir():
+            home.chmod(0o755)
+        auth = home / "auth.json"
+        if auth.exists():
+            auth.chmod(0o644)
+    except OSError as e:
+        ui.warn(
+            f"could not relax codex-auth permissions for the container import bridge: {e} "
+            f"— `hermes auth add openai-codex` inside the container will fall back to "
+            f"its own device-code login"
+        )
 
 
 def _sync_host_codex_to_vm(cfg: AgentsConfig) -> None:
@@ -155,6 +187,9 @@ def refresh(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> None:
         raise UserError(
             "silent refresh not possible; run `agents codex login` for interactive re-auth"
         )
+    # The refresh rewrites auth.json — codex CLI recreates it mode 600,
+    # which would silently re-break the import bridge (see _grant_bridge_read).
+    _grant_bridge_read(cfg)
     if cfg.paths.data_dir_in_vm:
         _sync_host_codex_to_vm(cfg)
     ui.emit({"refresh": "ok"}, human="codex token refreshed")

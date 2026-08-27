@@ -63,7 +63,14 @@ def enable(
 
     plugins = doc.setdefault("plugins", {})
     block = plugins.setdefault("hermes-memory-store", {})
-    block.setdefault("db_path", db_path)
+    if profile is not None:
+        # A profile created with `--clone default` inherits the DEFAULT
+        # profile's db_path — setdefault would keep it and silently share
+        # one memory DB across profiles. Named profiles always get their
+        # own store, unconditionally.
+        block["db_path"] = db_path
+    else:
+        block.setdefault("db_path", db_path)
     block.setdefault("auto_extract", False)
     block.setdefault("default_trust", 0.5)
     block.setdefault("hrr_dim", DEFAULT_HRR_DIM)

@@ -95,6 +95,11 @@ def set_secret(
             _ensure_env_passthrough(cfg, agent_name, key, profile=profile)
 
     compose_runner.up(cfg, svc)
+    # A profile-only passthrough edit changes config.yaml, not compose
+    # inputs — `up` is then a NO-OP and the running gateway would keep
+    # filtering the var until the next unrelated restart.
+    if profile is not None:
+        compose_runner.restart(cfg, svc)
     ui.emit(
         {"agent": agent_name, "key": key, "status": "set"},
         human=f"secret[{agent_name}] {key}: set",
@@ -123,6 +128,8 @@ def unset_secret(
             _drop_env_passthrough(cfg, agent_name, key, profile=profile)
 
     compose_runner.up(cfg, svc)
+    if profile is not None:
+        compose_runner.restart(cfg, svc)
     ui.emit(
         {"agent": agent_name, "key": key, "status": "unset"},
         human=f"secret[{agent_name}] {key}: unset",
@@ -148,12 +155,10 @@ def clear_secrets(
     agent_name: str,
     *,
     yes: bool = False,
-    profile: str | None = None,
     config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH,
 ) -> None:
     cfg = cfg_mod.load(config_path)
     svc, agent_type = _resolve_service(cfg, agent_name)
-    profile = _require_hermes_for_profile(agent_type, profile)
     if not yes and not ui.confirm(f"clear ALL secrets for {agent_name!r}?", default=False):
         raise UserError("aborted by user")
 
@@ -166,13 +171,19 @@ def clear_secrets(
         keys = sorted(_read_env(cfg, agent_name))
         _write_env(cfg, agent_name, {})
         if agent_type == "hermes" and keys:
-            # Sweeps the targeted profile's passthrough list only; with
-            # multiple profiles, run clear once per profile (the .env
-            # wipe itself is container-wide and idempotent).
-            doc = hermes_config.read_doc(cfg, agent_name, profile)
-            for key in keys:
-                hermes_config.remove_env_passthrough(doc, key)
-            hermes_config.write_atomically(cfg, agent_name, doc, profile)
+            # Sweep the DEFAULT profile plus every named profile: the
+            # .env wipe below erases the key inventory, so a per-profile
+            # clear could never clean the remaining profiles afterwards —
+            # stale passthrough entries would re-expose a future value
+            # set under the same key.
+            for prof in [None, *_list_profile_names(cfg, svc)]:
+                doc = hermes_config.read_doc(cfg, agent_name, prof)
+                before = list((doc.get("terminal") or {}).get("env_passthrough") or [])
+                for key in keys:
+                    hermes_config.remove_env_passthrough(doc, key)
+                after = list((doc.get("terminal") or {}).get("env_passthrough") or [])
+                if before != after:
+                    hermes_config.write_atomically(cfg, agent_name, doc, prof)
 
     compose_runner.up(cfg, svc)
     ui.emit(
@@ -295,6 +306,31 @@ def _drop_env_passthrough(
     doc = hermes_config.read_doc(cfg, agent_name, profile)
     hermes_config.remove_env_passthrough(doc, key)
     hermes_config.write_atomically(cfg, agent_name, doc, profile)
+
+
+def _list_profile_names(cfg: AgentsConfig, svc: str) -> list[str]:
+    """Named profiles present in the running container (empty when the
+    exec fails — e.g. no profiles dir yet)."""
+    from agents_cli.ops import _compose_exec_in_vm_argv
+
+    result = mp.exec_in_vm(
+        cfg.vm.name,
+        *_compose_exec_in_vm_argv(
+            cfg, svc, "sh", "-c", "ls /opt/data/profiles 2>/dev/null || true", no_tty=True
+        ),
+        check=False,
+    )
+    if result.returncode != 0:
+        return []
+    names = []
+    for line in result.stdout.splitlines():
+        try:
+            normalized = hermes_config.normalize_profile(line.strip())
+        except Exception:
+            continue
+        if normalized:
+            names.append(normalized)
+    return names
 
 
 def _require_hermes_for_profile(agent_type: str, profile: str | None) -> str | None:

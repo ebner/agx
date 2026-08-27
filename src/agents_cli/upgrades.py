@@ -374,8 +374,23 @@ def upgrade(
             if cfg.upgrades.keep_generations > 0:
                 from agents_cli import prune_cmd
 
+                # Prune against the FUTURE defaults baseline: image retention
+                # protects defaults.<type>_image_tag, and at this point
+                # config.toml still holds the OUTGOING tag — counting it as
+                # the baseline retains one extra image per --latest upgrade
+                # (permanently at keep_generations=1). A mutated COPY, not
+                # cfg itself: _persist_default_tag below skips its save when
+                # the in-memory value already matches, so mutating cfg here
+                # would silently drop the on-disk defaults refresh.
+                prune_cfg = cfg
+                if resolved_latest is not None:
+                    prune_cfg = cfg.model_copy(deep=True)
+                    if agent_type == "hermes":
+                        prune_cfg.defaults.hermes_image_tag = resolved_latest
+                    else:
+                        prune_cfg.defaults.openclaw_image_tag = resolved_latest
                 try:
-                    pruned = prune_cmd.auto_prune_after_upgrade(cfg, name)
+                    pruned = prune_cmd.auto_prune_after_upgrade(prune_cfg, name)
                 except Exception as prune_err:
                     ui.warn(f"post-upgrade prune failed (non-fatal): {prune_err}")
                 else:

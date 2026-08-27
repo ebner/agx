@@ -902,14 +902,23 @@ def agents_rollback(
 )
 @click.option("--dry-run", is_flag=True, help="Show what would be deleted; delete nothing.")
 @click.option("-y", "--yes", "yes_local", is_flag=True, help="Skip the confirmation prompt.")
-def agents_prune(name: str | None, keep: int | None, dry_run: bool, yes_local: bool) -> None:
+@click.pass_context
+def agents_prune(
+    ctx: click.Context, name: str | None, keep: int | None, dry_run: bool, yes_local: bool
+) -> None:
     """Delete old upgrade artifacts (tarballs, VM snapshots, image tags).
 
     Runs automatically after every successful ``agents upgrade`` (see
     ``[upgrades].keep_generations``); this command is the manual sweep
     for history that predates that hook, or for a custom ``--keep``.
     """
-    _run(prune_cmd.prune, name, keep=keep, dry_run=dry_run, yes=yes_local)
+    _run(
+        prune_cmd.prune,
+        name,
+        keep=keep,
+        dry_run=dry_run,
+        yes=yes_local or ctx.obj.get("yes", False),
+    )
 
 
 # ---------- export / import ----------
@@ -1433,6 +1442,11 @@ def model_rm(ctx: click.Context, engine: str, model: str, yes_local: bool) -> No
         "— it can't be probed remotely, and the model's native window is usually larger."
     ),
 )
+@click.option(
+    "--profile",
+    default=None,
+    help="Target a named Hermes profile (its own HERMES_HOME under profiles/<name>/).",
+)
 def model_use(
     agent: str,
     engine: str,
@@ -1450,7 +1464,15 @@ def model_use(
     reroutes auxiliary tasks (compression/vision/all) to the same
     endpoint.
     """
-    _run(models_cmd.use, agent, engine=engine, model=model, aux=aux, context_length=context_length)
+    _run(
+        models_cmd.use,
+        agent,
+        engine=engine,
+        model=model,
+        aux=aux,
+        context_length=context_length,
+        profile=profile,
+    )
 
 
 # ---------- secrets ----------
@@ -1521,16 +1543,11 @@ def secret_list(agent: str) -> None:
 @secret_group.command("clear")
 @click.argument("agent")
 @click.option("-y", "--yes", "yes_local", is_flag=True, help="Skip confirmation.")
-@click.option(
-    "--profile",
-    default=None,
-    help="Target a named Hermes profile (its own HERMES_HOME under profiles/<name>/).",
-)
 @click.pass_context
-def secret_clear(ctx: click.Context, agent: str, yes_local: bool, profile: str | None) -> None:
-    """Wipe ALL secrets for an agent."""
+def secret_clear(ctx: click.Context, agent: str, yes_local: bool) -> None:
+    """Wipe ALL secrets for an agent (sweeps every profile's passthrough list)."""
     yes = yes_local or ctx.obj.get("yes", False)
-    _run(secrets_cmd.clear_secrets, agent, yes=yes, profile=profile)
+    _run(secrets_cmd.clear_secrets, agent, yes=yes)
 
 
 # ---------- mounts ----------
