@@ -1047,14 +1047,14 @@ def test_ensure_hermes_image_pulled_silent_when_cached(cfg: AgentsConfig, mocker
 def test_create_narrates_long_steps(
     cfg: AgentsConfig, saved_config: Path, stub_runners, mocker
 ) -> None:
-    """create's slow sub-steps (compose up, ACL grant, install-path
+    """create's slow sub-steps (compose up, install-path
     chown) each get an always-on progress line."""
     spy = mocker.spy(agents_cmd.ui, "progress")
 
     create(name="coder", agent_type="hermes", config_path=saved_config)
 
     lines = _progress_lines(spy)
-    assert any("granting host-user ACL" in ln for ln in lines)
+    assert not any("ACL" in ln for ln in lines)  # create no longer sets ACLs
     assert any("starting container hermes-coder" in ln for ln in lines)
     assert any("install paths" in ln for ln in lines)
     # firecrawl isn't installed — the wiring no-op must stay silent.

@@ -1,10 +1,10 @@
 """``agents vm migrate-data`` — move agent state from the host mount onto
 the VM disk, in place.
 
-Why this exists: on host-mount deployments the Hermes entrypoint chmods
-``/opt/data`` on every container start, which collapses the POSIX-ACL
-mask that ``agents access grant`` set — so the host user keeps losing
-read access (doctor's recurring ``host_access`` warning). And the s6
+Why this exists: on host-mount deployments the agent's state is a
+subuid-owned, mode-700 tree on the host that the host user can't read
+(the retired ACL-based ``agents access grant`` never held — see
+``agents access mount`` for the idmapped-view replacement). And the s6
 supervision tree (container-root) cannot write to the 9p/virtiofs share
 at all, which is a whole class of "agent silently stops replying" bugs.
 Both problems are structural to the host-mount layout; CLAUDE.md already

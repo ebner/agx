@@ -1,6 +1,5 @@
 """``agents access``: idmapped host views — mount / unmount / list, the
-state file, lifecycle guards and the doctor check. (Plus the legacy
-create-time auto-grant hook until it is removed.)
+state file, lifecycle guards and the doctor check.
 
 ``sudo`` and ``/proc/self/mountinfo`` are faked by a tiny in-memory
 mount table, so nothing here mounts anything.
@@ -54,18 +53,6 @@ def saved_config(cfg_with_coder: AgentsConfig, tmp_path: Path) -> Path:
     p = tmp_path / "config.toml"
     cfg_mod.save(cfg_with_coder, p)
     return p
-
-
-@pytest.fixture
-def acl_mocked(mocker: Any):
-    """Stub the ACL probe and the two run paths so tests don't shell out."""
-    return {
-        "probe": mocker.patch(
-            "agents_cli.permissions.probe_acl_support", return_value=(True, None)
-        ),
-        "run_sudo": mocker.patch("agents_cli.permissions.run_with_sudo"),
-        "run_owned": mocker.patch("agents_cli.permissions.run_owned"),
-    }
 
 
 class FakeMounts:
@@ -338,70 +325,44 @@ def test_remove_and_rename_refuse_while_a_view_is_registered(
     access_cmd.refuse_if_view_registered(cfg_with_coder, "bob", "remove 'bob'")
 
 
-# ---------- auto_grant_on_create hook ----------
+# ---------- retired ACL mechanism ----------
 
 
-def test_auto_grant_on_create_sets_default_acl_only(
-    cfg_with_coder: AgentsConfig, acl_mocked
-) -> None:
-    """At create time the dir is empty — recurse is pointless but the
-    default ACL is the whole point. Verifies the toolkit emits the
-    -d -m form so future container-written files inherit access.
-    """
-    access_cmd.auto_grant_on_create(cfg_with_coder, "coder", "hermes")
-    acl_mocked["run_owned"].assert_called_once()
-    cmds = acl_mocked["run_owned"].call_args.args[0]
-    # Must include the -d form for both recipients (host user + subuid).
-    default_cmds = [c for c in cmds if c[1] == "-d"]
-    assert default_cmds, "must emit at least one -d -m form so future files inherit ACL"
-    # And no -R (recurse) form since the dir is empty.
-    assert not any("-R" in c for c in cmds)
-
-
-def test_auto_grant_on_create_skips_on_bare_metal(
-    cfg_with_coder: AgentsConfig, acl_mocked
-) -> None:
-    cfg_with_coder.vm.backend = "bare_metal"
-    access_cmd.auto_grant_on_create(cfg_with_coder, "coder", "hermes")
-    acl_mocked["run_owned"].assert_not_called()
-
-
-def test_auto_grant_on_create_skips_in_data_dir_in_vm_mode(
-    cfg_with_coder: AgentsConfig, acl_mocked
-) -> None:
-    cfg_with_coder.paths = PathsConfig(
-        host_data_dir=str(cfg_with_coder.paths.host_data_dir),
-        data_dir_in_vm=True,
-    )
-    access_cmd.auto_grant_on_create(cfg_with_coder, "coder", "hermes")
-    acl_mocked["run_owned"].assert_not_called()
-
-
-def test_auto_grant_on_create_warns_on_unsupported_fs(
-    cfg_with_coder: AgentsConfig, mocker: Any
-) -> None:
-    """Lack of ACL support shouldn't break `agents create` — surface
-    a warning, let creation proceed. The user can still `agents
-    export` for host-side reads."""
-    mocker.patch(
-        "agents_cli.permissions.probe_acl_support",
-        return_value=(False, "Operation not supported"),
-    )
+def test_create_sets_no_acl_on_the_agent_data_dir(tmp_path: Path, mocker: Any) -> None:
+    """ACLs can't hold on runtime-owned state (restrictive creates are
+    born masked); create must not pretend otherwise."""
+    assert not hasattr(access_cmd, "auto_grant_on_create")
     run_owned = mocker.patch("agents_cli.permissions.run_owned")
-    access_cmd.auto_grant_on_create(cfg_with_coder, "coder", "hermes")
+    sudo = mocker.patch("agents_cli.permissions.run_with_sudo")
+    cfg = AgentsConfig(paths=PathsConfig(host_data_dir=str(tmp_path / "data")))
+    (tmp_path / "data").mkdir()
+    agents_cmd._create_data_dirs(cfg, "coder", "hermes")
+    assert (tmp_path / "data" / "coder" / ".env").exists()
     run_owned.assert_not_called()
+    sudo.assert_not_called()
 
 
-def test_auto_grant_on_create_swallows_run_errors(
-    cfg_with_coder: AgentsConfig, mocker: Any
+def test_mount_hints_at_leftover_default_acls(
+    saved_config: Path, mounts: FakeMounts, mocker: Any
 ) -> None:
-    """If setfacl itself errors at runtime, don't break the whole
-    create — it's a best-effort convenience hook. The user can later
-    `agents access grant <name>` to retry."""
-    mocker.patch("agents_cli.permissions.probe_acl_support", return_value=(True, None))
     mocker.patch(
-        "agents_cli.permissions.run_owned",
-        side_effect=RuntimeError("simulated setfacl crash"),
+        "agents_cli.access_cmd.os.listxattr",
+        return_value=["system.posix_acl_access", "system.posix_acl_default"],
     )
-    # Must not raise.
-    access_cmd.auto_grant_on_create(cfg_with_coder, "coder", "hermes")
+    progress = mocker.patch("agents_cli.ui.progress")
+    access_cmd.mount(agent="coder", writable=False, yes=True, config_path=saved_config)
+    (hint,) = [c.args[0] for c in progress.call_args_list if "setfacl" in c.args[0]]
+    assert "sudo setfacl -R -b -k" in hint and "coder/.data" in hint
+
+
+def test_retired_grant_and_revoke_point_at_the_replacement() -> None:
+    from click.testing import CliRunner
+
+    from agents_cli import cli as cli_mod
+
+    for name in ("grant", "revoke"):
+        result = CliRunner().invoke(cli_mod.main, ["access", name, "coder", "--rw", "-y"])
+        assert result.exit_code == 1
+        assert "agents access mount" in result.output
+    listed = CliRunner().invoke(cli_mod.main, ["access", "--help"]).output.split("Commands:")[1]
+    assert "grant" not in listed and "revoke" not in listed  # hidden stubs

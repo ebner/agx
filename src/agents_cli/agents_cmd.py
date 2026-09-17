@@ -318,16 +318,6 @@ def _create_data_dirs(cfg: AgentsConfig, name: str, agent_type: str) -> None:
     env_path = cfg.paths.host_data_dir / name / ".env"
     if not env_path.exists():
         env_path.write_text("", encoding="utf-8")
-    # Default ACL so files the container will create (at rootless
-    # subuid) inherit a `u:<host-uid>:rwx` entry — the host user can
-    # read/edit the agent's files without sudo from day one. No-op
-    # on bare-metal / data-dir-in-vm; warn-only if the fs lacks ACL
-    # support. See agents_cli.access_cmd for the post-hoc grant
-    # variant pre-existing agents need.
-    from agents_cli import access_cmd
-
-    ui.progress(f"granting host-user ACL on {name!r}'s data dir...")
-    access_cmd.auto_grant_on_create(cfg, name, agent_type)
 
 
 def _refuse_if_host_view(cfg: AgentsConfig, name: str, action: str) -> None:

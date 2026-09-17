@@ -733,27 +733,17 @@ def _fmt_size(n: int) -> str:
 def _host_data_snapshot(cfg: AgentsConfig, name: str) -> Path:
     """Tar+zstd the agent's data dir + compose + .env.
 
-    The naïve "stream through zstandard on the host" path doesn't
-    work in general: rootless-Docker writes the agent's files at a
-    subuid (e.g. host uid 100999 for container uid 1000), mode 0700.
-    The host user owns the *directory layout* but cannot read the
-    contents — every ``walk`` into the agent's ``.data/`` hits
-    EACCES. The toolkit's ``agents access grant`` lifts the mask via
-    POSIX ACLs, but the grant gets clobbered every time the Hermes
-    entrypoint chmods ``/opt/data`` on container restart (the chmod
-    resets the mask back to ``---``), so even a freshly-granted
-    agent goes back to unreadable after the next ``compose up``.
+    Always tarred inside the VM as root, in both data-dir modes:
+    rootless Docker writes the agent's state at a subuid (e.g. host uid
+    100999 for container uid 1000) under mode 0700, so neither the host
+    user nor the VM's ``ubuntu`` user can walk into ``<name>/.data`` —
+    and host ACLs can't be relied on to change that (a ``mkdir(0700)``
+    under a default ACL is born with ``mask::---``). The share passes
+    ownership through to the guest, and root in the guest can read
+    everything regardless of subuid.
 
-    Tarring inside the VM with sudo sidesteps the whole problem:
-    virtiofs passes file ownership through to the guest, and root
-    in the guest can read everything regardless of subuid. Same
-    pattern as the existing ``--data-dir-in-vm`` branch — just
-    works on the host-mount layout too.
-
-    Bare-metal: no VM, runs sudo on the host directly. Best to
-    `agents access grant` first so sudo isn't needed at all; we
-    still attempt sudo as a fallback so a one-shot upgrade isn't
-    blocked by a fresh-but-clobbered ACL.
+    Bare-metal: no VM, so the ``sudo tar`` runs on the host directly
+    (prompting the user).
     """
     upgrades_dir = cfg.paths.host_data_dir / ".upgrades"
     upgrades_dir.mkdir(parents=True, exist_ok=True)

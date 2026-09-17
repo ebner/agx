@@ -17,15 +17,20 @@ additional rwx grants on top of POSIX ownership without changing the
 owner. The container keeps writing as 100999; the host user gets an
 ACL entry granting access; everyone's happy.
 
-This module is the shared plumbing for two callers:
+Callers:
 
-- :mod:`agents_cli.access_cmd` — explicit ``agents access {grant,
-  revoke,list}`` for the agent's own data dirs (which the rootless
-  container created — needs sudo to ACL).
 - :mod:`agents_cli.mounts_cmd` — auto-applies ACLs on the host folder
   added by ``agents mount add`` (which the user owns — no sudo
   needed). Bidirectional: agent gets read (or rw) access to user
   files; user gets default ACL for files the agent writes back.
+- :func:`run_with_sudo` is also the toolkit's one printed-and-confirmed
+  host ``sudo`` runner (``agents access mount``, bare-metal data-dir
+  delete).
+
+ACLs are deliberately NOT used on an agent's own data dir any more: a
+``mkdir(0700)`` / ``open(0600)`` under a default ACL is born with
+``mask::---``, so the grant never holds for the files that matter. Host
+access there is an idmapped view (:mod:`agents_cli.idmap_view`).
 
 Stylistically these helpers are argv-emitting (return the exact
 ``setfacl …`` argv they'd run). Callers decide whether to print +
@@ -206,8 +211,8 @@ def probe_acl_support(path: Path) -> tuple[bool, str | None]:
     writable parent of ``path``. Returns ``(supported, error_message)``.
 
     The "nearest user-writable parent" detail matters: when ``path``
-    itself is a subuid-owned dir (the common case for ``agents
-    access grant``), the calling user can't create files inside it
+    itself is a subuid-owned dir, the calling user can't create files
+    inside it
     — we'd get EACCES on the temp-file creation, which looks like
     "ACLs not supported" but is actually "you don't own this dir".
     Walking up to a user-writable ancestor side-steps the false
@@ -364,52 +369,6 @@ def has_user_acl(path: Path, uid: int) -> bool:
     return False
 
 
-def get_user_acl_perms(path: Path, uid: int) -> str | None:
-    """Return the access-ACL perm string (e.g. ``"r-x"``, ``"rwx"``)
-    for ``uid`` on ``path``, or ``None`` if there's no entry.
-
-    Used by ``agents access list`` to tell the user whether they
-    granted read-only or read-write — the binary ok/missing signal
-    from :func:`assess_host_access` isn't enough on its own. Only the
-    access ACL is inspected (the default ACL governs what *future*
-    files inherit, which is a different question).
-    """
-    out = getfacl(path)
-    if not out:
-        return None
-    for line in out.splitlines():
-        line = line.strip()
-        if line.startswith(f"user:{uid}:"):
-            # Format: ``user:<uid>:<perms>`` — split on `:` and take
-            # the perms field. With ``--no-effective`` getfacl strips
-            # the ``#effective:…`` comment for us.
-            parts = line.split(":", 2)
-            if len(parts) >= 3:
-                return parts[2].strip()
-    return None
-
-
-def summarize_acl_mode(perms: str | None) -> str:
-    """Compress a perm string into a human label for table output.
-
-    - ``None`` → ``"—"`` (no entry)
-    - perms containing ``w`` → ``"rw"`` (writable)
-    - any other entry (``r-x``, ``r--``, ``---``) → ``"r"``
-
-    The simplification is deliberate: users who ran ``agents access
-    grant`` (without ``--rw``) see ``"r"``; those who ran ``--rw``
-    see ``"rw"``; the all-zero case (``mask::---`` zeroing the entry
-    pre-fix) surfaces as ``"r"`` because the granted perms still say
-    ``r-x``. The effective-readability question is answered by the
-    separate ``status`` column.
-    """
-    if perms is None:
-        return "—"
-    if "w" in perms:
-        return "rw"
-    return "r"
-
-
 # ---------- convenience: typical recipient sets ----------
 
 
@@ -431,52 +390,3 @@ def container_recipient(
 
 
 # ---------- doctor probe (used by agents_cli.ops) ----------
-
-
-def assess_host_access(path: Path, host_uid: int) -> str:
-    """Return ``"ok"`` | ``"masked"`` | ``"missing"`` | ``"path-missing"``
-    describing whether the host user has effective access to ``path``.
-
-    - **ok** — host user can actually read+traverse (dir) or read
-      (file) ``path`` right now, either by ownership or via an
-      effective ACL entry.
-    - **masked** — the host user has an ACL entry on ``path`` but
-      it's masked to ``---`` so reads still fail. Surfaces the
-      mask-stuck-at-zero failure mode (see the comment in
-      :func:`apply_acl_argv`). Hint: re-run ``agents access grant
-      <name>`` to apply the ``m::rwx`` fix.
-    - **missing** — no ACL entry at all; ``agents access grant``
-      will set one.
-    - **path-missing** — ``path`` doesn't exist (agent never started
-      or data dir got removed).
-
-    Uses ``os.access`` for the effective check — the kernel's own
-    decision, which honors ACL masks correctly. Plain
-    "entry present in getfacl output" is necessary but not sufficient.
-    """
-    if not path.exists():
-        return "path-missing"
-    try:
-        owner = path.stat().st_uid
-    except OSError:
-        return "missing"
-    if owner == host_uid:
-        return "ok"
-    needed = os.R_OK | os.X_OK if path.is_dir() else os.R_OK
-    if os.access(path, needed):
-        return "ok"
-    if has_user_acl(path, host_uid):
-        return "masked"
-    return "missing"
-
-
-# Re-exported for places that need it but want to avoid pulling
-# ``pwd`` directly.
-def host_user_name(host_uid: int) -> str:
-    try:
-        return pwd.getpwuid(host_uid).pw_name
-    except KeyError:
-        return str(host_uid)
-
-
-_ = os  # silence the import linter; used by callers indirectly

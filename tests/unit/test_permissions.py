@@ -273,49 +273,6 @@ def test_getfacl_passes_numeric_flag(mocker: Any, tmp_path: Path) -> None:
     assert "--numeric" in argv
 
 
-def test_get_user_acl_perms_returns_perm_string(mocker: Any, tmp_path: Path) -> None:
-    """``agents access list`` needs to tell the user whether they
-    granted read-only or read-write — the binary has_user_acl signal
-    isn't enough.
-    """
-    mocker.patch(
-        "agents_cli.permissions.getfacl",
-        return_value="user::rwx\nuser:1000:r-x\ngroup::---\nmask::rwx\nother::---\n",
-    )
-    assert permissions.get_user_acl_perms(tmp_path, 1000) == "r-x"
-
-
-def test_get_user_acl_perms_returns_none_when_no_entry(mocker: Any, tmp_path: Path) -> None:
-    mocker.patch(
-        "agents_cli.permissions.getfacl",
-        return_value="user::rwx\ngroup::---\nmask::---\nother::---\n",
-    )
-    assert permissions.get_user_acl_perms(tmp_path, 1000) is None
-
-
-def test_get_user_acl_perms_ignores_default_namespace(mocker: Any, tmp_path: Path) -> None:
-    """The default ACL governs future files; the access ACL governs
-    the dir itself. ``list`` reports current readability, which means
-    the access entry — not the default one."""
-    mocker.patch(
-        "agents_cli.permissions.getfacl",
-        return_value=(
-            "user::rwx\ngroup::---\nmask::---\nother::---\n"
-            "default:user:1000:rwx\n"  # only in default, not access
-        ),
-    )
-    assert permissions.get_user_acl_perms(tmp_path, 1000) is None
-
-
-def test_summarize_acl_mode_labels() -> None:
-    assert permissions.summarize_acl_mode(None) == "—"
-    assert permissions.summarize_acl_mode("r-x") == "r"
-    assert permissions.summarize_acl_mode("r--") == "r"
-    assert permissions.summarize_acl_mode("---") == "r"  # masked but entry exists
-    assert permissions.summarize_acl_mode("rwx") == "rw"
-    assert permissions.summarize_acl_mode("rw-") == "rw"
-
-
 def test_has_user_acl_handles_real_getfacl_numeric_output(mocker: Any, tmp_path: Path) -> None:
     """End-to-end style: feed an actual ``getfacl --numeric`` payload
     (uids, not names) and verify the substring matcher recognises it.
@@ -340,52 +297,6 @@ def test_has_user_acl_handles_real_getfacl_numeric_output(mocker: Any, tmp_path:
         ),
     )
     assert permissions.has_user_acl(tmp_path, 1000) is True
-
-
-def test_assess_host_access_returns_ok_when_owner_matches(tmp_path: Path) -> None:
-    """If the host user owns the path, no ACL needed."""
-    assert permissions.assess_host_access(tmp_path, tmp_path.stat().st_uid) == "ok"
-
-
-def test_assess_host_access_returns_missing_for_foreign_uid_no_acl(
-    tmp_path: Path, mocker: Any
-) -> None:
-    """Foreign owner + os.access fails + no ACL entry → ``missing``."""
-    mocker.patch.object(Path, "stat", return_value=MagicMock(st_uid=100999))
-    mocker.patch.object(Path, "is_dir", return_value=True)
-    mocker.patch("os.access", return_value=False)
-    mocker.patch("agents_cli.permissions.has_user_acl", return_value=False)
-    assert permissions.assess_host_access(tmp_path, 1000) == "missing"
-
-
-def test_assess_host_access_returns_ok_when_os_access_passes(tmp_path: Path, mocker: Any) -> None:
-    """Foreign owner but ``os.access`` says the kernel grants the user
-    read+traverse → ``ok``. This is the authoritative signal:
-    ``has_user_acl`` returning True is necessary but not sufficient
-    (the entry could be masked to ``---``)."""
-    mocker.patch.object(Path, "stat", return_value=MagicMock(st_uid=100999))
-    mocker.patch.object(Path, "is_dir", return_value=True)
-    mocker.patch("os.access", return_value=True)
-    assert permissions.assess_host_access(tmp_path, 1000) == "ok"
-
-
-def test_assess_host_access_returns_masked_when_entry_exists_but_zeroed(
-    tmp_path: Path, mocker: Any
-) -> None:
-    """The exact coder state from 2026-05-17: ``getfacl`` shows
-    ``user:1000:r-x`` but ``mask::---`` zeroes the effective perms.
-    Doctor should say ``masked`` (with the "re-run grant" hint) not
-    ``ok``, because reads actually fail.
-    """
-    mocker.patch.object(Path, "stat", return_value=MagicMock(st_uid=100999))
-    mocker.patch.object(Path, "is_dir", return_value=True)
-    mocker.patch("os.access", return_value=False)
-    mocker.patch("agents_cli.permissions.has_user_acl", return_value=True)
-    assert permissions.assess_host_access(tmp_path, 1000) == "masked"
-
-
-def test_assess_host_access_returns_path_missing_when_dir_gone(tmp_path: Path) -> None:
-    assert permissions.assess_host_access(tmp_path / "nope", 1000) == "path-missing"
 
 
 # ---------- convenience recipients ----------

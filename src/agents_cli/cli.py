@@ -1730,6 +1730,28 @@ def access_unmount(ctx: click.Context, agent: str, yes_local: bool) -> None:
     _run(access_cmd.unmount, agent=agent, yes=yes)
 
 
+def _retired_access_command(name: str) -> None:
+    raise UserError(
+        f"`agents access {name}` was retired: host ACLs can't hold on an agent's data dir "
+        "(files created with a restrictive mode are born with a masked ACL). Use "
+        "`agents access mount <agent>` for a host view, or `agents edit <agent> <path>`."
+    )
+
+
+@access_group.command("grant", hidden=True, context_settings={"ignore_unknown_options": True})
+@click.argument("args", nargs=-1, type=click.UNPROCESSED)
+def access_grant(args: tuple[str, ...]) -> None:
+    """Retired — see `agents access mount`."""
+    _run(_retired_access_command, "grant")
+
+
+@access_group.command("revoke", hidden=True, context_settings={"ignore_unknown_options": True})
+@click.argument("args", nargs=-1, type=click.UNPROCESSED)
+def access_revoke(args: tuple[str, ...]) -> None:
+    """Retired — see `agents access mount`."""
+    _run(_retired_access_command, "revoke")
+
+
 @access_group.command("list")
 @click.argument("agent", required=False)
 def access_list(agent: str | None) -> None:

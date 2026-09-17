@@ -170,6 +170,38 @@ def refuse_if_view_registered(cfg: AgentsConfig, agent: str | None, action: str)
         )
 
 
+# ---------- leftovers of the old ACL mechanism ----------
+
+
+def legacy_acl_dirs(dirs: list[Path]) -> list[Path]:
+    """Dirs still carrying a *default* ACL from the retired
+    ``access grant`` / create-time auto-grant. Harmless for the view,
+    but they keep propagating to every new file (overriding the agent's
+    umask), so tell the user how to drop them. The toolkit doesn't do it
+    itself: it needs sudo on a subuid-owned tree and changes nothing the
+    toolkit depends on."""
+    found = []
+    for d in dirs:
+        try:
+            if "system.posix_acl_default" in os.listxattr(d):
+                found.append(d)
+        except OSError:
+            continue
+    return found
+
+
+def _legacy_acl_hint(dirs: list[Path]) -> str | None:
+    legacy = legacy_acl_dirs(dirs)
+    if not legacy:
+        return None
+    return (
+        "note: leftover ACLs from the retired `agents access grant` are still set on "
+        + ", ".join(str(d) for d in legacy)
+        + ". They are unused now; to drop them: "
+        + " ; ".join(f"sudo setfacl -R -b -k {d}" for d in legacy)
+    )
+
+
 # ---------- mount ----------
 
 
@@ -292,6 +324,8 @@ def mount(
         _save_views(cfg, [*others, *active])
 
     lines = [line for v in active if (line := _fstab_line_for(cfg, v)) is not None]
+    if (hint := _legacy_acl_hint(dirs)) is not None:
+        ui.progress(hint)
     ui.emit(
         {
             "agent": agent,
@@ -418,78 +452,11 @@ def list_views(
                     f"`agents access mount {r['agent']}`"
                     + (" (or add the fstab line it prints)" if r["status"] == "not-mounted" else "")
                 )
+        if (hint := _legacy_acl_hint([Path(r["source"]) for r in rows])) is not None:
+            ui.echo_human(hint)
     else:
         ui.echo_human(
             "no host views registered — `agents access mount <agent>` creates one "
             "(`agents edit <agent> <path>` needs none)."
         )
     return rows
-
-
-# ---------- create-time auto-grant hook ----------
-
-
-def auto_grant_on_create(cfg: AgentsConfig, agent: str, agent_type: str) -> None:
-    """Called by ``agents_cmd.create`` after the agent's data dir is
-    laid down but BEFORE the container starts.
-
-    At that moment the host user owns the empty data dir, so we can
-    set the *default ACL* without sudo. When the container then
-    starts and writes files at subuid 100999, those files inherit
-    the default ACL — the host user can read everything the agent
-    creates from day one.
-
-    No-op on:
-
-    - ``data_dir_in_vm`` mode (the host dir is empty; the actual
-      data lives in the VM — ACLs there don't propagate)
-    - ``bare_metal`` (container uid maps to the host user; no
-      subuid translation; nothing to grant)
-    - filesystems without ACL support (warn; agent creation
-      continues — the user can later `agents export` archives or
-      move the data dir)
-    """
-    if cfg.paths.data_dir_in_vm or cfg.vm.backend == "bare_metal":
-        return
-    dirs = _agent_dirs(cfg, agent, agent_type)
-    if not dirs:
-        return
-    for d in dirs:
-        ok, err = permissions.probe_acl_support(d)
-        if not ok:
-            ui.warn(
-                f"skipping default-ACL grant on {d}: {err}. "
-                "Files the agent creates will be owned by a subuid and "
-                "unreadable without `sudo`. Move the data dir to a "
-                "filesystem with ACL support to fix."
-            )
-            return
-    # Two recipients — the host user (so files the agent creates
-    # inherit user-rwx) AND the container subuid (matches what the
-    # container would set anyway, but makes the inheritance explicit
-    # and survives chowns).
-    recipients = [
-        permissions.host_user_recipient(cfg.host.uid, writable=True),
-        permissions.container_recipient(cfg.host.uid, writable=True),
-    ]
-    cmds: list[list[str]] = []
-    for d in dirs:
-        # Only the default ACL — the dir is empty at this point, so
-        # the recurse-existing pass would be a no-op. We DON'T set
-        # an access ACL on the dir itself: the user owns it, so they
-        # already have rwx; the container will then own its own
-        # subtree via the entrypoint's chown.
-        cmds.extend(
-            permissions.apply_acl_argv(d, recipients=recipients, recurse=False, defaults=True)
-        )
-    if cmds:
-        try:
-            permissions.run_owned(cmds)
-        except Exception as e:
-            ui.warn(
-                f"default-ACL grant failed: {e}. Agent creation continues; "
-                "you can grant access later via `agents access grant {agent}`."
-            )
-
-
-_ = os  # used indirectly by callers via cfg.host.uid

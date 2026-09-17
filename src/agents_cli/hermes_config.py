@@ -139,11 +139,10 @@ def read_doc(cfg: AgentsConfig, agent_name: str, profile: str | None = None) -> 
     2. Host-mount mode: the dir is on the host but owned by a
        rootless-Docker subuid (e.g. host uid 100999 for container uid
        1000) under mode 700. A host-side ``load(config_path(...))``
-       call hits EACCES on every Hermes agent that hasn't been
-       ``agents access grant``-ed. Even after a grant, the Hermes
-       entrypoint's chmod on container restart can re-mask the ACL.
-       The runtime user inside the container always owns and can
-       read these files.
+       call hits EACCES, and host ACLs can't fix that durably
+       (restrictive creates are born with a masked ACL). The runtime
+       user inside the container always owns and can read these
+       files.
     3. Routing through one code path keeps the test simulator (which
        already maps ``docker compose exec ... cat /opt/data/X`` to
        the host-side file) consistent across modes.
