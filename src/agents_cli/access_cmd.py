@@ -35,6 +35,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import pwd
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -206,6 +207,17 @@ def _legacy_acl_hint(dirs: list[Path]) -> str | None:
 # ---------- mount ----------
 
 
+def _primary_gid(cfg: AgentsConfig) -> int:
+    """The host user's PRIMARY group — what files seen through the view
+    should be grouped as. Not ``cfg.host.gid``: that is whatever gid the
+    process had when the config was first written, which on the libvirt
+    backend is often a supplementary group (``sg libvirt …``)."""
+    try:
+        return pwd.getpwuid(cfg.host.uid).pw_gid
+    except KeyError:
+        return cfg.host.gid
+
+
 def _owner_ids(source: Path) -> tuple[int, int]:
     st = source.stat()  # stat needs no permission on the dir itself
     return st.st_uid, st.st_gid
@@ -219,7 +231,10 @@ def _spec_for(cfg: AgentsConfig, source: Path) -> str | None:
     if disk_uid == cfg.host.uid:
         return None
     return idmap_view.idmap_spec(
-        host_uid=cfg.host.uid, host_gid=cfg.host.gid, disk_uid=disk_uid, disk_gid=disk_gid
+        host_uid=cfg.host.uid,
+        host_gid=_primary_gid(cfg),
+        disk_uid=disk_uid,
+        disk_gid=disk_gid,
     )
 
 

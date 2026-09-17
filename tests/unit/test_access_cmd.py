@@ -425,3 +425,18 @@ def test_mount_recognises_its_view_when_the_data_dir_path_has_a_symlink(
     (argv,) = mounts.sudo_calls
     assert argv[-2] == str(tmp_path / "data" / "coder" / ".data")  # resolved source
     assert len(mounts.mounted()) == 1
+
+
+def test_view_groups_files_as_the_users_primary_group_not_the_recorded_gid(
+    cfg_with_coder: AgentsConfig, saved_config: Path, mounts: FakeMounts, mocker: Any
+) -> None:
+    """[host].gid is whatever gid the process had when the config was
+    written — under `sg libvirt` that's a supplementary group, and the
+    view showed every file as group `libvirt`."""
+    cfg_with_coder.host = HostConfig(uid=1000, gid=127)
+    cfg_mod.save(cfg_with_coder, saved_config)
+    mocker.patch("agents_cli.access_cmd.pwd.getpwuid", return_value=mocker.Mock(pw_gid=1000))
+    access_cmd.mount(agent="coder", writable=False, yes=True, config_path=saved_config)
+    (argv,) = mounts.sudo_calls
+    assert "g:1000:100999:1 g:100999:1000:1" in argv[3]
+    assert "g:127:" not in argv[3]
