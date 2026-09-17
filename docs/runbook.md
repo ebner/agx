@@ -281,7 +281,7 @@ alert on warn+ exit codes. Currently checks:
   `port_conflicts`, `data_dir_exists`, `codex_auth`, journals,
   per-agent container + docker-socket + hermes-doctor + codex-mount +
   data-dir-access + version (compose-pin vs running-image drift) +
-  host_access (foreign-uid data dir with no host ACL).
+  host_view (a registered `agents access mount` view that isn't mounted, or is stale).
 - `firecrawl_running` — warns when firecrawl is defined in compose and
   agents are still wired to it but the containers aren't running (the
   state a VM rebuild/migration leaves behind). A stack that's stopped
@@ -416,54 +416,57 @@ agents edit coder SOUL.md --profile work      # path relative to the profile's h
 
 ## Reading agent files from the host (`agents access`)
 
-The agent's runtime container writes files into the bind-mounted data dir as a rootless-Docker subuid (typically host uid `100999`, mapped from container uid `1000`). The host user owns the *directory* but not the files inside; without intervention, `ls /home/$USER/agents/coder/.data` fails with permission denied.
+The agent's runtime container writes its state into the bind-mounted data dir as a rootless-Docker subuid (typically host uid `100999`, mapped from container uid `1000`) under mode 700. `ls ~/agents/coder/.data` fails with permission denied, and that can't be fixed at the source: the container's uid map is one-to-one and your host uid is already taken by *container root*.
 
-`agents access` grants the host user a POSIX ACL entry so the files become readable (or editable) without changing ownership — the container keeps writing as `100999`, the host user gets an ACL row granting access, and the default ACL on the directory means new files the agent writes inherit the grant.
+`agents access mount` gives you a second path to the same directory — an **idmapped bind mount** under `~/agents-view/` in which the owner ids are swapped, so through the view you simply *are* the owner. Mode bits, the entrypoint's `chmod`s and ACL masks stop mattering. Nothing in the data dir changes.
 
 ```bash
-# Read-only access (safe; the agent owns the files, you can just look)
-agents access grant coder
-
-# Read-write (lets you edit skills/SOUL.md/etc.)
-agents access grant coder --rw
-
-# Drop the ACL
-agents access revoke coder
-
-# Per-agent ACL state
-agents access list           # all agents
-agents access list coder    # just coder
+agents access mount coder          # read-only view at ~/agents-view/coder
+agents access mount coder --rw     # read-write (files you create are owned by the agent)
+agents access list                  # registered views + mounted / not-mounted / stale
+agents access unmount coder
 ```
 
-### Defaults + automation
+For a quick edit you don't need a view at all — see [`agents edit`](#editing-an-agents-files-agents-edit).
 
-- **New agents get this automatically.** `agents create` sets a default ACL on the agent's `.data/` (or `.openclaw/` + `workspace/` for OpenClaw) *before* the container starts; files the agent then writes inherit `u:<host-uid>:rwx`. Pre-existing agents created before this feature need an explicit `agents access grant` once.
-- **Sudo is required** for `grant` / `revoke` (the target is owned by a subuid). The toolkit prints the exact `setfacl` commands first and confirms — `-y` (or global `--yes`) skips the prompt.
-- **OpenClaw grants both** `.openclaw/` and `workspace/`. State and workspace are usually both interesting; carving sub-scopes adds CLI surface for no clear win.
-- **Read-only is the default.** Use `--rw` only if you intend to edit. A prompt-injected agent on a writable mount is the same risk class as a writable `agents mount add --rw`.
+### What it does
+
+- One `sudo mount --bind -o ro,nosuid,nodev,noexec,nosymfollow,X-mount.idmap=…` — printed in full and confirmed before it runs (`--yes` skips the confirmation). The uid/gid in the mapping are read from the directory itself, not guessed from `/etc/subuid`.
+- Hermes: `<agent>/.data` → `~/agents-view/<agent>`. OpenClaw: `<agent>/.openclaw` → `~/agents-view/<agent>/openclaw`; `workspace` is usually already yours and is skipped.
+- Read-only unless `--rw`. To change mode, `unmount` first.
+- `unmount` is `sudo umount` plus a plain `rmdir` of the empty mountpoint. **Never `rm -rf` a view path yourself** — while mounted it *is* the agent's data.
+
+### Surviving reboots
+
+Mounts don't persist. `access mount` prints a ready-made `/etc/fstab` line (also in `agents --json access list` as `fstab_line`); add it yourself — the toolkit never edits `/etc`. It carries `nofail`, so a missing agent directory can't block boot. Until you add it, `agents doctor` warns after a reboot:
+
+```
+WARN  coder.host_view  host view /home/user/agents-view/coder is not-mounted — add its fstab line … or re-run `agents access mount coder`.
+```
+
+Doctor is silent if you never registered a view. Drop the fstab line again when you `unmount`.
+
+### Caveats
+
+- **The view is a second path to the same data, secrets included.** Exclude `~/agents-view` from host backups (`duplicity --exclude`) — otherwise it's archived twice — and remember that anything allowed to read your home can read it while mounted.
+- **Don't open `*.db` files through the view while the agent runs.** The host and the VM share no locks or shared memory; a host-side SQLite client on a live WAL database is a corruption risk. Use `agents conversations export` or stop the agent first.
+- `nosymfollow` is deliberate: the view carries agent-written content into your host namespace, and a planted `notes.md -> ~/.bashrc` must not resolve there. Symlinks inside the view show up but can't be followed.
+- `agents remove`, `agents rename` and `agents vm migrate-data` refuse while a view is registered for the agent — `agents access unmount <agent>` first. A view whose directory was deleted underneath it shows as `stale`.
+- View location: `[paths].host_view_dir` in `config.toml` (default `~/agents-view`). It must not be inside the data dir (it would be shared into the VM) nor contain it.
 
 ### Backend differences
 
-| Backend | Behavior |
+| Backend | `agents access mount` |
 |---|---|
-| multipass / libvirt | The grant runs setfacl on the host filesystem (under the multipass/virtiofs mount). 9p and virtiofs both honor ACLs — verified on Linux + ext4. |
-| bare_metal | No-op + informational message: the container uid maps 1:1 to the host user, so files are already host-owned. |
-| `--data-dir-in-vm` | Refused with a hint — the data isn't on the host filesystem; host ACLs can't reach it. Use `agents export` for host-side reads. |
+| `multipass` / `libvirt`, host-mounted data dir | works |
+| `bare_metal` | works — rootless Docker runs on the host, so agent files are subuid-owned there too |
+| `--data-dir-in-vm` | refused — nothing on the host to view; use `agents edit`, `agents exec` or `agents export` |
 
-### Doctor integration
+Requirements: Linux ≥ 5.12 with a filesystem that supports idmapped mounts (ext4, xfs, btrfs, …) and util-linux ≥ 2.39. On hosts without it (macOS, old kernels) the `mount` error is shown as-is; `agents edit` works everywhere.
 
-`agents doctor` warns (does NOT fail) when an agent's data dir is owned by a foreign uid with no ACL for the host user:
+### Coming from `agents access grant`
 
-```
-WARN  coder.host_access  /home/user/agents/coder/.data is owned by a foreign uid
-                          with no ACL for host user 1000 — run `agents access grant coder` to fix.
-```
-
-The warning is the right severity: the toolkit itself works fine without host access; this is a user-ergonomics check.
-
-### Filesystem requirements
-
-Needs POSIX ACL support (`getfacl`/`setfacl` work + the underlying FS carries the xattrs). ext4 + btrfs + zfs all qualify out of the box; FAT/exFAT and most network mounts do not. The toolkit probes before granting and refuses with a clear message rather than silently leaving a partial ACL.
+The ACL-based `grant`/`revoke` were retired: a directory or file created with a restrictive mode (`mkdir 0700`, `open 0600`) under a default ACL is *born* with an all-zero ACL mask, so the grant never held for the files that matter, and every entrypoint `chmod` re-masked the rest. `agents create` no longer sets ACLs either. Existing ACL entries on older agents are harmless but keep propagating to new files; `access mount` / `access list` print the one-liner to drop them (`sudo setfacl -R -b -k <dir>`).
 
 ## Sharing host folders with an agent (`agents mount`)
 

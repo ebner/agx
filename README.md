@@ -75,7 +75,7 @@ For the full lifecycle — Hermes profiles vs. personalities vs. skills, connect
 | `agents secret set/unset/list/clear` | Per-agent API keys via compose `env_file:` | [runbook](docs/runbook.md) |
 | `agents mount add/remove/list` | Share specific host folders with an agent (override-file volumes + ACLs) | [runbook](docs/runbook.md) |
 | `agents edit <name> <path>` | Edit one of a Hermes agent's text files (`SOUL.md`, skills, `config.yaml`) in `$EDITOR` via the container — no sudo, no host access to the data dir | [runbook](docs/runbook.md) |
-| `agents access grant/revoke/list` | Host-user ACLs on the agent's subuid-owned data dir | [runbook](docs/runbook.md) |
+| `agents access mount/unmount/list` | Host view of an agent's subuid-owned state dir (idmapped bind mount under `~/agents-view/`; read-only by default) | [runbook](docs/runbook.md) |
 | `agents codex login/refresh/status/skill-enable/skill-disable` | Toolkit-scoped Codex auth + the Codex coding skill | [codex-integration](docs/codex-integration.md) |
 | `agents memory list/enable/disable/status` | Managed memory backends for Hermes | [runbook](docs/runbook.md) |
 | `agents ollama configure/status/clear` | Point the toolkit at an **external** Ollama / OpenAI-compatible endpoint | [runbook](docs/runbook.md) |

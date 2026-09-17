@@ -205,13 +205,14 @@ converting an existing deployment to what `agents vm init
 
 ## When to use it
 
-The host-mount layout has two structural problems that no amount of
-`agents fix-perms` / `agents access grant` permanently fixes:
+The host-mount layout has two structural problems that `agents fix-perms`
+can't permanently fix:
 
-- **The ACL treadmill.** The Hermes entrypoint chmods `/opt/data` on
-  every container start, which collapses the POSIX-ACL mask that
-  `agents access grant` set — so the host user keeps losing read access
-  to the agent's files (doctor's recurring `host_access` warning).
+- **Subuid-owned state on the host.** The agent's files land on the host
+  as a rootless-Docker subuid under mode 700. The toolkit itself no
+  longer needs to read them from the host (it works through the VM), and
+  `agents access mount` / `agents edit` cover human access — but it stays
+  a second moving part that `--data-dir-in-vm` simply doesn't have.
 - **The 9p/virtiofs root asymmetry.** Container-root cannot write to
   the mounted share (container uid 0 maps to an unprivileged VM user,
   and 9p enforces DAC at the VM level) — the class of bug behind
