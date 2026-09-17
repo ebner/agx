@@ -94,6 +94,8 @@ re-resolving "latest" (see the Upgrades section above). The
 `config_migrated` phase runs `hermes config migrate` inside the
 container (silent no-op for OpenClaw).
 
+`remove`'s `data_dir_deleted` phase deletes `<name>/` **as root inside the VM** (on bare-metal: via `rootlesskit`, falling back to a printed + confirmed `sudo rm -rf`), because the agent's state is owned by a rootless-Docker subuid the host user can't traverse. It refuses — leaving the journal resumable — if the data share isn't mounted in the VM (`agents vm start` fixes that) or if anything is still mounted beneath the agent's directory. While a `remove` journal is pending, `agents create <same-name>` is refused: finish the removal first (`agents remove <name>`, with `--keep-data` if the data should survive). `backups`, `firecrawl` and `models` are reserved and can't be used as agent names.
+
 `agents doctor` warns about any journal older than 24 hours. To clear a stuck journal once you've manually reconciled state, simply delete the file from `<data-dir>/.journal/`.
 
 ## Reseating an agent after a toolkit upgrade
@@ -392,6 +394,25 @@ others 512 MB each. Idle target ~1.5–2 GB total.
 Networking: only `firecrawl-api` is reachable, and only over the
 docker network as `http://firecrawl-api:3002`. No host port is
 published; debug via `agents firecrawl logs` or `agents vm shell`.
+
+## Editing an agent's files (`agents edit`)
+
+An agent's state (`<data-dir>/<name>/.data/`) is owned by a rootless-Docker subuid under mode 700, so you can't just open `SOUL.md` from the host. `agents edit` goes through the running container instead — no sudo, no host-side access, and it works the same under `--data-dir-in-vm`:
+
+```bash
+agents edit coder SOUL.md
+agents edit coder skills/my-skill/SKILL.md
+agents edit coder config.yaml                 # validated like every toolkit config write
+agents edit coder SOUL.md --profile work      # path relative to the profile's home
+```
+
+- Hermes only; the container must be running (`agents start <name>`). For a stopped agent or OpenClaw, use `agents exec` / `agents export`.
+- `PATH` is relative to `/opt/data` (or the `--profile` home). It is resolved once inside the container and must stay inside that home; regular UTF-8 text files up to 1 MiB only — it will refuse `state.db` and friends.
+- Anything that *resolves* to a `config.yaml` (default or profile, including through a symlink) is written by the same validated writer as the rest of the toolkit: a `0.0.0.0` dashboard bind is refused and `hermes config validate` runs. A YAML error re-opens the editor.
+- The edit buffer lives in a private directory under `$XDG_RUNTIME_DIR` (tmpfs), never in the VM-shared data dir. If the write is refused — the file changed inside the agent meanwhile, validation failed, the editor crashed after saving — the buffer is **kept** and its path printed.
+- The conflict check is optimistic: the file is re-read under the toolkit lock right before writing. That protects against other `agents` commands, not against Hermes rewriting the same file in that instant.
+- `/opt/data/.env` is Hermes' own env file. Toolkit-managed per-agent secrets live in `<data-dir>/<name>/.env` — use `agents secret` for those.
+- Needs an interactive terminal; uses `$VISUAL`, then `$EDITOR`.
 
 ## Reading agent files from the host (`agents access`)
 

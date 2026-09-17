@@ -74,6 +74,7 @@ For the full lifecycle — Hermes profiles vs. personalities vs. skills, connect
 | `agents export/import` / `export-cron` | Archives into `<data-dir>/backups/` + host-cron scheduling; auto-prunes to `keep_last` | [runbook](docs/runbook.md) |
 | `agents secret set/unset/list/clear` | Per-agent API keys via compose `env_file:` | [runbook](docs/runbook.md) |
 | `agents mount add/remove/list` | Share specific host folders with an agent (override-file volumes + ACLs) | [runbook](docs/runbook.md) |
+| `agents edit <name> <path>` | Edit one of a Hermes agent's text files (`SOUL.md`, skills, `config.yaml`) in `$EDITOR` via the container — no sudo, no host access to the data dir | [runbook](docs/runbook.md) |
 | `agents access grant/revoke/list` | Host-user ACLs on the agent's subuid-owned data dir | [runbook](docs/runbook.md) |
 | `agents codex login/refresh/status/skill-enable/skill-disable` | Toolkit-scoped Codex auth + the Codex coding skill | [codex-integration](docs/codex-integration.md) |
 | `agents memory list/enable/disable/status` | Managed memory backends for Hermes | [runbook](docs/runbook.md) |
