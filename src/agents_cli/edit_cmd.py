@@ -57,6 +57,12 @@ from agents_cli.errors import RuntimeFailure, UserError
 MAX_BYTES = 1024 * 1024
 DATA_ROOT = "/opt/data"
 _CONFIG_RE = re.compile(r"/opt/data/(?:profiles/([^/]+)/)?config\.yaml")
+# Fixed text (no interpolation): canonical config path <TAB> its realpath,
+# for the default home and every profile.
+_LIST_CONFIGS = (
+    "for f in /opt/data/config.yaml /opt/data/profiles/*/config.yaml; do "
+    '[ -e "$f" ] && printf \'%s\\t%s\\n\' "$f" "$(realpath -e -- "$f")"; done; true'
+)
 _NOT_RUNNING_MARKERS = ("not running", "no such service", "no such container")
 
 
@@ -84,7 +90,9 @@ def _realpath(cfg: AgentsConfig, agent: str, svc: str, path: str) -> str | None:
     if result.returncode != 0:
         _raise_if_not_running(agent, svc, result)
         return None
-    return (result.stdout or "").strip() or None
+    # Drop only the output delimiter: ``.strip()`` would turn ``SOUL.md ``
+    # into ``SOUL.md`` and quietly edit a different file.
+    return (result.stdout or "").removesuffix("\n") or None
 
 
 def _is_under(path: str, base: str) -> bool:
@@ -121,6 +129,26 @@ def _resolve_target(cfg: AgentsConfig, agent: str, svc: str, rel: str, profile: 
     if not _is_under(resolved, home_real) or resolved == home_real:
         raise UserError(f"refusing: {rel!r} resolves outside {home} ({resolved})")
     return resolved
+
+
+def _config_profile(cfg: AgentsConfig, svc: str, resolved: str) -> tuple[bool, str | None]:
+    """Is ``resolved`` some home's ``config.yaml``? → ``(True, profile)``.
+
+    Matched by the realpath of each canonical config path, not by
+    ``resolved``'s own name: if ``config.yaml`` is a symlink to
+    ``settings.yaml``, an edit lands on ``settings.yaml`` and a
+    name-based check would send it to the unvalidated writer.
+    """
+    by_name = _CONFIG_RE.fullmatch(resolved)
+    if by_name is not None:
+        return True, by_name.group(1)
+    listing = _exec(cfg, svc, "sh", "-c", _LIST_CONFIGS)
+    for line in (listing.stdout or "").splitlines():
+        canonical, _, real = line.partition("\t")
+        match = _CONFIG_RE.fullmatch(canonical)
+        if match is not None and real == resolved:
+            return True, match.group(1)
+    return False, None
 
 
 def _require_regular_small_file(cfg: AgentsConfig, svc: str, resolved: str) -> None:
@@ -266,18 +294,17 @@ def edit(
     _require_regular_small_file(cfg, svc, resolved)
     original = _fetch(cfg, agent, svc, resolved)
     _decode(original, resolved)
-    config_match = _CONFIG_RE.fullmatch(resolved)
+    is_config, config_profile = _config_profile(cfg, svc, resolved)
 
     buffer = _make_buffer(PurePosixPath(resolved).name, original)
-    keep_buffer = False
+    done = False
     try:
         doc: Any = None
         while True:
             _run_editor(buffer)
-            keep_buffer = True
             edited = buffer.read_bytes()
             if edited == original:
-                keep_buffer = False
+                done = True
                 ui.emit(
                     {"agent": agent, "path": resolved, "changed": False},
                     human=f"{resolved}: no changes",
@@ -286,7 +313,7 @@ def edit(
             _decode(edited, "the edited buffer")
             if len(edited) > MAX_BYTES:
                 raise UserError("the edited buffer exceeds 1 MiB")
-            if config_match is None:
+            if not is_config:
                 break
             try:
                 doc = _parse_config(edited.decode("utf-8"))
@@ -304,17 +331,20 @@ def edit(
                     f"{resolved} changed inside {agent!r} while you were editing; "
                     "nothing was written."
                 )
-            if config_match is not None:
-                hermes_config.write_atomically(cfg, agent, doc, profile=config_match.group(1))
+            if is_config:
+                hermes_config.write_atomically(cfg, agent, doc, profile=config_profile)
             else:
                 _write_plain(cfg, svc, resolved, edited)
-        keep_buffer = False
-    except BaseException:
-        if keep_buffer:
-            ui.warn(f"your edits are kept at {buffer}")
-        raise
+        done = True
     finally:
-        if not keep_buffer:
+        # Keep the buffer whenever it holds edits that didn't land — that
+        # includes an editor that saved and then exited non-zero, or a
+        # Ctrl-C while it was open — and remove it (with the editor's
+        # swap files) otherwise.
+        unsaved = not done and buffer.exists() and buffer.read_bytes() != original
+        if unsaved:
+            ui.warn(f"your edits are kept at {buffer}")
+        else:
             shutil.rmtree(buffer.parent, ignore_errors=True)
 
     ui.emit(

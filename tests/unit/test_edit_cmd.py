@@ -14,6 +14,8 @@ from agents_cli.config import AgentsConfig, DefaultsConfig, HostConfig, PathsCon
 from agents_cli.errors import UserError
 from agents_cli.mp import MpResult
 
+WRITER = ("sh", "-c", 'umask 077; cat > "$1"')
+
 
 def _ok(stdout: str = "") -> MpResult:
     return MpResult(stdout=stdout, stderr="", returncode=0)
@@ -60,7 +62,15 @@ class FakeContainer:
                     self.on_fetch(path)
                 return _ok(base64.b64encode(self.files[path]).decode())
             case "sh":
-                assert inner[2] == 'umask 077; cat > "$1"' and stdin is not None
+                if stdin is None:  # the fixed list-configs script
+                    assert inner[2] == edit_cmd._LIST_CONFIGS
+                    rows = [
+                        f"{p}\t{self._real(p)}\n"
+                        for p in sorted({*self.files, *self.links})
+                        if edit_cmd._CONFIG_RE.fullmatch(p) and self._real(p)
+                    ]
+                    return _ok("".join(rows))
+                assert inner[2] == 'umask 077; cat > "$1"'
                 self.files[inner[4]] = stdin
                 return _ok()
             case "chmod":
@@ -166,7 +176,7 @@ def test_edit_without_changes_writes_nothing(env, mocker) -> None:
     box, config_path, run_dir = env
     _editor(mocker, None)
     edit_cmd.edit(agent="coder", path="SOUL.md", config_path=config_path)
-    assert not any(c[0] in ("sh", "mv") for c in box.calls)
+    assert not any(c[0] == "mv" or c[:3] == WRITER for c in box.calls)
     assert list(run_dir.iterdir()) == []
 
 
@@ -272,7 +282,7 @@ def test_edit_config_yaml_goes_through_write_atomically_with_derived_profile(env
     assert write.call_args.kwargs == {"profile": "work"}
     assert write.call_args.args[1] == "coder"
     assert write.call_args.args[2]["model"]["provider"] == "y"
-    assert not any(c[0] == "sh" for c in box.calls)  # never the plain writer
+    assert not any(c[:3] == WRITER for c in box.calls)  # never the plain writer
 
 
 def test_edit_config_yaml_via_symlink_is_still_routed_to_the_validated_writer(env, mocker) -> None:
@@ -310,3 +320,52 @@ def test_write_atomically_passes_stage_path_as_positional_not_shell_text(
     i = argv.index("sh")
     assert argv[i : i + 4] == ("sh", "-c", 'cat > "$1"', "sh")
     assert argv[i + 4].startswith("/opt/data/config.yaml.")
+
+
+def test_edit_detects_config_behind_a_symlinked_config_yaml(env, mocker) -> None:
+    """config.yaml -> settings.yaml: the edit resolves to settings.yaml,
+    whose NAME says nothing — it must still get the validated writer."""
+    box, config_path, _ = env
+    box.files["/opt/data/settings.yaml"] = b"dashboard:\n  address: 127.0.0.1\n"
+    box.links["/opt/data/config.yaml"] = "/opt/data/settings.yaml"
+    bad = b"dashboard:\n  address: 0.0.0.0\n"
+    _editor(mocker, bad, bad)
+    mocker.patch("agents_cli.ui.confirm", return_value=False)
+    write = mocker.patch("agents_cli.hermes_config.write_atomically")
+    for requested in ("config.yaml", "settings.yaml"):
+        with pytest.raises(UserError, match="not changed"):
+            edit_cmd.edit(agent="coder", path=requested, config_path=config_path)
+    write.assert_not_called()
+    assert not any(c[:3] == WRITER for c in box.calls)
+
+
+def test_edit_keeps_saved_buffer_when_the_editor_exits_nonzero(env, mocker) -> None:
+    box, config_path, run_dir = env
+
+    def crashy(path: Path) -> None:
+        path.write_bytes(b"precious\n")
+        raise UserError("editor exited 1; nothing was written")
+
+    mocker.patch("agents_cli.edit_cmd._run_editor", side_effect=crashy)
+    with pytest.raises(UserError, match="editor exited"):
+        edit_cmd.edit(agent="coder", path="SOUL.md", config_path=config_path)
+    kept = list(run_dir.glob("*/SOUL.md"))
+    assert len(kept) == 1 and kept[0].read_bytes() == b"precious\n"
+    assert box.files["/opt/data/SOUL.md"] == b"# Persona\n"
+
+
+def test_edit_drops_untouched_buffer_when_the_editor_fails(env, mocker) -> None:
+    _, config_path, run_dir = env
+    mocker.patch("agents_cli.edit_cmd._run_editor", side_effect=UserError("no tty"))
+    with pytest.raises(UserError):
+        edit_cmd.edit(agent="coder", path="SOUL.md", config_path=config_path)
+    assert list(run_dir.iterdir()) == []
+
+
+def test_edit_does_not_confuse_a_trailing_space_name_with_its_sibling(env, mocker) -> None:
+    box, config_path, _ = env
+    box.files["/opt/data/SOUL.md "] = b"the other one\n"
+    _editor(mocker, b"edited other\n")
+    edit_cmd.edit(agent="coder", path="SOUL.md ", config_path=config_path)
+    assert box.files["/opt/data/SOUL.md "] == b"edited other\n"
+    assert box.files["/opt/data/SOUL.md"] == b"# Persona\n"
