@@ -94,6 +94,7 @@ class MountEntry:
     options: tuple[str, ...]
     fstype: str
     source: str
+    device: str = ""  # major:minor of the filesystem
 
     @property
     def deleted(self) -> bool:
@@ -126,6 +127,7 @@ def parse_mountinfo(text: str) -> list[MountEntry]:
                 options=tuple(head[5].split(",")),
                 fstype=tail[0],
                 source=_unescape(tail[1]),
+                device=head[2],
             )
         )
     return entries
@@ -141,12 +143,9 @@ def mount_at(entries: Iterable[MountEntry], path: Path) -> MountEntry | None:
     return found
 
 
-def expected_root(entries: Iterable[MountEntry], source: Path) -> str | None:
-    """What a bind mount of ``source`` reports as its ``root``: the path
-    of ``source`` *within its filesystem*. That equals the absolute path
-    only when the filesystem is mounted at ``/`` — with a separate
-    ``/home`` it is ``/<user>/agents/…`` — so derive it from the mount
-    that contains ``source``."""
+def containing_mount(entries: Iterable[MountEntry], source: Path) -> MountEntry | None:
+    """The mount ``source`` lives on: the deepest (and, among stacked
+    ones, topmost) mount point that is ``source`` or one of its parents."""
     best: MountEntry | None = None
     for entry in entries:
         point = Path(entry.mount_point)
@@ -154,10 +153,20 @@ def expected_root(entries: Iterable[MountEntry], source: Path) -> str | None:
             best is None or len(entry.mount_point) >= len(best.mount_point)
         ):
             best = entry
+    return best
+
+
+def expected_root(entries: Iterable[MountEntry], source: Path) -> str | None:
+    """What a bind mount of ``source`` reports as its ``root``: the path
+    of ``source`` *within its filesystem*. That equals the absolute path
+    only when the filesystem is mounted at ``/`` — with a separate
+    ``/home`` it is ``/<user>/agents/…`` — so derive it from the mount
+    that contains ``source``. ``source`` must be symlink-resolved: the
+    kernel reports resolved paths."""
+    best = containing_mount(entries, source)
     if best is None:
         return None
-    rel = source.relative_to(best.mount_point)
-    return str(Path(best.root) / rel)
+    return str(Path(best.root) / source.relative_to(best.mount_point))
 
 
 VIEW_STATUSES = ("mounted", "not-mounted", "stale", "foreign")
@@ -166,14 +175,25 @@ VIEW_STATUSES = ("mounted", "not-mounted", "stale", "foreign")
 def view_status(entries: list[MountEntry], source: Path, view: Path) -> str:
     """``mounted`` | ``not-mounted`` | ``stale`` (source dir was deleted
     or replaced underneath it) | ``foreign`` (something else is mounted
-    there, or it isn't an idmapped view of ``source``)."""
+    there, or it isn't an idmapped view of ``source``).
+
+    A ``root`` is only a path *within a filesystem*, so the filesystem
+    itself (``major:minor``) must match too — otherwise a view of the
+    old data would still look right after the data dir was replaced or
+    overmounted by another filesystem with the same layout.
+    """
     entry = mount_at(entries, view)
     if entry is None:
         return "not-mounted"
     if entry.deleted:
         return "stale"
-    others = [e for e in entries if e is not entry]
-    if not entry.idmapped or entry.root != expected_root(others, source):
+    home = containing_mount([e for e in entries if e is not entry], source)
+    if (
+        home is None
+        or not entry.idmapped
+        or entry.device != home.device
+        or entry.root != str(Path(home.root) / source.relative_to(home.mount_point))
+    ):
         return "foreign"
     return "mounted"
 

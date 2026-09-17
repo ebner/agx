@@ -254,7 +254,8 @@ def test_unmount_never_deletes_through_a_view_that_failed_to_unmount(
     view = tmp_path / "views" / "coder"
     (view / "state.db").write_text("the real data, seen through the view")
     mocker.patch("agents_cli.permissions.run_with_sudo")  # umount "runs" but does nothing
-    access_cmd.unmount(agent="coder", yes=True, config_path=saved_config)
+    with pytest.raises(RuntimeFailure, match="still mounted"):
+        access_cmd.unmount(agent="coder", yes=True, config_path=saved_config)
     assert (view / "state.db").exists()
 
 
@@ -366,3 +367,61 @@ def test_retired_grant_and_revoke_point_at_the_replacement() -> None:
         assert "agents access mount" in result.output
     listed = CliRunner().invoke(cli_mod.main, ["access", "--help"]).output.split("Commands:")[1]
     assert "grant" not in listed and "revoke" not in listed  # hidden stubs
+
+
+# ---------- review regressions ----------
+
+
+def test_unmount_finds_views_made_under_a_previous_view_root(
+    cfg_with_coder: AgentsConfig, saved_config: Path, mounts: FakeMounts, tmp_path: Path
+) -> None:
+    access_cmd.mount(agent="coder", writable=False, yes=True, config_path=saved_config)
+    old_view = tmp_path / "views" / "coder"
+    cfg_with_coder.paths.host_view_dir = tmp_path / "elsewhere"
+    cfg_mod.save(cfg_with_coder, saved_config)
+    access_cmd.unmount(agent="coder", yes=True, config_path=saved_config)
+    assert mounts.sudo_calls[-1] == ["umount", str(old_view)]
+    assert mounts.mounted() == [] and _state(cfg_with_coder) == {}
+    assert not old_view.exists()
+
+
+def test_unmount_keeps_a_view_registered_when_umount_did_not_take(
+    cfg_with_coder: AgentsConfig, saved_config: Path, mounts: FakeMounts, mocker: Any
+) -> None:
+    access_cmd.mount(agent="coder", writable=False, yes=True, config_path=saved_config)
+    mocker.patch("agents_cli.permissions.run_with_sudo")  # "target is busy"
+    with pytest.raises(RuntimeFailure, match="still mounted"):
+        access_cmd.unmount(agent="coder", yes=True, config_path=saved_config)
+    assert list(_state(cfg_with_coder)["views"]) == ["coder"]  # guards + doctor still see it
+
+
+def test_remove_rechecks_the_view_guard_under_the_lock(
+    cfg_with_coder: AgentsConfig, saved_config: Path, mounts: FakeMounts, mocker: Any
+) -> None:
+    """A view registered while `remove` waited at its confirmation prompt
+    must still stop the delete."""
+
+    def confirm_and_race(*_: Any, **__: Any) -> bool:
+        access_cmd.mount(agent="coder", writable=False, yes=True, config_path=saved_config)
+        return True
+
+    mocker.patch("agents_cli.ui.confirm", side_effect=confirm_and_race)
+    stop = mocker.patch("agents_cli.compose_runner.stop")
+    with pytest.raises(UserError, match="agents access unmount coder"):
+        agents_cmd.remove("coder", yes=False, config_path=saved_config)
+    stop.assert_not_called()
+    assert (cfg_with_coder.paths.host_data_dir / "coder" / ".data").exists()
+
+
+def test_mount_recognises_its_view_when_the_data_dir_path_has_a_symlink(
+    cfg_with_coder: AgentsConfig, saved_config: Path, mounts: FakeMounts, tmp_path: Path
+) -> None:
+    """mountinfo reports resolved paths; the configured data dir may not be one."""
+    link = tmp_path / "data-link"
+    link.symlink_to(cfg_with_coder.paths.host_data_dir)
+    cfg_with_coder.paths.host_data_dir = link
+    cfg_mod.save(cfg_with_coder, saved_config)
+    access_cmd.mount(agent="coder", writable=False, yes=True, config_path=saved_config)
+    (argv,) = mounts.sudo_calls
+    assert argv[-2] == str(tmp_path / "data" / "coder" / ".data")  # resolved source
+    assert len(mounts.mounted()) == 1

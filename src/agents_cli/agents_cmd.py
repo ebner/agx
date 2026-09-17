@@ -585,6 +585,10 @@ def remove(
         raise UserError("aborted by user")
 
     with compose.acquire_lock(cfg.paths.host_data_dir):
+        # Again under the lock: `access mount` registers views under this
+        # same lock, and one may have appeared while we sat at the prompt.
+        if delete_data:
+            _refuse_if_host_view(cfg, name, f"remove {name!r}'s data")
         journal = Journal.find_resumable(cfg.paths.host_data_dir, "remove", name) or Journal.begin(
             cfg.paths.host_data_dir, "remove", name, REMOVE_PHASES, meta={"agent_type": agent_type}
         )
@@ -679,6 +683,7 @@ def rename(
     new_dir = cfg.paths.host_data_dir / new_name
 
     with compose.acquire_lock(cfg.paths.host_data_dir):
+        _refuse_if_host_view(cfg, old_name, f"rename {old_name!r}")  # re-check under the lock
         journal = Journal.find_resumable(
             cfg.paths.host_data_dir, "rename", old_name
         ) or Journal.begin(cfg.paths.host_data_dir, "rename", old_name, RENAME_PHASES)

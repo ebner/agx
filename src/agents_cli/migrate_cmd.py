@@ -205,6 +205,7 @@ def migrate_data(
     archives: list[Path] = []
 
     with compose.acquire_lock(cfg.paths.host_data_dir):
+        access_cmd.refuse_if_view_registered(cfg, None, "migrate the data dir into the VM")
         # Re-find AND re-reconcile under the lock (mirrors upgrades'
         # relock pattern — the unlocked peek is only the fast path).
         journal = _reconcile_journal(

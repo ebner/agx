@@ -32,6 +32,7 @@ For quick edits without any mount, see ``agents edit``.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import subprocess
@@ -270,9 +271,13 @@ def mount(
         entries = idmap_view.read_mountinfo()
         planned: list[tuple[View, str]] = []
         already: list[View] = []
-        for source in dirs:
-            if source.is_symlink():
-                raise UserError(f"refusing: {source} is a symlink")
+        for unresolved in dirs:
+            if unresolved.is_symlink():
+                raise UserError(f"refusing: {unresolved} is a symlink")
+            # The kernel reports resolved paths in mountinfo; a symlinked
+            # component in the data-dir path would otherwise make our own
+            # fresh mount look foreign.
+            source = unresolved.resolve()
             spec = _spec_for(cfg, source)
             if spec is None:
                 ui.info(f"{source} is already owned by you; no view needed")
@@ -374,21 +379,42 @@ def unmount(
 
     with compose.acquire_lock(cfg.paths.host_data_dir):
         base = root / agent
-        entries = idmap_view.read_mountinfo()
-        mounted = [
-            Path(e.mount_point)
-            for e in entries
-            if Path(e.mount_point) == base or base in Path(e.mount_point).parents
-        ]
-        # Deepest first, and once per stacked mount.
-        mounted.sort(key=lambda p: len(p.parts), reverse=True)
+        recorded = registered_views(cfg, agent)
+        # The recorded view paths as well as the current root: if
+        # [paths].host_view_dir changed since the mount, the live view is
+        # still where it was made.
+        anchors = {base, *(v.view for v in recorded)}
+        mounted = sorted(
+            {
+                Path(e.mount_point)
+                for e in idmap_view.read_mountinfo()
+                for a in anchors
+                if Path(e.mount_point) == a or a in Path(e.mount_point).parents
+            },
+            key=lambda p: len(p.parts),
+            reverse=True,  # deepest first
+        )
         if mounted:
+            # Once per stacked layer would need a loop; one pass + the
+            # re-read below keeps whatever is left registered.
             permissions.run_with_sudo([["umount", str(p)] for p in mounted], yes=yes)
         still = {e.mount_point for e in idmap_view.read_mountinfo()}
-        for view in {*mounted, *(v.view for v in registered_views(cfg, agent))}:
-            if str(view) not in still:
+        for view in {*mounted, *(v.view for v in recorded)}:
+            if str(view) in still:
+                continue
+            if root in view.parents:
                 _rmdir_quietly(view, root)
-        _save_views(cfg, [v for v in registered_views(cfg) if v.agent != agent])
+            else:  # made under a previous view root: just the mountpoint
+                with contextlib.suppress(OSError):
+                    view.rmdir()
+        kept = [v for v in recorded if str(v.view) in still]
+        _save_views(cfg, [*(v for v in registered_views(cfg) if v.agent != agent), *kept])
+        if kept:
+            raise RuntimeFailure(
+                "still mounted after umount: "
+                + ", ".join(str(v.view) for v in kept)
+                + " — close whatever is using it and run the command again."
+            )
 
     ui.emit(
         {"agent": agent, "action": "unmount", "unmounted": [str(p) for p in mounted]},
@@ -426,7 +452,7 @@ def view_rows(cfg: AgentsConfig, agent: str | None = None) -> list[dict[str, Any
                 "view": str(v.view),
                 "source": str(v.source),
                 "mode": "rw" if v.writable else "ro",
-                "status": idmap_view.view_status(entries, v.source, v.view),
+                "status": idmap_view.view_status(entries, v.source.resolve(), v.view),
                 "fstab_line": _fstab_line_for(cfg, v),
             }
         )

@@ -146,3 +146,19 @@ def test_view_status_distinguishes_missing_stale_and_foreign() -> None:
     )
     # a plain (non-idmapped) bind mount is not a view
     assert iv.view_status(entries, Path("/home/u/my dir"), Path("/home/u/view x")) == "foreign"
+
+
+def test_view_status_requires_the_same_filesystem_not_just_the_same_root() -> None:
+    """The data dir got replaced/overmounted by another filesystem with
+    the same layout: the old view's root string still matches, its device
+    doesn't — it must not pass as a view of the new data."""
+    text = (
+        "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n"
+        "2 1 8:1 /data/a/.data /views/a ro,idmapped - ext4 /dev/sda1 rw\n"
+        "3 1 8:2 / /data rw - ext4 /dev/sdb1 rw\n"
+    )
+    entries = iv.parse_mountinfo(text)
+    assert entries[1].device == "8:1"
+    assert iv.view_status(entries, Path("/data/a/.data"), Path("/views/a")) == "foreign"
+    before = iv.parse_mountinfo("".join(text.splitlines(keepends=True)[:2]))
+    assert iv.view_status(before, Path("/data/a/.data"), Path("/views/a")) == "mounted"
