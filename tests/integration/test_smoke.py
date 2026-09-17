@@ -20,9 +20,11 @@ from pathlib import Path
 import pytest
 
 from tests.integration.conftest import (
+    CREATE_TIMEOUT,
     EXEC_TIMEOUT,
     MUTATE_TIMEOUT,
     QUICK_TIMEOUT,
+    TEST_PREFIX,
     Cli,
     Deployment,
     DisposableAgent,
@@ -216,6 +218,48 @@ def test_export_import_roundtrip(
     assert value in back.stdout
 
     cli.exec_in_agent(name, "rm", "-f", sentinel)  # leave the agent tidy
+
+
+@pytest.mark.slow
+def test_remove_deletes_subuid_owned_state(
+    cli: Cli, deployment: Deployment, request: pytest.FixtureRequest
+) -> None:
+    """`agents remove` must leave nothing behind on the host, although the
+    started container has filled `<name>/.data` with files owned by a
+    rootless-Docker subuid under mode 700 that the host user cannot even
+    list. Unit tests can only assert the argv; this proves the delete
+    (root inside the VM, or rootlesskit on bare-metal) really works on
+    this backend's share — without any host sudo prompt (`--json --yes`
+    has no TTY to prompt on)."""
+    if deployment.config["paths"].get("data_dir_in_vm"):
+        pytest.skip("data dir lives in the VM — nothing to observe from the host")
+    name = f"{TEST_PREFIX}{uuid.uuid4().hex[:8]}"
+    agent_dir = deployment.host_data_dir / name
+    # Safety net only; the assertion below is the real removal.
+    request.addfinalizer(
+        lambda: (
+            cli.run("--json", "--yes", "remove", name, timeout=MUTATE_TIMEOUT)
+            if agent_dir.exists()
+            else None
+        )
+    )
+
+    created = cli.run("--json", "--yes", "create", name, "--type", "hermes", timeout=CREATE_TIMEOUT)
+    assert created.returncode == 0, created.stderr
+    seeded = cli.exec_in_agent(
+        name,
+        "sh",
+        "-c",
+        "mkdir -m 700 /opt/data/itest-private && touch /opt/data/itest-private/f "
+        "&& chmod 600 /opt/data/itest-private/f",
+    )
+    assert seeded.returncode == 0, seeded.stderr
+    assert (agent_dir / ".data").stat().st_uid != deployment.host_data_dir.stat().st_uid
+
+    removed = cli.run("--json", "--yes", "remove", name, timeout=MUTATE_TIMEOUT)
+    assert removed.returncode == 0, removed.stderr
+    assert parse_single_json(removed.stdout)["status"] == "removed"
+    assert not agent_dir.exists()
 
 
 def test_logs_returns_content(cli: Cli, disposable_agent: DisposableAgent) -> None:
