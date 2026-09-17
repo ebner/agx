@@ -330,6 +330,13 @@ def _create_data_dirs(cfg: AgentsConfig, name: str, agent_type: str) -> None:
     access_cmd.auto_grant_on_create(cfg, name, agent_type)
 
 
+def _refuse_if_host_view(cfg: AgentsConfig, name: str, action: str) -> None:
+    # Lazy import: access_cmd imports this module.
+    from agents_cli import access_cmd
+
+    access_cmd.refuse_if_view_registered(cfg, name, action)
+
+
 def _delete_data_dir(cfg: AgentsConfig, name: str, *, yes: bool = False) -> None:
     """Delete ``<data-dir>/<name>`` without traversing it as the host user.
 
@@ -579,6 +586,8 @@ def remove(
             raise UserError(f"agent {name!r} not found in compose")
         agent_type = str(stranded.meta.get("agent_type") or AGENT_TYPES[0])
     svc = service_name(name, agent_type)
+    if delete_data:
+        _refuse_if_host_view(cfg, name, f"remove {name!r}'s data")
 
     if not yes and not ui.confirm(
         removal_confirm_message(cfg, name, delete_data=delete_data), default=False
@@ -662,6 +671,7 @@ def rename(
     agent_type = _detect_type_from_compose(cfg, old_name)
     if agent_type is None:
         raise UserError(f"agent {old_name!r} not in compose")
+    _refuse_if_host_view(cfg, old_name, f"rename {old_name!r}")
     if _detect_type_from_compose(cfg, new_name) is not None:
         raise UserError(f"agent {new_name!r} already exists")
     _refuse_rename_with_openviking_sidecar(cfg, old_name)

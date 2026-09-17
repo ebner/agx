@@ -161,6 +161,12 @@ def migrate_data(
     # only refuse when there is no migration in flight to resume. This is
     # also the guard that stops a re-run from ever "copying backwards":
     # with the flag set and no journal, there is nothing to do.
+    # A host view pins the host copy of an agent's state; after the move
+    # it would be a mounted, editable path to stale data.
+    from agents_cli import access_cmd
+
+    access_cmd.refuse_if_view_registered(cfg, None, "migrate the data dir into the VM")
+
     peek = Journal.find_resumable(cfg.paths.host_data_dir, MIGRATE_OP, cfg.vm.name)
     if peek is None and cfg.paths.data_dir_in_vm:
         raise UserError(

@@ -1,22 +1,24 @@
-"""``agents access`` end-to-end: grant/revoke/list, bare-metal no-op,
-filesystem refusals, auto-grant hook.
+"""``agents access``: idmapped host views — mount / unmount / list, the
+state file, lifecycle guards and the doctor check. (Plus the legacy
+create-time auto-grant hook until it is removed.)
 
-Mocked at the ``permissions.run_*`` / ``probe_acl_support`` boundary
-so tests don't actually try to sudo or write ACLs to the test runner's
-filesystem.
+``sudo`` and ``/proc/self/mountinfo`` are faked by a tiny in-memory
+mount table, so nothing here mounts anything.
 """
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from agents_cli import access_cmd
+from agents_cli import access_cmd, agents_cmd, ops
 from agents_cli import config as cfg_mod
+from agents_cli import idmap_view as iv
 from agents_cli.config import AgentsConfig, DefaultsConfig, HostConfig, PathsConfig, VmRuntimeConfig
-from agents_cli.errors import UserError
+from agents_cli.errors import RuntimeFailure, UserError
 
 # ---------- fixtures ----------
 
@@ -36,7 +38,7 @@ def cfg_with_coder(tmp_path: Path) -> AgentsConfig:
     (data_dir / "bob" / ".openclaw").mkdir()
     (data_dir / "bob" / "workspace").mkdir()
     return AgentsConfig(
-        paths=PathsConfig(host_data_dir=str(data_dir)),
+        paths=PathsConfig(host_data_dir=str(data_dir), host_view_dir=str(tmp_path / "views")),
         host=HostConfig(uid=1000, gid=1000),
         vm_runtime=VmRuntimeConfig(
             docker_socket_path="/run/user/1000/docker.sock",
@@ -66,293 +68,274 @@ def acl_mocked(mocker: Any):
     }
 
 
-# ---------- grant ----------
+class FakeMounts:
+    """In-memory mount table standing in for sudo + /proc/self/mountinfo."""
+
+    def __init__(self, mocker: Any) -> None:
+        self.entries: list[iv.MountEntry] = [iv.MountEntry("/", "/", ("rw",), "ext4", "/dev/x")]
+        self.sudo_calls: list[list[str]] = []
+        self.fail_on: str | None = None  # substring of a view path whose mount fails
+        self.lie = False  # mount "succeeds" but nothing shows up
+        mocker.patch("agents_cli.idmap_view.read_mountinfo", side_effect=lambda: list(self.entries))
+        mocker.patch("agents_cli.permissions.run_with_sudo", side_effect=self._sudo)
+        mocker.patch("agents_cli.access_cmd.subprocess.run", side_effect=self._raw_sudo)
+        mocker.patch(
+            "agents_cli.access_cmd._owner_ids",
+            side_effect=lambda src: (1000, 1000) if src.name == "workspace" else (100999, 100999),
+        )
+
+    def _sudo(self, argvs: list[list[str]], *, yes: bool) -> None:
+        for argv in argvs:
+            self.sudo_calls.append(list(argv))
+            if argv[0] == "mount":
+                source, view = argv[-2], argv[-1]
+                if self.fail_on and self.fail_on in view:
+                    raise RuntimeFailure("mount: wrong fs type")
+                if not self.lie:
+                    opts = tuple(o for o in argv[3].split(",") if not o.startswith("X-mount"))
+                    self.entries.append(
+                        iv.MountEntry(view, source, (*opts, "idmapped"), "ext4", "/dev/x")
+                    )
+            elif argv[0] == "umount":
+                self.entries = [e for e in self.entries if e.mount_point != argv[-1]]
+
+    def _raw_sudo(self, argv: list[str], **_: Any) -> Any:
+        self._sudo([argv[1:]], yes=True)
+
+    def mounted(self) -> list[str]:
+        return [e.mount_point for e in self.entries if e.mount_point != "/"]
 
 
-def test_grant_hermes_targets_data_dir_with_ro_acl(
-    cfg_with_coder: AgentsConfig, saved_config: Path, acl_mocked
+@pytest.fixture
+def mounts(mocker: Any) -> FakeMounts:
+    return FakeMounts(mocker)
+
+
+def _state(cfg: AgentsConfig) -> dict[str, Any]:
+    path = cfg.paths.host_data_dir / access_cmd.STATE_FILE
+    return json.loads(path.read_text()) if path.exists() else {}
+
+
+# ---------- mount ----------
+
+
+def test_mount_hermes_is_read_only_hardened_and_idmapped_from_disk_owner(
+    cfg_with_coder: AgentsConfig, saved_config: Path, mounts: FakeMounts, tmp_path: Path
 ) -> None:
-    """Default grant is read-only; setfacl spec must be ``u:<huid>:rX``,
-    NOT ``rwX``. RO is the safe default — the user's likely use case
-    is "I just want to read auth.json / SOUL.md".
-    """
-    access_cmd.grant(agent="coder", writable=False, yes=True, config_path=saved_config)
-    acl_mocked["run_sudo"].assert_called_once()
-    cmds = acl_mocked["run_sudo"].call_args.args[0]
-    # Both -m (recurse) and -d -m (default) for the .data dir.
-    assert any("u:1000:rX" in arg for cmd in cmds for arg in cmd)
-    assert not any("rwX" in arg for cmd in cmds for arg in cmd)
-    paths_targeted = {c[-1] for c in cmds}
-    assert str(cfg_with_coder.paths.host_data_dir / "coder" / ".data") in paths_targeted
+    access_cmd.mount(agent="coder", writable=False, yes=True, config_path=saved_config)
+    (argv,) = mounts.sudo_calls
+    source = cfg_with_coder.paths.host_data_dir / "coder" / ".data"
+    view = tmp_path / "views" / "coder"
+    assert argv[:3] == ["mount", "--bind", "-o"] and argv[4:] == [str(source), str(view)]
+    opts = argv[3].split(",")
+    assert opts[:5] == ["ro", "nosuid", "nodev", "noexec", "nosymfollow"]
+    assert "u:1000:100999:1 u:100999:1000:1" in argv[3]  # from the on-disk owner
+    assert view.is_dir() and (tmp_path / "views").stat().st_mode & 0o777 == 0o700
+    assert _state(cfg_with_coder) == {
+        "views": {"coder": [{"source": str(source), "view": str(view), "rw": False}]}
+    }
 
 
-def test_grant_with_rw_uses_rwx_spec(
-    cfg_with_coder: AgentsConfig, saved_config: Path, acl_mocked
+def test_mount_emits_an_escaped_nofail_fstab_line(
+    saved_config: Path, mounts: FakeMounts, mocker: Any
 ) -> None:
-    access_cmd.grant(agent="coder", writable=True, yes=True, config_path=saved_config)
-    cmds = acl_mocked["run_sudo"].call_args.args[0]
-    assert any("u:1000:rwX" in arg for cmd in cmds for arg in cmd)
+    emit = mocker.patch("agents_cli.ui.emit")
+    access_cmd.mount(agent="coder", writable=True, yes=True, config_path=saved_config)
+    payload = emit.call_args.args[0]
+    (line,) = payload["fstab_lines"]
+    fields = line.split(" ")
+    assert len(fields) == 6 and fields[2] == "none"
+    assert fields[3].startswith("bind,nofail,rw,nosuid,nodev,noexec,nosymfollow,X-mount.idmap=")
+    assert "\\040" in fields[3]
+    assert "exclude" in emit.call_args.kwargs["human"]
 
 
-def test_grant_openclaw_targets_both_workspace_and_state(
-    cfg_with_coder: AgentsConfig, saved_config: Path, acl_mocked
+def test_mount_openclaw_views_state_dir_and_skips_host_owned_workspace(
+    cfg_with_coder: AgentsConfig, saved_config: Path, mounts: FakeMounts, tmp_path: Path
 ) -> None:
-    """OpenClaw stores state under .openclaw AND workspace. Granting
-    both is the consistent default — peeking at workspace is the
-    obvious case but state-dir access matters too (the user may want
-    to inspect logs or saved sessions).
-    """
-    access_cmd.grant(agent="bob", writable=False, yes=True, config_path=saved_config)
-    cmds = acl_mocked["run_sudo"].call_args.args[0]
-    paths_targeted = {c[-1] for c in cmds}
-    assert str(cfg_with_coder.paths.host_data_dir / "bob" / ".openclaw") in paths_targeted
-    assert str(cfg_with_coder.paths.host_data_dir / "bob" / "workspace") in paths_targeted
+    access_cmd.mount(agent="bob", writable=False, yes=True, config_path=saved_config)
+    assert mounts.mounted() == [str(tmp_path / "views" / "bob" / "openclaw")]
+    assert [v["view"] for v in _state(cfg_with_coder)["views"]["bob"]] == mounts.mounted()
 
 
-def test_grant_refuses_when_filesystem_lacks_acl(
-    cfg_with_coder: AgentsConfig, saved_config: Path, mocker: Any
+def test_mount_is_idempotent_and_never_stacks(saved_config: Path, mounts: FakeMounts) -> None:
+    access_cmd.mount(agent="coder", writable=False, yes=True, config_path=saved_config)
+    access_cmd.mount(agent="coder", writable=False, yes=True, config_path=saved_config)
+    assert len(mounts.sudo_calls) == 1 and len(mounts.mounted()) == 1
+
+
+def test_mount_refuses_to_silently_change_mode(saved_config: Path, mounts: FakeMounts) -> None:
+    access_cmd.mount(agent="coder", writable=False, yes=True, config_path=saved_config)
+    with pytest.raises(UserError, match="already mounted read-only"):
+        access_cmd.mount(agent="coder", writable=True, yes=True, config_path=saved_config)
+
+
+def test_mount_refuses_foreign_mount_non_empty_dir_and_symlinked_view(
+    saved_config: Path, mounts: FakeMounts, tmp_path: Path
 ) -> None:
-    """A polite hard failure beats a silent partial grant that leaves
-    the user confused about why they can't read their files."""
-    mocker.patch(
-        "agents_cli.permissions.probe_acl_support",
-        return_value=(False, "Operation not supported"),
-    )
-    mocker.patch("agents_cli.permissions.run_with_sudo")
-    with pytest.raises(UserError, match="doesn't support ACLs"):
-        access_cmd.grant(agent="coder", writable=False, yes=True, config_path=saved_config)
+    view = tmp_path / "views" / "coder"
+    mounts.entries.append(iv.MountEntry(str(view), "/somewhere/else", ("rw",), "ext4", "/dev/x"))
+    with pytest.raises(UserError, match="foreign"):
+        access_cmd.mount(agent="coder", writable=False, yes=True, config_path=saved_config)
+    mounts.entries.pop()
+
+    view.mkdir(parents=True)
+    (view / "leftover").write_text("x")
+    with pytest.raises(UserError, match="non-empty"):
+        access_cmd.mount(agent="coder", writable=False, yes=True, config_path=saved_config)
+    (view / "leftover").unlink()
+    view.rmdir()
+
+    view.symlink_to(tmp_path)
+    with pytest.raises(UserError, match="symlink"):
+        access_cmd.mount(agent="coder", writable=False, yes=True, config_path=saved_config)
+    assert mounts.sudo_calls == []
 
 
-def test_grant_refuses_unknown_agent(saved_config: Path, acl_mocked) -> None:
+def test_mount_failure_rolls_back_and_registers_nothing(
+    cfg_with_coder: AgentsConfig, saved_config: Path, mounts: FakeMounts, tmp_path: Path
+) -> None:
+    mounts.fail_on = "coder"
+    with pytest.raises(RuntimeFailure, match="wrong fs type"):
+        access_cmd.mount(agent="coder", writable=False, yes=True, config_path=saved_config)
+    assert mounts.mounted() == [] and _state(cfg_with_coder) == {}
+    assert not (tmp_path / "views" / "coder").exists()
+
+
+def test_mount_verifies_the_view_is_really_there(
+    cfg_with_coder: AgentsConfig, saved_config: Path, mounts: FakeMounts
+) -> None:
+    mounts.lie = True
+    with pytest.raises(RuntimeFailure, match="no idmapped view"):
+        access_cmd.mount(agent="coder", writable=False, yes=True, config_path=saved_config)
+    assert _state(cfg_with_coder) == {}
+
+
+def test_mount_refusals(
+    cfg_with_coder: AgentsConfig, saved_config: Path, mounts: FakeMounts, tmp_path: Path
+) -> None:
     with pytest.raises(UserError, match="no agent named"):
-        access_cmd.grant(agent="ghost", writable=False, yes=True, config_path=saved_config)
-
-
-def test_grant_refuses_when_data_dir_missing(
-    cfg_with_coder: AgentsConfig, saved_config: Path, acl_mocked
-) -> None:
-    """If the agent was created but never started, .data doesn't exist
-    yet — better to surface "start it first" than mysteriously fail."""
-    import shutil
-
-    shutil.rmtree(cfg_with_coder.paths.host_data_dir / "coder" / ".data")
-    with pytest.raises(UserError, match="bring it up first"):
-        access_cmd.grant(agent="coder", writable=False, yes=True, config_path=saved_config)
-
-
-def test_grant_no_op_on_bare_metal(
-    cfg_with_coder: AgentsConfig, saved_config: Path, acl_mocked
-) -> None:
-    """Container uid maps to host user on bare-metal — files are
-    already host-owned, ACL grant would be a sudoed no-op."""
-    cfg_with_coder.vm.backend = "bare_metal"
+        access_cmd.mount(agent="ghost", writable=False, yes=True, config_path=saved_config)
+    cfg_with_coder.paths.host_view_dir = cfg_with_coder.paths.host_data_dir / "views"
     cfg_mod.save(cfg_with_coder, saved_config)
-    access_cmd.grant(agent="coder", writable=False, yes=True, config_path=saved_config)
-    acl_mocked["run_sudo"].assert_not_called()
-
-
-def test_grant_refuses_in_data_dir_in_vm_mode(
-    cfg_with_coder: AgentsConfig, saved_config: Path, acl_mocked
-) -> None:
-    """Host ACLs don't reach into the VM disk. Refuse with hint to
-    use `agents export` instead."""
-    cfg_with_coder.paths = PathsConfig(
-        host_data_dir=str(cfg_with_coder.paths.host_data_dir),
-        data_dir_in_vm=True,
-    )
+    with pytest.raises(UserError, match="must not contain, or be inside"):
+        access_cmd.mount(agent="coder", writable=False, yes=True, config_path=saved_config)
+    cfg_with_coder.paths.host_view_dir = tmp_path / "views"
+    cfg_with_coder.paths.data_dir_in_vm = True
     cfg_mod.save(cfg_with_coder, saved_config)
     with pytest.raises(UserError, match="data-dir-in-vm"):
-        access_cmd.grant(agent="coder", writable=False, yes=True, config_path=saved_config)
+        access_cmd.mount(agent="coder", writable=False, yes=True, config_path=saved_config)
 
 
-# ---------- revoke ----------
-
-
-def test_revoke_emits_x_form_for_correct_uid(
-    cfg_with_coder: AgentsConfig, saved_config: Path, acl_mocked
+def test_mount_is_supported_on_bare_metal(
+    cfg_with_coder: AgentsConfig, saved_config: Path, mounts: FakeMounts
 ) -> None:
-    access_cmd.revoke(agent="coder", yes=True, config_path=saved_config)
-    cmds = acl_mocked["run_sudo"].call_args.args[0]
-    assert all("-x" in c for c in cmds)
-    assert all("u:1000" in arg for cmd in cmds for arg in cmd if arg.startswith("u:"))
-
-
-def test_revoke_no_op_on_bare_metal(
-    cfg_with_coder: AgentsConfig, saved_config: Path, acl_mocked
-) -> None:
-    cfg_with_coder.vm.backend = "bare_metal"
+    """Rootless Docker on the host: agent files are subuid-owned there too."""
+    cfg_with_coder.vm = cfg_with_coder.vm.model_copy(update={"backend": "bare_metal"})
     cfg_mod.save(cfg_with_coder, saved_config)
-    access_cmd.revoke(agent="coder", yes=True, config_path=saved_config)
-    acl_mocked["run_sudo"].assert_not_called()
+    access_cmd.mount(agent="coder", writable=False, yes=True, config_path=saved_config)
+    assert len(mounts.mounted()) == 1
 
 
-# ---------- list ----------
+def test_default_view_root_is_not_persisted_to_config(tmp_path: Path) -> None:
+    cfg = AgentsConfig(paths=PathsConfig(host_data_dir=str(tmp_path / "data")))
+    path = tmp_path / "c.toml"
+    cfg_mod.save(cfg, path)
+    assert "host_view_dir" not in path.read_text()
+    assert cfg_mod.load(path).paths.host_view_dir is None
+    assert access_cmd.view_root(cfg) == Path("~/agents-view").expanduser().resolve()
 
 
-def test_list_returns_rows_with_status_per_path(
-    cfg_with_coder: AgentsConfig, saved_config: Path, mocker: Any
+# ---------- unmount ----------
+
+
+def test_unmount_umounts_then_plain_rmdirs_and_deregisters(
+    cfg_with_coder: AgentsConfig, saved_config: Path, mounts: FakeMounts, tmp_path: Path
 ) -> None:
-    """Every probed path produces a row with ``agent``, ``path``,
-    ``owner_uid``, ``host_uid``, ``status``. The status comes from
-    permissions.assess_host_access — mock it to return a controlled mix.
-    """
+    access_cmd.mount(agent="bob", writable=False, yes=True, config_path=saved_config)
+    access_cmd.unmount(agent="bob", yes=True, config_path=saved_config)
+    assert mounts.sudo_calls[-1] == ["umount", str(tmp_path / "views" / "bob" / "openclaw")]
+    assert mounts.mounted() == [] and _state(cfg_with_coder) == {}
+    assert not (tmp_path / "views" / "bob").exists()  # empty parents go too
+    assert (tmp_path / "views").exists()
 
-    def fake_assess(p: Path, uid: int) -> str:
-        # Match on basename so the test isn't fooled by parent dirs
-        # named "data" (tmp_path here contains "data" higher up).
-        return "ok" if Path(p).name == ".data" else "missing"
 
-    mocker.patch("agents_cli.permissions.assess_host_access", side_effect=fake_assess)
-    rows = access_cmd.list_access(agent=None, config_path=saved_config)
-    statuses_by_path = {r["path"]: r["status"] for r in rows}
-    # coder/.data → ok; bob/.openclaw + bob/workspace → missing
-    assert statuses_by_path[str(cfg_with_coder.paths.host_data_dir / "coder" / ".data")] == "ok"
-    assert (
-        statuses_by_path[str(cfg_with_coder.paths.host_data_dir / "bob" / ".openclaw")]
-        == "missing"
+def test_unmount_never_deletes_through_a_view_that_failed_to_unmount(
+    saved_config: Path, mounts: FakeMounts, tmp_path: Path, mocker: Any
+) -> None:
+    access_cmd.mount(agent="coder", writable=False, yes=True, config_path=saved_config)
+    view = tmp_path / "views" / "coder"
+    (view / "state.db").write_text("the real data, seen through the view")
+    mocker.patch("agents_cli.permissions.run_with_sudo")  # umount "runs" but does nothing
+    access_cmd.unmount(agent="coder", yes=True, config_path=saved_config)
+    assert (view / "state.db").exists()
+
+
+def test_unmount_works_for_an_agent_already_gone_from_compose(
+    cfg_with_coder: AgentsConfig, saved_config: Path, mounts: FakeMounts
+) -> None:
+    access_cmd.mount(agent="coder", writable=False, yes=True, config_path=saved_config)
+    (cfg_with_coder.paths.host_data_dir / "docker-compose.yml").write_text("services: {}\n")
+    access_cmd.unmount(agent="coder", yes=True, config_path=saved_config)
+    assert mounts.mounted() == [] and _state(cfg_with_coder) == {}
+
+
+# ---------- list + doctor ----------
+
+
+def test_list_reports_status_and_fstab_line(
+    saved_config: Path, mounts: FakeMounts, mocker: Any
+) -> None:
+    assert access_cmd.list_views(config_path=saved_config) == []
+    access_cmd.mount(agent="coder", writable=False, yes=True, config_path=saved_config)
+    (row,) = access_cmd.list_views(config_path=saved_config)
+    assert (row["agent"], row["mode"], row["status"]) == ("coder", "ro", "mounted")
+    assert row["fstab_line"].split(" ")[3].startswith("bind,nofail,ro,")
+    mounts.entries = mounts.entries[:1]  # host rebooted without the fstab line
+    (row,) = access_cmd.list_views(agent="coder", config_path=saved_config)
+    assert row["status"] == "not-mounted"
+
+
+def test_doctor_is_silent_without_views_and_warns_on_unmounted_or_stale(
+    cfg_with_coder: AgentsConfig, saved_config: Path, mounts: FakeMounts
+) -> None:
+    report = ops.DoctorReport()
+    ops._check_access_views(cfg_with_coder, report)
+    assert report.checks == []
+
+    access_cmd.mount(agent="coder", writable=False, yes=True, config_path=saved_config)
+    ops._check_access_views(cfg_with_coder, report)
+    assert report.checks == []
+
+    view = mounts.entries[-1]
+    mounts.entries[-1] = iv.MountEntry(
+        view.mount_point, view.root + "//deleted", view.options, view.fstype, view.source
     )
-    assert (
-        statuses_by_path[str(cfg_with_coder.paths.host_data_dir / "bob" / "workspace")]
-        == "missing"
-    )
+    ops._check_access_views(cfg_with_coder, report)
+    mounts.entries = mounts.entries[:1]
+    ops._check_access_views(cfg_with_coder, report)
+    assert [(c.name, c.status) for c in report.checks] == [
+        ("coder.host_view", "warn"),
+        ("coder.host_view", "warn"),
+    ]
+    assert "stale" in report.checks[0].detail and "fstab" in report.checks[1].detail
 
 
-def test_list_includes_mode_column_per_acl_perms(
-    cfg_with_coder: AgentsConfig, saved_config: Path, mocker: Any
+# ---------- lifecycle guards ----------
+
+
+def test_remove_and_rename_refuse_while_a_view_is_registered(
+    cfg_with_coder: AgentsConfig, saved_config: Path, mounts: FakeMounts, mocker: Any
 ) -> None:
-    """The mode column tells the user whether they granted r or rw —
-    the ok/missing status alone doesn't say which permission set is
-    in effect. Mirrors the coder ergonomics issue from 2026-05-17.
-    """
-    mocker.patch("agents_cli.permissions.assess_host_access", return_value="ok")
-    # The fixture creates dirs owned by uid 1000 (the test runner);
-    # force them to look subuid-owned so the ACL path runs.
-    from unittest.mock import MagicMock
-
-    mocker.patch.object(Path, "stat", lambda self, *a, **k: MagicMock(st_uid=100999))
-
-    def fake_perms(p: Path, uid: int) -> str | None:
-        # coder granted r-only, bob/.openclaw granted rwx, bob/workspace not granted.
-        if p.name == ".data":
-            return "r-x"
-        if p.name == ".openclaw":
-            return "rwx"
-        return None
-
-    mocker.patch("agents_cli.permissions.get_user_acl_perms", side_effect=fake_perms)
-    rows = access_cmd.list_access(agent=None, config_path=saved_config)
-    modes = {r["path"]: r["mode"] for r in rows}
-    assert modes[str(cfg_with_coder.paths.host_data_dir / "coder" / ".data")] == "r"
-    assert modes[str(cfg_with_coder.paths.host_data_dir / "bob" / ".openclaw")] == "rw"
-    assert modes[str(cfg_with_coder.paths.host_data_dir / "bob" / "workspace")] == "—"
-
-
-def test_list_marks_owner_when_host_user_owns_path(
-    cfg_with_coder: AgentsConfig, saved_config: Path, mocker: Any
-) -> None:
-    """No ACL is needed when the user owns the dir — show 'owner' so
-    the user isn't confused about whether they need to run grant."""
-
-    def fake_stat(self: Path, *args: Any, **kwargs: Any) -> Any:
-        from unittest.mock import MagicMock
-
-        # Pretend the dir is owned by uid 1000 (the host user).
-        return MagicMock(st_uid=1000)
-
-    mocker.patch.object(Path, "stat", fake_stat)
-    mocker.patch("agents_cli.permissions.assess_host_access", return_value="ok")
-    perms_mock = mocker.patch("agents_cli.permissions.get_user_acl_perms")
-    rows = access_cmd.list_access(agent="coder", config_path=saved_config)
-    assert rows
-    for r in rows:
-        assert r["mode"] == "owner"
-    # When the user already owns the path, no ACL lookup should happen
-    # — owner mode is the answer.
-    perms_mock.assert_not_called()
-
-
-def test_list_emits_plain_english_access_column(
-    cfg_with_coder: AgentsConfig, saved_config: Path, mocker: Any
-) -> None:
-    """The user-facing column answers "can I read this?" in plain
-    English: 'yes' for ok, 'no' for both missing AND masked. The
-    internal ``status`` field keeps the distinction so the doctor +
-    remediation hint can differ.
-    """
-    from unittest.mock import MagicMock
-
-    mocker.patch.object(Path, "stat", lambda self, *a, **k: MagicMock(st_uid=100999))
-
-    def fake_assess(p: Path, uid: int) -> str:
-        # Three dirs → three different statuses.
-        if p.name == ".data":
-            return "ok"
-        if p.name == ".openclaw":
-            return "masked"
-        return "missing"
-
-    mocker.patch("agents_cli.permissions.assess_host_access", side_effect=fake_assess)
-    mocker.patch("agents_cli.permissions.get_user_acl_perms", return_value="r-x")
-    rows = access_cmd.list_access(agent=None, config_path=saved_config)
-    access_by_path = {r["path"]: r["access"] for r in rows}
-    assert access_by_path[str(cfg_with_coder.paths.host_data_dir / "coder" / ".data")] == "yes"
-    assert access_by_path[str(cfg_with_coder.paths.host_data_dir / "bob" / ".openclaw")] == "no"
-    assert access_by_path[str(cfg_with_coder.paths.host_data_dir / "bob" / "workspace")] == "no"
-
-
-def test_list_prints_remediation_hint_for_masked_state(
-    cfg_with_coder: AgentsConfig, saved_config: Path, mocker: Any
-) -> None:
-    """The exact coder symptom — mode shows 'rw' but reads fail —
-    must come with a one-line remediation telling the user to re-run
-    the grant (which is what applies the m::rwx mask reset).
-    """
-    from unittest.mock import MagicMock
-
-    mocker.patch.object(Path, "stat", lambda self, *a, **k: MagicMock(st_uid=100999))
-    mocker.patch("agents_cli.permissions.assess_host_access", return_value="masked")
-    mocker.patch("agents_cli.permissions.get_user_acl_perms", return_value="rwx")
-    warn_mock = mocker.patch("agents_cli.ui.warn")
-    access_cmd.list_access(agent="coder", config_path=saved_config)
-    warn_calls = " ".join(call.args[0] for call in warn_mock.call_args_list)
-    assert "re-run" in warn_calls.lower()
-    assert "agents access grant coder" in warn_calls
-
-
-def test_list_prints_remediation_hint_for_missing_state(
-    cfg_with_coder: AgentsConfig, saved_config: Path, mocker: Any
-) -> None:
-    from unittest.mock import MagicMock
-
-    mocker.patch.object(Path, "stat", lambda self, *a, **k: MagicMock(st_uid=100999))
-    mocker.patch("agents_cli.permissions.assess_host_access", return_value="missing")
-    mocker.patch("agents_cli.permissions.get_user_acl_perms", return_value=None)
-    warn_mock = mocker.patch("agents_cli.ui.warn")
-    access_cmd.list_access(agent="coder", config_path=saved_config)
-    warn_calls = " ".join(call.args[0] for call in warn_mock.call_args_list)
-    assert "agents access grant coder" in warn_calls
-
-
-def test_list_omits_hint_when_everything_ok(
-    cfg_with_coder: AgentsConfig, saved_config: Path, mocker: Any
-) -> None:
-    """No noise below the table when there's nothing to fix."""
-    from unittest.mock import MagicMock
-
-    mocker.patch.object(Path, "stat", lambda self, *a, **k: MagicMock(st_uid=100999))
-    mocker.patch("agents_cli.permissions.assess_host_access", return_value="ok")
-    mocker.patch("agents_cli.permissions.get_user_acl_perms", return_value="r-x")
-    warn_mock = mocker.patch("agents_cli.ui.warn")
-    access_cmd.list_access(agent="coder", config_path=saved_config)
-    warn_mock.assert_not_called()
-
-
-def test_list_filtered_to_single_agent(
-    cfg_with_coder: AgentsConfig, saved_config: Path, mocker: Any
-) -> None:
-    mocker.patch("agents_cli.permissions.assess_host_access", return_value="ok")
-    rows = access_cmd.list_access(agent="coder", config_path=saved_config)
-    assert {r["agent"] for r in rows} == {"coder"}
+    access_cmd.mount(agent="coder", writable=False, yes=True, config_path=saved_config)
+    stop = mocker.patch("agents_cli.compose_runner.stop")
+    with pytest.raises(UserError, match="agents access unmount coder"):
+        agents_cmd.remove("coder", yes=True, config_path=saved_config)
+    with pytest.raises(UserError, match="agents access unmount coder"):
+        agents_cmd.rename("coder", "alfie", yes=True, config_path=saved_config)
+    stop.assert_not_called()
+    # --keep-data leaves the directory (and so the view) intact: allowed past the guard.
+    access_cmd.refuse_if_view_registered(cfg_with_coder, "bob", "remove 'bob'")
 
 
 # ---------- auto_grant_on_create hook ----------

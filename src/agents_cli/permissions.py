@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import os
 import pwd
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -289,13 +290,13 @@ def run_with_sudo(argvs: Sequence[Sequence[str]], *, yes: bool) -> None:
         return
     if not shutil.which("sudo"):
         raise UserError(
-            "sudo not available; can't apply ACL on a subuid-owned path. "
+            "sudo not available; this step needs root. "
             "Run the commands manually after logging in as root:\n  "
             + "\n  ".join("sudo " + " ".join(a) for a in argvs)
         )
     ui.progress("The toolkit will run (sudo will prompt for your password if not cached):")
     for argv in argvs:
-        ui.progress("  sudo " + " ".join(argv))
+        ui.progress("  sudo " + shlex.join(argv))
     if not yes and not ui.confirm("apply now?", default=True):
         raise UserError("aborted by user")
     for idx, argv in enumerate(argvs):
@@ -303,21 +304,19 @@ def run_with_sudo(argvs: Sequence[Sequence[str]], *, yes: bool) -> None:
         if proc.returncode != 0:
             # sudo's own auth-failure rc is 1 with the explanation
             # already on stderr (which we let through unredirected).
-            # If we never got to the first setfacl, nothing has been
-            # applied; if we're past the first, partial state is
-            # possible. Surface both cases distinctly so the user
-            # knows whether they need to re-run grant or revoke.
+            # If we never got past the first command, nothing has been
+            # applied; after that, partial state is possible. Surface
+            # both cases distinctly.
             if idx == 0:
                 raise UserError(
-                    f"sudo failed before any ACL was applied (exit {proc.returncode}). "
+                    f"sudo failed before anything was applied (exit {proc.returncode}). "
                     "Common cause: no interactive TTY for the sudo password prompt. "
                     "Run this from your shell instead of a non-interactive context, "
                     "or pre-cache sudo with `sudo -v` first."
                 )
             raise RuntimeFailure(
-                f"sudo setfacl exited {proc.returncode} after applying {idx} of "
-                f"{len(argvs)} commands. Some entries may be partially applied; "
-                "inspect with `getfacl <path>` and re-run `agents access grant` to converge."
+                f"`sudo {' '.join(argv)}` exited {proc.returncode} after {idx} of "
+                f"{len(argvs)} commands had been applied; state may be partial."
             )
 
 

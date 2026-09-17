@@ -85,6 +85,9 @@ class PathsConfig(BaseModel):
     host_data_dir: Path
     vm_agents_root: Path = Path("/home/ubuntu/agents")
     data_dir_in_vm: bool = False
+    # Root for `agents access mount` views. Unset = ``~/agents-view``
+    # (resolved at use time and never written back to config.toml).
+    host_view_dir: Path | None = None
 
     @field_validator("host_data_dir", mode="before")
     @classmethod
@@ -95,6 +98,16 @@ class PathsConfig(BaseModel):
         if not p.is_absolute():
             raise ValueError(f"host_data_dir must be absolute: {v}")
         _refuse_forbidden_data_dir(p)
+        return p
+
+    @field_validator("host_view_dir", mode="before")
+    @classmethod
+    def _resolve_host_view_dir(cls, v: Any) -> Path | None:
+        if v is None or v == "":
+            return None
+        p = Path(str(v)).expanduser()
+        if not p.is_absolute():
+            raise ValueError(f"host_view_dir must be absolute: {v}")
         return p
 
     @field_validator("vm_agents_root", mode="before")
@@ -362,7 +375,8 @@ def _toml_to_plain(obj: Any) -> Any:
 
 def _model_to_plain(cfg: AgentsConfig) -> dict[str, Any]:
     """Pydantic dump with Paths coerced to strings (tomlkit doesn't grok PosixPath)."""
-    data = cfg.model_dump(mode="json")
+    # exclude_none: TOML has no null, and unset optionals must stay unset.
+    data: dict[str, Any] = cfg.model_dump(mode="json", exclude_none=True)
     return data
 
 

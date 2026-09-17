@@ -1687,63 +1687,54 @@ def mount_list(agent: str | None) -> None:
     _run(mounts_cmd.list_mounts, agent=agent, config_path=cfg_mod.DEFAULT_CONFIG_PATH)
 
 
-# ---------- access (host-user ACL on agent data dirs) ----------
+# ---------- access (idmapped host view of an agent's state) ----------
 
 
 @main.group("access")
 def access_group() -> None:
-    """Grant the host user access to an agent's data dir.
+    """Read (or edit) an agent's files from the host via a mounted view.
 
-    Rootless Docker writes the agent's files at a subuid (e.g. host
-    uid 100999 for container uid 1000), so the host user can't read
-    or edit them without sudo. ``agents access grant`` adds a POSIX
-    ACL granting the host user access; the default-ACL bit makes the
-    grant survive container recreates.
-
-    New agents (created with this version of the toolkit) get this
-    automatically at ``agents create`` time — only pre-existing
-    agents need an explicit ``grant``.
-
-    No-op on the bare_metal backend (container uid maps to the host
-    user; files are already accessible).
+    The agent's container writes its state as a rootless-Docker subuid
+    under mode 700, which the host user can't open. ``access mount``
+    bind-mounts that directory at ``~/agents-view/<agent>`` with the owner
+    ids swapped (an idmapped mount), so through the view you are the
+    owner — immune to the chmod/ACL-mask drift the old ``access grant``
+    suffered from. For a quick edit without any mount: ``agents edit``.
     """
 
 
-@access_group.command("grant")
+@access_group.command("mount")
 @click.argument("agent")
-@click.option(
-    "--rw",
-    "writable",
-    is_flag=True,
-    help="Grant read-write (default: read-only).",
-)
+@click.option("--rw", "writable", is_flag=True, help="Mount read-write (default: read-only).")
 @click.option("-y", "--yes", "yes_local", is_flag=True, help="Skip the sudo confirmation.")
 @click.pass_context
-def access_grant(ctx: click.Context, agent: str, writable: bool, yes_local: bool) -> None:
-    """Grant the host user access to ``agent``'s data dir.
+def access_mount(ctx: click.Context, agent: str, writable: bool, yes_local: bool) -> None:
+    """Mount a host view of AGENT's state under the view root.
 
-    Requires sudo (the dir is owned by a rootless-Docker subuid).
-    The exact ``setfacl`` commands are printed before sudo runs.
+    Needs sudo once (mounting is root-only); the exact command is printed
+    before it runs. Always nosymfollow,nosuid,nodev,noexec. Prints a
+    ``nofail`` /etc/fstab line to make the view survive reboots — the
+    toolkit never edits /etc itself.
     """
     yes = yes_local or ctx.obj.get("yes", False)
-    _run(access_cmd.grant, agent=agent, writable=writable, yes=yes)
+    _run(access_cmd.mount, agent=agent, writable=writable, yes=yes)
 
 
-@access_group.command("revoke")
+@access_group.command("unmount")
 @click.argument("agent")
 @click.option("-y", "--yes", "yes_local", is_flag=True, help="Skip the sudo confirmation.")
 @click.pass_context
-def access_revoke(ctx: click.Context, agent: str, yes_local: bool) -> None:
-    """Drop the host-user ACL from ``agent``'s data dir."""
+def access_unmount(ctx: click.Context, agent: str, yes_local: bool) -> None:
+    """Unmount AGENT's host view(s) and remove the empty mountpoint."""
     yes = yes_local or ctx.obj.get("yes", False)
-    _run(access_cmd.revoke, agent=agent, yes=yes)
+    _run(access_cmd.unmount, agent=agent, yes=yes)
 
 
 @access_group.command("list")
 @click.argument("agent", required=False)
 def access_list(agent: str | None) -> None:
-    """Show per-agent ACL status (ok / missing)."""
-    _run(access_cmd.list_access, agent=agent)
+    """Show registered host views and whether each is mounted."""
+    _run(access_cmd.list_views, agent=agent)
 
 
 # ---------- config (read-only convenience) ----------

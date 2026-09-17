@@ -1,66 +1,69 @@
-"""``agents access`` — let the host user read/write the agent's data.
+"""``agents access`` — read (or edit) an agent's files from the host.
 
-The agent's runtime container writes files at rootless-Docker subuid
-(e.g. host uid 100999 for container uid 1000), which the host user
-can't read or edit without sudo. This module wraps ``setfacl`` to
-grant the host user an ACL entry on the agent's data subtree,
-surviving container recreates because the default ACL on the
-directory makes new files inherit the grant.
+The agent's runtime container writes its state as a rootless-Docker
+subuid (e.g. host uid 100999 for container uid 1000) under mode 700, so
+the host user can't open it. The userns map is bijective and the host
+uid is already taken by container root, so ownership can't be fixed at
+the source; and POSIX ACLs — what this command used to manage — don't
+hold: a ``mkdir(0700)`` under a default ACL is born with ``mask::---``.
 
-Three commands:
+Instead this mounts an **idmapped bind-mount view** of the state dir at
+``<view-root>/<agent>`` (default ``~/agents-view``) with the owner ids
+swapped: through the view the host user simply is the owner, whatever
+the mode bits or a later ``chmod`` say. The data itself is untouched.
 
-- ``agents access grant <agent> [--rw]`` — add the ACL. ``setfacl``
-  on a subuid-owned path needs sudo; the toolkit prints the exact
-  command and confirms before running unless ``--yes``.
-- ``agents access revoke <agent>`` — drop the toolkit's ACL entry.
-- ``agents access list [<agent>]`` — show current ACL state per
-  agent (``ok`` / ``missing``).
+- ``agents access mount <agent> [--rw]`` — one printed + confirmed
+  ``sudo mount``. Read-only unless ``--rw``. Always ``nosymfollow``
+  (agent-planted symlinks must not resolve in the host namespace),
+  ``nosuid,nodev,noexec``. Prints a ``nofail`` fstab line for
+  persistence — the toolkit never edits ``/etc``.
+- ``agents access unmount <agent>`` — ``sudo umount`` + plain ``rmdir``.
+  NEVER a recursive delete of a view path: it is the real data.
+- ``agents access list [<agent>]`` — registered views and their state.
 
-On bare-metal where the container uid maps back to the host user
-1:1, this is a no-op + informational message. Granting requires no
-sudo because the dir is already host-owned. Revoking is similarly a
-no-op.
+Registered views live in ``<data-dir>/.access-views.json`` (opt-in gate
+for the doctor check, like the tailscale/firecrawl state files). Mount
+state is read from ``/proc/self/mountinfo`` — ``os.path.ismount`` can't
+see a bind mount on the same filesystem.
 
-See also: :mod:`agents_cli.mounts_cmd` auto-applies the symmetric
-ACL (host folder → agent's subuid) so `agents mount add` works
-bidirectionally without a separate command.
+Not available under ``--data-dir-in-vm`` (nothing on the host to view).
+For quick edits without any mount, see ``agents edit``.
 """
 
 from __future__ import annotations
 
+import json
 import os
+import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from agents_cli import agents_cmd, compose, permissions, ui
+from agents_cli import agents_cmd, compose, idmap_view, permissions, ui
 from agents_cli import config as cfg_mod
 from agents_cli.config import AgentsConfig
-from agents_cli.errors import UserError
+from agents_cli.errors import RuntimeFailure, UserError
+
+STATE_FILE = ".access-views.json"
+DEFAULT_VIEW_ROOT = "~/agents-view"
 
 # ---------- target-path resolution ----------
 
 
-def _agent_dirs(cfg: AgentsConfig, agent: str, agent_type: str) -> list[Path]:
-    """The host-side directories ``agents access`` operates on.
-
-    For Hermes that's just ``<agent>/.data/`` (the bind-mount target
-    for ``/opt/data``). For OpenClaw it's ``<agent>/.openclaw/`` AND
-    ``<agent>/workspace/`` — the workspace is the one a user usually
-    wants to peek at, but granting both is the consistent default
-    (carving sub-scopes adds CLI surface for no clear win).
-
-    Returns only directories that actually exist on disk — silently
-    skips any the agent never produced. Refuses on
-    ``data_dir_in_vm`` mode (the dirs live inside the VM disk; ACLs
-    don't propagate across the boundary in any useful way; users on
-    that mode should `agents export` and read the tarball instead).
-    """
+def _refuse_data_dir_in_vm(cfg: AgentsConfig) -> None:
     if cfg.paths.data_dir_in_vm:
         raise UserError(
-            "agents access is not supported in --data-dir-in-vm mode "
-            "(the data lives inside the VM disk; host ACLs don't apply). "
-            "Use `agents export` to pull a host-readable archive."
+            "agents access is not supported in --data-dir-in-vm mode (the data lives "
+            "on the VM disk; there is nothing on the host to view). Use `agents edit`, "
+            "`agents exec`, or `agents export`."
         )
+
+
+def _agent_dirs(cfg: AgentsConfig, agent: str, agent_type: str) -> list[Path]:
+    """The runtime-owned directories of an agent on the host: Hermes
+    ``<agent>/.data``; OpenClaw ``<agent>/.openclaw`` + ``<agent>/workspace``.
+    Only those that exist."""
+    _refuse_data_dir_in_vm(cfg)
     root = cfg.paths.host_data_dir / agent
     if agent_type == "hermes":
         candidates = [root / ".data"]
@@ -84,280 +87,341 @@ def _resolve_agent(cfg: AgentsConfig, agent: str) -> tuple[str, str, list[Path]]
     raise UserError(f"no agent named {agent!r} in the compose file")
 
 
-def _bare_metal_noop_warning(cfg: AgentsConfig) -> None:
-    """Bare-metal: the container uid maps back to the host user (1:1),
-    so files are already host-owned. This is informational, not an
-    error — calling grant/revoke is benign.
-    """
-    if cfg.vm.backend == "bare_metal":
-        ui.warn(
-            "bare_metal backend: the container runs as your host user; "
-            "files in the agent's data dir are already accessible without "
-            "an ACL. This command is a no-op here."
-        )
-
-
-# ---------- grant ----------
-
-
-def _readable_access_label(status: str) -> str:
-    """Translate an :func:`permissions.assess_host_access` status into
-    a plain-English answer to "can I read this from the host right now?".
-
-    The internal vocabulary distinguishes ``masked`` (ACL exists but
-    is zeroed by the POSIX mask) from ``missing`` (no ACL at all) so
-    the remediation hint can differ. The user-facing column collapses
-    both into a single ``no`` — what they want to know is whether
-    reads work, not the POSIX-ACL theory.
-    """
-    return {
-        "ok": "yes",
-        "missing": "no",
-        "masked": "no",
-        "path-missing": "?",
-    }.get(status, status)
-
-
-def _print_remediation_hints(rows: list[dict[str, Any]]) -> None:
-    """For any non-ok rows, print a one-line remediation per agent
-    BELOW the table. Keeps the table compact while still telling the
-    user how to fix what's broken.
-    """
-    by_agent: dict[str, list[str]] = {}
-    for r in rows:
-        if r["status"] == "ok":
-            continue
-        hint: str | None
-        if r["status"] == "missing":
-            hint = f"no grant — run `agents access grant {r['agent']}` to enable host reads"
-        elif r["status"] == "masked":
-            hint = (
-                f"grant exists but masked → reads blocked. Re-run "
-                f"`agents access grant {r['agent']}` (or with --rw) to apply the "
-                f"mask reset and unblock reads."
-            )
-        elif r["status"] == "path-missing":
-            hint = f"data dir missing — start the agent first: `agents start {r['agent']}`"
-        else:
-            hint = None
-        if hint:
-            by_agent.setdefault(r["agent"], []).append(hint)
-    if not by_agent:
-        return
-    lines = []
-    for agent, hints in by_agent.items():
-        # De-dup hints per agent (e.g. OpenClaw has two dirs that
-        # usually fail the same way).
-        for h in dict.fromkeys(hints):
-            lines.append(f"  {agent}: {h}")
-    ui.warn("hint:\n" + "\n".join(lines))
-
-
-def _refuse_data_dir_in_vm(cfg: AgentsConfig) -> None:
-    if cfg.paths.data_dir_in_vm:
+def view_root(cfg: AgentsConfig) -> Path:
+    """The views' parent dir. Must not nest with the data dir in either
+    direction: a view inside it would be re-exported into the VM over
+    the share (and archived twice); the data dir inside the view root
+    would mount views over themselves."""
+    root = (cfg.paths.host_view_dir or Path(DEFAULT_VIEW_ROOT).expanduser()).resolve()
+    data = cfg.paths.host_data_dir.resolve()
+    if root == data or data in root.parents or root in data.parents:
         raise UserError(
-            "agents access is not supported in --data-dir-in-vm mode "
-            "(the data lives inside the VM disk; host ACLs don't apply). "
-            "Use `agents export` to pull a host-readable archive."
+            f"[paths].host_view_dir ({root}) must not contain, or be inside, the data dir ({data})"
+        )
+    return root
+
+
+def _view_path(cfg: AgentsConfig, agent: str, agent_type: str, source: Path) -> Path:
+    base = view_root(cfg) / agent
+    return base if agent_type == "hermes" else base / source.name.lstrip(".")
+
+
+# ---------- state file ----------
+
+
+@dataclass(frozen=True)
+class View:
+    agent: str
+    source: Path
+    view: Path
+    writable: bool
+
+    def to_json(self) -> dict[str, Any]:
+        return {"source": str(self.source), "view": str(self.view), "rw": self.writable}
+
+
+def _state_path(cfg: AgentsConfig) -> Path:
+    return cfg.paths.host_data_dir / STATE_FILE
+
+
+def registered_views(cfg: AgentsConfig, agent: str | None = None) -> list[View]:
+    path = _state_path(cfg)
+    if not path.exists():
+        return []
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    views = [
+        View(name, Path(item["source"]), Path(item["view"]), bool(item.get("rw", False)))
+        for name, items in (raw.get("views") or {}).items()
+        for item in items
+        if isinstance(item, dict) and "source" in item and "view" in item
+    ]
+    return [v for v in views if agent is None or v.agent == agent]
+
+
+def _save_views(cfg: AgentsConfig, views: list[View]) -> None:
+    path = _state_path(cfg)
+    if not views:
+        path.unlink(missing_ok=True)
+        return
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for v in views:
+        grouped.setdefault(v.agent, []).append(v.to_json())
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps({"views": grouped}, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def refuse_if_view_registered(cfg: AgentsConfig, agent: str | None, action: str) -> None:
+    """Lifecycle guard: a view pins the directory it was made from, so
+    removing/renaming/migrating underneath it leaves a stale mount (and a
+    stale fstab line) pointing at deleted data."""
+    if cfg.paths.data_dir_in_vm:
+        return
+    views = registered_views(cfg, agent)
+    if views:
+        names = sorted({v.agent for v in views})
+        raise UserError(
+            f"cannot {action}: host view(s) registered for {', '.join(names)}. Run "
+            + " / ".join(f"`agents access unmount {n}`" for n in names)
+            + " first (and drop the matching /etc/fstab line)."
         )
 
 
-def grant(
+# ---------- mount ----------
+
+
+def _owner_ids(source: Path) -> tuple[int, int]:
+    st = source.stat()  # stat needs no permission on the dir itself
+    return st.st_uid, st.st_gid
+
+
+def _spec_for(cfg: AgentsConfig, source: Path) -> str | None:
+    """idmap spec from the ids actually on disk; None when the host user
+    already owns ``source`` (nothing to map — e.g. a host-created
+    OpenClaw ``workspace``)."""
+    disk_uid, disk_gid = _owner_ids(source)
+    if disk_uid == cfg.host.uid:
+        return None
+    return idmap_view.idmap_spec(
+        host_uid=cfg.host.uid, host_gid=cfg.host.gid, disk_uid=disk_uid, disk_gid=disk_gid
+    )
+
+
+def _prepare_view_dir(view: Path, root: Path) -> None:
+    """Create the mountpoint as the invoking user. Every component from
+    the view root down must be a real directory — the mount itself runs
+    as root, and a symlink here would aim it somewhere else."""
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    rel = view.relative_to(root)
+    current = root
+    for part in ("", *rel.parts):
+        current = current / part if part else current
+        if current.is_symlink():
+            raise UserError(f"refusing: {current} is a symlink")
+        current.mkdir(exist_ok=True)
+    if any(view.iterdir()):
+        raise UserError(f"refusing to mount over non-empty directory {view}")
+
+
+def _fstab_hint(lines: list[str], root: Path) -> str:
+    return (
+        "to keep the view across reboots, add to /etc/fstab:\n"
+        + "\n".join(f"  {line}" for line in lines)
+        + f"\nexclude {root} from host backups (duplicity etc.) — it is a second path "
+        "to the same data, secrets included. Never open *.db files through the view "
+        "while the agent runs."
+    )
+
+
+def mount(
     *,
     agent: str,
     writable: bool,
     yes: bool,
     config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH,
 ) -> None:
-    """Add a recursive ACL on the agent's data subtree granting the
-    host user access. Also sets the default ACL so future files the
-    agent creates inherit the grant.
-
-    Targets per agent type:
-
-    - Hermes: ``<agent>/.data/``
-    - OpenClaw: ``<agent>/.openclaw/`` and ``<agent>/workspace/``
-
-    Requires sudo (path is subuid-owned). With ``yes=True`` skips the
-    confirmation; otherwise prints the exact ``setfacl`` argv and
-    confirms.
-    """
+    agents_cmd.validate_name(agent)
     cfg = cfg_mod.load(config_path)
     _refuse_data_dir_in_vm(cfg)
-    _, _, dirs = _resolve_agent(cfg, agent)
+    _, agent_type, dirs = _resolve_agent(cfg, agent)
     if not dirs:
         raise UserError(
             f"agent {agent!r} has no on-disk data dir yet — bring it up first "
-            f"(`agents start {agent}`) so the entrypoint can create it."
+            f"(`agents start {agent}`)."
         )
+    root = view_root(cfg)
 
-    _bare_metal_noop_warning(cfg)
-    if cfg.vm.backend == "bare_metal":
-        # Files are already host-owned; nothing for setfacl to do.
-        ui.emit({"agent": agent, "action": "grant", "noop": True}, human=f"{agent}: nothing to do")
-        return
+    with compose.acquire_lock(cfg.paths.host_data_dir):
+        entries = idmap_view.read_mountinfo()
+        planned: list[tuple[View, str]] = []
+        already: list[View] = []
+        for source in dirs:
+            if source.is_symlink():
+                raise UserError(f"refusing: {source} is a symlink")
+            spec = _spec_for(cfg, source)
+            if spec is None:
+                ui.info(f"{source} is already owned by you; no view needed")
+                continue
+            view = View(agent, source, _view_path(cfg, agent, agent_type, source), writable)
+            status = idmap_view.view_status(entries, source, view.view)
+            if status == "mounted":
+                current = idmap_view.mount_at(entries, view.view)
+                if current is not None and ("rw" in current.options) != writable:
+                    raise UserError(
+                        f"{view.view} is already mounted "
+                        f"{'read-write' if 'rw' in current.options else 'read-only'}; run "
+                        f"`agents access unmount {agent}` first to change the mode."
+                    )
+                already.append(view)
+                continue
+            if status != "not-mounted":
+                raise UserError(
+                    f"{view.view} holds a {status} mount; run `agents access unmount "
+                    f"{agent}` first."
+                )
+            _prepare_view_dir(view.view, root)
+            planned.append((view, idmap_view.mount_options(spec, writable=writable)))
 
-    recipient = permissions.host_user_recipient(cfg.host.uid, writable=writable)
-    all_cmds: list[list[str]] = []
-    for d in dirs:
-        ok, err = permissions.probe_acl_support(d)
-        if not ok:
-            raise UserError(
-                f"filesystem under {d} doesn't support ACLs: {err}. "
-                "Move the data dir to an ext4/btrfs/zfs filesystem, "
-                "or use `agents export` for host-side reads."
-            )
-        all_cmds.extend(
-            permissions.apply_acl_argv(d, recipients=[recipient], recurse=True, defaults=True)
-        )
+        done: list[View] = []
+        try:
+            for view, options in planned:
+                permissions.run_with_sudo(
+                    [["mount", "--bind", "-o", options, str(view.source), str(view.view)]],
+                    yes=yes,
+                )
+                done.append(view)
+            entries = idmap_view.read_mountinfo()
+            for view in done:
+                if idmap_view.view_status(entries, view.source, view.view) != "mounted":
+                    raise RuntimeFailure(
+                        f"mount of {view.view} reported success but no idmapped view of "
+                        f"{view.source} is visible there"
+                    )
+        except BaseException:
+            for view in done:  # roll back this call's mounts; never leave half an agent
+                subprocess.run(["sudo", "umount", str(view.view)], check=False)
+            for view, _ in planned:
+                _rmdir_quietly(view.view, root)
+            raise
 
-    permissions.run_with_sudo(all_cmds, yes=yes)
+        active = [*already, *done]
+        others = [v for v in registered_views(cfg) if v.agent != agent]
+        _save_views(cfg, [*others, *active])
 
+    lines = [line for v in active if (line := _fstab_line_for(cfg, v)) is not None]
     ui.emit(
         {
             "agent": agent,
-            "action": "grant",
+            "action": "mount",
             "writable": writable,
-            "host_uid": cfg.host.uid,
-            "paths": [str(d) for d in dirs],
+            "views": [v.to_json() for v in active],
+            "fstab_lines": lines,
+            "view_root": str(root),
         },
         human=(
-            f"granted host user (uid {cfg.host.uid}) {'rw' if writable else 'r'} access to:\n"
-            + "\n".join(f"  {d}" for d in dirs)
+            (f"mounted {'read-write' if writable else 'read-only'} view(s):\n" if active else "")
+            + "\n".join(f"  {v.view}  ->  {v.source}" for v in active)
+            + ("\n" + _fstab_hint(lines, root) if active else "nothing to mount")
         ),
     )
 
 
-# ---------- revoke ----------
+# ---------- unmount ----------
 
 
-def revoke(
+def _rmdir_quietly(view: Path, root: Path) -> None:
+    """Plain ``rmdir`` of the (now empty) mountpoint and its empty
+    parents up to the view root. Never recursive: a view path shares its
+    ``st_dev`` with the data, so a recursive delete of a still-mounted
+    view would be a delete of the agent's state."""
+    for p in (view, *view.parents):
+        if p == root or root not in p.parents:
+            break
+        try:
+            p.rmdir()
+        except OSError:
+            break
+
+
+def unmount(
     *,
     agent: str,
     yes: bool,
     config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH,
 ) -> None:
-    """Remove the host user's ACL entries on the agent's data subtree.
-
-    Does NOT touch unrelated ACL entries — only the toolkit-added
-    ``u:<host_uid>:`` entries (both access and default). User-set
-    ACLs and any third-party-added ACLs stay put.
-    """
+    """Works from the state file and the live mount table — the agent
+    may already be gone from compose."""
+    agents_cmd.validate_name(agent)
     cfg = cfg_mod.load(config_path)
-    _refuse_data_dir_in_vm(cfg)
-    _, _, dirs = _resolve_agent(cfg, agent)
-    if not dirs:
-        raise UserError(f"agent {agent!r} has no on-disk data dir to revoke ACL on")
+    root = view_root(cfg)
 
-    _bare_metal_noop_warning(cfg)
-    if cfg.vm.backend == "bare_metal":
-        ui.emit({"agent": agent, "action": "revoke", "noop": True}, human=f"{agent}: nothing to do")
-        return
-
-    # Build a no-perms recipient; remove_acl_argv only uses the uid.
-    recipient = permissions.AclRecipient(uid=cfg.host.uid, perms="")
-    all_cmds: list[list[str]] = []
-    for d in dirs:
-        all_cmds.extend(
-            permissions.remove_acl_argv(d, recipients=[recipient], recurse=True, defaults=True)
-        )
-
-    permissions.run_with_sudo(all_cmds, yes=yes)
+    with compose.acquire_lock(cfg.paths.host_data_dir):
+        base = root / agent
+        entries = idmap_view.read_mountinfo()
+        mounted = [
+            Path(e.mount_point)
+            for e in entries
+            if Path(e.mount_point) == base or base in Path(e.mount_point).parents
+        ]
+        # Deepest first, and once per stacked mount.
+        mounted.sort(key=lambda p: len(p.parts), reverse=True)
+        if mounted:
+            permissions.run_with_sudo([["umount", str(p)] for p in mounted], yes=yes)
+        still = {e.mount_point for e in idmap_view.read_mountinfo()}
+        for view in {*mounted, *(v.view for v in registered_views(cfg, agent))}:
+            if str(view) not in still:
+                _rmdir_quietly(view, root)
+        _save_views(cfg, [v for v in registered_views(cfg) if v.agent != agent])
 
     ui.emit(
-        {
-            "agent": agent,
-            "action": "revoke",
-            "host_uid": cfg.host.uid,
-            "paths": [str(d) for d in dirs],
-        },
+        {"agent": agent, "action": "unmount", "unmounted": [str(p) for p in mounted]},
         human=(
-            f"revoked host user (uid {cfg.host.uid}) ACL on:\n" + "\n".join(f"  {d}" for d in dirs)
-        ),
+            "unmounted:\n" + "\n".join(f"  {p}" for p in mounted)
+            if mounted
+            else f"no view mounted for {agent!r}"
+        )
+        + f"\nremember to drop any /etc/fstab line for {base}",
     )
 
 
 # ---------- list ----------
 
 
-def list_access(
+def _fstab_line_for(cfg: AgentsConfig, v: View) -> str | None:
+    try:
+        spec = _spec_for(cfg, v.source)
+    except (OSError, ValueError):
+        return None
+    if spec is None:
+        return None
+    return idmap_view.fstab_line(
+        v.source, v.view, idmap_view.mount_options(spec, writable=v.writable)
+    )
+
+
+def view_rows(cfg: AgentsConfig, agent: str | None = None) -> list[dict[str, Any]]:
+    entries = idmap_view.read_mountinfo()
+    rows = []
+    for v in registered_views(cfg, agent):
+        rows.append(
+            {
+                "agent": v.agent,
+                "view": str(v.view),
+                "source": str(v.source),
+                "mode": "rw" if v.writable else "ro",
+                "status": idmap_view.view_status(entries, v.source, v.view),
+                "fstab_line": _fstab_line_for(cfg, v),
+            }
+        )
+    return rows
+
+
+def list_views(
     *,
-    agent: str | None,
+    agent: str | None = None,
     config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH,
 ) -> list[dict[str, Any]]:
-    """Per-agent ACL status. ``ok`` if the host user has access (either
-    by ownership or ACL); ``missing`` if they'd hit EACCES.
-    """
     cfg = cfg_mod.load(config_path)
     _refuse_data_dir_in_vm(cfg)
-
-    if agent is not None:
-        _, _, dirs_per_agent = _resolve_agent(cfg, agent)
-        agents_to_probe = [(agent, dirs_per_agent)]
+    rows = view_rows(cfg, agent)
+    if ui.is_json():
+        ui.emit({"views": rows})
+    elif rows:
+        ui.table(rows, ["agent", "view", "mode", "status"])
+        for r in rows:
+            if r["status"] != "mounted":
+                ui.echo_human(
+                    f"{r['agent']}: {r['status']} — `agents access unmount {r['agent']}` then "
+                    f"`agents access mount {r['agent']}`"
+                    + (" (or add the fstab line it prints)" if r["status"] == "not-mounted" else "")
+                )
     else:
-        doc = compose.read_compose_doc(cfg)
-        services = (doc.get("services") or {}).keys()
-        agents_to_probe = []
-        for svc in services:
-            agent_type = agents_cmd._agent_type_from_service(svc)
-            if agent_type is None:
-                continue
-            name = agents_cmd._name_from_service(svc, agent_type)
-            try:
-                dirs = _agent_dirs(cfg, name, agent_type)
-            except UserError:
-                continue
-            agents_to_probe.append((name, dirs))
-
-    rows: list[dict[str, Any]] = []
-    for name, dirs in agents_to_probe:
-        for d in dirs:
-            status = permissions.assess_host_access(d, cfg.host.uid)
-            owner_uid: int | None
-            try:
-                owner_uid = d.stat().st_uid
-            except OSError:
-                owner_uid = None
-            # If the host user is the dir's owner, no ACL entry is
-            # involved — show "owner" as the mode for clarity.
-            if owner_uid == cfg.host.uid:
-                mode = "owner"
-                perms: str | None = None
-            else:
-                perms = permissions.get_user_acl_perms(d, cfg.host.uid)
-                mode = permissions.summarize_acl_mode(perms)
-            rows.append(
-                {
-                    "agent": name,
-                    "path": str(d),
-                    "owner_uid": owner_uid,
-                    "host_uid": cfg.host.uid,
-                    "mode": mode,
-                    "perms": perms,
-                    "status": status,
-                    "access": _readable_access_label(status),
-                }
-            )
-
-    if rows:
-        ui.table(
-            [
-                {
-                    "agent": r["agent"],
-                    "path": r["path"],
-                    "owner": r["owner_uid"] if r["owner_uid"] is not None else "?",
-                    "mode": r["mode"],
-                    "host can read?": r["access"],
-                }
-                for r in rows
-            ],
-            ["agent", "path", "owner", "mode", "host can read?"],
-        )
-        _print_remediation_hints(rows)
-    else:
-        ui.emit(
-            {"agent": agent, "entries": []},
-            human=f"no data dirs to probe for {agent or '<all agents>'}",
+        ui.echo_human(
+            "no host views registered — `agents access mount <agent>` creates one "
+            "(`agents edit <agent> <path>` needs none)."
         )
     return rows
 
