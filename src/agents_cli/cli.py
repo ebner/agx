@@ -21,6 +21,7 @@ from agents_cli import (
     access_cmd,
     agents_cmd,
     conversations_cmd,
+    edit_cmd,
     export_cmd,
     firecrawl_cmd,
     fixperms_cmd,
@@ -1210,6 +1211,30 @@ def profile_list(agent: str) -> None:
     inside the container: ``agents exec <agent> hermes profile create <p>``.
     """
     _run(profile_cmd.list_profiles, agent)
+
+
+# ---------- edit ----------
+
+
+@main.command("edit")
+@click.argument("agent")
+@click.argument("path")
+@click.option(
+    "--profile",
+    default=None,
+    help="Resolve PATH inside this named profile's home instead of /opt/data.",
+)
+def edit(agent: str, path: str, profile: str | None) -> None:
+    """Edit one of a Hermes agent's text files in $VISUAL/$EDITOR.
+
+    PATH is relative to the agent's /opt/data (e.g. ``SOUL.md``,
+    ``skills/<id>/SKILL.md``). The file is read and written through the
+    running container as its runtime user — no sudo and no host access to
+    the subuid-owned data dir needed. ``config.yaml`` edits go through the
+    same validation as every other toolkit config write (a ``0.0.0.0``
+    dashboard bind is refused). Needs an interactive terminal.
+    """
+    _run(edit_cmd.edit, agent=agent, path=path, profile=profile)
 
 
 # ---------- tailscale ----------

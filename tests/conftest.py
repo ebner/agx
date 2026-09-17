@@ -170,13 +170,15 @@ def install_vm_fs_simulation(mocker, cfg: AgentsConfig) -> dict:
         inner = cmd
         if stripped is not None:
             inner, svc = stripped
+        # ``sh -c '[umask 077; ]cat > "$1"' sh FILE`` — FILE rides in as
+        # a positional parameter so it never becomes shell text.
         if (
-            len(inner) >= 3
+            len(inner) >= 5
             and inner[0] == "sh"
             and inner[1] == "-c"
-            and inner[2].startswith("cat > ")
+            and inner[2].endswith('cat > "$1"')
         ):
-            path = inner[2][len("cat > ") :].strip()
+            path = inner[4]
             dst = _container_path(svc, path) if svc else host_path(path)
             dst.parent.mkdir(parents=True, exist_ok=True)
             dst.write_bytes(input_bytes)

@@ -224,7 +224,10 @@ def write_atomically(
     # user; the content is piped via stdin so it never appears on the argv
     # (avoiding both quoting hell and process-listing leaks for sensitive
     # config like API keys).
-    write_argv = _compose_exec_in_vm_argv(cfg, svc, "sh", "-c", f"cat > {stage}", no_tty=True)
+    # The stage path is a positional parameter, not shell text.
+    write_argv = _compose_exec_in_vm_argv(
+        cfg, svc, "sh", "-c", 'cat > "$1"', "sh", stage, no_tty=True
+    )
     write = mp.exec_in_vm_with_stdin(cfg.vm.name, *write_argv, input_bytes=content, check=False)
     if write.returncode != 0:
         err = (write.stderr or "").lower()
