@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from agents_cli import config as cfg_mod
-from agents_cli import export_cmd
+from agents_cli import export_cmd, mp
 from agents_cli.agents_cmd import create
 from agents_cli.config import AgentsConfig, DefaultsConfig, HostConfig, PathsConfig, VmRuntimeConfig
 from agents_cli.errors import RuntimeFailure, UserError
@@ -72,6 +72,29 @@ def test_export_writes_archive_into_backups_dir(with_coder: Path, cfg: AgentsCon
     extract_tar_zst(archive, extract_dest)
     extracted = list(extract_dest.rglob("*"))
     assert any(p.name == "state.db" for p in extracted)
+
+
+def test_export_in_vm_mode_tars_as_root_and_captures_agent_state(
+    with_coder: Path, cfg: AgentsConfig, saved_config: Path, mocker
+) -> None:
+    """``--data-dir-in-vm``: the state subtree is subuid-owned under mode
+    700 on the VM disk. The unprivileged tar + ``--ignore-failed-read``
+    this branch used to run produced a "successful" archive without it."""
+    from agents_cli.archive import extract_tar_zst
+
+    cfg.paths.data_dir_in_vm = True
+    cfg_mod.save(cfg, saved_config)
+    exec_bash = mocker.spy(mp, "exec_bash")
+
+    archive = export_cmd.export("coder", config_path=saved_config)
+
+    script = exec_bash.call_args.args[1]
+    assert "sudo tar --zstd" in script
+    assert 'sudo chown "$(id -u):$(id -g)"' in script
+    dest = cfg.paths.host_data_dir / ".test-extract-invm"
+    dest.mkdir()
+    extract_tar_zst(archive, dest)
+    assert (dest / "coder" / ".data" / "state.db").read_text() == "fake-db"
 
 
 def test_export_respects_to_directory(with_coder: Path, cfg: AgentsConfig, tmp_path: Path) -> None:
@@ -370,6 +393,8 @@ def test_import_in_vm_mode_temp_path_excludes_user_filename(
     assert "rm -rf $HOME" not in script
     assert HOSTILE_ARCHIVE_NAME not in script
     assert re.search(r"/tmp/agents-import-coder-\d+-[0-9a-f]{8}\.tar\b", script)
+    # Root extract so the members' subuid ownership is restored.
+    assert re.search(r"sudo tar -xf /tmp/agents-import-coder-\S+ --numeric-owner", script)
 
 
 # ---------- remove --export-first (CLI ordering) ----------

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import re
 import shutil
+import subprocess
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
@@ -26,17 +27,34 @@ from agents_cli.errors import RuntimeFailure, UserError
 from agents_cli.journal import Journal
 
 AGENT_TYPES = ("hermes", "openclaw")
-_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,49}$")
+_NAME_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,49}")
+
+# Top-level dirs under the data dir that belong to project-scoped
+# features, not to an agent. An agent with one of these names would
+# share its directory with that feature — and `agents remove` deletes
+# the agent dir as root inside the VM, so `create --reuse-data firecrawl`
+# followed by `remove` would take the postgres data with it.
+RESERVED_NAMES = frozenset({"backups", "firecrawl", "models"})
 
 
 # ---------- helpers ----------
 
 
 def validate_name(name: str) -> None:
-    if not _NAME_RE.match(name):
+    # fullmatch, not match + ``$``: ``$`` also matches before a trailing
+    # newline, and names are interpolated into VM-side paths.
+    if not _NAME_RE.fullmatch(name):
         raise UserError(
             f"invalid agent name {name!r}; use lowercase letters, digits, _ or - "
             "(start with a letter or digit, 1-50 chars)"
+        )
+
+
+def refuse_reserved_name(name: str) -> None:
+    if name in RESERVED_NAMES:
+        raise UserError(
+            f"agent name {name!r} is reserved — <data-dir>/{name}/ belongs to a "
+            "project-scoped toolkit feature. Pick a different name."
         )
 
 
@@ -138,6 +156,7 @@ def create(
     config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH,
 ) -> None:
     validate_name(name)
+    refuse_reserved_name(name)
     if agent_type not in AGENT_TYPES:
         raise UserError(f"unknown agent type {agent_type!r}; expected one of {AGENT_TYPES}")
 
@@ -176,6 +195,17 @@ def create(
         # journal, not to block the resume path the journal was built for.
         # The live-container guard still applies in both cases.
         resumable = Journal.find_resumable(cfg.paths.host_data_dir, "create", name)
+
+        # An interrupted `agents remove` still owns this name: its journal
+        # resumes at ``data_dir_deleted`` without re-running the stop
+        # phase, so attaching new or reused data now would hand a live
+        # agent's dir to a pending root-powered delete.
+        if Journal.find_resumable(cfg.paths.host_data_dir, "remove", name) is not None:
+            raise UserError(
+                f"a previous `agents remove {name}` did not finish. Re-run it to "
+                "completion (add --keep-data if the data should survive) before "
+                "creating an agent with this name."
+            )
 
         if _data_dir_exists(cfg, name, agent_type):
             if resumable is None and not reuse_data:
@@ -301,43 +331,112 @@ def _create_data_dirs(cfg: AgentsConfig, name: str, agent_type: str) -> None:
 
 
 def _delete_data_dir(cfg: AgentsConfig, name: str, *, yes: bool = False) -> None:
-    if cfg.paths.data_dir_in_vm:
-        mp.exec_in_vm(
-            cfg.vm.name,
-            "rm",
-            "-rf",
-            f"{cfg.paths.vm_agents_root}/{name}",
-            check=False,
-        )
+    """Delete ``<data-dir>/<name>`` without traversing it as the host user.
+
+    The runtime-owned subtree (``.data`` / ``.openclaw``) belongs to a
+    rootless-Docker subuid under mode 700, so a host-side ``rmtree``
+    fails — and host ACLs can't be relied on to change that (a
+    ``mkdir(0700)`` under a default ACL is born with ``mask::---``).
+    VM backends delete as root inside the VM instead: guest root acts as
+    root on the share, same as the ``sudo tar`` export/snapshot paths.
+    """
+    validate_name(name)
+    refuse_reserved_name(name)
+    if cfg.vm.backend in ("multipass", "libvirt"):
+        _delete_data_dir_in_vm(cfg, name)
         return
+    _delete_data_dir_on_host(cfg, name, yes=yes)
+
+
+def _delete_data_dir_in_vm(cfg: AgentsConfig, name: str) -> None:
+    vm_root = str(cfg.paths.vm_agents_root)
+    vm_target = f"{vm_root}/{name}"
+    manual = f"sudo rm -rf {cfg.paths.host_data_dir / name}"
+    if cfg.paths.data_dir_in_vm:
+        manual = f"`agents vm shell`, then: sudo rm -rf {vm_target}"
+
+    def fail(why: str) -> RuntimeFailure:
+        return RuntimeFailure(
+            f"could not delete {name!r}'s data dir: {why}. The removal journal stays "
+            f"resumable: fix the cause (or delete manually: {manual}) and re-run "
+            f"`agents remove {name}` to finish."
+        )
+
+    if not cfg.paths.data_dir_in_vm:
+        # A detached share would make the VM-side path an empty stub:
+        # ``rm -rf`` succeeds, the real host data survives, and the
+        # journal would record a delete that never happened.
+        mounted = mp.exec_in_vm(cfg.vm.name, "mountpoint", "-q", vm_root, check=False)
+        if mounted.returncode != 0:
+            raise fail(f"{vm_root} is not mounted in the VM (run `agents vm start`)")
+
+    # ``--one-file-system`` does not stop at same-filesystem bind mounts,
+    # so refuse outright if anything is mounted beneath the target.
+    mounts = mp.exec_in_vm(cfg.vm.name, "findmnt", "-rno", "TARGET", check=False)
+    nested = [
+        line
+        for line in (mounts.stdout or "").splitlines()
+        if line == vm_target or line.startswith(vm_target + "/")
+    ]
+    if nested:
+        raise fail(f"mounts are still active beneath it in the VM ({', '.join(nested)})")
+
+    rm = mp.exec_in_vm(
+        cfg.vm.name,
+        "sudo",
+        "rm",
+        "-rf",
+        "--one-file-system",
+        "--preserve-root=all",
+        "--",
+        vm_target,
+        check=False,
+    )
+    if rm.returncode != 0:
+        raise fail((rm.stderr or "").strip() or f"rm exited {rm.returncode}")
+    if not cfg.paths.data_dir_in_vm and (cfg.paths.host_data_dir / name).exists():
+        raise fail("the VM-side delete reported success but the directory is still there")
+
+
+def _delete_data_dir_on_host(cfg: AgentsConfig, name: str, *, yes: bool) -> None:
+    """bare_metal: no VM to borrow root from, and the agent's files are
+    subuid-owned here too (rootless Docker on the host). ``rootlesskit``
+    enters a user namespace whose root owns the subuid range, so it can
+    delete them without sudo; confirmed sudo is the fallback.
+    """
     target = cfg.paths.host_data_dir / name
     if not target.exists():
         return
     try:
         shutil.rmtree(target)
+        return
     except PermissionError:
-        # The agent entrypoint chmods subuid-owned paths (``.data`` to
-        # 700, auth files to 600), which resets each object's POSIX-ACL
-        # *mask* to ``---`` — the host-user entry auto_grant_on_create
-        # installed stays present but reads ``#effective:---``, so the
-        # host user can't traverse or delete the tree. Repair with sudo
-        # (apply_acl_argv always forces ``m::rwx`` back open), then
-        # retry the delete. Deletion only needs w+x on directories, so
-        # defaults are pointless on a tree that's about to go away.
-        recipient = permissions.host_user_recipient(cfg.host.uid, writable=True)
-        argvs = permissions.apply_acl_argv(
-            target, recipients=[recipient], recurse=True, defaults=False
+        pass
+    rootlesskit = shutil.which("rootlesskit")
+    if rootlesskit:
+        subprocess.run(
+            [rootlesskit, "rm", "-rf", "--one-file-system", "--", str(target)],
+            capture_output=True,
+            check=False,
         )
+    if target.exists():
         try:
-            permissions.run_with_sudo(argvs, yes=yes)
-            shutil.rmtree(target)
-        except (UserError, RuntimeFailure, PermissionError) as exc:
+            permissions.run_with_sudo(
+                [["rm", "-rf", "--one-file-system", "--", str(target)]], yes=yes
+            )
+        except (UserError, RuntimeFailure) as exc:
             raise RuntimeFailure(
                 f"could not delete {target} ({exc}). The removal journal stays "
                 f"resumable: delete the directory manually with "
                 f"`sudo rm -rf {target}` and re-run `agents remove {name}` to "
                 "finish."
             ) from exc
+    if target.exists():
+        raise RuntimeFailure(
+            f"could not delete {target}. The removal journal stays resumable: "
+            f"delete it manually with `sudo rm -rf {target}` and re-run "
+            f"`agents remove {name}` to finish."
+        )
 
 
 def _add_service_to_compose(

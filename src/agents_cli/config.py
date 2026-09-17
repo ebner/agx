@@ -113,6 +113,11 @@ class PathsConfig(BaseModel):
                 f"vm_agents_root must contain only [A-Za-z0-9_./-]; got {v!r}. "
                 "Shell-meta characters in this path would break exec_bash heredocs."
             )
+        # `agents remove` deletes `<vm_agents_root>/<name>` as root inside
+        # the VM; a root this shallow (or one that climbs back out) would
+        # aim that at system directories.
+        if len(p.parts) < 3 or ".." in p.parts:
+            raise ValueError(f"vm_agents_root must be at least two levels deep with no '..': {v!r}")
         return p
 
 

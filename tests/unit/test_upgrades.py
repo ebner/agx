@@ -543,6 +543,33 @@ def test_rollback_restores_from_latest_archive(with_coder: Path, mocker, cfg: Ag
     assert (cfg.paths.host_data_dir / "coder" / "marker.txt").read_text() == "from-snapshot"
 
 
+@pytest.mark.parametrize("in_vm", [False, True])
+def test_restore_host_snapshot_extracts_as_root_inside_vm(
+    with_coder: Path, mocker, cfg: AgentsConfig, in_vm: bool
+) -> None:
+    """The snapshot's members are subuid-owned under mode-700 parents: a
+    host-side extract can't enter ``<name>/.data`` and an unprivileged
+    in-VM one can't restore the owners. Both modes go through
+    ``sudo tar`` in the VM, and the VM-side temp is always removed."""
+    cfg.paths = cfg.paths.model_copy(update={"data_dir_in_vm": in_vm})
+    archive = cfg.paths.host_data_dir / ".upgrades" / "coder-20260512T120000Z.tar.zst"
+    archive.parent.mkdir(exist_ok=True)
+    archive.write_bytes(b"")
+    transfer = mocker.patch("agents_cli.mp.transfer_to_vm", return_value=_ok())
+    exec_bash = mocker.patch("agents_cli.mp.exec_bash", side_effect=RuntimeFailure("tar: exploded"))
+    exec_in_vm = mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok())
+
+    with pytest.raises(RuntimeFailure):
+        upgrades._restore_host_snapshot(cfg, archive)
+
+    vm_tmp = transfer.call_args.args[2]
+    assert vm_tmp.startswith("/tmp/agents-restore-") and archive.name not in vm_tmp
+    script = exec_bash.call_args.args[1]
+    assert f"cd {cfg.paths.vm_agents_root}\n" in script
+    assert f"sudo tar -xf {vm_tmp} --numeric-owner" in script
+    assert exec_in_vm.call_args.args[1:] == ("rm", "-f", vm_tmp)
+
+
 def test_rollback_aborts_without_confirmation(with_coder: Path, mocker, cfg: AgentsConfig) -> None:
     upgrades_dir = cfg.paths.host_data_dir / ".upgrades"
     upgrades_dir.mkdir(exist_ok=True)
@@ -1237,18 +1264,19 @@ def test_host_data_snapshot_runs_sudo_tar_inside_vm_in_host_mount_mode(
     # The tar MUST run as root via sudo — without it, the host user
     # can't read subuid-owned files inside the VM either.
     assert "sudo tar" in script
-    # And the archive MUST get chowned back to ubuntu before SFTP
-    # tries to read it — otherwise the transfer hits EACCES.
-    assert "sudo chown ubuntu:ubuntu" in script
+    # And the archive MUST get chowned back to the invoking user before
+    # SFTP tries to read it — otherwise the transfer hits EACCES.
+    assert 'sudo chown "$(id -u):$(id -g)"' in script
     transfer.assert_called_once()
 
 
-def test_host_data_snapshot_data_dir_in_vm_branch_unchanged(
+def test_host_data_snapshot_data_dir_in_vm_also_tars_as_root(
     with_coder: Path, mocker, cfg: AgentsConfig
 ) -> None:
-    """In ``--data-dir-in-vm`` mode the data already lives in the VM
-    as the ubuntu user — no sudo needed. Make sure the fix to the
-    host-mount branch didn't accidentally tighten this one too.
+    """``--data-dir-in-vm``: the state subtree is subuid-owned under
+    mode 700 on the VM disk as well. An unprivileged tar with
+    ``--ignore-failed-read`` skipped it silently — a hollow snapshot
+    that a later rollback would "restore".
     """
     cfg.paths = cfg.paths.model_copy(update={"data_dir_in_vm": True})
     cfg_mod.save(cfg, with_coder)
@@ -1260,8 +1288,8 @@ def test_host_data_snapshot_data_dir_in_vm_branch_unchanged(
     upgrades._host_data_snapshot(cfg, "coder")
 
     script = exec_bash.call_args.args[1]
-    assert "tar --zstd" in script
-    assert "sudo tar" not in script  # not needed in this mode
+    assert "sudo tar --zstd" in script
+    assert 'sudo chown "$(id -u):$(id -g)"' in script
 
 
 def test_vm_snapshot_waits_for_ssh_on_libvirt_after_start(

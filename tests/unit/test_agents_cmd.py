@@ -142,7 +142,8 @@ def test_ensure_hermes_image_pulled_raises_on_pull_failure(cfg: AgentsConfig, mo
 
 
 @pytest.mark.parametrize(
-    "bad", ["", "Coder", "coder!", "-leading-dash", "with space", "a" * 51, "../slashy"]
+    "bad",
+    ["", "Coder", "coder!", "-leading-dash", "with space", "a" * 51, "../slashy", "coder\n"],
 )
 def test_validate_name_rejects(bad: str) -> None:
     with pytest.raises(UserError):
@@ -439,56 +440,211 @@ def test_remove_resume_tolerates_pre_meta_journal(
     assert Journal.find_resumable(cfg.paths.host_data_dir, "remove", "coder") is None
 
 
-def test_remove_repairs_acl_mask_and_retries_on_permission_error(
-    cfg: AgentsConfig, saved_config: Path, stub_runners, mocker
+def _wrap_exec_in_vm(stub_runners, handler):
+    """Let ``handler(cmd)`` answer selected VM commands (return an
+    ``MpResult``) and fall through to the fs simulator on ``None``."""
+    mock = stub_runners["exec_in_vm"]
+    simulator = mock.side_effect
+
+    def runner(vm_name, *cmd, check=True):
+        answer = handler(cmd)
+        return answer if answer is not None else simulator(vm_name, *cmd, check=check)
+
+    mock.side_effect = runner
+    return mock
+
+
+def test_remove_deletes_data_dir_as_root_inside_vm(
+    cfg: AgentsConfig, saved_config: Path, stub_runners
 ) -> None:
-    """PermissionError from rmtree (the entrypoint's chmod clobbered the
-    ACL mask) triggers a sudo setfacl repair — with the ``m::rwx`` mask
-    reset — and a retry."""
+    """The host user can't traverse the subuid-owned state subtree, so
+    the delete runs as root in the VM — never a host-side rmtree, never
+    a host sudo prompt."""
     create(name="coder", agent_type="hermes", config_path=saved_config)
-    target = cfg.paths.host_data_dir / "coder"
-    real_rmtree = shutil.rmtree
-    state = {"denied": False}
-
-    def flaky_rmtree(path, *args, **kwargs):
-        if Path(path) == target and not state["denied"]:
-            state["denied"] = True
-            raise PermissionError(13, "Permission denied", str(path))
-        return real_rmtree(path, *args, **kwargs)
-
-    mocker.patch("agents_cli.agents_cmd.shutil.rmtree", side_effect=flaky_rmtree)
-    sudo = mocker.patch("agents_cli.agents_cmd.permissions.run_with_sudo")
     remove("coder", yes=True, config_path=saved_config)
-    assert not target.exists()
-    sudo.assert_called_once()
-    joined = [" ".join(argv) for argv in sudo.call_args.args[0]]
-    assert any("setfacl" in c and "m::rwx" in c and str(target) in c for c in joined)
-    assert sudo.call_args.kwargs == {"yes": True}
+    assert not (cfg.paths.host_data_dir / "coder").exists()
+    argvs = [c.args[1:] for c in stub_runners["exec_in_vm"].call_args_list]
+    rm = [a for a in argvs if a[:2] == ("sudo", "rm")]
+    assert rm == [
+        (
+            "sudo",
+            "rm",
+            "-rf",
+            "--one-file-system",
+            "--preserve-root=all",
+            "--",
+            f"{cfg.paths.vm_agents_root}/coder",
+        )
+    ]
+    assert ("mountpoint", "-q", str(cfg.paths.vm_agents_root)) in argvs
 
 
-def test_remove_acl_repair_failure_keeps_journal_and_hints_manual_cleanup(
-    cfg: AgentsConfig, saved_config: Path, stub_runners, mocker
+def test_delete_data_dir_in_vm_mode_also_deletes_as_root(cfg: AgentsConfig, stub_runners) -> None:
+    """``--data-dir-in-vm``: the state subtree is subuid-owned on the VM
+    disk too — an unprivileged ``rm`` silently left it behind."""
+    cfg.paths = cfg.paths.model_copy(update={"data_dir_in_vm": True})
+    agents_cmd._delete_data_dir(cfg, "coder")
+    argvs = [c.args[1:] for c in stub_runners["exec_in_vm"].call_args_list]
+    assert any(a[:3] == ("sudo", "rm", "-rf") and a[-1].endswith("/coder") for a in argvs)
+    # No share to verify in this mode.
+    assert not any(a[:1] == ("mountpoint",) for a in argvs)
+
+
+def test_remove_refuses_when_share_is_not_mounted_in_vm(
+    cfg: AgentsConfig, saved_config: Path, stub_runners
 ) -> None:
-    """If the sudo repair is declined or fails, remove surfaces the
-    manual ``sudo rm -rf`` remediation and leaves the journal resumable."""
+    """A detached share makes the VM path an empty stub: ``rm -rf``
+    would succeed while the real data survives on the host."""
     create(name="coder", agent_type="hermes", config_path=saved_config)
-    target = cfg.paths.host_data_dir / "coder"
+    _wrap_exec_in_vm(
+        stub_runners,
+        lambda cmd: MpResult("", "", 32) if cmd[:1] == ("mountpoint",) else None,
+    )
+    with pytest.raises(RuntimeFailure, match="not mounted"):
+        remove("coder", yes=True, config_path=saved_config)
+    assert (cfg.paths.host_data_dir / "coder").exists()
+    assert Journal.find_resumable(cfg.paths.host_data_dir, "remove", "coder") is not None
+
+
+def test_remove_refuses_when_mounts_are_nested_under_the_data_dir(
+    cfg: AgentsConfig, saved_config: Path, stub_runners
+) -> None:
+    """``--one-file-system`` doesn't stop at same-fs bind mounts, so a
+    mount beneath the target must block the root-powered delete."""
+    create(name="coder", agent_type="hermes", config_path=saved_config)
+    vm_target = f"{cfg.paths.vm_agents_root}/coder"
+    listing = f"/\n{cfg.paths.vm_agents_root}\n{vm_target}/.data/shared\n{vm_target}-other\n"
+    _wrap_exec_in_vm(stub_runners, lambda cmd: _ok(listing) if cmd[:1] == ("findmnt",) else None)
+    with pytest.raises(RuntimeFailure, match=r"coder/\.data/shared") as exc:
+        remove("coder", yes=True, config_path=saved_config)
+    assert "coder-other" not in str(exc.value)  # sibling prefix is not "beneath"
+    assert (cfg.paths.host_data_dir / "coder").exists()
+    assert Journal.find_resumable(cfg.paths.host_data_dir, "remove", "coder") is not None
+
+
+def test_remove_surfaces_vm_rm_failure_and_hints_manual_cleanup(
+    cfg: AgentsConfig, saved_config: Path, stub_runners
+) -> None:
+    create(name="coder", agent_type="hermes", config_path=saved_config)
+    _wrap_exec_in_vm(
+        stub_runners,
+        lambda cmd: (
+            MpResult("", "rm: cannot remove: Operation not permitted", 1)
+            if cmd[:2] == ("sudo", "rm")
+            else None
+        ),
+    )
+    with pytest.raises(RuntimeFailure, match="Operation not permitted") as exc:
+        remove("coder", yes=True, config_path=saved_config)
+    assert "sudo rm -rf" in str(exc.value)
+    assert Journal.find_resumable(cfg.paths.host_data_dir, "remove", "coder") is not None
+
+
+def test_remove_detects_vm_delete_that_did_not_reach_the_host(
+    cfg: AgentsConfig, saved_config: Path, stub_runners
+) -> None:
+    """rc=0 from the VM is not proof: verify the directory is gone."""
+    create(name="coder", agent_type="hermes", config_path=saved_config)
+    _wrap_exec_in_vm(stub_runners, lambda cmd: _ok() if cmd[:2] == ("sudo", "rm") else None)
+    with pytest.raises(RuntimeFailure, match="still there"):
+        remove("coder", yes=True, config_path=saved_config)
+    assert Journal.find_resumable(cfg.paths.host_data_dir, "remove", "coder") is not None
+
+
+def _bare_metal(cfg: AgentsConfig, tmp_path: Path) -> Path:
+    cfg.vm = cfg.vm.model_copy(update={"backend": "bare_metal"})
+    path = tmp_path / "config.toml"
+    cfg_mod.save(cfg, path)
+    return path
+
+
+def _deny_rmtree(mocker, target: Path) -> None:
     real_rmtree = shutil.rmtree
 
-    def denying_rmtree(path, *args, **kwargs):
+    def denying(path, *args, **kwargs):
         if Path(path) == target:
             raise PermissionError(13, "Permission denied", str(path))
         return real_rmtree(path, *args, **kwargs)
 
-    mocker.patch("agents_cli.agents_cmd.shutil.rmtree", side_effect=denying_rmtree)
-    mocker.patch(
+    mocker.patch("agents_cli.agents_cmd.shutil.rmtree", side_effect=denying)
+
+
+def test_delete_data_dir_bare_metal_uses_rootlesskit_without_sudo(
+    cfg: AgentsConfig, tmp_path: Path, mocker
+) -> None:
+    """bare_metal files are subuid-owned too (rootless Docker on the
+    host). rootlesskit's userns root owns that range — no sudo."""
+    cfg_mod.load(_bare_metal(cfg, tmp_path))
+    target = cfg.paths.host_data_dir / "coder"
+    (target / ".data").mkdir(parents=True)
+    _deny_rmtree(mocker, target)
+    mocker.patch("agents_cli.agents_cmd.shutil.which", return_value="/usr/bin/rootlesskit")
+
+    def fake_run(argv, **kwargs):
+        assert argv == [
+            "/usr/bin/rootlesskit",
+            "rm",
+            "-rf",
+            "--one-file-system",
+            "--",
+            str(target),
+        ]
+        (target / ".data").rmdir()
+        target.rmdir()
+        return mocker.Mock(returncode=0)
+
+    mocker.patch("agents_cli.agents_cmd.subprocess.run", side_effect=fake_run)
+    sudo = mocker.patch("agents_cli.agents_cmd.permissions.run_with_sudo")
+    agents_cmd._delete_data_dir(cfg, "coder", yes=True)
+    assert not target.exists()
+    sudo.assert_not_called()
+
+
+def test_delete_data_dir_bare_metal_falls_back_to_confirmed_sudo(
+    cfg: AgentsConfig, tmp_path: Path, mocker
+) -> None:
+    _bare_metal(cfg, tmp_path)
+    target = cfg.paths.host_data_dir / "coder"
+    target.mkdir()
+    _deny_rmtree(mocker, target)
+    mocker.patch("agents_cli.agents_cmd.shutil.which", return_value=None)
+    sudo = mocker.patch(
         "agents_cli.agents_cmd.permissions.run_with_sudo",
         side_effect=UserError("aborted by user"),
     )
     with pytest.raises(RuntimeFailure, match="sudo rm -rf"):
-        remove("coder", yes=True, config_path=saved_config)
+        agents_cmd._delete_data_dir(cfg, "coder", yes=False)
+    assert sudo.call_args.args[0] == [["rm", "-rf", "--one-file-system", "--", str(target)]]
+    assert sudo.call_args.kwargs == {"yes": False}
     assert target.exists()
-    assert Journal.find_resumable(cfg.paths.host_data_dir, "remove", "coder") is not None
+
+
+def test_delete_data_dir_refuses_reserved_and_malformed_names(cfg: AgentsConfig) -> None:
+    (cfg.paths.host_data_dir / "firecrawl").mkdir()
+    for bad in ("firecrawl", "models", "backups", "", "coder\n", "../coder"):
+        with pytest.raises(UserError):
+            agents_cmd._delete_data_dir(cfg, bad)
+    assert (cfg.paths.host_data_dir / "firecrawl").exists()
+
+
+def test_create_refuses_reserved_name(saved_config: Path, stub_runners) -> None:
+    with pytest.raises(UserError, match="reserved"):
+        create(name="firecrawl", agent_type="hermes", reuse_data=True, config_path=saved_config)
+
+
+def test_create_refuses_while_a_remove_is_pending(
+    cfg: AgentsConfig, saved_config: Path, stub_runners, mocker
+) -> None:
+    """A stranded remove journal resumes straight at the data delete; a
+    re-created agent of the same name must not walk into that."""
+    create(name="coder", agent_type="hermes", config_path=saved_config)
+    mocker.patch(
+        "agents_cli.agents_cmd._delete_data_dir", side_effect=RuntimeFailure("disk on fire")
+    )
+    with pytest.raises(RuntimeFailure):
+        remove("coder", yes=True, config_path=saved_config)
+    with pytest.raises(UserError, match="did not finish"):
+        create(name="coder", agent_type="hermes", reuse_data=True, config_path=saved_config)
 
 
 # ---------- rename ----------

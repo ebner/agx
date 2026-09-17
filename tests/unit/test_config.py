@@ -75,6 +75,13 @@ def test_data_dir_normal_absolute_path_ok(tmp_path: Path) -> None:
     assert p.host_data_dir == tmp_path / "data"
 
 
+@pytest.mark.parametrize("bad", ["/", "/agents", "/home/ubuntu/../../etc"])
+def test_vm_agents_root_too_shallow_or_climbing_rejected(tmp_path: Path, bad: str) -> None:
+    """`agents remove` deletes `<vm_agents_root>/<name>` as root in the VM."""
+    with pytest.raises(ValueError):
+        PathsConfig(host_data_dir=str(tmp_path / "data"), vm_agents_root=bad)
+
+
 def test_vm_backend_accepts_three_backends() -> None:
     from agents_cli.config import VmConfig
 

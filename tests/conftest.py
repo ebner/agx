@@ -110,6 +110,13 @@ def install_vm_fs_simulation(mocker, cfg: AgentsConfig) -> dict:
         def resolve(p: str) -> Path:
             return _container_path(svc, p) if svc else host_path(p)
 
+        # ``sudo <cmd>`` in the VM (e.g. the root-powered data-dir delete)
+        # acts on the same simulated tree — the test runner already owns
+        # every seeded file. Without this an unrecognized ``sudo rm``
+        # would fall through to the catch-all OK and delete nothing.
+        if cmd and cmd[0] == "sudo":
+            cmd = cmd[1:]
+
         if cmd and cmd[0] == "mv" and len(cmd) >= 3:
             src = resolve(cmd[1])
             dst = resolve(cmd[2])

@@ -21,9 +21,10 @@ from __future__ import annotations
 
 import datetime
 import json
+import os
 import re
-import tarfile
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -758,29 +759,13 @@ def _host_data_snapshot(cfg: AgentsConfig, name: str) -> Path:
     upgrades_dir.mkdir(parents=True, exist_ok=True)
     archive_path = upgrades_dir / f"{name}-{_utc_stamp()}{archive_mod.ARCHIVE_SUFFIX}"
 
-    if cfg.paths.data_dir_in_vm:
-        vm_archive = f"/tmp/agents-upgrade-snap-{name}-{_utc_stamp()}{archive_mod.ARCHIVE_SUFFIX}"
-        mp.exec_bash(
-            cfg.vm.name,
-            (
-                f"set -eu\n"
-                f"cd {cfg.paths.vm_agents_root}\n"
-                f"tar --zstd --warning=no-file-changed --ignore-failed-read "
-                f"-cf {vm_archive} "
-                f"$([ -d {name} ] && echo {name} || true) "
-                f"$([ -f docker-compose.yml ] && echo docker-compose.yml || true) "
-                f"$([ -f .env ] && echo .env || true)\n"
-            ),
-        )
-        mp.transfer_from_vm(cfg.vm.name, vm_archive, archive_path)
-        mp.exec_in_vm(cfg.vm.name, "rm", "-f", vm_archive, check=False)
-        return archive_path
-
-    # Host-mount mode: tar inside the VM as root so subuid-owned
-    # files are readable. The archive's owner inside the VM is root
-    # after the tar runs; chown to ``ubuntu`` so the SFTP/SCP
-    # transfer back to the host (which runs as ``ubuntu``) doesn't
-    # hit EACCES. After transfer the archive lands at
+    # Both data-dir modes: tar inside the VM as root so subuid-owned
+    # files are readable. (The in-VM mode used to run an unprivileged
+    # tar; with ``--ignore-failed-read`` that silently skipped the whole
+    # mode-700 ``.data`` subtree and produced a hollow snapshot.) The
+    # archive's owner inside the VM is root after the tar runs; chown
+    # it back to the invoking user so the SFTP/SCP transfer to the host
+    # (which runs as that user) doesn't hit EACCES. After transfer the archive lands at
     # ``<host_data_dir>/.upgrades/`` owned by the toolkit user
     # (host-side default — ``shutil.copy`` semantics), which is what
     # the rollback path expects.
@@ -800,7 +785,7 @@ def _host_data_snapshot(cfg: AgentsConfig, name: str) -> Path:
             f"$([ -d {name} ] && echo {name} || true) "
             f"$([ -f docker-compose.yml ] && echo docker-compose.yml || true) "
             f"$([ -f .env ] && echo .env || true)\n"
-            f"sudo chown ubuntu:ubuntu {vm_archive}\n"
+            f'sudo chown "$(id -u):$(id -g)" {vm_archive}\n'
         ),
     )
     mp.transfer_from_vm(cfg.vm.name, vm_archive, archive_path)
@@ -809,21 +794,29 @@ def _host_data_snapshot(cfg: AgentsConfig, name: str) -> Path:
 
 
 def _restore_host_snapshot(cfg: AgentsConfig, archive_path: Path) -> None:
-    if cfg.paths.data_dir_in_vm:
-        vm_archive = f"/tmp/agents-restore-{archive_path.name}"
-        mp.transfer_to_vm(archive_path, cfg.vm.name, vm_archive)
-        # `tar -xf` auto-detects compression by content (gz, zst, etc).
+    """Extract a pre-upgrade snapshot back over the data dir.
+
+    Always inside the VM as root, in both data-dir modes — the mirror
+    image of :func:`_host_data_snapshot`. The archive members carry
+    subuid ownership under mode-700 parents: a host-side extraction
+    can't even enter ``<name>/.data`` (and couldn't restore the owners
+    if it did), and an unprivileged in-VM one has the same problem.
+    ``tar -xf`` auto-detects compression, so legacy ``.tar.gz``
+    snapshots restore through the same path.
+    """
+    vm_archive = f"/tmp/agents-restore-{os.getpid()}-{uuid.uuid4().hex[:8]}.tar"
+    mp.transfer_to_vm(archive_path, cfg.vm.name, vm_archive)
+    try:
         mp.exec_bash(
             cfg.vm.name,
-            f"set -eu\ncd {cfg.paths.vm_agents_root} && tar -xf {vm_archive} && rm -f {vm_archive}\n",
+            (
+                f"set -eu\n"
+                f"cd {cfg.paths.vm_agents_root}\n"
+                f"sudo tar -xf {vm_archive} --numeric-owner\n"
+            ),
         )
-        return
-    if archive_path.suffix == ".zst":
-        archive_mod.extract_tar_zst(archive_path, cfg.paths.host_data_dir)
-    else:
-        # Legacy .tar.gz path (archives from pre-G6 versions).
-        with tarfile.open(archive_path, "r:gz") as tf:
-            tf.extractall(cfg.paths.host_data_dir, filter="data")
+    finally:
+        mp.exec_in_vm(cfg.vm.name, "rm", "-f", vm_archive, check=False)
 
 
 def _latest_host_snapshot(cfg: AgentsConfig, name: str) -> Path | None:

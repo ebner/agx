@@ -104,12 +104,18 @@ def export(
         if check.returncode != 0:
             raise UserError(f"agent data dir for {name!r} not found in VM")
         vm_archive = f"/tmp/agents-export-{name}-{_utc_stamp()}{archive_mod.ARCHIVE_SUFFIX}"
+        # As root, like the host-mount branch below: the agent's state
+        # subtree is subuid-owned under mode 700 on the VM disk too, and
+        # an unprivileged tar with ``--ignore-failed-read`` skips it
+        # without an error — a "successful" archive with no agent data.
         mp.exec_bash(
             cfg.vm.name,
             (
-                f"cd {cfg.paths.vm_agents_root} && tar --zstd "
-                f"--warning=no-file-changed --ignore-failed-read "
-                f"-cf {vm_archive} {name}"
+                f"set -eu\n"
+                f"cd {cfg.paths.vm_agents_root}\n"
+                f"sudo tar --zstd --warning=no-file-changed --ignore-failed-read "
+                f"-cf {vm_archive} {name}\n"
+                f'sudo chown "$(id -u):$(id -g)" {vm_archive}\n'
             ),
         )
         target_dir = _archive_dir(cfg, to)
@@ -157,7 +163,7 @@ def export(
                 f"cd {cfg.paths.vm_agents_root}\n"
                 f"sudo tar --zstd --warning=no-file-changed --ignore-failed-read "
                 f"-cf {vm_archive} {name}\n"
-                f"sudo chown ubuntu:ubuntu {vm_archive}\n"
+                f'sudo chown "$(id -u):$(id -g)" {vm_archive}\n'
             ),
         )
         mp.transfer_from_vm(cfg.vm.name, vm_archive, out)
@@ -315,9 +321,16 @@ def import_archive(
         # filename is user-supplied and must never reach shell text.
         vm_tmp = _vm_import_temp_path(name)
         mp.transfer_to_vm(archive_path, cfg.vm.name, vm_tmp)
+        # As root so the members' subuid ownership is restored (an
+        # unprivileged extract lands everything as ``ubuntu``).
         mp.exec_bash(
             cfg.vm.name,
-            f"set -eu\ncd {cfg.paths.vm_agents_root} && tar -xf {vm_tmp} && rm -f {vm_tmp}\n",
+            (
+                f"set -eu\n"
+                f"cd {cfg.paths.vm_agents_root}\n"
+                f"sudo tar -xf {vm_tmp} --numeric-owner\n"
+                f"rm -f {vm_tmp}\n"
+            ),
         )
         if emit:
             ui.emit(
