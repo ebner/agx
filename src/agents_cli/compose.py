@@ -206,20 +206,55 @@ def write_override_atomically(cfg: AgentsConfig, doc: Any) -> None:
     try:
         tmp.write_text(content, encoding="utf-8")
         if cfg.paths.data_dir_in_vm:
-            vm_stage = (
-                f"{cfg.paths.vm_agents_root}/.compose.{os.getpid()}.{uuid.uuid4().hex[:8]}.new"
-            )
-            vm_target = f"{cfg.paths.vm_agents_root}/{OVERRIDE_FILENAME}"
-            try:
-                mp.transfer_to_vm(tmp, cfg.vm.name, vm_stage)
-                mp.exec_in_vm(cfg.vm.name, "mv", vm_stage, vm_target)
-            except Exception:
-                mp.exec_in_vm(cfg.vm.name, "rm", "-f", vm_stage, check=False)
-                raise
+            _transfer_override_to_vm(cfg, tmp)
         os.replace(tmp, target)
         ui.info(f"compose: wrote {target}")
     finally:
         tmp.unlink(missing_ok=True)
+
+
+def _transfer_override_to_vm(cfg: AgentsConfig, src: Path) -> None:
+    """Mirror a host file into the VM as ``<vm_agents_root>/docker-compose.override.yml``
+    via stage → atomic ``mv`` (``--data-dir-in-vm`` only; the VM project
+    dir is a separate filesystem there)."""
+    vm_stage = f"{cfg.paths.vm_agents_root}/.compose.{os.getpid()}.{uuid.uuid4().hex[:8]}.new"
+    vm_target = f"{cfg.paths.vm_agents_root}/{OVERRIDE_FILENAME}"
+    try:
+        mp.transfer_to_vm(src, cfg.vm.name, vm_stage)
+        mp.exec_in_vm(cfg.vm.name, "mv", vm_stage, vm_target)
+    except Exception:
+        mp.exec_in_vm(cfg.vm.name, "rm", "-f", vm_stage, check=False)
+        raise
+
+
+def sync_override_to_vm(cfg: AgentsConfig, *, only_if_missing: bool = False) -> bool:
+    """Push the host-side override file into the VM project dir
+    (``--data-dir-in-vm`` only). Returns ``True`` iff a file was pushed.
+    ``only_if_missing`` skips the push when the VM already has a mirror
+    (``vm start``'s heal path — never clobbers a live copy).
+
+    The host copy is authoritative and outlives the VM: ``vm rebuild``
+    destroys the VM disk (and with it the mirror that
+    :func:`write_override_atomically` made), while the host file — and
+    therefore the extra ``-f`` from :func:`override_file_args` — stays.
+    Without re-pushing, every ``docker compose`` verb in the fresh VM
+    fails on the missing file, which stranded ``agents mount`` users
+    after a rebuild. Called from the in-VM data-dir seeding that
+    ``vm init`` (and hence ``vm rebuild``) runs. The raw file is
+    transferred verbatim so user hand edits keep their formatting.
+    No-op in host-mount mode and on bare-metal (one filesystem) or when
+    there is no host override.
+    """
+    src = override_path(cfg)
+    if not cfg.paths.data_dir_in_vm or not src.exists():
+        return False
+    if only_if_missing:
+        vm_copy = f"{cfg.paths.vm_agents_root}/{OVERRIDE_FILENAME}"
+        if mp.exec_in_vm(cfg.vm.name, "test", "-f", vm_copy, check=False).returncode == 0:
+            return False
+    _transfer_override_to_vm(cfg, src)
+    ui.info(f"compose: mirrored {OVERRIDE_FILENAME} into the VM")
+    return True
 
 
 def host_staging_dir(cfg: AgentsConfig) -> Path:

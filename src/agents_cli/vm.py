@@ -311,6 +311,10 @@ def start(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> None:
     if not cfg.paths.data_dir_in_vm:
         _ensure_mount(cfg)
         _mount_probe(cfg)
+    else:
+        # The host override file arms an extra `-f`; heal a missing in-VM
+        # mirror (VM rebuilt by an older toolkit) so compose verbs work.
+        compose.sync_override_to_vm(cfg, only_if_missing=True)
     # Sweep stale .compose.*.new in the VM and host-side compose-staging
     # files from prior crashes.
     compose.cleanup_stale_temps(cfg)
@@ -1298,7 +1302,15 @@ def _seed_data_dir(cfg: AgentsConfig) -> None:
 def _seed_vm_data_dir(cfg: AgentsConfig) -> None:
     """Seed compose + .env + skeleton dirs inside the VM for
     ``--data-dir-in-vm`` mode. Only writes files that don't already exist.
+
+    Also re-pushes the host-side ``docker-compose.override.yml`` when one
+    exists: it survives a ``vm rebuild`` on the host (and keeps the extra
+    ``-f`` armed via ``compose.override_file_args``) while its in-VM
+    mirror dies with the old VM disk — without this, every compose verb
+    in the fresh VM failed on the missing file.
     """
+    from agents_cli import compose
+
     root = cfg.paths.vm_agents_root
     compose_content = templates.initial_compose_content()
     env_content = templates.initial_env_content(
@@ -1313,6 +1325,7 @@ def _seed_vm_data_dir(cfg: AgentsConfig) -> None:
         f"{env_content}__AGENTS_EOF__\n"
     )
     mp.exec_bash(cfg.vm.name, script)
+    compose.sync_override_to_vm(cfg)
 
 
 def _unique_snapshot_name(vm: str, requested: str) -> str:

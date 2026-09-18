@@ -165,6 +165,7 @@ def doctor(
     _check_vm_reachable(cfg, report)
     if cfg.paths.host_data_dir.exists():
         _check_mount_round_trip(cfg, report)
+        _check_override_mirror(cfg, report)
         _check_user_docker_service(cfg, report)
         _check_disk_space(cfg, report)
         _check_vm_disk(cfg, report)
@@ -309,6 +310,34 @@ def _check_mount_round_trip(cfg: AgentsConfig, report: DoctorReport) -> None:
             )
     finally:
         probe.unlink(missing_ok=True)
+
+
+def _check_override_mirror(cfg: AgentsConfig, report: DoctorReport) -> None:
+    """``--data-dir-in-vm`` only: the host-side override file arms the
+    extra ``-f`` (``compose.override_file_args``), so its in-VM mirror
+    must exist or every compose verb fails on a missing file. The mirror
+    used to be lost on ``vm rebuild`` (fixed in the in-VM seeding); this
+    catches a VM rebuilt by an older toolkit or a hand-deleted mirror.
+    """
+    from agents_cli import compose
+
+    if not cfg.paths.data_dir_in_vm:
+        report.add("override_mirror", "ok", "skipped (host-mount mode)")
+        return
+    if not compose.override_path(cfg).exists():
+        report.add("override_mirror", "ok", "no override file")
+        return
+    vm_copy = f"{cfg.paths.vm_agents_root}/{compose.OVERRIDE_FILENAME}"
+    result = mp.exec_in_vm(cfg.vm.name, "test", "-f", vm_copy, check=False)
+    if result.returncode == 0:
+        report.add("override_mirror", "ok")
+    else:
+        report.add(
+            "override_mirror",
+            "fail",
+            f"host {compose.OVERRIDE_FILENAME} has no in-VM mirror at {vm_copy}; "
+            "every compose verb will fail — re-push it with `agents vm start`",
+        )
 
 
 def _check_user_docker_service(cfg: AgentsConfig, report: DoctorReport) -> None:

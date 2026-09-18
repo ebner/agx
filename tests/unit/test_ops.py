@@ -198,6 +198,33 @@ def test_doctor_warns_on_dangling_journal(with_coder: Path, mocker, cfg: AgentsC
     assert statuses["journals"] == "warn"
 
 
+def test_doctor_override_mirror_check(cfg: AgentsConfig, mocker) -> None:
+    """--data-dir-in-vm: a host override with no in-VM mirror breaks every
+    compose verb (the -f points at a missing file) — doctor must say so.
+    Host-mount mode and no-override are skips."""
+    from agents_cli.ops import DoctorReport, _check_override_mirror
+
+    report = DoctorReport()
+    _check_override_mirror(cfg, report)
+    assert report.checks[-1].status == "ok"  # host-mount mode: skipped
+
+    cfg.paths.data_dir_in_vm = True
+    _check_override_mirror(cfg, report)
+    assert report.checks[-1].status == "ok"  # no override file
+
+    (cfg.paths.host_data_dir / "docker-compose.override.yml").write_text(
+        "services: {}\n", encoding="utf-8"
+    )
+    mocker.patch("agents_cli.mp.exec_in_vm", return_value=MpResult("", "", 1))
+    _check_override_mirror(cfg, report)
+    assert report.checks[-1].status == "fail"
+    assert "agents vm start" in (report.checks[-1].detail or "")
+
+    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok())
+    _check_override_mirror(cfg, report)
+    assert report.checks[-1].status == "ok"
+
+
 @pytest.mark.parametrize(
     "free,total,expected",
     [

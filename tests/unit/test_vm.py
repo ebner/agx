@@ -133,6 +133,73 @@ def test_seed_data_dir_is_idempotent_and_preserves_user_compose(tmp_path: Path) 
     assert "custom" in content  # user content preserved
 
 
+def test_seed_data_dir_in_vm_repushes_host_override(mocker, tmp_path: Path) -> None:
+    """--data-dir-in-vm: the host override file survives `vm rebuild`
+    (and keeps the extra -f armed) while its in-VM mirror dies with the
+    VM disk. Seeding the fresh VM must push it back or every compose
+    verb fails on the missing file (bit `agents mount` users)."""
+    cfg = _make_config(tmp_path)
+    cfg.paths.data_dir_in_vm = True
+    cfg.paths.host_data_dir.mkdir()
+    (cfg.paths.host_data_dir / ".journal").mkdir()
+    override = cfg.paths.host_data_dir / "docker-compose.override.yml"
+    override.write_text("services:\n  hermes-a:\n    volumes: [/x:/y:ro]\n", encoding="utf-8")
+    mocker.patch("agents_cli.mp.exec_bash", return_value=_ok())
+    transfer = mocker.patch("agents_cli.mp.transfer_to_vm", return_value=_ok())
+    exec_in_vm = mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok())
+
+    vm._seed_data_dir(cfg)
+
+    transfer.assert_called_once()
+    assert transfer.call_args.args[0] == override  # verbatim, not re-dumped
+    assert transfer.call_args.args[2].startswith(f"{cfg.paths.vm_agents_root}/.compose.")
+    mv = [c.args for c in exec_in_vm.call_args_list if c.args[1] == "mv"]
+    assert mv and mv[-1][3] == f"{cfg.paths.vm_agents_root}/docker-compose.override.yml"
+
+
+def test_seed_data_dir_in_vm_without_override_transfers_nothing(mocker, tmp_path: Path) -> None:
+    cfg = _make_config(tmp_path)
+    cfg.paths.data_dir_in_vm = True
+    cfg.paths.host_data_dir.mkdir()
+    mocker.patch("agents_cli.mp.exec_bash", return_value=_ok())
+    transfer = mocker.patch("agents_cli.mp.transfer_to_vm", return_value=_ok())
+    vm._seed_data_dir(cfg)
+    transfer.assert_not_called()
+
+
+def test_start_in_vm_mode_heals_missing_override_mirror(mocker, tmp_path: Path) -> None:
+    """A VM rebuilt by an older toolkit has the host override but no
+    mirror; `vm start` re-pushes it — and only then (a live mirror is
+    never clobbered)."""
+    cfg = _make_config(tmp_path)
+    cfg.paths.data_dir_in_vm = True
+    cfg.paths.host_data_dir.mkdir()
+    (cfg.paths.host_data_dir / "docker-compose.override.yml").write_text(
+        "services: {}\n", encoding="utf-8"
+    )
+    config_path = _saved_config(tmp_path)
+    cfg_mod.save(cfg, config_path)
+    mocker.patch("agents_cli.mp.start_vm", return_value=_ok())
+    mocker.patch("agents_cli.compose.cleanup_stale_temps")
+    mocker.patch("agents_cli.ui.emit")
+    transfer = mocker.patch("agents_cli.mp.transfer_to_vm", return_value=_ok())
+
+    def exec_in_vm(vm_name: str, *argv: str, **kw: object) -> MpResult:
+        if argv[0] == "test":
+            return MpResult(stdout="", stderr="", returncode=1)  # mirror missing
+        return _ok()
+
+    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=exec_in_vm)
+    vm.start(config_path=config_path)
+    transfer.assert_called_once()
+
+    # Mirror present → no push.
+    transfer.reset_mock()
+    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok())
+    vm.start(config_path=config_path)
+    transfer.assert_not_called()
+
+
 # ---------- _prepare_host_data_dir ----------
 
 
