@@ -34,7 +34,8 @@ npm install -g @openai/codex
 agents vm init --data-dir /data/agents                      # SQLite WAL falls back to JSONL; files live on host
 agents vm init --data-dir /data/agents --data-dir-in-vm     # SQLite WAL works; files visible only via archives
 
-# 4. (Optional) Authenticate a toolkit-scoped Codex account, separate from your personal ~/.codex/
+# 4. (Optional) Authenticate a toolkit-scoped Codex account for the Codex *sandbox skill*, separate from your personal ~/.codex/
+#    (a Hermes agent's openai-codex LLM provider is authenticated inside the container instead — see "Codex paths")
 agents codex login
 
 # 5. Create your first Hermes agent and run the setup wizard
@@ -76,7 +77,8 @@ For the full lifecycle — Hermes profiles vs. personalities vs. skills, connect
 | `agents mount add/remove/list` | Share specific host folders with an agent (override-file volumes + ACLs) | [runbook](docs/runbook.md) |
 | `agents edit <name> <path>` | Edit one of a Hermes agent's text files (`SOUL.md`, skills, `config.yaml`) in `$EDITOR` via the container — no sudo, no host access to the data dir | [runbook](docs/runbook.md) |
 | `agents access mount/unmount/list` | Host view of an agent's subuid-owned state dir (idmapped bind mount under `~/agents-view/`; read-only by default) | [runbook](docs/runbook.md) |
-| `agents codex login/refresh/status/skill-enable/skill-disable` | Toolkit-scoped Codex auth + the Codex coding skill | [codex-integration](docs/codex-integration.md) |
+| `agents codex login/status/skill-enable/skill-disable` | Toolkit-scoped Codex auth for the Codex coding *skill* (sandbox). Provider auth is `hermes auth add openai-codex` in-container | [codex-integration](docs/codex-integration.md) |
+| `agents doctor-cron install/uninstall/status/run` | Host cron: run doctor every N min, mail on state change via the host's `sendmail` (catches expired Codex credentials within one interval) | [runbook](docs/runbook.md#doctor-cron) |
 | `agents memory list/enable/disable/status` | Managed memory backends for Hermes | [runbook](docs/runbook.md) |
 | `agents ollama configure/status/clear` | Point the toolkit at an **external** Ollama / OpenAI-compatible endpoint | [runbook](docs/runbook.md) |
 | `agents inference up/down/status/load/unload` | **In-VM** local inference (Ollama, llama.cpp) as sibling services | [runbook](docs/runbook.md) |
@@ -107,9 +109,9 @@ Every command supports `--json` (machine-readable output) and `--yes` (skip conf
 
 ## Codex paths
 
-Two distinct ways Hermes can use your toolkit-scoped Codex account, both supported:
+Two distinct ways Hermes can use Codex, both supported — but authenticated differently:
 
-1. **As an LLM provider** (`model.provider: openai-codex`): pick this in the `hermes setup` wizard. The CLI mounts `<data-dir>/.codex` into the Hermes container so the setup wizard imports the auth into `<data-dir>/<name>/.data/.hermes/auth.json`. From then on the mount is just a fallback path — Hermes uses its own copy.
+1. **As an LLM provider** (`model.provider: openai-codex`): authenticate **inside the container** — `agents exec <name> -- hermes auth add openai-codex --type oauth --no-browser` (device-code flow; open the URL on any browser logged into your ChatGPT account). Hermes owns that credential and its refresh cycle in the agent's `/opt/data/auth.json`. The toolkit no longer mounts `<data-dir>/.codex` into the runtime container: the old "import bridge" shared one single-use OAuth refresh chain between the host file and the agent, so refreshing either invalidated the other. Expect the subscription chain to die every few weeks anyway (upstream bug) — set `fallback_providers` and `agents doctor-cron install --mail …`.
 2. **As a coding skill** (the bundled `autonomous-ai-agents/codex` skill): opt in with `agents codex skill-enable <name>`. The CLI builds a sandbox image with Codex CLI baked in and points the agent's `terminal.docker_image` at it. The sandbox container — not the Hermes runtime — is where `codex` runs when Hermes delegates coding tasks.
 
 OpenClaw bundles its own Codex plugin; the toolkit does **not** mount Codex into OpenClaw. Run `openclaw models auth login --provider openai-codex --device-code` inside the container after creation.

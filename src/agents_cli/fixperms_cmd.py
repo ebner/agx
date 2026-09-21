@@ -168,10 +168,11 @@ def chown_data_dir(cfg: AgentsConfig, svc: str, uid: int) -> None:
 
 HERMES_WRITABLE_PATHS: tuple[tuple[str, tuple[str, ...]], ...] = (
     # (target, paths-to-prune). `find -path <prune> -prune` keeps the
-    # chown from touching read-only bind-mounts the toolkit owns
-    # — notably the Codex import bridge at /home/hermes/.codex,
-    # which is mounted :ro and would emit "Read-only file system"
-    # on every entry without the prune.
+    # chown from touching read-only bind-mounts. /home/hermes/.codex is
+    # the RETIRED Codex import bridge (2026-09): agents not yet
+    # `reseat`ed still carry it mounted :ro, where every entry would
+    # emit "Read-only file system" without the prune. Harmless once the
+    # mount is gone — a non-existent prune path matches nothing.
     #
     # Where Hermes' `setup` wizard installs per-bridge helpers (e.g.
     # whatsapp-bridge → npm install target). Image-baked at build,

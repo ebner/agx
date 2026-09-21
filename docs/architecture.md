@@ -22,7 +22,7 @@
 │     .env                    │   │   (9p or virtiofs mount)         │  │
 │     <coder>/.data/  ◄───────┼──►│   <coder>/.data/                 │  │
 │     <personal>/.openclaw/ ◄─┼──►│   <personal>/.openclaw/          │  │
-│     .codex/auth.json ◄──────┼──►│   .codex/auth.json               │  │
+│     .codex/auth.json ◄──────┼──►│   .codex/auth.json (skill only)  │  │
 │     backups/                │   │                                  │  │
 │     .upgrades/              │   │  rootless dockerd (user ubuntu)  │  │
 │     .journal/               │   │  ┌──────────────┐ ┌─────────────┐│  │
@@ -112,7 +112,8 @@ The cost is 9p/virtiofs mount overhead for SQLite-heavy workloads. The opt-out i
 | `outdated_cmd.py` | `agents outdated`: classify each agent against the latest GitHub Releases tag (current / outdated / unknown). |
 | `export_cmd.py` | export / import / host-cron integration. Auto-prunes the default backups dir to `[export_cron].keep_last`. |
 | `archive.py` | tar.zst helpers shared by export and upgrade snapshots. |
-| `codex.py` | Codex login / refresh / status / skill-enable / skill-disable. |
+| `codex.py` | Codex login / status / skill-enable / skill-disable — the sandbox *skill* only; provider auth is in-container `hermes auth add`. `refresh` retired (hidden stub). |
+| `doctor_cron.py` | `agents doctor-cron {install,uninstall,status,run}` — host cron running doctor, mails on state change via host `sendmail`. |
 | `ollama_cmd.py` | configure / status / clear for an **external** Ollama / OpenAI-compatible endpoint. Stores URL + model names in `[ollama]`; stores bearer token (if any) in `<data-dir>/.env`, never in TOML. Refuses `localhost` URLs. |
 | `inference_cmd.py` | `agents inference {up,down,status,load,unload}` — **in-VM** Ollama + per-model llama.cpp sibling services, digest-pinned on first up. |
 | `models_cmd.py` | `agents model {pull,list,rm,use}` — model lifecycle (Ollama Hub / HF refs; HF GGUF downloads for llama.cpp) + wiring an agent's `model:` block. |

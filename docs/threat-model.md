@@ -67,13 +67,13 @@ For Hermes' nested-sandbox feature to work, the rootless Docker socket (`/run/us
 
 ### 3. Codex auth mount
 
-`<data-dir>/.codex/auth.json` is mounted read-only into the Hermes container at `/home/hermes/.codex` (for setup-time import) and, when `agents codex skill-enable` is invoked, into the Hermes nested sandbox at `/codex:ro`. The derived sandbox image bakes in `ENV CODEX_HOME=/codex`, so the Codex CLI reads auth from there regardless of which user the sandbox image runs as (root, `pn`, `node`, …) — see [codex-integration.md](codex-integration.md).
+`<data-dir>/.codex/auth.json` is mounted, only when `agents codex skill-enable` is invoked, into the Hermes nested sandbox at `/codex:ro`. It is **not** mounted into the Hermes runtime container any more (the `/home/hermes/.codex` "import bridge" was retired 2026-09); a Hermes agent's `openai-codex` LLM-provider credential is created in-container via `hermes auth add` and lives in the agent's own `/opt/data/auth.json`, so a compromised agent holds only its own chain. The derived sandbox image bakes in `ENV CODEX_HOME=/codex`, so the Codex CLI reads auth from there regardless of which user the sandbox image runs as (root, `pn`, `node`, …) — see [codex-integration.md](codex-integration.md).
 
 **Mitigations:**
 
 - The toolkit-scoped Codex auth is **separate** from the user's personal `~/.codex/`. Use a dedicated Codex account for the agents; compromise of that account doesn't leak the user's personal Codex.
 - The auth is bind-mounted, never baked into a Docker image, so a token rotation propagates immediately.
-- `agents codex status` warns when the OAuth token expires within 7 days. Token expiry is a routine event, not a security event, but stale tokens block work and should be refreshed.
+- `agents codex status` warns when the skill's OAuth token expires within 7 days; `agents doctor`'s `credential_pool` check (and `agents doctor-cron`'s mail) flags an agent whose provider credential died. Token expiry is a routine event, not a security event, but stale tokens block work and should be re-authenticated.
 
 ### 4. Image source
 

@@ -990,12 +990,78 @@ def export_cron_status() -> None:
     _run(export_cmd.export_cron_status)
 
 
+# ---------- doctor-cron ----------
+
+
+@main.group("doctor-cron")
+def doctor_cron_group() -> None:
+    """Host cron that runs `agents doctor` and mails on state change.
+
+    Catches "the agent silently stopped working" (e.g. an expired Codex
+    OAuth credential) within one interval instead of when you next need
+    the agent. Mail is delivered through the host's `sendmail`.
+    """
+
+
+@doctor_cron_group.command("install")
+@click.option(
+    "--every",
+    "every_minutes",
+    type=click.IntRange(1, 59),
+    default=15,
+    show_default=True,
+    help="Poll interval in minutes.",
+)
+@click.option(
+    "--mail",
+    "mail_to",
+    multiple=True,
+    help="Recipient address (repeatable). Required on first install.",
+)
+def doctor_cron_install(every_minutes: int, mail_to: tuple[str, ...]) -> None:
+    """Install (or replace) the host cron entry."""
+    from agents_cli import doctor_cron
+
+    _run(doctor_cron.install, every_minutes=every_minutes, mail_to=list(mail_to))
+
+
+@doctor_cron_group.command("uninstall")
+def doctor_cron_uninstall() -> None:
+    """Remove the host cron entry."""
+    from agents_cli import doctor_cron
+
+    _run(doctor_cron.uninstall)
+
+
+@doctor_cron_group.command("status")
+def doctor_cron_status() -> None:
+    """Show install state, last run, and currently failing checks."""
+    from agents_cli import doctor_cron
+
+    _run(doctor_cron.status)
+
+
+@doctor_cron_group.command("run")
+def doctor_cron_run() -> None:
+    """One poll: run doctor, mail if the failing set changed (what cron calls)."""
+    from agents_cli import doctor_cron
+
+    _run(doctor_cron.run)
+
+
 # ---------- codex helpers ----------
 
 
 @main.group("codex")
 def codex_group() -> None:
-    """Codex CLI integration (toolkit-scoped auth)."""
+    """Codex CLI *skill* for the Hermes sandbox (toolkit-scoped auth).
+
+    This is NOT how a Hermes agent authenticates its `openai-codex` LLM
+    provider — do that inside the container, where Hermes owns the
+    credential and its refresh cycle:
+
+        agents exec <name> -- hermes auth add openai-codex --type oauth --no-browser
+    """
 
 
 @codex_group.command("login")
@@ -1009,14 +1075,26 @@ def codex_group() -> None:
     ),
 )
 def codex_login(device_auth: bool) -> None:
-    """Interactively authenticate the toolkit-scoped Codex account."""
+    """Authenticate the toolkit-scoped Codex account (sandbox skill only)."""
     _run(codex_mod.login, device_auth=device_auth)
 
 
-@codex_group.command("refresh")
-def codex_refresh() -> None:
-    """Silently refresh the token; fails if interactive re-auth is needed."""
-    _run(codex_mod.refresh)
+def _retired_codex_refresh() -> None:
+    raise UserError(
+        "`agents codex refresh` was retired: refreshing the toolkit-scoped Codex "
+        "auth rotates a single-use OAuth refresh chain that a running Hermes agent "
+        "may share, invalidating the agent's token (\"Your authentication token has "
+        'been invalidated"). Re-authenticate the agent inside its container '
+        "instead: `agents exec <name> -- hermes auth add openai-codex --type oauth "
+        "--no-browser`. For the sandbox skill, `agents codex login`."
+    )
+
+
+@codex_group.command("refresh", hidden=True, context_settings={"ignore_unknown_options": True})
+@click.argument("args", nargs=-1, type=click.UNPROCESSED)
+def codex_refresh(args: tuple[str, ...]) -> None:
+    """Retired — see `hermes auth add openai-codex` inside the container."""
+    _run(_retired_codex_refresh)
 
 
 @codex_group.command("status")

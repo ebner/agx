@@ -91,11 +91,13 @@ def test_hermes_fragment_has_required_mounts(cfg: AgentsConfig) -> None:
     # cannot write to that mount.
     assert "user" not in s
 
-    # Three required mounts: data dir, socket, codex auth at the
-    # *container user's* home (NOT /opt/data).
+    # Two required mounts: data dir, socket. NO Codex import bridge at
+    # the container user's home — retired 2026-09 (the bridge-seeded
+    # credential shared a single-use OAuth refresh chain with the host
+    # copy); provider auth is done inside the container.
     assert "./coder/.data:/opt/data" in s["volumes"]
     assert "/run/user/1000/docker.sock:/run/user/1000/docker.sock" in s["volumes"]
-    assert "./.codex:/home/hermes/.codex:ro" in s["volumes"]
+    assert not any("/home/hermes/.codex" in v for v in s["volumes"])
 
     # The toolkit-managed cont-init.d perms hook is bind-mounted read-only
     # so it re-applies the install-path chown + gateway-logdir pre-create on

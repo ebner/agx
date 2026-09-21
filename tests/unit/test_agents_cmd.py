@@ -178,7 +178,7 @@ def test_create_hermes_writes_compose_and_dirs(
     assert "hermes-coder" in doc["services"]
     svc = doc["services"]["hermes-coder"]
     assert svc["image"] == "nousresearch/hermes-agent:v1.0.0"
-    assert any("/.codex:/home/hermes/.codex" in v for v in svc["volumes"])
+    assert not any("/home/hermes/.codex" in v for v in svc["volumes"])
 
 
 def test_create_openclaw_uses_per_agent_paths(

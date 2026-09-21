@@ -97,7 +97,7 @@ The rest of this tutorial assumes the default — one toolkit agent named `coder
 agents create coder --type hermes --setup
 ```
 
-`--setup` chains `hermes setup`, which is the interactive wizard for model provider, terminal backend, gateway, etc. Pick `openai-codex` as the model provider if you ran `agents codex login` first — Hermes imports the toolkit-scoped auth automatically.
+`--setup` chains `hermes setup`, which is the interactive wizard for model provider, terminal backend, gateway, etc. If you pick `openai-codex` as the model provider, authenticate it inside the container afterwards: `agents exec coder -- hermes auth add openai-codex --type oauth --no-browser` (device-code URL + code, any browser logged into your ChatGPT account). `agents codex login` is unrelated — it only feeds the optional Codex *sandbox skill*.
 
 ### 4.2 Customize the personality
 
@@ -415,7 +415,7 @@ Not natively in Hermes — each profile that runs a gateway needs its own bot to
 If you want true auto-routing by channel, you'd need a custom gateway adapter that selects an LLM + skill set per message — not a profile-switching trick.
 
 **Q: Where does Codex auth live for a Hermes agent that uses Codex as its LLM?**
-After the first `hermes setup`, persistent auth is at `<data-dir>/coder/.data/.hermes/auth.json` *inside* the agent's data dir. The toolkit-scoped `<data-dir>/.codex/` is only a one-time import bridge — bind-mounted read-only at `/home/hermes/.codex` in the container so Hermes can pick it up.
+In Hermes' own pooled auth store at `<data-dir>/coder/.data/auth.json` (`/opt/data/auth.json` in the container), written by `agents exec coder -- hermes auth add openai-codex --type oauth --no-browser`. The toolkit-scoped `<data-dir>/.codex/` is NOT involved any more — it used to be bind-mounted as an "import bridge", which tied the agent's credential to the host file's single-use OAuth refresh chain and got agents' tokens invalidated whenever the host copy refreshed. The subscription chain still dies every few weeks on its own (upstream Hermes #65346): set `fallback_providers` in the agent's `config.yaml` so it keeps answering, and `agents doctor-cron install --mail you@…` so you hear about it within 15 minutes; re-auth is the same one-liner, from any device with a browser (phone + `agents tailscale` + SSH works).
 
 **Q: My agent needs an inbound webhook for Slack/Discord/Mattermost.**
 Prefer the platform's outbound mode (Slack Socket Mode, Discord gateway, Mattermost websocket) — no inbound port required. If you truly need a webhook, terminate it on the host with a tunnel (Cloudflare Tunnel, tailscale-funnel) that forwards to `127.0.0.1:<vm-forwarded-port>`. Avoid binding `0.0.0.0` directly on the VM.

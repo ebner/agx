@@ -59,6 +59,11 @@ OPENCLAW_IMAGE_BASE: Final = "openclaw/openclaw"
 # bind-mounted read-only into each Hermes container.
 CONT_INIT_REL: Final = ".toolkit/cont-init/99-fixperms"
 CONT_INIT_CONTAINER_PATH: Final = "/etc/cont-init.d/99-toolkit-fixperms"
+# Container-side target of the retired Codex "import bridge" volume
+# (``./.codex:/home/hermes/.codex:ro``). Stock fragments no longer emit
+# it; ``agents reseat`` drops it from existing agents explicitly, because
+# its carry-user-additions diff would otherwise preserve it forever.
+LEGACY_CODEX_BRIDGE_TARGET: Final = "/home/hermes/.codex"
 # Sibling-service memory backends managed by the toolkit. Whitelisted by
 # the same parsed (registry, repo) tuple check as the agent images so an
 # attacker-controlled compose can't sneak in a typo-squatted variant.
@@ -460,8 +465,13 @@ def hermes_service_fragment(
 
     Mounts the per-agent data dir at /opt/data ($HERMES_HOME for the
     official image), the rootless Docker socket so Hermes can spawn its
-    nested sandbox, and the toolkit-scoped Codex auth at the container
-    user's ~/.codex for setup-time import.
+    nested sandbox, and the toolkit's cont-init perms hook.
+
+    Deliberately NO ``./.codex:/home/hermes/.codex:ro`` "import bridge"
+    (retired 2026-09 — see :data:`LEGACY_CODEX_BRIDGE_TARGET`): a
+    Hermes agent authenticates its ``openai-codex`` provider inside the
+    container (``hermes auth add openai-codex``) so the credential and
+    its single-use OAuth refresh chain are owned by the agent alone.
 
     No ``user:`` override. Under rootless Docker, container UID 0 (the
     image's default entrypoint user) maps to the rootless host user
@@ -469,9 +479,9 @@ def hermes_service_fragment(
     ``-u 1000:1000`` mapping is the host user owning the data dir on
     the host. Setting ``user: 1000:1000`` would force the container into
     a subuid that does NOT match the multipass mount ownership, breaking
-    every write into ``/opt/data``. HOME is pinned in env so the Codex
-    import bridge resolves to the same path we mount, independent of
-    image USER/HOME drift.
+    every write into ``/opt/data``. HOME is pinned in env so paths under
+    the runtime user's home are stable independent of image USER/HOME
+    drift between Hermes releases.
     """
     socket_path = cfg.vm_runtime.docker_socket_path
     return {
@@ -483,7 +493,6 @@ def hermes_service_fragment(
         "volumes": [
             f"./{name}/.data:/opt/data",
             f"{socket_path}:{socket_path}",
-            "./.codex:/home/hermes/.codex:ro",
             # Toolkit-managed perms hook. Runs as root on every boot to
             # chown image-baked install paths + pre-create the gateway
             # logdir, so rootless-Docker perm drift no longer needs a

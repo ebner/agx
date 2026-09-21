@@ -586,58 +586,6 @@ def test_doctor_skips_docker_socket_when_backend_local(with_coder: Path, mocker)
     assert "local" in check.detail
 
 
-def test_doctor_codex_mount_ok_when_persistent_auth_exists(with_coder: Path, mocker) -> None:
-    """Post-import state: the bind-mounted /home/hermes/.codex/auth.json
-    is unreadable to the runtime user (root-owned via rootless userns
-    mapping), but Hermes already imported it to /opt/data/auth.json.
-    This is the expected steady state — must not fail.
-    """
-    cfg = cfg_mod.load(with_coder)
-    (cfg.paths.host_data_dir / ".codex").mkdir(exist_ok=True)
-    (cfg.paths.host_data_dir / ".codex" / "auth.json").write_text(
-        '{"expires_at": "2099-01-01T00:00:00Z"}', encoding="utf-8"
-    )
-    # Pretend /opt/data/auth.json exists in the container.
-    persistent = cfg.paths.host_data_dir / "coder" / ".data" / "auth.json"
-    persistent.parent.mkdir(parents=True, exist_ok=True)
-    persistent.write_text("imported", encoding="utf-8")
-
-    mocker.patch(
-        "agents_cli.mp.info_vm",
-        return_value=_ok(json.dumps({"info": {"agents": {"state": "Running"}}})),
-    )
-
-    def runner(vm_name: str, *cmd: str, check: bool = True) -> MpResult:
-        joined = " ".join(cmd)
-        if "is-active" in joined:
-            return _ok("active\n")
-        if "stat" in cmd and "/opt/data" in cmd:
-            return _ok("755 1000\n")
-        if cmd[:2] == ("cat", "/proc/meminfo"):
-            return _ok("MemTotal: 8388608 kB\nMemAvailable: 4194304 kB\n")
-        if cmd[:1] == ("nproc",):
-            return _ok("4\n")
-        if cmd[:2] == ("cat", "/proc/loadavg"):
-            return _ok("0.5 0.3 0.2 1/100 999\n")
-        # test -r /opt/data/auth.json (post-import probe): persistent exists → rc 0
-        if "test" in cmd and "/opt/data/auth.json" in cmd:
-            return _ok("")
-        # test -r /home/hermes/.codex/auth.json (bridge probe): not reachable
-        if "test" in cmd and "/home/hermes/.codex/auth.json" in cmd:
-            return MpResult(stdout="", stderr="", returncode=1)
-        return _ok("ok\n")
-
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=runner)
-    mocker.patch(
-        "agents_cli.compose_runner.ps",
-        return_value=_ok(json.dumps([{"Service": "hermes-coder", "State": "running"}])),
-    )
-    report = ops.doctor(config_path=with_coder)
-    [check] = [c for c in report.checks if c.name == "coder.codex_mount"]
-    assert check.status == "ok"
-    assert "post-import" in check.detail
-
-
 def test_doctor_table_wraps_long_detail_in_human_mode(with_coder: Path, mocker, capsys) -> None:
     """A very long detail string would otherwise blow out the column
     width and break the separator. Confirm we wrap onto continuation
@@ -1511,3 +1459,88 @@ def test_in_vm_compose_exec_argv_threads_env_vars(cfg: AgentsConfig) -> None:
     assert "-e" in argv
     assert "HERMES_CONFIG=/opt/data/config.yaml.new" in argv
     assert "-T" in argv
+
+
+# ---------- credential pool ----------
+
+
+def _run_credential_pool_check(cfg: AgentsConfig, with_coder: Path, mocker, auth_json: str):
+    _seed_agent_config_dict_model(cfg, "coder", "gpt-6-astra")
+    mocker.patch(
+        "agents_cli.mp.info_vm",
+        return_value=_ok(json.dumps({"info": {"agents": {"state": "Running"}}})),
+    )
+    mocker.patch(
+        "agents_cli.mp.exec_in_vm",
+        side_effect=_doctor_runner_with_auth(auth_json, host_data_dir=cfg.paths.host_data_dir),
+    )
+    mocker.patch(
+        "agents_cli.compose_runner.ps",
+        return_value=_ok(json.dumps([{"Service": "hermes-coder", "State": "running"}])),
+    )
+    report = ops.doctor(config_path=with_coder, emit=False, raise_on_fail=False)
+    [check] = [c for c in report.checks if c.name == "coder.credential_pool"]
+    return check
+
+
+def _pool(*entries: dict) -> str:
+    return json.dumps(
+        {"active_provider": "openai-codex", "credential_pool": {"openai-codex": list(entries)}}
+    )
+
+
+def test_doctor_credential_pool_fails_when_every_credential_is_dead(
+    with_coder: Path, cfg: AgentsConfig, mocker
+) -> None:
+    """The "Provider authentication failed" class: Hermes marked the only
+    Codex credential exhausted/token_expired. Detail must carry the
+    reason and the in-container re-auth one-liner, never a token."""
+    check = _run_credential_pool_check(
+        cfg,
+        with_coder,
+        mocker,
+        _pool(
+            {
+                "label": "openai-codex-oauth-1",
+                "last_status": "exhausted",
+                "last_error_reason": "token_expired",
+                "access_token": "SECRET-ACCESS",
+                "refresh_token": "SECRET-REFRESH",
+            }
+        ),
+    )
+    assert check.status == "fail"
+    assert "exhausted/token_expired" in check.detail
+    assert "hermes auth add openai-codex --type oauth --no-browser" in check.detail
+    assert "SECRET" not in check.detail
+
+
+def test_doctor_credential_pool_warns_when_some_credentials_remain(
+    with_coder: Path, cfg: AgentsConfig, mocker
+) -> None:
+    check = _run_credential_pool_check(
+        cfg,
+        with_coder,
+        mocker,
+        _pool(
+            {"label": "a", "last_status": "dead", "last_error_reason": "token_invalidated"},
+            {"label": "b", "last_status": "ok"},
+        ),
+    )
+    assert check.status == "warn"
+    assert "1/2" in check.detail
+
+
+def test_doctor_credential_pool_ok_and_edge_cases(
+    with_coder: Path, cfg: AgentsConfig, mocker
+) -> None:
+    check = _run_credential_pool_check(
+        cfg, with_coder, mocker, _pool({"label": "a", "last_status": "ok"}, {"label": "b"})
+    )
+    assert check.status == "ok" and "2 credential(s) healthy" in check.detail
+
+    # Provider configured but nothing pooled for it → warn, not fail.
+    check = _run_credential_pool_check(
+        cfg, with_coder, mocker, json.dumps({"active_provider": "x", "credential_pool": {}})
+    )
+    assert check.status == "warn" and "no pooled credential" in check.detail

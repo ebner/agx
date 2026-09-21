@@ -340,50 +340,31 @@ def test_status_no_warning_when_far_from_expiry(
     assert info["expiry_warning"] is False
 
 
-def test_status_includes_per_agent_mount_status(
+def test_status_includes_per_agent_skill_status(
     with_coder: Path, mocker, cfg: AgentsConfig
 ) -> None:
+    """Status reports only the SKILL dimension per agent. The retired
+    import-bridge probe (`container_mount`) is gone: provider auth is
+    Hermes-owned inside the container, not something the toolkit mounts."""
     mocker.patch("agents_cli.compose_runner.restart", return_value=_ok())
+    exec_spy = mocker.spy(codex.mp, "exec_in_vm")
     info = codex.status(config_path=with_coder)
-    names = {entry["name"] for entry in info["per_agent_mounts"]}
+    names = {entry["name"] for entry in info["per_agent_skill"]}
     assert "coder" in names
-    coder = next(e for e in info["per_agent_mounts"] if e["name"] == "coder")
+    coder = next(e for e in info["per_agent_skill"] if e["name"] == "coder")
     assert coder["skill_enabled"] is False
+    assert "container_mount" not in coder
+    assert not any(
+        "/home/hermes/.codex" in " ".join(map(str, c.args)) for c in exec_spy.call_args_list
+    )
 
     codex.skill_enable("coder", config_path=with_coder)
     info = codex.status(config_path=with_coder)
-    coder = next(e for e in info["per_agent_mounts"] if e["name"] == "coder")
+    coder = next(e for e in info["per_agent_skill"] if e["name"] == "coder")
     assert coder["skill_enabled"] is True
 
 
-# ---------- mount probe argv (override merge consistency) ----------
-
-
-def test_mount_probe_argv_merges_override_iff_present(cfg: AgentsConfig, mocker) -> None:
-    """The probe's compose exec must be built on compose_runner._base_argv
-    so the override file (architecture rule #10) is merged exactly like
-    every other compose invocation: no override -f when the file is
-    absent, the extra -f pair when it exists.
-    """
-    (cfg.paths.host_data_dir / ".codex").mkdir()
-    (cfg.paths.host_data_dir / ".codex" / "auth.json").write_text("{}", encoding="utf-8")
-    exec_spy = mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok())
-
-    assert codex._container_codex_mount_probe(cfg, "hermes-coder") == "ok"
-    argv = exec_spy.call_args.args
-    assert "-f" in argv
-    assert "/home/ubuntu/agents/docker-compose.yml" in argv
-    assert not any("docker-compose.override.yml" in str(a) for a in argv)
-
-    (cfg.paths.host_data_dir / "docker-compose.override.yml").write_text(
-        "services: {}\n", encoding="utf-8"
-    )
-    codex._container_codex_mount_probe(cfg, "hermes-coder")
-    argv = exec_spy.call_args.args
-    assert "/home/ubuntu/agents/docker-compose.override.yml" in argv
-
-
-# ---------- login / refresh (subprocess wrappers) ----------
+# ---------- login (subprocess wrapper) ----------
 
 
 def test_login_invokes_codex_with_codex_home(mocker, saved_config: Path, cfg: AgentsConfig) -> None:
@@ -406,13 +387,13 @@ def test_login_device_auth_appends_flag(mocker, saved_config: Path, cfg: AgentsC
     assert args[0] == ["/usr/local/bin/codex", "login", "--device-auth"]
 
 
-def test_login_relaxes_bridge_permissions(mocker, saved_config: Path, cfg: AgentsConfig) -> None:
-    """codex CLI writes auth.json mode 600 — unreadable by the container's
-    runtime user through the ro import-bridge mount (host ACLs don't
-    propagate through virtiofs/9p; mode bits do). Login must chmod the
-    file other-readable and the dir traversable, or `hermes auth add
-    openai-codex` silently finds nothing and falls back to a fresh
-    device login (2026-08-27)."""
+def test_login_does_not_relax_auth_permissions(
+    mocker, saved_config: Path, cfg: AgentsConfig
+) -> None:
+    """The retired import bridge needed auth.json other-readable so the
+    container's runtime user could read it through the :ro mount. With
+    the bridge gone the toolkit leaves the Codex CLI's mode-600 file
+    alone — nothing in a Hermes container reads it any more."""
     home = cfg.paths.host_data_dir / ".codex"
     home.mkdir(mode=0o700)
     auth = home / "auth.json"
@@ -422,26 +403,8 @@ def test_login_relaxes_bridge_permissions(mocker, saved_config: Path, cfg: Agent
 
     codex.login(config_path=saved_config)
 
-    assert (auth.stat().st_mode & 0o777) == 0o644
-    assert (home.stat().st_mode & 0o777) == 0o755
-
-
-def test_refresh_rerelaxes_bridge_permissions(
-    mocker, saved_config: Path, cfg: AgentsConfig
-) -> None:
-    """The silent refresh rewrites auth.json (recreated mode 600 by the
-    codex CLI) — refresh must re-apply the bridge grant or the next
-    rotation silently re-breaks imports."""
-    home = cfg.paths.host_data_dir / ".codex"
-    home.mkdir(mode=0o755)
-    auth = home / "auth.json"
-    auth.touch(mode=0o600)
-    mocker.patch("shutil.which", return_value="/usr/local/bin/codex")
-    mocker.patch("subprocess.run", return_value=type("R", (), {"returncode": 0})())
-
-    codex.refresh(config_path=saved_config)
-
-    assert (auth.stat().st_mode & 0o777) == 0o644
+    assert (auth.stat().st_mode & 0o777) == 0o600
+    assert (home.stat().st_mode & 0o777) == 0o700
 
 
 def test_login_raises_when_codex_missing(mocker, saved_config: Path) -> None:
@@ -450,24 +413,21 @@ def test_login_raises_when_codex_missing(mocker, saved_config: Path) -> None:
         codex.login(config_path=saved_config)
 
 
-def test_refresh_raises_when_auth_absent(saved_config: Path) -> None:
-    with pytest.raises(UserError, match="codex login"):
-        codex.refresh(config_path=saved_config)
+def test_refresh_is_retired() -> None:
+    """`agents codex refresh` rotated a single-use OAuth refresh chain a
+    running agent could share, invalidating the agent's token. Hidden
+    stub: exit 1 with the in-container re-auth pointer, absent from help."""
+    from click.testing import CliRunner
 
+    from agents_cli.cli import main
 
-def test_refresh_calls_status_for_silent_check(
-    mocker, saved_config: Path, cfg: AgentsConfig
-) -> None:
-    (cfg.paths.host_data_dir / ".codex").mkdir()
-    (cfg.paths.host_data_dir / ".codex" / "auth.json").write_text("{}")
-    mocker.patch("shutil.which", return_value="/usr/local/bin/codex")
-    run_spy = mocker.patch(
-        "subprocess.run",
-        return_value=type("R", (), {"returncode": 0, "stdout": b"", "stderr": b""})(),
-    )
-    codex.refresh(config_path=saved_config)
-    args, _ = run_spy.call_args
-    assert args[0] == ["/usr/local/bin/codex", "auth", "status"]
+    assert not hasattr(codex, "refresh")
+    runner = CliRunner()
+    result = runner.invoke(main, ["codex", "refresh"])
+    assert result.exit_code == 1
+    assert "hermes auth add openai-codex" in result.output
+    helptext = runner.invoke(main, ["codex", "--help"]).output
+    assert "refresh" not in helptext.split("Commands:")[-1]
 
 
 # ---------- progress narration ----------

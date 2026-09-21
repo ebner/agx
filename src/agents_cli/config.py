@@ -298,6 +298,35 @@ class ExportCronConfig(BaseModel):
         return v
 
 
+class DoctorCronConfig(BaseModel):
+    """``agents doctor-cron``: host cron that runs ``agents doctor`` and
+    mails on state change (a check turning red, or everything green
+    again). Mail goes out through the host's ``sendmail`` — the toolkit
+    carries no SMTP configuration of its own.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    every_minutes: int = 15
+    mail_to: list[str] = Field(default_factory=list)
+
+    @field_validator("every_minutes")
+    @classmethod
+    def _validate_every(cls, v: int) -> int:
+        if not (1 <= v <= 59):
+            raise ValueError(f"doctor_cron.every_minutes must be 1..59, got {v}")
+        return v
+
+    @field_validator("mail_to")
+    @classmethod
+    def _validate_mail_to(cls, v: list[str]) -> list[str]:
+        for addr in v:
+            if "@" not in addr or any(c.isspace() for c in addr) or "," in addr:
+                raise ValueError(f"doctor_cron.mail_to: not a mail address: {addr!r}")
+        return v
+
+
 class UpgradesConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -326,6 +355,7 @@ class AgentsConfig(BaseModel):
     ollama: OllamaConfig = Field(default_factory=OllamaConfig)
     inference: InferenceConfig = Field(default_factory=InferenceConfig)
     export_cron: ExportCronConfig = Field(default_factory=ExportCronConfig)
+    doctor_cron: DoctorCronConfig = Field(default_factory=DoctorCronConfig)
     upgrades: UpgradesConfig = Field(default_factory=UpgradesConfig)
 
 

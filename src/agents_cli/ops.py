@@ -9,6 +9,7 @@ import sys
 import textwrap
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Final
 
 from agents_cli import compose, compose_runner, mp, ui
 from agents_cli import config as cfg_mod
@@ -149,8 +150,14 @@ def doctor(
     target: str | None = None,
     config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH,
     emit: bool = True,
+    raise_on_fail: bool = True,
 ) -> DoctorReport:
     """Run the health checks; render the report table unless ``emit=False``.
+
+    ``raise_on_fail=False`` returns the report even when a check failed
+    — for ``agents doctor-cron``, which reduces the report to a
+    notification and must not turn a red doctor into a non-zero cron
+    exit (cron would then mail the raw log through its own MAILTO).
 
     ``emit=False`` is for composite callers (``agents vm migrate-data``)
     that own their command's single stdout object — the table renders to
@@ -188,14 +195,14 @@ def doctor(
         if agent_type == "hermes":
             _check_hermes_data_dir_accessible(cfg, svc, agent_name, report)
             _check_hermes_doctor(cfg, svc, agent_name, report)
-            _check_hermes_codex_mount(cfg, svc, agent_name, report)
             _check_hermes_model_set(cfg, svc, agent_name, report)
+            _check_hermes_credential_pool(cfg, svc, agent_name, report)
             _check_profile_gateways(cfg, svc, agent_name, report)
             _check_profile_dashboard_bindings(cfg, svc, agent_name, report)
 
     if emit:
         _emit_doctor_table(report)
-    if report.failed:
+    if report.failed and raise_on_fail:
         raise HealthCheckFailure(
             f"{sum(1 for c in report.checks if c.status == 'fail')} doctor check(s) failed"
         )
@@ -996,9 +1003,12 @@ def _check_profile_gateways(
 
 
 def _check_codex_auth(cfg: AgentsConfig, report: DoctorReport) -> None:
-    """Verify the toolkit-scoped Codex auth is present and not near expiry.
+    """Verify the toolkit-scoped Codex auth (used ONLY by the Codex
+    sandbox skill, ``agents codex skill-enable``) is present and not
+    near expiry. Hermes agents' ``openai-codex`` LLM-provider auth is
+    NOT this file — see ``_check_hermes_credential_pool``.
 
-    Reports OK if no auth file exists yet (Codex usage is optional);
+    Reports OK if no auth file exists yet (the skill is optional);
     warns when the token expires in less than 7 days; fails only on
     malformed JSON or parse-but-already-expired.
     """
@@ -1009,7 +1019,7 @@ def _check_codex_auth(cfg: AgentsConfig, report: DoctorReport) -> None:
 
     auth_path = cfg.paths.host_data_dir / ".codex" / "auth.json"
     if not auth_path.exists():
-        report.add("codex_auth", "ok", "not configured (skip `agents codex login`)")
+        report.add("codex_auth", "ok", "not configured (only the Codex sandbox skill needs it)")
         return
     try:
         data = _json.loads(auth_path.read_text(encoding="utf-8"))
@@ -1031,70 +1041,107 @@ def _check_codex_auth(cfg: AgentsConfig, report: DoctorReport) -> None:
         report.add("codex_auth", "ok", f"expires in {delta.days} day(s)")
 
 
-def _check_hermes_codex_mount(
+_CREDENTIAL_BAD_STATUSES: Final = frozenset({"exhausted", "dead"})
+
+
+def _check_hermes_credential_pool(
     cfg: AgentsConfig, svc: str, agent_name: str, report: DoctorReport
 ) -> None:
-    """Verify the Hermes container has the toolkit-scoped Codex auth bound
-    at the container user's ``~/.codex`` so the LLM-provider import path
-    works on FIRST setup.
+    """Fail when every pooled credential of the agent's PRIMARY provider
+    is ``exhausted``/``dead`` in Hermes' own auth store.
 
-    The mount is a one-time import bridge. After ``hermes setup`` runs,
-    persistent auth lives at ``/opt/data/auth.json`` (hermes-owned)
-    and the bind-mounted ``/home/hermes/.codex/auth.json`` is no longer
-    consulted. Critically, under rootless Docker the host-uid-1000-owned
-    auth file appears as root-owned mode 600 inside the container, which
-    is NOT readable by the runtime hermes user — so after setup, the
-    mount being unreadable is expected, not a failure.
+    This is the "agent answers *Provider authentication failed*" class:
+    a ChatGPT-subscription Codex OAuth chain dies without warning (Hermes
+    upstream #65346, unresolved) and there is no reliable pre-warning —
+    the access token is refreshed continuously and says nothing about
+    when the refresh chain will stop working. What IS possible is prompt
+    detection: Hermes marks the credential the moment a request fails
+    (``last_status`` = ``exhausted`` for retryable errors, ``dead`` for
+    terminal ``token_invalidated``/``token_revoked``). ``agents
+    doctor-cron`` polls this check and mails on state change.
 
-    Decision tree:
-
-    - No host auth → skip (Codex not configured).
-    - Host auth + persistent in-container auth → ok (post-import).
-    - Host auth + no persistent + mount readable → ok (pre-import,
-      bridge available).
-    - Host auth + no persistent + mount unreadable → fail (setup
-      can't import; investigate).
+    Reads ``/opt/data/auth.json`` through the container as root
+    (mode-600, hermes-owned) and never surfaces token values — only
+    status/reason fields. Provider = ``model.provider`` in config.yaml,
+    falling back to ``active_provider`` in auth.json.
     """
-    auth_path = cfg.paths.host_data_dir / ".codex" / "auth.json"
-    if not auth_path.exists():
-        report.add(f"{agent_name}.codex_mount", "ok", "skipped (no host auth)")
-        return
+    from agents_cli import hermes_config
 
-    # Did Hermes already import the auth into its persistent home?
-    post_import = mp.exec_in_vm(
-        cfg.vm.name,
-        *_compose_exec_in_vm_argv(cfg, svc, "test", "-r", "/opt/data/auth.json", no_tty=True),
-        check=False,
-    )
-    if post_import.returncode == 0:
-        report.add(
-            f"{agent_name}.codex_mount",
-            "ok",
-            "post-import; persistent auth at /opt/data/auth.json",
-        )
-        return
-
-    # Pre-setup state: the mount must be readable so `hermes setup`
-    # can import it. Probe through the container.
-    bridge = mp.exec_in_vm(
+    cat = mp.exec_in_vm(
         cfg.vm.name,
         *_compose_exec_in_vm_argv(
-            cfg, svc, "test", "-r", "/home/hermes/.codex/auth.json", no_tty=True
+            cfg, svc, "cat", "/opt/data/auth.json", no_tty=True, as_root=True
         ),
         check=False,
     )
-    if bridge.returncode == 0:
-        report.add(f"{agent_name}.codex_mount", "ok", "pre-import; bridge mount readable")
-    elif bridge.returncode in (124, 125, 126):
-        report.add(f"{agent_name}.codex_mount", "warn", "container not up; skipping")
-    else:
+    if cat.returncode != 0:
+        err = (cat.stderr or "").lower()
+        if "is not running" in err or "no such" in err:
+            report.add(f"{agent_name}.credential_pool", "warn", "container not up")
+        else:
+            report.add(f"{agent_name}.credential_pool", "ok", "skipped (no auth.json yet)")
+        return
+    try:
+        auth = json.loads(cat.stdout)
+    except json.JSONDecodeError:
+        report.add(f"{agent_name}.credential_pool", "warn", "auth.json unparseable")
+        return
+
+    provider = ""
+    try:
+        doc = hermes_config.read_doc(cfg, agent_name)
+        raw_model = doc.get("model")
+        if isinstance(raw_model, dict):
+            provider = str(raw_model.get("provider") or "")
+    except (RuntimeFailure, UserError):
+        pass
+    if not provider or provider == "auto":
+        provider = str(auth.get("active_provider") or "")
+    if not provider:
+        report.add(f"{agent_name}.credential_pool", "ok", "skipped (no primary provider set)")
+        return
+
+    pool = auth.get("credential_pool") or {}
+    entries = pool.get(provider) if isinstance(pool, dict) else None
+    if not isinstance(entries, list) or not entries:
         report.add(
-            f"{agent_name}.codex_mount",
-            "fail",
-            f"/home/hermes/.codex/auth.json unreadable AND no persistent "
-            f"/opt/data/auth.json — `hermes setup` won't be able to import "
-            f"(rc={bridge.returncode})",
+            f"{agent_name}.credential_pool",
+            "warn",
+            f"no pooled credential for primary provider {provider!r}",
         )
+        return
+
+    bad = [
+        e
+        for e in entries
+        if isinstance(e, dict) and str(e.get("last_status") or "") in _CREDENTIAL_BAD_STATUSES
+    ]
+    if not bad:
+        report.add(
+            f"{agent_name}.credential_pool",
+            "ok",
+            f"{provider}: {len(entries)} credential(s) healthy",
+        )
+        return
+
+    reasons = sorted(
+        {
+            f"{e.get('last_status')}"
+            + (f"/{e.get('last_error_reason')}" if e.get("last_error_reason") else "")
+            for e in bad
+        }
+    )
+    detail = f"{provider}: {len(bad)}/{len(entries)} credential(s) {', '.join(reasons)}"
+    if provider == "openai-codex":
+        detail += (
+            f" — re-auth: `agents exec {agent_name} -- hermes auth add openai-codex "
+            f"--type oauth --no-browser`"
+        )
+    report.add(
+        f"{agent_name}.credential_pool",
+        "fail" if len(bad) == len(entries) else "warn",
+        detail,
+    )
 
 
 def _check_inference_health(cfg: AgentsConfig, report: DoctorReport) -> None:

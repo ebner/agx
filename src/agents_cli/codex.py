@@ -1,23 +1,36 @@
-"""Codex CLI integration: login / refresh / status / skill-enable / skill-disable.
+"""Codex CLI integration: login / status / skill-enable / skill-disable.
 
 The toolkit-scoped Codex account lives at ``<data-dir>/.codex/`` and is
 distinct from the user's personal ``~/.codex/``. Authentication is done
 on the host via the ``codex`` CLI with ``CODEX_HOME`` pointed at the
 toolkit dir.
 
-For Hermes agents there are two Codex paths:
+This module serves exactly ONE purpose: the **Codex coding skill**
+inside Hermes' nested sandbox (the bundled ``autonomous-ai-agents/codex``
+skill). Opt-in via ``agents codex skill-enable <hermes-agent>``: build a
+derived sandbox image with Codex baked in, point the agent's
+``terminal.docker_image`` at it, and add the Codex auth as a
+sandbox-volume entry (``<vm_agents_root>/.codex:/codex:ro``) using
+**VM-side** host paths.
 
-1. **As an LLM provider** (``model.provider: openai-codex``). Doesn't
-   need the Codex CLI at all — Hermes imports the OAuth tokens from
-   the mounted ``/home/hermes/.codex`` on first setup. Always available;
-   the toolkit just provisions the mount and the auth lives at
-   ``<data-dir>/.codex/auth.json``.
-2. **As a coding skill** (the bundled ``autonomous-ai-agents/codex``
-   skill). Needs the Codex CLI inside Hermes' nested sandbox container.
-   Opt-in via ``agents codex skill-enable <hermes-agent>``: build a
-   derived sandbox image with Codex baked in, point the agent's
-   ``terminal.docker_image`` at it, and add the Codex auth as a
-   sandbox-volume entry using **VM-side** host paths.
+It is deliberately NOT the way a Hermes agent authenticates its
+``openai-codex`` **LLM provider** any more. That used to be an "import
+bridge" (``<data-dir>/.codex`` bind-mounted at ``/home/hermes/.codex``
+for ``hermes setup`` to seed a credential from), retired 2026-09: the
+seeded credential shared ONE single-use OAuth refresh-token chain with
+the host copy, so any refresh of the host file (``agents codex
+refresh``, the CLI itself) rotated the token under the running agent —
+"Your authentication token has been invalidated" — and the two copies
+could never both stay valid. Provider auth is now done inside the
+container, where Hermes owns the credential and its refresh cycle::
+
+    agents exec <name> -- hermes auth add openai-codex --type oauth --no-browser
+
+(device-code flow: prints a URL + code to open on any browser that is
+logged into the ChatGPT account; the credential persists in the agent's
+``/opt/data/auth.json``). Because of the same single-use-chain rule,
+nothing in the toolkit refreshes ``<data-dir>/.codex`` on the user's
+behalf: ``agents codex refresh`` is retired.
 
 OpenClaw bundles its own Codex plugin — the toolkit refuses
 ``skill-enable`` on OpenClaw agents.
@@ -58,7 +71,7 @@ def _require_host_codex() -> str:
     return binary
 
 
-# ---------- login / refresh / status ----------
+# ---------- login / status ----------
 
 
 def login(
@@ -85,49 +98,18 @@ def login(
     result = subprocess.run(argv, env=env, check=False)
     if result.returncode != 0:
         raise RuntimeFailure(f"codex login failed (rc={result.returncode})")
-    _grant_bridge_read(cfg)
-    # Under --data-dir-in-vm the containers mount <vm_agents_root>/.codex,
-    # not the host. Sync the freshly-written auth into the VM.
+    # Under --data-dir-in-vm the sandbox skill volume points at
+    # <vm_agents_root>/.codex, not the host. Sync the freshly-written
+    # auth into the VM.
     if cfg.paths.data_dir_in_vm:
         _sync_host_codex_to_vm(cfg)
     ui.emit({"auth": "ok", "codex_home": env["CODEX_HOME"]}, human="codex auth ok")
 
 
-def _grant_bridge_read(cfg: AgentsConfig) -> None:
-    """Make the freshly-written toolkit Codex auth readable through the
-    per-agent import-bridge mounts.
-
-    The Codex CLI writes ``auth.json`` mode 600 owned by the host user.
-    Inside a Hermes container the host user maps to container ROOT while
-    the runtime ``hermes`` user (uid 1000) maps to the subuid range — so
-    a 600 file is unreadable exactly where it's needed. Host-side ACLs
-    are NOT the fix: virtiofs/9p evaluate DAC at the VM level and do not
-    propagate host ACLs (verified live 2026-08-27 — the import silently
-    found nothing and `hermes auth add openai-codex` fell through to a
-    fresh device-code login). Mode bits DO propagate: other-read on the
-    file + traverse on the dir is the only lever, and it is no broader
-    than the group/other-readable per-agent ``.env`` files the toolkit
-    already writes — the deployment model is a single-user host.
-    """
-    home = _codex_home(cfg)
-    try:
-        if home.is_dir():
-            home.chmod(0o755)
-        auth = home / "auth.json"
-        if auth.exists():
-            auth.chmod(0o644)
-    except OSError as e:
-        ui.warn(
-            f"could not relax codex-auth permissions for the container import bridge: {e} "
-            f"— `hermes auth add openai-codex` inside the container will fall back to "
-            f"its own device-code login"
-        )
-
-
 def _sync_host_codex_to_vm(cfg: AgentsConfig) -> None:
-    """Push the host-side toolkit Codex dir into the VM so per-agent
-    bind-mounts (which point at the VM-side ``<vm_agents_root>/.codex``)
-    see the same auth as ``agents codex login`` just wrote.
+    """Push the host-side toolkit Codex dir into the VM so the sandbox
+    skill volume (which points at the VM-side ``<vm_agents_root>/.codex``)
+    sees the same auth as ``agents codex login`` just wrote.
 
     Real directory sync: tars the host ``.codex/`` (including subdirs),
     transfers the archive, and extracts in the VM after ``rm -rf``ing
@@ -169,32 +151,6 @@ def _sync_host_codex_to_vm(cfg: AgentsConfig) -> None:
         host_tar.unlink(missing_ok=True)
 
 
-def refresh(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> None:
-    """Non-interactive token refresh. Fails if interactive re-auth is needed."""
-    cfg = cfg_mod.load(config_path)
-    codex_home = _codex_home(cfg)
-    if not (codex_home / "auth.json").exists():
-        raise UserError("no toolkit-scoped Codex auth yet; run `agents codex login` first")
-    codex_bin = _require_host_codex()
-    env = dict(os.environ, CODEX_HOME=str(codex_home))
-    # `codex auth status` is the lowest-impact way to trigger a silent refresh
-    # in current Codex CLI builds. If it fails with a non-zero exit, interactive
-    # re-auth is required and the user is told to run `agents codex login`.
-    result = subprocess.run(
-        [codex_bin, "auth", "status"], env=env, capture_output=True, check=False
-    )
-    if result.returncode != 0:
-        raise UserError(
-            "silent refresh not possible; run `agents codex login` for interactive re-auth"
-        )
-    # The refresh rewrites auth.json — codex CLI recreates it mode 600,
-    # which would silently re-break the import bridge (see _grant_bridge_read).
-    _grant_bridge_read(cfg)
-    if cfg.paths.data_dir_in_vm:
-        _sync_host_codex_to_vm(cfg)
-    ui.emit({"refresh": "ok"}, human="codex token refreshed")
-
-
 def status(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> dict[str, Any]:
     cfg = cfg_mod.load(config_path)
     codex_home = _codex_home(cfg)
@@ -207,7 +163,7 @@ def status(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> dict[str, Any]
         "expires_at": None,
         "expires_in_days": None,
         "expiry_warning": False,
-        "per_agent_mounts": _per_agent_mount_status(cfg),
+        "per_agent_skill": _per_agent_skill_status(cfg),
     }
 
     if auth_path.exists():
@@ -231,10 +187,9 @@ def status(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> dict[str, Any]
             f"expires: {info['expires_at']} ({info['expires_in_days']} day(s))"
             + ("  ⚠ less than 7 days remain" if info["expiry_warning"] else "")
         )
-    for entry in info["per_agent_mounts"]:
+    for entry in info["per_agent_skill"]:
         human_lines.append(
             f"  {entry['name']}: skill={entry['skill_enabled']}, "
-            f"container_mount={entry['container_mount']}, "
             f"sandbox_image={entry['sandbox_image'] or '(default)'}"
         )
 
@@ -287,10 +242,8 @@ def _parse_expiry(auth_data: dict[str, Any]) -> datetime.datetime | None:
     return None
 
 
-def _per_agent_mount_status(cfg: AgentsConfig) -> list[dict[str, Any]]:
-    """For each Hermes agent: skill-enable state + whether the Codex
-    auth is actually readable inside its running container.
-    """
+def _per_agent_skill_status(cfg: AgentsConfig) -> list[dict[str, Any]]:
+    """For each Hermes agent: skill-enable state + derived sandbox image."""
     from agents_cli import compose as compose_mod
 
     doc = compose_mod.read_compose_doc(cfg)
@@ -300,12 +253,10 @@ def _per_agent_mount_status(cfg: AgentsConfig) -> list[dict[str, Any]]:
             continue
         name = svc_name[len("hermes-") :]
         state_path = _skill_state_path(cfg, name)
-        container_mount = _container_codex_mount_probe(cfg, svc_name)
         out.append(
             {
                 "name": name,
                 "skill_enabled": state_path.exists(),
-                "container_mount": container_mount,
                 "sandbox_image": (
                     json.loads(state_path.read_text())["derived_image"]
                     if state_path.exists()
@@ -314,34 +265,6 @@ def _per_agent_mount_status(cfg: AgentsConfig) -> list[dict[str, Any]]:
             }
         )
     return out
-
-
-def _container_codex_mount_probe(cfg: AgentsConfig, svc_name: str) -> str:
-    """Return 'ok' / 'missing' / 'container-down' / 'skipped'.
-
-    Built on ``compose_runner._base_argv`` so the override file
-    (architecture rule #10) is merged like every other compose
-    invocation — a hand-rolled single ``-f`` argv would silently drop it.
-    """
-    if not (cfg.paths.host_data_dir / ".codex" / "auth.json").exists():
-        return "skipped"
-    result = mp.exec_in_vm(
-        cfg.vm.name,
-        *compose_runner._base_argv(cfg),
-        "exec",
-        "-T",
-        svc_name,
-        "test",
-        "-r",
-        "/home/hermes/.codex/auth.json",
-        check=False,
-    )
-    if result.returncode == 0:
-        return "ok"
-    err = (result.stderr or "").lower()
-    if "is not running" in err or "no such" in err:
-        return "container-down"
-    return "missing"
 
 
 # ---------- skill-enable / skill-disable ----------

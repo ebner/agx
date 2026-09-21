@@ -13,7 +13,8 @@ npm install -g @openai/codex
 # Bring up the VM. Pick any path your duplicity (or other host backup) covers.
 agents vm init --data-dir /data/agents
 
-# (Optional) Authenticate the toolkit-scoped Codex account
+# (Optional) Authenticate the toolkit-scoped Codex account (only for the Codex sandbox skill;
+# an agent's openai-codex LLM provider is authenticated in-container with `hermes auth add`)
 agents codex login
 
 # Create your first Hermes agent, run the wizard
@@ -261,9 +262,10 @@ The two known targets:
 The toolkit auto-chowns both after every container recreate (in
 `fixperms_cmd.chown_hermes_install_paths`) from three code paths:
 `agents create` (service_up phase), `agents fix-perms`, and
-`agents reseat`. The recursive chown prunes the Codex import
-bridge at `/home/hermes/.codex` (which is `:ro` and would otherwise
-emit "Read-only file system" on every entry).
+`agents reseat`. The recursive chown still prunes `/home/hermes/.codex`:
+that is the RETIRED Codex import bridge, which agents not yet `reseat`ed
+carry mounted `:ro` (it would emit "Read-only file system" on every
+entry); once the mount is gone the prune matches nothing.
 
 If you ever see an `EACCES` on a path inside `/opt/hermes/` or
 `/home/hermes/` that *isn't* in this list, add it to
@@ -279,7 +281,11 @@ alert on warn+ exit codes. Currently checks:
 
 - `vm_reachable`, `mount_round_trip`, `user_docker_service`,
   `port_conflicts`, `data_dir_exists`, `codex_auth`, journals,
-  per-agent container + docker-socket + hermes-doctor + codex-mount +
+  `override_mirror` (`--data-dir-in-vm`: the host override file has its in-VM mirror),
+  per-agent container + docker-socket + hermes-doctor + `credential_pool`
+  (every pooled credential of the primary provider `exhausted`/`dead` in
+  Hermes' auth store — the "Provider authentication failed" class; detail
+  carries the in-container re-auth one-liner) +
   data-dir-access + version (compose-pin vs running-image drift) +
   host_view (a registered `agents access mount` view that isn't mounted, or is stale).
 - `firecrawl_running` — warns when firecrawl is defined in compose and
@@ -623,7 +629,37 @@ agents codex skill-enable coder    # build sandbox image with Codex baked in
 agents codex skill-disable coder   # restore original sandbox image
 ```
 
-The first call slugifies the agent's current `terminal.docker_image` and builds `agents/hermes-sandbox-codex:<sha256[:12]>`. The state file at `<data-dir>/<name>/.data/.codex-skill.json` remembers the original image so `skill-disable` can restore it exactly.
+The first call slugifies the agent's current `terminal.docker_image` and builds `agents/hermes-sandbox-codex:<sha256[:12]>`. The state file at `<data-dir>/.codex-skill/<name>.json` remembers the original image so `skill-disable` can restore it exactly. The skill reads the toolkit-scoped `<data-dir>/.codex` (`agents codex login`); this is the ONLY thing that file is for.
+
+## Codex as a Hermes agent's LLM provider — auth, expiry, recovery
+
+Authenticate the `openai-codex` provider **inside the container**; the toolkit-scoped `.codex` is not involved:
+
+```bash
+agents exec coder -- hermes auth add openai-codex --type oauth --no-browser   # prints URL + code
+agents exec coder -- hermes auth list openai-codex                            # shows pooled credentials
+agents exec coder -- hermes auth remove openai-codex 1                        # drop an exhausted one
+```
+
+Symptom of a dead credential: the agent answers *"Provider authentication failed. Check the configured credentials; raw provider details are in the gateway logs."*, `agents logs coder` shows `HTTP 401 … token_expired` / `token_invalidated`, and `agents doctor` reports `coder.credential_pool: fail`. ChatGPT-subscription OAuth chains die every 1–3 weeks (upstream Hermes #65346, unresolved) — plan for it rather than around it:
+
+- **Keep answering:** `fallback_providers` in the agent's `config.yaml` (a cheap OpenRouter model; Hermes fails over immediately on 401/403).
+- **Hear about it within 15 min:** `agents doctor-cron install --mail you@example.org` (below).
+- **Re-auth from anywhere:** the device-code URL works from a phone browser; with `agents tailscale up` + an SSH app you can run the `hermes auth add` line from the phone too.
+- **Never** `agents codex refresh` / `agents codex login` "for the agent" — the retired import bridge is why that used to invalidate agents' tokens; `agents reseat <name>` removes the bridge mount from agents created before 2026-09.
+
+## doctor-cron
+
+Host cron that runs `agents doctor` every N minutes and mails **on state change only** — one mail when a check turns red (with every failing check's detail and the fix one-liner), one when everything is green again; warnings are listed for context but never trigger a mail. Delivery is through the host's `sendmail` (postfix, msmtp, …): the toolkit carries no SMTP config, and `install` refuses when no `sendmail` is on PATH.
+
+```bash
+agents doctor-cron install --mail you@example.org [--every 15]
+agents doctor-cron status      # installed?, last run, currently failing checks, last mail
+agents doctor-cron run         # one poll by hand (what cron calls)
+agents doctor-cron uninstall
+```
+
+State lives at `<data-dir>/.doctor-cron/state.json`; the cron log at `<data-dir>/.doctor-cron.log`. A red doctor never makes the cron line exit non-zero (that would trigger cron's own MAILTO spam) — only a failed run itself (config missing, sendmail rejected) does.
 
 OpenClaw bundles its own Codex plugin — run `openclaw models auth login --provider openai-codex --device-code` *inside* the OpenClaw container instead:
 

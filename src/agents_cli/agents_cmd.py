@@ -459,10 +459,10 @@ def _add_service_to_compose(
 def _ensure_hermes_image_pulled(cfg: AgentsConfig, tag: str) -> None:
     """Pull the Hermes image up front so `docker compose up` doesn't hit a
     network failure mid-mutation. We used to also verify the image's
-    entrypoint USER/HOME, but the compose fragment now sets both
-    `user:` and `HOME` explicitly — the runtime user is fully ours to
-    own, so image drift in those fields doesn't break the Codex import
-    mount. We just need the image local before compose up.
+    entrypoint USER/HOME for the (since retired) Codex import mount;
+    the fragment pins `HOME` in env and the entrypoint remaps the
+    runtime uid via HERMES_UID, so image drift there is no longer our
+    concern. We just need the image local before compose up.
     """
     image_ref = f"{HERMES_IMAGE_BASE}:{tag}"
     inspect = mp.exec_in_vm(cfg.vm.name, "docker", "image", "inspect", image_ref, check=False)
@@ -988,6 +988,22 @@ def _carry_user_additions(new_fragment: dict[str, object], existing: dict[str, o
     _merge_list_additions(new_fragment, existing, "depends_on")
     _merge_list_additions(new_fragment, existing, "ports", entry_identity=_port_identity)
     _merge_list_additions(new_fragment, existing, "volumes", entry_identity=_volume_identity)
+    _drop_retired_stock_volumes(new_fragment)
+
+
+def _drop_retired_stock_volumes(new_fragment: dict[str, object]) -> None:
+    """Remove volumes the toolkit itself used to emit and has since
+    retired. The carry-over diff can't tell "user addition" from "stale
+    stock entry" — both are absent from the fresh template — so a retired
+    toolkit volume would otherwise be preserved on every reseat forever.
+    Currently: the Codex import bridge (``compose.LEGACY_CODEX_BRIDGE_TARGET``).
+    """
+    volumes = new_fragment.get("volumes")
+    if not isinstance(volumes, list):
+        return
+    kept = [v for v in volumes if _volume_identity(v) != compose.LEGACY_CODEX_BRIDGE_TARGET]
+    if len(kept) != len(volumes):
+        new_fragment["volumes"] = kept
 
 
 def _merge_list_additions(
