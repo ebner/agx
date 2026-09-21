@@ -223,6 +223,36 @@ def test_chown_hermes_install_paths_chowns_both_targets(
     assert "/home/hermes" in chowned
 
 
+def test_chown_hermes_install_paths_creates_runtime_home(
+    with_coder: Path, cfg: AgentsConfig, mocker: Any
+) -> None:
+    """HOME=/home/hermes is pinned by the fragment but the image never
+    creates the dir; it only existed as the parent of the retired
+    .codex bridge mount. Without it npm has no cache/log dir and the
+    WhatsApp bridge's dependency install fails half-way (2026-09-21).
+    The helper must `mkdir -p` it (as root) BEFORE the existence-gated
+    chown so the chown then applies."""
+    mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())
+    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    calls: list[tuple[str, ...]] = []
+
+    def runner(vm_name: str, *cmd: str, check: bool = True) -> MpResult:
+        calls.append(cmd)
+        if "id" in cmd and "-u" in cmd and "hermes" in cmd:
+            return _ok(stdout="1000\n")
+        return _ok()
+
+    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=runner)
+    fixperms_cmd.fix_perms("coder", yes=True, config_path=with_coder)
+
+    mkdir_idx = next(
+        i for i, c in enumerate(calls) if "mkdir" in c and "-p" in c and "/home/hermes" in c
+    )
+    assert "--user" not in calls[mkdir_idx]  # as root
+    chown_idx = next(i for i, c in enumerate(calls) if "chown" in c and "/home/hermes" in c)
+    assert mkdir_idx < chown_idx
+
+
 def test_chown_hermes_install_paths_skips_missing(
     with_coder: Path, cfg: AgentsConfig, mocker: Any
 ) -> None:

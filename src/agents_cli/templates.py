@@ -317,6 +317,11 @@ if [ -n "$HUID" ] && [ -n "$HGID" ]; then
     if [ -e /opt/hermes/scripts ]; then
         find /opt/hermes/scripts -exec chown "$HUID:$HGID" {} + 2>/dev/null
     fi
+    # HOME is pinned to /home/hermes by the compose fragment but the
+    # image never creates it (it used to appear only as the parent of the
+    # retired .codex bridge mount). npm needs it for cache/logs, or the
+    # WhatsApp bridge's dependency install fails half-way.
+    mkdir -p /home/hermes 2>/dev/null
     if [ -e /home/hermes ]; then
         find /home/hermes -path /home/hermes/.codex -prune -o -exec chown "$HUID:$HGID" {} + 2>/dev/null
     fi

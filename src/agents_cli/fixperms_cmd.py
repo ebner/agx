@@ -166,6 +166,10 @@ def chown_data_dir(cfg: AgentsConfig, svc: str, uid: int) -> None:
         raise RuntimeFailure(f"chown -R {uid}:{uid} /opt/data failed: {result.stderr.strip()}")
 
 
+# Runtime user's home — pinned via HOME= in the compose fragment, created
+# by chown_hermes_install_paths + the cont-init hook (the image doesn't).
+HERMES_HOME_DIR = "/home/hermes"
+
 HERMES_WRITABLE_PATHS: tuple[tuple[str, tuple[str, ...]], ...] = (
     # (target, paths-to-prune). `find -path <prune> -prune` keeps the
     # chown from touching read-only bind-mounts. /home/hermes/.codex is
@@ -204,6 +208,20 @@ def chown_hermes_install_paths(cfg: AgentsConfig, svc: str, uid: int) -> None:
     fix-perms``, ``agents reseat``) calls this helper after start.
     """
     ui.progress(f"chowning image-baked install paths in {svc} (hermes setup prerequisites)...")
+    # The runtime user's HOME is pinned to /home/hermes by the compose
+    # fragment, but nothing in the image creates it (`usermod` doesn't,
+    # and newer images run as root with no home at all). It used to
+    # exist only as a side effect of Docker creating the parent of the
+    # retired /home/hermes/.codex bridge mount — without it npm has no
+    # cache/log dir and the WhatsApp bridge's dependency install fails
+    # half-way (ERR_MODULE_NOT_FOUND, 2026-09-21).
+    mp.exec_in_vm(
+        cfg.vm.name,
+        *_compose_exec_in_vm_argv(
+            cfg, svc, "mkdir", "-p", HERMES_HOME_DIR, no_tty=True, as_root=True
+        ),
+        check=False,
+    )
     for path, prunes in HERMES_WRITABLE_PATHS:
         check = mp.exec_in_vm(
             cfg.vm.name,
