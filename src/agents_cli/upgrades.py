@@ -42,7 +42,7 @@ from agents_cli.agents_cmd import _detect_type_from_compose
 from agents_cli.agents_cmd import service_name as _service_name_for
 from agents_cli.compose import HERMES_IMAGE_BASE, OPENCLAW_IMAGE_BASE
 from agents_cli.config import AgentsConfig
-from agents_cli.errors import RuntimeFailure, UserError
+from agents_cli.errors import HealthCheckFailure, RuntimeFailure, UserError
 from agents_cli.journal import Journal
 
 CONFIG_MIGRATE_PHASE = "config_migrated"
@@ -360,10 +360,20 @@ def upgrade(
                 _step("doctor_passed", "running doctor health checks on the upgraded agent...")
                 # emit=False: upgrade owns this command's single stdout
                 # object — doctor's own table/array would stack a second
-                # JSON document under --json. On red it still raises
-                # HealthCheckFailure; the hint below points at the full
-                # report.
-                ops.doctor(target=name, config_path=config_path, emit=False)
+                # JSON document under --json. raise_on_fail=False so the
+                # failing checks can be NAMED in the error: a bare "1
+                # doctor check(s) failed" left the user no way to know
+                # what rolled the upgrade back, since the revert replaces
+                # the container the report was about (2026-10-10).
+                report = ops.doctor(
+                    target=name, config_path=config_path, emit=False, raise_on_fail=False
+                )
+                if report.failed:
+                    failed_checks = [c for c in report.checks if c.status == "fail"]
+                    raise HealthCheckFailure(
+                        f"{len(failed_checks)} doctor check(s) failed on the upgraded agent: "
+                        + "; ".join(f"{c.name}: {c.detail or '(no detail)'}" for c in failed_checks)
+                    )
                 journal.advance("doctor_passed")
 
             journal.complete()

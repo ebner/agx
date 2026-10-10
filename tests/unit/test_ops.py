@@ -755,6 +755,42 @@ def test_doctor_flags_hermes_doctor_failure(with_coder: Path, mocker) -> None:
         ops.doctor(config_path=with_coder)
 
 
+def test_hermes_doctor_issue_report_is_warn_not_fail(cfg: AgentsConfig, mocker) -> None:
+    """Hermes >= v0.21.6 exits 1 whenever `hermes doctor` finds ANY issue
+    (incl. advisory WAL-on-9p notes) — older images exited 0 with the
+    same findings. A completed run that reports issues is a `warn` with
+    the flagged lines; only a run that couldn't happen is a `fail`.
+    Mapping the former to fail rolled back a healthy upgrade."""
+    from agents_cli.ops import DoctorReport, _check_hermes_doctor
+
+    out = (
+        "◆ Database\n"
+        "  ⚠ state.db is in WAL mode on a cross-VM filesystem (virtiofs/9p, 168.0 KB)\n"
+        "  ✗ ~/.local/bin/hermes not found\n"
+        "  ✓ config.yaml ok\n"
+        "Found 2 issue(s) to address:\n"
+    )
+    mocker.patch("agents_cli.mp.exec_in_vm", return_value=MpResult(out, "", 1))
+    report = DoctorReport()
+    _check_hermes_doctor(cfg, "hermes-coder", "coder", report)
+    [check] = report.checks
+    assert check.status == "warn"
+    assert "reported 2 issue(s)" in check.detail
+    assert "WAL mode on a cross-VM filesystem" in check.detail
+    assert "✓ config.yaml" not in check.detail
+    assert "agents exec coder -- hermes doctor" in check.detail
+
+    # Could not run at all → still a hard fail.
+    mocker.patch(
+        "agents_cli.mp.exec_in_vm",
+        return_value=MpResult("", 'exec: "hermes": executable file not found in $PATH', 126),
+    )
+    report = DoctorReport()
+    _check_hermes_doctor(cfg, "hermes-coder", "coder", report)
+    assert report.checks[0].status == "fail"
+    assert "executable file not found" in report.checks[0].detail
+
+
 def test_doctor_arm64_emulation_warns_when_firecrawl_running_on_arm64(
     with_coder: Path, mocker, cfg: AgentsConfig
 ) -> None:

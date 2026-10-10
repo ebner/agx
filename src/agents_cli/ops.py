@@ -701,10 +701,12 @@ def _check_agent_version(
             check=False,
         )
         if ver.returncode == 0:
-            m = re.search(r"Hermes Agent (v\d+\.\d+(?:\.\d+)?)\s*\(", ver.stdout)
+            # Since v0.21.6 the release tag IS the semver and the calver
+            # parenthetical may be absent, so the "(" is optional.
+            m = re.search(r"Hermes Agent (v\d+\.\d+(?:\.\d+)?)", ver.stdout)
             if m:
                 semver = m.group(1)
-    suffix = f" (app {semver})" if semver else ""
+    suffix = f" (app {semver})" if semver and semver != running_tag else ""
 
     if running_tag == pinned_tag:
         report.add(f"{agent_name}.version", "ok", f"{running_tag}{suffix}")
@@ -808,9 +810,27 @@ def _check_hermes_data_dir_accessible(
     )
 
 
+_HERMES_DOCTOR_ISSUES_RE = re.compile(r"Found (\d+) issue\(s\)")
+_HERMES_DOCTOR_MAX_DETAIL_LINES: Final = 4
+
+
 def _check_hermes_doctor(
     cfg: AgentsConfig, svc: str, agent_name: str, report: DoctorReport
 ) -> None:
+    """Run ``hermes doctor`` in the container and classify the outcome.
+
+    Two very different non-zero exits must not be conflated:
+
+    - ``hermes doctor`` RAN and reported issues. Hermes ≥ v0.21.6 exits 1
+      whenever it finds any issue — including advisory ``⚠`` items such
+      as "state.db is in WAL mode on a cross-VM filesystem" — whereas
+      ≤ v2026.9.x exited 0 with the same findings. Mapping that to
+      ``fail`` made ``agents upgrade`` roll back a perfectly healthy
+      v0.21.6 (2026-10-10). It is a ``warn`` carrying the issue lines.
+    - ``hermes doctor`` could NOT run (binary missing, import crash,
+      container down): ``fail`` — that is the "upgrade broke the agent"
+      signal this check exists for.
+    """
     result = mp.exec_in_vm(
         cfg.vm.name,
         *_compose_exec_in_vm_argv(cfg, svc, "hermes", "doctor", no_tty=True),
@@ -818,12 +838,24 @@ def _check_hermes_doctor(
     )
     if result.returncode == 0:
         report.add(f"{agent_name}.hermes_doctor", "ok")
-    else:
+        return
+    output = f"{result.stdout}\n{result.stderr}"
+    issues = _HERMES_DOCTOR_ISSUES_RE.search(output)
+    if issues is None:
         report.add(
             f"{agent_name}.hermes_doctor",
             "fail",
             result.stderr.strip() or result.stdout.strip(),
         )
+        return
+    flagged = [line.strip() for line in output.splitlines() if line.strip().startswith(("✗", "⚠"))]
+    shown = "; ".join(line[:160] for line in flagged[:_HERMES_DOCTOR_MAX_DETAIL_LINES])
+    more = len(flagged) - _HERMES_DOCTOR_MAX_DETAIL_LINES
+    detail = f"`hermes doctor` reported {issues.group(1)} issue(s)"
+    if shown:
+        detail += f": {shown}" + (f" (+{more} more)" if more > 0 else "")
+    detail += f" — full list: `agents exec {agent_name} -- hermes doctor`"
+    report.add(f"{agent_name}.hermes_doctor", "warn", detail)
 
 
 # One in-container pass over every secondary Hermes profile: emit one

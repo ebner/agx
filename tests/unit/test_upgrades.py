@@ -1177,6 +1177,34 @@ def test_upgrade_rollback_clears_journal_to_force_clean_retry(
     )
 
 
+def test_upgrade_doctor_failure_names_the_failing_checks(
+    with_coder: Path, mocker, cfg: AgentsConfig
+) -> None:
+    """A red doctor phase must say WHICH check failed (and why): the
+    revert replaces the container the report was about, so a bare
+    "1 doctor check(s) failed" left the user nothing to investigate
+    (2026-10-10, v0.21.6 rolled back with no hint). Warnings must not
+    trip the gate and must not be listed as failures."""
+    from agents_cli.errors import HealthCheckFailure
+    from agents_cli.ops import DoctorReport
+
+    _stub_happy_upgrade(mocker, cfg)
+    report = DoctorReport()
+    report.add("coder.container", "ok")
+    report.add("coder.hermes_doctor", "fail", "hermes: command not found")
+    report.add("coder.version", "warn", "drift")
+    doctor = mocker.patch("agents_cli.ops.doctor", return_value=report)
+
+    with pytest.raises(HealthCheckFailure) as exc:
+        upgrades.upgrade("coder", tag="v1.0.1", config_path=with_coder)
+
+    msg = str(exc.value)
+    assert "1 doctor check(s) failed" in msg
+    assert "coder.hermes_doctor: hermes: command not found" in msg
+    assert "coder.version" not in msg
+    assert doctor.call_args.kwargs["raise_on_fail"] is False
+
+
 def test_upgrade_failed_run_does_not_bump_default_tag(
     with_coder: Path, mocker, cfg: AgentsConfig
 ) -> None:
