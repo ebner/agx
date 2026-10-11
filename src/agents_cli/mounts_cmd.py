@@ -100,6 +100,16 @@ class MountEntry:
         base = PurePosixPath(self.container_path).name or "root"
         return str(VM_HOST_EXTRAS_ROOT / agent / f"{h}-{base}")
 
+    def volume_source(self, agent: str, backend: str) -> str:
+        """Bind source as the Docker daemon sees it. On the VM backends
+        that is the VM-side mount point; on bare_metal the daemon runs
+        on the host, so it is the host folder itself — there is no
+        ``host-extras`` mount behind :meth:`vm_path` there.
+        """
+        if backend == "bare_metal":
+            return self.host_path
+        return self.vm_path(agent)
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "host": self.host_path,
@@ -269,10 +279,13 @@ def add(
         target=effective_target,
     )
     vm_path = new_entry.vm_path(agent)
+    source = new_entry.volume_source(agent, cfg.vm.backend)
+    bare_metal = cfg.vm.backend == "bare_metal"
 
     with compose.acquire_lock(cfg.paths.host_data_dir):
+        where = "" if bare_metal else f"  vm={vm_path}"
         ui.info(
-            f"adding mount: host={host_resolved}  vm={vm_path}  "
+            f"adding mount: host={host_resolved}{where}  "
             f"container={container_resolved}  ({'ro' if readonly else 'rw'}, target={effective_target})"
         )
 
@@ -282,12 +295,13 @@ def add(
         # agent gets rwX on existing + future files, AND we set a
         # default ACL granting the host user rwx on future files the
         # agent creates back (so the user can read what the agent
-        # wrote). No-op on bare-metal (container uid maps to host
-        # user) and when the fs doesn't support ACLs (warn).
+        # wrote). Applies on bare-metal too: rootless Docker runs there
+        # as well, so the agent is a subuid on the host. No-op (warn)
+        # when the fs doesn't support ACLs.
         applied_acl = _auto_acl_host_folder(cfg, host_resolved, readonly)
 
         # Phase 1: VM mount. No-op on bare-metal.
-        if cfg.vm.backend != "bare_metal":
+        if not bare_metal:
             result = mp.mount(
                 host_resolved,
                 cfg.vm.name,
@@ -310,14 +324,14 @@ def add(
             # and the rollback below must not delete it (rule #10).
             if effective_target in {"runtime", "both"}:
                 applied_runtime = _add_runtime_volume(
-                    cfg, svc, vm_path, container_resolved, readonly
+                    cfg, svc, source, container_resolved, readonly
                 )
 
             # Phase 3: hermes config.yaml (sandbox target). Same
             # actually-inserted contract as phase 2.
             if effective_target in {"sandbox", "both"}:
                 applied_sandbox = _add_sandbox_volume(
-                    cfg, svc, agent, vm_path, container_resolved, readonly
+                    cfg, svc, agent, source, container_resolved, readonly
                 )
 
             # Phase 4: manifest persist.
@@ -336,7 +350,7 @@ def add(
                         cfg,
                         svc,
                         agent,
-                        vm_path,
+                        source,
                         container_resolved,
                         readonly,
                         include_flipped=False,
@@ -346,12 +360,12 @@ def add(
                     _remove_runtime_volume(
                         cfg,
                         svc,
-                        vm_path,
+                        source,
                         container_resolved,
                         readonly,
                         include_flipped=False,
                     )
-            if cfg.vm.backend != "bare_metal":
+            if not bare_metal:
                 with _suppress():
                     mp.umount(cfg.vm.name, vm_path)
             # Phase-0 ACLs: strip only when this call introduced the
@@ -378,11 +392,13 @@ def add(
             f"`agents upgrade {agent} --recreate`"
         )
 
+    vm_line = "" if bare_metal else f"  vm:        {vm_path}\n"
     ui.emit(
         {
             "agent": agent,
             "host_path": str(host_resolved),
-            "vm_path": vm_path,
+            "vm_path": None if bare_metal else vm_path,
+            "volume_source": source,
             "container_path": container_resolved,
             "readonly": readonly,
             "target": effective_target,
@@ -391,7 +407,7 @@ def add(
         human=(
             f"mount added for {agent!r}:\n"
             f"  host:      {host_resolved}\n"
-            f"  vm:        {vm_path}\n"
+            f"{vm_line}"
             f"  container: {container_resolved}\n"
             f"  mode:      {'ro' if readonly else 'rw'}\n"
             f"  target:    {effective_target}"
@@ -424,18 +440,26 @@ def remove(
         )
     entry = matching[0]
     vm_path = entry.vm_path(agent)
+    bare_metal = cfg.vm.backend == "bare_metal"
+    # Toolkit versions before 2026-10 wrote the VM-side path as the bind
+    # source on bare-metal too (a dead mount: nothing backs it on the
+    # host). Strip that legacy form as well so such entries still go.
+    sources = [entry.volume_source(agent, cfg.vm.backend)]
+    if bare_metal:
+        sources.append(vm_path)
 
     with compose.acquire_lock(cfg.paths.host_data_dir):
-        ui.info(f"removing mount: vm={vm_path}  container={container}")
+        ui.info(f"removing mount: source={sources[0]}  container={container}")
 
-        if entry.target in {"runtime", "both"}:
-            with _suppress():
-                _remove_runtime_volume(cfg, svc, vm_path, container, entry.readonly)
-        if entry.target in {"sandbox", "both"}:
-            with _suppress():
-                _remove_sandbox_volume(cfg, svc, agent, vm_path, container, entry.readonly)
+        for source in sources:
+            if entry.target in {"runtime", "both"}:
+                with _suppress():
+                    _remove_runtime_volume(cfg, svc, source, container, entry.readonly)
+            if entry.target in {"sandbox", "both"}:
+                with _suppress():
+                    _remove_sandbox_volume(cfg, svc, agent, source, container, entry.readonly)
 
-        if cfg.vm.backend != "bare_metal":
+        if not bare_metal:
             mp.umount(cfg.vm.name, vm_path)
 
         entries = [e for e in entries if e.container_path != container]
@@ -507,7 +531,8 @@ def list_mounts(
         for e in load_manifest(cfg, a):
             row = e.to_dict()
             row["agent"] = a
-            row["vm"] = e.vm_path(a)
+            row["vm"] = None if cfg.vm.backend == "bare_metal" else e.vm_path(a)
+            row["source"] = e.volume_source(a, cfg.vm.backend)
             out.append(row)
 
     if out:
@@ -563,7 +588,7 @@ def _format_volume(vm_path: str, container_path: str, readonly: bool) -> str:
 def _add_runtime_volume(
     cfg: AgentsConfig,
     svc: str,
-    vm_path: str,
+    source: str,
     container_path: str,
     readonly: bool,
 ) -> bool:
@@ -579,7 +604,7 @@ def _add_runtime_volume(
     services = doc.setdefault("services", {})
     svc_block = services.setdefault(svc, {})
     volumes = svc_block.setdefault("volumes", [])
-    entry = _format_volume(vm_path, container_path, readonly)
+    entry = _format_volume(source, container_path, readonly)
     if entry in volumes:
         return False
     volumes.append(entry)
@@ -590,7 +615,7 @@ def _add_runtime_volume(
 def _remove_runtime_volume(
     cfg: AgentsConfig,
     svc: str,
-    vm_path: str,
+    source: str,
     container_path: str,
     readonly: bool,
     *,
@@ -602,7 +627,7 @@ def _remove_runtime_volume(
     if not svc_block:
         return
     volumes = svc_block.get("volumes") or []
-    target = _format_volume(vm_path, container_path, readonly)
+    target = _format_volume(source, container_path, readonly)
     # Tolerate that the user may have flipped the :ro suffix manually
     # since add — remove the canonical form AND the toggled form.
     # ``add``'s rollback passes ``include_flipped=False``: it must only
@@ -610,7 +635,7 @@ def _remove_runtime_volume(
     # flipped-suffix twin the user may have hand-added.
     forms = {target}
     if include_flipped:
-        forms.add(_format_volume(vm_path, container_path, not readonly))
+        forms.add(_format_volume(source, container_path, not readonly))
     new_volumes = [v for v in volumes if v not in forms]
     if new_volumes == list(volumes):
         return
@@ -628,7 +653,7 @@ def _add_sandbox_volume(
     cfg: AgentsConfig,
     svc: str,
     agent: str,
-    vm_path: str,
+    source: str,
     container_path: str,
     readonly: bool,
 ) -> bool:
@@ -640,7 +665,7 @@ def _add_sandbox_volume(
     same actually-changed contract as :func:`_add_runtime_volume`, so
     ``add``'s rollback never strips a user-added pre-existing entry.
     """
-    entry = _format_volume(vm_path, container_path, readonly)
+    entry = _format_volume(source, container_path, readonly)
     doc = hermes_config.read_doc(cfg, agent)
     volumes = (doc.get("terminal") or {}).get("docker_volumes") or []
     if entry in volumes:
@@ -654,20 +679,20 @@ def _remove_sandbox_volume(
     cfg: AgentsConfig,
     svc: str,
     agent: str,
-    vm_path: str,
+    source: str,
     container_path: str,
     readonly: bool,
     *,
     include_flipped: bool = True,
 ) -> None:
     doc = hermes_config.read_doc(cfg, agent)
-    hermes_config.remove_docker_volume(doc, _format_volume(vm_path, container_path, readonly))
+    hermes_config.remove_docker_volume(doc, _format_volume(source, container_path, readonly))
     if include_flipped:
         # Same rationale as _remove_runtime_volume: only the manifest-
         # driven remove tolerates a user-flipped :ro suffix; add's
         # rollback removes exactly what it inserted.
         hermes_config.remove_docker_volume(
-            doc, _format_volume(vm_path, container_path, not readonly)
+            doc, _format_volume(source, container_path, not readonly)
         )
     hermes_config.write_atomically(cfg, agent, doc)
 
@@ -681,8 +706,11 @@ def _auto_acl_host_folder(cfg: AgentsConfig, host_path: Path, readonly: bool) ->
     when ``--rw``). Idempotent — setfacl on an already-present entry
     is a no-op. No sudo needed; the user owns the folder.
 
-    Skipped on bare-metal because the container uid maps 1:1 to the
-    host user there. Warn-only if the filesystem can't carry ACLs;
+    Applies on bare-metal too: rootless Docker runs on the host there,
+    so the container uid is a subuid of the host user exactly as in the
+    VM (the host's ``/etc/subuid`` IS the daemon's mapping on bare-metal,
+    so ``compute_container_subuid`` is exact). Warn-only if the
+    filesystem can't carry ACLs;
     the mount still works in the obvious case (mode-permissive files)
     but file-level permission errors will surface at runtime.
 
@@ -696,8 +724,6 @@ def _auto_acl_host_folder(cfg: AgentsConfig, host_path: Path, readonly: bool) ->
     """
     from agents_cli import permissions
 
-    if cfg.vm.backend == "bare_metal":
-        return False
     ok, err = permissions.probe_acl_support(host_path)
     if not ok:
         ui.warn(
@@ -724,12 +750,11 @@ def _auto_acl_host_folder_remove(cfg: AgentsConfig, host_path: Path, readonly: b
     """Reverse :func:`_auto_acl_host_folder`. Only removes the entries
     the toolkit added — leaves any user-set ACLs intact.
 
-    Skipped on bare-metal (the add path skipped too). Tolerates a
-    missing host folder (the user may have removed it after add).
+    Tolerates a missing host folder (the user may have removed it after add).
     """
     from agents_cli import permissions
 
-    if cfg.vm.backend == "bare_metal" or not host_path.exists():
+    if not host_path.exists():
         return
     recipients = [
         permissions.AclRecipient(uid=permissions.compute_container_subuid(cfg.host.uid), perms="")

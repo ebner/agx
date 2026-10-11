@@ -195,6 +195,11 @@ def main(ctx: click.Context, json_output: bool, assume_yes: bool, verbose: bool)
         from agents_cli.backends import libvirt as libvirt_mod
 
         libvirt_mod.configure(cfg.paths.host_data_dir)
+    # bare_metal pins DOCKER_HOST to the recorded rootless socket.
+    elif cfg.vm.backend == "bare_metal":
+        from agents_cli.backends import bare_metal as bare_metal_mod
+
+        bare_metal_mod.configure(cfg.vm_runtime.docker_socket_path)
 
 
 # ---------- vm lifecycle ----------

@@ -85,6 +85,37 @@ def test_exec_in_vm_interactive_returns_rc_and_inherits_stdio(bare_metal: Any, m
     assert "capture_output" not in run_mock.call_args.kwargs
 
 
+def test_run_pins_docker_host_to_rootless_socket(
+    bare_metal: Any, mocker: Any, monkeypatch: Any
+) -> None:
+    """The ambient DOCKER_HOST / docker context (a shell rc, cron's minimal
+    env, a rootful daemon the user also runs) must never decide which
+    daemon the toolkit drives — it is always the recorded rootless socket."""
+    monkeypatch.setattr(bare_metal, "_docker_socket", None)
+    monkeypatch.setenv("DOCKER_HOST", "unix:///var/run/docker.sock")
+    monkeypatch.setenv("DOCKER_CONTEXT", "default")
+    run_mock = mocker.patch("subprocess.run", return_value=_ok_proc())
+
+    bare_metal.configure("/run/user/4242/docker.sock")
+    bare_metal.exec_in_vm("ignored", "docker", "ps")
+
+    env = run_mock.call_args.kwargs["env"]
+    assert env["DOCKER_HOST"] == "unix:///run/user/4242/docker.sock"
+    assert "DOCKER_CONTEXT" not in env
+
+
+def test_run_falls_back_to_default_rootless_socket_before_init(
+    bare_metal: Any, mocker: Any, monkeypatch: Any
+) -> None:
+    import os
+
+    monkeypatch.setattr(bare_metal, "_docker_socket", None)
+    run_mock = mocker.patch("subprocess.run", return_value=MagicMock(returncode=0))
+    bare_metal.exec_in_vm_interactive("ignored", "docker", "compose", "ps")
+    env = run_mock.call_args.kwargs["env"]
+    assert env["DOCKER_HOST"] == f"unix:///run/user/{os.getuid()}/docker.sock"
+
+
 # ---------- transfers ----------
 
 

@@ -33,6 +33,7 @@ npm install -g @openai/codex
 #    below shows how to schedule those for multi-times-a-day backups).
 agents vm init --data-dir /data/agents                      # SQLite WAL falls back to JSONL; files live on host
 agents vm init --data-dir /data/agents --data-dir-in-vm     # SQLite WAL works; files visible only via archives
+agents vm init --backend bare_metal --data-dir /data/agents # Linux only: no VM — see "Choosing a backend"
 
 # 4. (Optional) Authenticate a toolkit-scoped Codex account for the Codex *sandbox skill*, separate from your personal ~/.codex/
 #    (a Hermes agent's openai-codex LLM provider is authenticated inside the container instead — see "Codex paths")
@@ -59,6 +60,30 @@ agents exec coder -- hermes shell
 ```
 
 For the full lifecycle — Hermes profiles vs. personalities vs. skills, connecting to Slack / WhatsApp / Mattermost / Matrix, and the OpenClaw flow — see [docs/tutorial.md](docs/tutorial.md). The [runbook](docs/runbook.md) is the cheat-sheet.
+
+## Choosing a backend
+
+All three backends run the same compose project through the same commands — `create`, `start`/`stop`, `logs`, `exec`, `setup`, `doctor`, `upgrade`/`rollback`, `export`/`import`, `reseat`, `secret`, `firecrawl`, `inference`, `model`, `memory`, `profile`, `edit` behave identically. What differs:
+
+| | `multipass` (default) | `libvirt` | `bare_metal` |
+|---|---|---|---|
+| Host OS | macOS / Linux / Windows | Linux, experimental | Linux |
+| Outer trust boundary | VM | VM | **none — the host** |
+| Bootstrap | installs rootless Docker in the VM | same | **verify-only**: you install the prerequisites, the toolkit checks them |
+| Container-log rotation | written by the bootstrap | same | **you** write `~/.config/docker/daemon.json` (`vm init` and `doctor` warn until you do) |
+| GPU | none | vfio-pci passthrough | native (device flags via `docker-compose.override.yml`) |
+| `--data-dir-in-vm` | yes | yes | n/a — state is always on the host fs |
+| `vm stop`/`resize`/`rebuild` | yes | yes | no-op / refused |
+| `vm snapshot`/`restore` | yes | yes (stop-cycle while the data dir is host-mounted) | refused — `agents export` + a host snapshot tool |
+| Upgrade rollback point | VM snapshot + data tarball | same | data tarball only |
+| `vm migrate-data` | yes | yes | refused |
+| `tailscale` | yes (in the VM) | yes | refused — install Tailscale on the host yourself |
+| `mount add` | VM share (multipass: ~30 s VM restart) + bind | virtiofs hot-attach + bind | direct bind of the host folder |
+| `access mount` | yes (not with `--data-dir-in-vm`) | same | yes |
+
+Pick `bare_metal` only where the host is already trusted (single-user workstation, dedicated LLM box) — see [docs/threat-model.md](docs/threat-model.md). Setup guides: [libvirt](docs/runbook.md#using-the-libvirt-backend-experimental--linux--gpu-passthrough), [bare-metal](docs/runbook.md#using-the-bare_metal-backend-no-vm-linux-only).
+
+**One backend per host user.** `~/.config/agents/config.toml` selects exactly one backend, and the cron entries (`export-cron`, `doctor-cron`) are per-user singletons, so one user cannot run a VM deployment and a bare-metal deployment side by side. Two separate Linux users (each with its own config, data dir, crontab and rootless Docker) can — see [the runbook](docs/runbook.md#running-a-vm-deployment-and-bare-metal-side-by-side).
 
 ## Command overview
 

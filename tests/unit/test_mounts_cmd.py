@@ -1064,11 +1064,12 @@ def test_add_warns_but_proceeds_on_filesystem_without_acl(
     mounts_mocked["acl_run_owned"].assert_not_called()
 
 
-def test_add_skips_acl_on_bare_metal(
+def test_add_applies_acl_on_bare_metal(
     host_folder: Path, cfg_with_agent: AgentsConfig, saved_config: Path, mounts_mocked
 ) -> None:
-    """Bare-metal: container uid 1000 maps 1:1 to the host user.
-    No subuid translation, no need to ACL."""
+    """Bare-metal runs rootless Docker too: the agent is a subuid on the
+    host (NOT a 1:1 map to the host user), so the folder needs the same
+    ACL grant as on the VM backends or restrictive files stay unreadable."""
     cfg_with_agent.vm.backend = "bare_metal"
     cfg_mod.save(cfg_with_agent, saved_config)
     mounts_cmd.add(
@@ -1080,7 +1081,69 @@ def test_add_skips_acl_on_bare_metal(
         restart=False,
         config_path=saved_config,
     )
-    mounts_mocked["acl_run_owned"].assert_not_called()
+    flat_argv = " ".join(
+        arg
+        for call in mounts_mocked["acl_run_owned"].call_args_list
+        for cmd in call.args[0]
+        for arg in cmd
+    )
+    assert "u:100999:rX" in flat_argv
+
+
+def test_add_on_bare_metal_binds_the_host_folder_directly(
+    host_folder: Path, cfg_with_agent: AgentsConfig, saved_config: Path, mounts_mocked
+) -> None:
+    """Bare-metal has no ``host-extras`` VM mount behind ``vm_path`` —
+    the daemon runs on the host, so both the override volume and the
+    sandbox ``docker_volumes`` entry must name the host folder itself."""
+    cfg_with_agent.vm.backend = "bare_metal"
+    cfg_mod.save(cfg_with_agent, saved_config)
+    mounts_cmd.add(
+        agent="coder",
+        host=str(host_folder),
+        container="/workspace/x",
+        readonly=True,
+        target="both",
+        restart=False,
+        config_path=saved_config,
+    )
+    data_dir = cfg_with_agent.paths.host_data_dir
+    override = YAML().load((data_dir / "docker-compose.override.yml").read_text(encoding="utf-8"))
+    assert override["services"]["hermes-coder"]["volumes"] == [f"{host_folder}:/workspace/x:ro"]
+    config = YAML().load(
+        (data_dir / "coder" / ".data" / "config.yaml").read_text(encoding="utf-8")
+    )
+    assert config["terminal"]["docker_volumes"] == [f"{host_folder}:/workspace/x:ro"]
+
+    rows = mounts_cmd.list_mounts(agent="coder", config_path=saved_config)
+    assert rows[0]["source"] == str(host_folder)
+    assert rows[0]["vm"] is None
+
+
+def test_remove_on_bare_metal_also_strips_legacy_vm_path_entries(
+    host_folder: Path, cfg_with_agent: AgentsConfig, saved_config: Path, mounts_mocked
+) -> None:
+    """Older toolkit versions wrote the (non-existent) VM-side path as the
+    bind source on bare-metal. ``remove`` must still clean those up."""
+    cfg_with_agent.vm.backend = "bare_metal"
+    cfg_mod.save(cfg_with_agent, saved_config)
+    entry = MountEntry(
+        host_path=str(host_folder), container_path="/workspace/x", readonly=True, target="runtime"
+    )
+    mounts_cmd.save_manifest(cfg_with_agent, "coder", [entry])
+    data_dir = cfg_with_agent.paths.host_data_dir
+    legacy = f"{entry.vm_path('coder')}:/workspace/x:ro"
+    (data_dir / "docker-compose.override.yml").write_text(
+        f"services:\n  hermes-coder:\n    volumes:\n      - {legacy}\n", encoding="utf-8"
+    )
+
+    mounts_cmd.remove(
+        agent="coder", container="/workspace/x", restart=False, config_path=saved_config
+    )
+
+    override = YAML().load((data_dir / "docker-compose.override.yml").read_text(encoding="utf-8"))
+    assert "hermes-coder" not in (override.get("services") or {})
+    mounts_mocked["mp_umount"].assert_not_called()
 
 
 def test_remove_strips_the_acl_entries_we_added(

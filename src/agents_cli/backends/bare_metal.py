@@ -40,6 +40,37 @@ from agents_cli import ui
 from agents_cli.backends import BootstrapStatus, MpResult, parse_bootstrap_ok
 from agents_cli.errors import RuntimeFailure, UserError
 
+# Rootless socket every toolkit ``docker`` call targets. Set by
+# :func:`configure` from ``[vm_runtime].docker_socket_path``; before
+# ``vm init`` has captured it, the rootless default (the same path
+# ``verify_bootstrap`` probes and records) applies.
+_docker_socket: str | None = None
+
+
+def configure(docker_socket_path: str) -> None:
+    """Pin the rootless socket for this process. ``cli.main`` calls this
+    when bare_metal is the active backend (mirrors ``libvirt.configure``).
+    """
+    global _docker_socket
+    _docker_socket = docker_socket_path or None
+
+
+def _docker_env() -> dict[str, str]:
+    """Host env with ``DOCKER_HOST`` forced to the rootless socket.
+
+    In the VM the only daemon is the rootless one. On the host, the
+    caller's ambient ``DOCKER_HOST`` / docker context is whatever the
+    user's shell (or cron's minimal env) happens to have — possibly a
+    rootful daemon, which the security model refuses (see the check in
+    :func:`verify_bootstrap`). ``DOCKER_CONTEXT`` is dropped so it
+    can't contend with the pinned host.
+    """
+    env = os.environ.copy()
+    env.pop("DOCKER_CONTEXT", None)
+    socket_path = _docker_socket or f"/run/user/{os.getuid()}/docker.sock"
+    env["DOCKER_HOST"] = f"unix://{socket_path}"
+    return env
+
 
 def _refuse_non_linux() -> None:
     if platform.system() != "Linux":
@@ -64,6 +95,7 @@ def _run(
             capture_output=True,
             timeout=timeout,
             check=False,
+            env=_docker_env(),
         )
     except FileNotFoundError as e:
         raise RuntimeFailure(f"command not found: {argv[0]} ({e})") from e
@@ -104,7 +136,7 @@ def exec_in_vm_interactive(vm: str, *cmd: str) -> int:
     argv = list(cmd)
     ui.info(f"$ {' '.join(argv)}")
     try:
-        result = subprocess.run(argv, check=False)
+        result = subprocess.run(argv, check=False, env=_docker_env())
     except FileNotFoundError as e:
         raise RuntimeFailure(f"command not found: {argv[0]} ({e})") from e
     return result.returncode

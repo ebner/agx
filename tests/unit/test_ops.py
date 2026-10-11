@@ -279,6 +279,106 @@ def test_doctor_vm_disk_degrades_to_warn_on_unparseable_df(cfg: AgentsConfig, mo
     assert report.checks[0].status == "warn"
 
 
+_ROTATING = '{"log-driver": "json-file", "log-opts": {"max-size": "50m", "max-file": "3"}}'
+
+
+@pytest.mark.parametrize(
+    ("daemon_json", "rotates"),
+    [
+        (_ROTATING, True),
+        ('{"log-driver": "local"}', True),
+        ('{"log-driver": "journald"}', True),
+        (None, False),
+        ("", False),
+        ('{"log-driver": "json-file"}', False),
+        ('{"log-opts": {"max-file": "3"}}', False),
+        ("{not json", False),
+        ("[]", False),
+    ],
+)
+def test_daemon_log_rotation_gap(daemon_json: str | None, rotates: bool) -> None:
+    from agents_cli.ops import daemon_log_rotation_gap
+
+    assert (daemon_log_rotation_gap(daemon_json) is None) is rotates
+
+
+def _stub_log_rotation(
+    mocker, *, daemon_json: str | None, inspect_lines: list[str]
+) -> list[tuple[str, ...]]:
+    """Stub the daemon.json read + project container listing/inspect.
+    Returns the list the exec_in_vm calls are recorded into."""
+    mocker.patch(
+        "agents_cli.mp.exec_bash",
+        return_value=_ok(daemon_json) if daemon_json is not None else _fail(""),
+    )
+    calls: list[tuple[str, ...]] = []
+
+    def vm_command(vm_name: str, *cmd: str, check: bool = True) -> MpResult:
+        calls.append(cmd)
+        if cmd[:2] == ("docker", "ps"):
+            return _ok("".join(f"id{i}\n" for i in range(len(inspect_lines))))
+        if cmd[:2] == ("docker", "inspect"):
+            return _ok("".join(f"{line}\n" for line in inspect_lines))
+        return _fail()
+
+    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=vm_command)
+    return calls
+
+
+def test_doctor_container_logs_ok_when_daemon_and_containers_rotate(
+    cfg: AgentsConfig, mocker
+) -> None:
+    from agents_cli.ops import DoctorReport, _check_container_logs
+
+    calls = _stub_log_rotation(
+        mocker,
+        daemon_json=_ROTATING,
+        inspect_lines=["/hermes-coder|json-file|50m", "/firecrawl-api|local|<no value>"],
+    )
+    report = DoctorReport()
+    _check_container_logs(cfg, report)
+    assert report.checks[0].status == "ok"
+    # Scoped to this project's containers, never the whole daemon.
+    ps = next(c for c in calls if c[:2] == ("docker", "ps"))
+    assert f"label=com.docker.compose.project.working_dir={cfg.paths.vm_agents_root}" in ps
+
+
+def test_doctor_container_logs_warns_on_missing_daemon_config(cfg: AgentsConfig, mocker) -> None:
+    """Bare-metal's verify-only bootstrap never writes daemon.json — doctor
+    is the standing guard (2026-08 disk-full outage class)."""
+    from agents_cli.ops import DoctorReport, _check_container_logs
+
+    cfg.vm.backend = "bare_metal"
+    _stub_log_rotation(mocker, daemon_json=None, inspect_lines=[])
+    report = DoctorReport()
+    _check_container_logs(cfg, report)
+    check = report.checks[0]
+    assert check.status == "warn"
+    assert "host root fs" in check.detail
+    assert "max-size" in check.detail
+
+
+def test_doctor_container_logs_names_containers_created_before_rotation(
+    cfg: AgentsConfig, mocker
+) -> None:
+    """log-opts bind at create time: a fixed daemon still leaves older
+    containers unbounded until they are recreated."""
+    from agents_cli.ops import DoctorReport, _check_container_logs
+
+    _stub_log_rotation(
+        mocker,
+        daemon_json=_ROTATING,
+        inspect_lines=["/hermes-coder|json-file|<no value>", "/hermes-bob|json-file|50m"],
+    )
+    report = DoctorReport()
+    _check_container_logs(cfg, report)
+    check = report.checks[0]
+    assert check.status == "warn"
+    assert "hermes-coder" in check.detail
+    assert "hermes-bob" not in check.detail
+    assert "reseat" in check.detail
+
+
 def test_doctor_port_conflict_detection(cfg: AgentsConfig, mocker) -> None:
     # used_ports first asks the VM's `docker compose config` — stub the
     # backend exec to fail so the check deterministically exercises the

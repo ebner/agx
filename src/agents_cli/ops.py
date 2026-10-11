@@ -176,6 +176,7 @@ def doctor(
         _check_user_docker_service(cfg, report)
         _check_disk_space(cfg, report)
         _check_vm_disk(cfg, report)
+        _check_container_logs(cfg, report)
         _check_vm_memory(cfg, report)
         _check_vm_load(cfg, report)
         _check_journals(cfg, report)
@@ -426,6 +427,106 @@ def _check_vm_disk(cfg: AgentsConfig, report: DoctorReport) -> None:
         )
     else:
         report.add("vm_disk", "ok", detail)
+
+
+# What the VM bootstrap writes (templates step 3b2); the remediation hint
+# prints it verbatim so bare-metal users get the identical setting.
+DAEMON_JSON_LOG_ROTATION = (
+    '{"log-driver": "json-file", "log-opts": {"max-size": "50m", "max-file": "3"}}'
+)
+
+
+def daemon_log_rotation_gap(daemon_json: str | None) -> str | None:
+    """``None`` when a rootless daemon config rotates container logs,
+    else a one-line reason. ``daemon_json`` is the file's text, or
+    ``None`` when it doesn't exist.
+
+    Only the ``json-file`` driver (Docker's default) grows unbounded
+    without ``max-size``; ``local``, ``journald`` and friends rotate or
+    hand off on their own.
+    """
+    if daemon_json is None or not daemon_json.strip():
+        return "no daemon.json, so the default json-file log driver never rotates"
+    try:
+        conf = json.loads(daemon_json)
+    except json.JSONDecodeError as e:
+        return f"daemon.json is not valid JSON ({e.msg})"
+    if not isinstance(conf, dict):
+        return "daemon.json is not a JSON object"
+    if conf.get("log-driver", "json-file") != "json-file":
+        return None
+    opts = conf.get("log-opts")
+    if isinstance(opts, dict) and opts.get("max-size"):
+        return None
+    return "daemon.json sets no log-opts.max-size, so the json-file log driver never rotates"
+
+
+def _check_container_logs(cfg: AgentsConfig, report: DoctorReport) -> None:
+    """Container-log rotation — the 2026-08 disk-full outage class.
+
+    Rootless Docker ships no log rotation: one chatty container
+    (firecrawl-postgres: 2.8 GB in 5 days) can fill the disk the engine
+    lives on. Two layers, because log-opts apply at container CREATE
+    time: (1) the daemon config — the VM bootstrap writes it, the
+    verify-only bare-metal bootstrap can't, so this is the only
+    standing guard there; (2) the project's existing containers, which
+    keep unbounded logs until recreated even after the daemon is fixed.
+    """
+    bare_metal = cfg.vm.backend == "bare_metal"
+    conf = mp.exec_bash(
+        cfg.vm.name,
+        'cat "${XDG_CONFIG_HOME:-$HOME/.config}/docker/daemon.json" 2>/dev/null',
+        check=False,
+    )
+    problems: list[str] = []
+    daemon_gap = daemon_log_rotation_gap(conf.stdout if conf.returncode == 0 else None)
+    if daemon_gap:
+        where = (
+            "~/.config/docker/daemon.json"
+            if bare_metal
+            else "the VM's ~/.config/docker/daemon.json"
+        )
+        problems.append(
+            f"{daemon_gap} — new containers can fill the "
+            f"{'host root fs' if bare_metal else 'VM root disk'}. Write {DAEMON_JSON_LOG_ROTATION} "
+            f"to {where}, then `systemctl --user restart docker`"
+        )
+
+    ids = mp.exec_in_vm(
+        cfg.vm.name,
+        "docker",
+        "ps",
+        "-aq",
+        "--filter",
+        f"label=com.docker.compose.project.working_dir={cfg.paths.vm_agents_root}",
+        check=False,
+    )
+    unbounded: list[str] = []
+    if ids.returncode == 0 and ids.stdout.split():
+        inspect = mp.exec_in_vm(
+            cfg.vm.name,
+            "docker",
+            "inspect",
+            "--format",
+            '{{.Name}}|{{.HostConfig.LogConfig.Type}}|{{index .HostConfig.LogConfig.Config "max-size"}}',
+            *ids.stdout.split(),
+            check=False,
+        )
+        for line in inspect.stdout.splitlines() if inspect.returncode == 0 else []:
+            name, _, rest = line.partition("|")
+            driver, _, max_size = rest.partition("|")
+            if driver == "json-file" and max_size.strip() in ("", "<no value>"):
+                unbounded.append(name.lstrip("/"))
+    if unbounded:
+        problems.append(
+            f"{len(unbounded)} container(s) log without rotation ({', '.join(sorted(unbounded))}) "
+            "— log-opts apply at create time; recreate them (`agents reseat <agent>` for agents)"
+        )
+
+    if problems:
+        report.add("container_logs", "warn", "; ".join(problems))
+    else:
+        report.add("container_logs", "ok", "daemon and project containers rotate their logs")
 
 
 def _check_vm_memory(cfg: AgentsConfig, report: DoctorReport) -> None:

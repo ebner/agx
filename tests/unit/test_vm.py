@@ -1222,3 +1222,33 @@ def test_rebuild_data_dir_in_vm_stages_and_restores_sidecar_fragments(
     # The bulk-state loss is surfaced, never silent.
     warnings = [c.args[0] for c in warn.call_args_list]
     assert any("postgres starts empty" in w and "re-pulled" in w for w in warnings)
+
+
+# ---------- bare-metal container-log rotation hint ----------
+
+
+def test_bare_metal_init_warns_when_daemon_json_lacks_rotation(
+    tmp_path: Path, mocker, monkeypatch
+) -> None:
+    """The verify-only bare-metal bootstrap can't write daemon.json the way
+    the VM bootstrap does, so init must point out the gap before agents
+    (and their unbounded logs) exist."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    warn = mocker.patch("agents_cli.ui.warn")
+    vm._warn_bare_metal_log_rotation()
+    assert warn.call_count == 1
+    assert "max-size" in warn.call_args.args[0]
+
+
+def test_bare_metal_init_quiet_when_daemon_json_rotates(
+    tmp_path: Path, mocker, monkeypatch
+) -> None:
+    (tmp_path / "docker").mkdir()
+    (tmp_path / "docker" / "daemon.json").write_text(
+        '{"log-driver": "json-file", "log-opts": {"max-size": "50m", "max-file": "3"}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    warn = mocker.patch("agents_cli.ui.warn")
+    vm._warn_bare_metal_log_rotation()
+    warn.assert_not_called()

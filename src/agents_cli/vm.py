@@ -251,6 +251,7 @@ def init(
             "agent that escapes its container reaches the host directly. Only use this "
             "on single-user dev workstations where the host is already trusted."
         )
+        _warn_bare_metal_log_rotation()
         human_ready = (
             f"bare_metal runtime ready (no VM).\n"
             f"  data-dir: {cfg.paths.host_data_dir}\n"
@@ -1099,6 +1100,32 @@ def destroy(*, yes: bool = False, config_path: Path = cfg_mod.DEFAULT_CONFIG_PAT
 
 
 # ---------- private helpers ----------
+
+
+def _warn_bare_metal_log_rotation() -> None:
+    """The VM bootstrap writes container-log rotation into the daemon's
+    ``daemon.json``; the verify-only bare-metal bootstrap must not touch
+    the user's daemon config, so it only points out the gap (doctor's
+    ``container_logs`` check keeps flagging it afterwards).
+    """
+    from agents_cli import ops
+
+    conf_dir = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    daemon_json = conf_dir / "docker" / "daemon.json"
+    try:
+        text: str | None = daemon_json.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        text = None
+    except OSError as e:
+        ui.warn(f"could not read {daemon_json} to check container-log rotation: {e}")
+        return
+    gap = ops.daemon_log_rotation_gap(text)
+    if gap:
+        ui.warn(
+            f"container-log rotation: {gap}; one chatty container can fill the host "
+            f"root fs. Write {ops.DAEMON_JSON_LOG_ROTATION} to {daemon_json}, then "
+            "`systemctl --user restart docker` BEFORE creating agents."
+        )
 
 
 def _load_or_default_config(path: Path) -> AgentsConfig:

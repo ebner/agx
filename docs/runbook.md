@@ -476,7 +476,7 @@ The ACL-based `grant`/`revoke` were retired: a directory or file created with a 
 
 ## Sharing host folders with an agent (`agents mount`)
 
-Give an agent access to a specific folder on the host. The toolkit handles the two hops the folder needs to traverse before the agent container sees it: host → VM mount → docker bind volume.
+Give an agent access to a specific folder on the host. The toolkit handles the two hops the folder needs to traverse before the agent container sees it: host → VM mount → docker bind volume. On `bare_metal` there is only one hop: the Docker daemon runs on the host and binds the folder directly.
 
 ```bash
 # Default: ro, target both runtime + sandbox on Hermes
@@ -503,7 +503,7 @@ agents mount add coder --host ~/projects/x --container /workspace/x --restart
 
 - **Read-only** unless `--rw`. The CLAUDE.md threat model is explicit: a prompt-injected agent can be persuaded into destructive ops on any writable mount.
 - **`--target`** defaults per agent type: **Hermes → `both`** (runtime container + Hermes sandbox via `terminal.docker_volumes`), **OpenClaw → `runtime`** (sandbox is Hermes-only).
-- **Per-agent isolation.** Each agent gets its own VM-side mount target at `/home/ubuntu/host-extras/<agent>/<hash>-<basename>` — no cross-agent sharing. Two agents wanting the same host folder both run `agents mount add`.
+- **Per-agent isolation.** On the VM backends each agent gets its own VM-side mount target at `/home/ubuntu/host-extras/<agent>/<hash>-<basename>` — no cross-agent sharing. Two agents wanting the same host folder both run `agents mount add`. On `bare_metal` the bind source is the host folder itself.
 
 ### What lives where
 
@@ -519,7 +519,7 @@ agents mount add coder --host ~/projects/x --container /workspace/x --restart
 |---|---|---|
 | multipass | Stops the VM, runs `multipass mount --type native`, restarts (~30s downtime). The toolkit prompts; `--yes` skips. | Live `multipass umount` (no stop needed). |
 | libvirt | Hot-attaches a virtiofs `<filesystem>` block via `virsh attach-device --live --config` + `mount -t virtiofs` + `_netdev` fstab entry inside the guest. No downtime. | Hot-detach via `virsh detach-device --live --config` + in-guest umount + fstab cleanup. |
-| bare_metal | No-op VM step (the folder is already addressable to the rootless Docker daemon). | No-op VM step. |
+| bare_metal | No VM step: the compose/sandbox volume entry binds the host folder directly (`<host-folder>:<container-path>`). ACLs are applied exactly as on the VM backends — the agent is a subuid on the host too. | No VM step. Also strips the `/home/ubuntu/host-extras/…` source that toolkit versions before this fix wrote on bare-metal (those mounts never worked). |
 
 ### Reserved container paths
 
@@ -549,7 +549,7 @@ The agent (uid 1000 inside the container, which maps to host subuid 100999) and 
 - **Read-only mount** (default): grants the agent's subuid `rX` on existing files + sets a default ACL so future files you add inherit the grant.
 - **`--rw` mount**: grants the agent's subuid `rwX` for both directions, AND adds a default ACL granting your uid `rwx` so files the agent writes back are readable by you.
 
-No sudo needed (you own the host folder). Probed first — if the filesystem doesn't support ACLs (FAT/exFAT/network mount), the mount still works but you'll see a warning about likely permission errors on mode-restrictive files.
+This applies on every backend, `bare_metal` included — rootless Docker maps the container uid to a subuid there as well. No sudo needed (you own the host folder). Probed first — if the filesystem doesn't support ACLs (FAT/exFAT/network mount), the mount still works but you'll see a warning about likely permission errors on mode-restrictive files.
 
 `agents mount remove` strips the toolkit-added ACL entries; any unrelated entries you added by hand are left in place.
 
@@ -1121,12 +1121,22 @@ sudo loginctl enable-linger "$USER"
 # 3. Install rootless Docker
 curl -fsSL https://get.docker.com/rootless | sh
 
-# 4. Start it + enable autostart
+# 4. Container-log rotation. Rootless Docker never rotates container logs by
+#    default; the VM bootstrap writes this file, bare-metal leaves it to you.
+#    Do it BEFORE creating agents: log-opts bind at container create time.
+mkdir -p ~/.config/docker
+[ -e ~/.config/docker/daemon.json ] || cat > ~/.config/docker/daemon.json <<'JSON'
+{"log-driver": "json-file", "log-opts": {"max-size": "50m", "max-file": "3"}}
+JSON
+
+# 5. Start it + enable autostart (restart instead if it was already running)
 systemctl --user enable --now docker.service
 
-# 5. Sanity check
+# 6. Sanity check
 docker version
 ```
+
+If you already have a `daemon.json`, merge the `log-driver` / `log-opts` keys into it by hand. `agents vm init` warns when rotation is missing, and `agents doctor`'s `container_logs` check keeps warning — it also names containers created before rotation was set up (recreate them with `agents reseat <name>`). Without it, one chatty container fills your **host** root fs (the 2026-08 outage class, see CLAUDE.md).
 
 If `/var/run/docker.sock` already exists (rootful Docker), the toolkit will refuse to run on top of it — uninstall rootful first or migrate via `dockerd-rootless-setuptool.sh install`. The toolkit's security model assumes the rootless user namespace; running on rootful would put compromised containers' processes as effective root on the host.
 
@@ -1161,7 +1171,12 @@ Output ends with a `bare_metal runtime ready (no VM)` line plus the standard tru
 | `agents vm snapshot` / `restore` | Refuse. Use `agents export` archives + a host snapshot tool. |
 | `agents vm resize` / `rebuild` | Refuse — host sizing is real hardware. |
 | `agents vm destroy` | Stops and removes all toolkit-managed containers (`docker compose down --remove-orphans`). Host data-dir is preserved; `rm -rf <data-dir>` manually for a complete reset. |
-| `agents create/start/stop/restart/logs/exec/setup/doctor/upgrade/rollback` | Work transparently — every host↔runtime call goes through the same backend dispatcher. |
+| `agents create/start/stop/restart/logs/exec/setup/doctor/upgrade/rollback` | Work transparently — every host↔runtime call goes through the same backend dispatcher. Every `docker` call is pinned to the rootless socket recorded at init (`DOCKER_HOST` is forced; your shell's `DOCKER_HOST` / docker context is ignored), so cron jobs and shells pointing at another daemon can't redirect the toolkit. |
+| `agents upgrade` | Rollback point is the data-dir tarball only (no VM snapshot). |
+| `agents mount add/remove` | Binds the host folder directly; ACLs as on the VM backends. |
+| `agents access mount` | Works (agent files are subuid-owned on the host too). |
+| `agents tailscale ...` | Refuses — the toolkit never mutates the host OS. Install Tailscale on the host yourself. |
+| `agents vm migrate-data` | Refuses — the data dir is already on the host fs. |
 
 ### Host reboot recovery
 
@@ -1177,6 +1192,18 @@ systemctl --user status docker.service            # should be active
 ### Local inference on bare-metal
 
 `agents inference up ollama` works the same on bare-metal — Ollama runs as a sibling Docker service. The win is GPU access: Ollama in a bare-metal container can use `--device /dev/kfd --device /dev/dri/renderD128` (ROCm/AMD) or `--gpus all` (NVIDIA Container Toolkit) to talk to the host GPU directly, while the host's X session keeps sharing the same GPU. No vfio-pci, no libvirt vGPU. The toolkit's `inference up` doesn't yet auto-wire those flags — add them via `docker-compose.override.yml` for now (tracked as a Phase 2 follow-up to issue #5).
+
+### Running a VM deployment and bare-metal side by side
+
+Not as one user. The toolkit reads exactly one config (`~/.config/agents/config.toml`, one `vm.backend`), and the `export-cron` / `doctor-cron` entries are per-user singletons in that user's crontab — a second install would replace the first.
+
+Two Linux users on the same host can each run one deployment, because everything the toolkit owns is per-user: config, data dir, crontab, host view dir, and the rootless Docker daemon (each user has its own socket under `/run/user/<uid>/` and its own subuid range). Things to watch, none of which the toolkit coordinates across users:
+
+- **Loopback ports.** Bare-metal agents publish dashboard/API ports on the host's `127.0.0.1`; the port allocator only knows its own compose file. Keep tunnels/forwards from the VM deployment off those ports.
+- **Disk and RAM.** The VM's disk image, the bare-metal Docker image cache, and both sets of containers share the host. `agents doctor` in each deployment only sees its own share.
+- **multipass VM name.** Only relevant if both users run a VM backend: `vm.name` (default `agents`) must differ.
+
+This layout is not covered by the test suite.
 
 ## Troubleshooting
 
