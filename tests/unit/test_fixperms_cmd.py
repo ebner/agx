@@ -186,6 +186,34 @@ def test_chown_uses_numeric_uid(with_coder: Path, cfg: AgentsConfig, mocker: Any
     assert "1000:1000" not in args_joined.split("chown")[1].split("/opt/data")[0]
 
 
+def test_chown_data_dir_tolerates_paths_deleted_mid_walk(cfg: AgentsConfig, mocker: Any) -> None:
+    """Hermes prunes old install venvs on boot while the recursive chown
+    walks /opt/data; vanished entries make chown exit 1 but must not
+    abort a reseat half-way.
+    """
+    vanished = (
+        "chown: cannot access '/opt/data/installs/x/environments/old/venv/lib': "
+        "No such file or directory\n"
+        "chown: cannot access '/opt/data/installs/x/environments/old/.leases': "
+        "No such file or directory\n"
+    )
+    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_fail(vanished))
+    fixperms_cmd.chown_data_dir(cfg, "hermes-coder", 1000)
+
+
+def test_chown_data_dir_still_fails_on_real_errors(cfg: AgentsConfig, mocker: Any) -> None:
+    mixed = (
+        "chown: cannot access '/opt/data/gone': No such file or directory\n"
+        "chown: changing ownership of '/opt/data/auth.json': Operation not permitted\n"
+    )
+    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_fail(mixed))
+    with pytest.raises(RuntimeFailure, match="Operation not permitted"):
+        fixperms_cmd.chown_data_dir(cfg, "hermes-coder", 1000)
+    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_fail(""))
+    with pytest.raises(RuntimeFailure):
+        fixperms_cmd.chown_data_dir(cfg, "hermes-coder", 1000)
+
+
 def test_chown_hermes_install_paths_chowns_both_targets(
     with_coder: Path, cfg: AgentsConfig, mocker: Any
 ) -> None:

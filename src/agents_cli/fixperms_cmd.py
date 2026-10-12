@@ -162,8 +162,23 @@ def chown_data_dir(cfg: AgentsConfig, svc: str, uid: int) -> None:
         ),
         check=False,
     )
-    if result.returncode != 0:
+    if result.returncode != 0 and not _only_vanished_paths(result.stderr):
         raise RuntimeFailure(f"chown -R {uid}:{uid} /opt/data failed: {result.stderr.strip()}")
+
+
+def _only_vanished_paths(stderr: str) -> bool:
+    """True when every chown error is a path deleted mid-walk.
+
+    The container is already running while the recursive chown walks
+    /opt/data, and Hermes prunes its own state on boot (e.g.
+    ``collect_generations`` deletes superseded ``installs/*/environments``
+    venvs — tens of thousands of files). Each entry removed between
+    readdir and chown is a "No such file or directory" and makes chown
+    exit 1; there is nothing left to fix for it, so that alone must not
+    fail a reseat/fix-perms half-way (2026-10-12, coder).
+    """
+    lines = [line for line in stderr.splitlines() if line.strip()]
+    return bool(lines) and all(line.endswith("No such file or directory") for line in lines)
 
 
 # The runtime user's HOME in fragments written before 2026-10 (current
