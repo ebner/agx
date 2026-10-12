@@ -71,10 +71,32 @@ Semantics worth knowing:
 
 - **Bare `agents upgrade <name>` needs network** (GitHub Releases API). It *refuses* — rather than silently no-oping — when the latest tag can't be resolved; pass `--tag <T>` to pin explicitly or `--recreate` to refresh at the current pin. `--latest` is the explicit spelling of the same default behavior.
 - **No-op short-circuit**: when the target tag equals the current pin (and `--recreate` isn't set), the command reports "already at X — nothing to do" and exits without snapshots or downtime.
-- **Successful upgrades re-baseline `defaults.<type>_image_tag`** in `~/.config/agents/config.toml`, so future `agents create` starts on the tag the upgrade just proved out. A failed-and-rolled-back upgrade never re-baselines.
+- **Successful upgrades re-baseline `defaults.<type>_image_tag`** in `~/.config/agents/config.toml`. A failed-and-rolled-back upgrade never re-baselines.
+- **`agents create` also starts on the newest upstream release** (GitHub's "latest", never a pre-release) and re-baselines the default once the agent is up. Offline, it falls back to the configured default with a warning; `--pinned` uses the default without asking GitHub, `--image-tag <T>` names one. Tags are always pinned concretely in compose — never `:latest`.
+- **Release tag ≠ image tag.** Hermes images carry the release tag verbatim (`v0.21.6`); OpenClaw images drop the `v` (release `v2026.10.1` → `openclaw/openclaw:2026.10.1`). The toolkit converts automatically, including tags you pass with `--image-tag` / `--tag`, and ignores non-version release tags such as OpenClaw's `linux-stable` desktop channel.
+- **Rollback never silently discards the present.** It overwrites the agent's data dir with the pre-upgrade snapshot, so everything the agent learned or changed since (skills, memories, sessions, config) would be lost. Before overwriting, the current state is exported to `<data-dir>/backups/pre-rollback/` (never auto-pruned; restore with `agents import`); the rollback aborts if that export fails. Under `--data-dir-in-vm` a VM-snapshot restore rewinds *every* agent's data, so every agent is exported first. The prompt shows the snapshot's age. Restored credentials may be stale — OAuth refresh tokens are single-use, so expect to re-authenticate providers that rotated since the snapshot.
 - **Interrupted upgrades resume faithfully.** The journal records the original old→new tags at begin time; re-running `agents upgrade <name>` completes *that* upgrade (skipping done phases) instead of re-resolving latest — a release that appeared upstream mid-crash can't silently retarget the resume.
 
 `agents upgrade` takes two snapshots before touching anything: a host-data `.tar.zst` at `<data-dir>/.upgrades/<name>-<utc>.tar.zst` and a multipass VM snapshot `pre-upgrade-<name>-<utc>`. Both are listed in the upgrade outcome JSON / human output. Legacy `.tar.gz` archives from pre-v0.1.1 versions still work for rollback.
+
+### What survives restarts, recreates and upgrades
+
+Agents modify themselves: they write skills, memories, config, cron jobs, plugins, and install tools. Whether such a change survives depends only on **where** it lands:
+
+| Event | Bind-mounted state (below) | Container writable layer |
+|---|---|---|
+| `agents restart` / `stop` + `start`, VM or host reboot | kept | kept |
+| any recreate — `upgrade`, `reseat`, `fix-perms`, `secret set`, `mount --restart`, `memory`, `codex skill-*`, `vm rebuild` | kept | **lost** |
+| `agents rollback` | replaced by the snapshot — current state saved to `backups/pre-rollback/` first | lost |
+
+What is bind-mounted:
+
+- **Hermes:** all of `/opt/data` (`$HERMES_HOME`): `config.yaml`, `SOUL.md`, `skills/`, `memories/`, `plugins/`, `cron/`, `hooks/`, sessions, `auth.json`, `installs/` (dependencies Hermes installs on demand), `home/` (HOME of the agent's tool subprocesses — `git`, `gh`, `npm`, skill CLIs). The gateway always ran with HOME=`/opt/data`; `agents exec` sessions do too for agents created or `reseat`ed since 2026-10 (before that they got the ephemeral `/home/hermes`), so `agents exec <name> -- gh auth login` and friends persist.
+- **OpenClaw:** `/home/node/.openclaw` (`openclaw.json`, SQLite state, agents, downloaded plugins, skills), `/home/node/.openclaw/workspace`, `/home/node/.config` (incl. the auth-profile key in `.config/openclaw`), `/home/node/.local` (`~/.local/bin` is on the image PATH; pnpm's global dir). The toolkit hands these dirs to the image's `node` user (uid 1000) at create and reseat — without that, OpenClaw cannot write its own state under rootless Docker.
+
+Lost on recreate, by design: anything installed into the image (`apt`, `pip` into the image venv, edits under `/opt/hermes` — Hermes' `hermes update` refuses in Docker anyway; replace the image with `agents upgrade`), caches outside the mounts (OpenClaw `~/.cache`, Playwright browsers, `/tmp/openclaw` logs). For tools an agent needs permanently, have it use `npx`/`uvx` and remember that in its memory, or bake them into a derived image.
+
+**Agents created before 2026-10:** run `agents reseat <name>` once to pick up the Hermes HOME change and OpenClaw's new mounts. OpenClaw's own config and skills edits are safe as-is; the toolkit's own `config.yaml` writes (`secret`, `model use`, `memory`, `firecrawl`) refuse instead of overwriting when the agent changed the file in the meantime — re-run the command.
 
 `agents doctor` also reports each agent's version: the `<agent>.version` check shows the running tag and warns when the compose pin and the live container's image diverge (e.g. a hand-edited compose file without a restart) — the fix is `agents restart <name>`.
 
@@ -254,10 +276,11 @@ The two known targets:
   default. Without a chown to uid 1000, `hermes setup` (or a
   re-run of one of its install branches) hits `EACCES: permission
   denied, mkdir '/opt/hermes/scripts/whatsapp-bridge/node_modules'`.
-- `/home/hermes/` — the runtime user's home. npm cache, pip cache,
-  browser cache, dotfiles. The image's `usermod -u 1000 hermes`
-  doesn't migrate the existing home dir, so it stays at the
-  image-baked ownership.
+- `/home/hermes/` — the runtime user's HOME in fragments written
+  before 2026-10 (current ones pin HOME to the persisted `/opt/data`;
+  `agents reseat` migrates). npm cache, pip cache, browser cache,
+  dotfiles. The image's `usermod -u 1000 hermes` doesn't migrate the
+  existing home dir, so it stays at the image-baked ownership.
 
 The toolkit auto-chowns both after every container recreate (in
 `fixperms_cmd.chown_hermes_install_paths`) from three code paths:
@@ -661,10 +684,10 @@ agents doctor-cron uninstall
 
 State lives at `<data-dir>/.doctor-cron/state.json`; the cron log at `<data-dir>/.doctor-cron.log`. A red doctor never makes the cron line exit non-zero (that would trigger cron's own MAILTO spam) — only a failed run itself (config missing, sendmail rejected) does.
 
-OpenClaw bundles its own Codex plugin — run `openclaw models auth login --provider openai-codex --device-code` *inside* the OpenClaw container instead:
+OpenClaw bundles its own Codex plugin — run `openclaw models auth login --provider openai --device-code` *inside* the OpenClaw container instead:
 
 ```bash
-agents exec personal -- openclaw models auth login --provider openai-codex --device-code
+agents exec personal -- openclaw models auth login --provider openai --device-code
 ```
 
 ## Backups (host-side)

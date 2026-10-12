@@ -655,6 +655,94 @@ def test_rollback_locks_stops_restores_and_recreates_in_order(
     raw_start.assert_not_called()
 
 
+def test_rollback_saves_current_state_before_overwriting(
+    with_coder: Path, mocker, cfg: AgentsConfig
+) -> None:
+    """Everything the agent learned since the snapshot must survive a
+    rollback somewhere: exported to backups/pre-rollback/ AFTER the stop
+    (consistent archive) and BEFORE the extraction."""
+    _write_rollback_archive(cfg, "coder")
+    mocker.patch("agents_cli.ui.confirm", return_value=True)
+    mocker.patch("agents_cli.upgrades._latest_vm_snapshot", return_value=None)
+    order: list[str] = []
+    mocker.patch(
+        "agents_cli.compose_runner.stop", side_effect=lambda *a, **k: order.append("stop") or _ok()
+    )
+    safety = cfg.paths.host_data_dir / "backups" / "pre-rollback" / "coder-x.tar.zst"
+    export = mocker.patch(
+        "agents_cli.export_cmd.export",
+        side_effect=lambda *a, **k: order.append("safety") or safety,
+    )
+    mocker.patch(
+        "agents_cli.upgrades._restore_host_snapshot",
+        side_effect=lambda *a, **k: order.append("restore_host"),
+    )
+    mocker.patch(
+        "agents_cli.compose_runner.up", side_effect=lambda *a, **k: order.append("up") or _ok()
+    )
+    emit = mocker.patch("agents_cli.ui.emit")
+
+    upgrades.rollback("coder", config_path=with_coder)
+
+    assert order == ["stop", "safety", "restore_host", "up"]
+    assert export.call_args.kwargs["to"] == cfg.paths.host_data_dir / "backups" / "pre-rollback"
+    assert emit.call_args.args[0]["pre_rollback_archives"] == [str(safety)]
+
+
+def test_rollback_aborts_without_overwriting_when_safety_export_fails(
+    with_coder: Path, mocker, cfg: AgentsConfig
+) -> None:
+    _write_rollback_archive(cfg, "coder")
+    mocker.patch("agents_cli.ui.confirm", return_value=True)
+    mocker.patch("agents_cli.upgrades._latest_vm_snapshot", return_value=None)
+    mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())
+    mocker.patch("agents_cli.export_cmd.export", side_effect=RuntimeFailure("tar failed"))
+    restore = mocker.patch("agents_cli.upgrades._restore_host_snapshot")
+    up = mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+
+    with pytest.raises(RuntimeFailure, match="tar failed"):
+        upgrades.rollback("coder", config_path=with_coder)
+    restore.assert_not_called()
+    up.assert_called_once()  # the stopped agent comes back on its current state
+
+
+def test_rollback_exports_every_agent_when_vm_restore_reverts_in_vm_data(
+    with_coder: Path, mocker, cfg: AgentsConfig
+) -> None:
+    """Under --data-dir-in-vm a VM-snapshot restore rewinds ALL agents'
+    data, so all of it is saved first — and the prompt says so."""
+    cfg.paths.data_dir_in_vm = True
+    cfg_mod.save(cfg, with_coder)
+    _write_rollback_archive(cfg, "coder")
+    confirm = mocker.patch("agents_cli.ui.confirm", return_value=True)
+    mocker.patch(
+        "agents_cli.upgrades._latest_vm_snapshot",
+        return_value="pre-upgrade-coder-20260512T120000Z",
+    )
+    mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())
+    export_all = mocker.patch("agents_cli.export_cmd.export_all", return_value=[])
+    export_one = mocker.patch("agents_cli.export_cmd.export")
+    mocker.patch("agents_cli.upgrades._restore_host_snapshot")
+    mocker.patch("agents_cli.vm.restore_snapshot")
+    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+
+    upgrades.rollback("coder", config_path=with_coder)
+
+    export_all.assert_called_once()
+    export_one.assert_not_called()
+    assert "EVERY agent" in confirm.call_args.args[0]
+
+
+def test_snapshot_age_reads_the_utc_stamp() -> None:
+    import datetime
+
+    stamp = (datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=3)).strftime(
+        "%Y%m%dT%H%M%SZ"
+    )
+    assert upgrades._snapshot_age(f"coder-{stamp}.tar.zst") == "3 days ago"
+    assert upgrades._snapshot_age("no-stamp-here") == ""
+
+
 def test_rollback_restarts_service_when_host_restore_fails(
     with_coder: Path, mocker, cfg: AgentsConfig
 ) -> None:

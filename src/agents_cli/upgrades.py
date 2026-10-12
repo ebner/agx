@@ -179,7 +179,11 @@ def upgrade(
             new_tag = latest
             resolved_latest = latest
         else:
-            new_tag = tag or old_tag  # explicit tag wins; otherwise refresh in place
+            from agents_cli import outdated_cmd
+
+            # explicit tag wins (in the upstream's image-tag form); otherwise
+            # refresh in place
+            new_tag = outdated_cmd.normalize_image_tag(agent_type, tag) if tag else old_tag
 
         # No-op short-circuit when the target tag matches the current pin.
         # Covers both:
@@ -539,6 +543,16 @@ def rollback(
       matches, that's used.
 
     Confirms unless ``--yes``.
+
+    Never discards the present silently: everything the agent learned or
+    changed since the snapshot (skills, memories, sessions, config, and
+    rotated credentials) would otherwise be gone for good. Before
+    overwriting, the current state is exported to
+    ``<data-dir>/backups/pre-rollback/`` (restorable via ``agents import``,
+    never auto-pruned, seen by the host backup) — for the agent itself,
+    or for EVERY agent when a VM-snapshot restore will revert agent data
+    on the VM disk (``--data-dir-in-vm``). The rollback aborts if that
+    safety export fails.
     """
     cfg = cfg_mod.load(config_path)
 
@@ -576,10 +590,23 @@ def rollback(
             else:
                 raise UserError(f"no host snapshot matches {snapshot_id!r} for {name!r}")
 
+    vm_snap_name = snapshot_id if vm_only else _latest_vm_snapshot(cfg.vm.name, name)
+    # A VM-snapshot restore reverts agent data too when it lives on the
+    # VM disk — for every agent in the VM, not just this one.
+    vm_reverts_all_data = bool(vm_snap_name) and cfg.paths.data_dir_in_vm
     prompt_target = archive.name if archive else snapshot_id
+    age = _snapshot_age(prompt_target or "")
     if not yes and not ui.confirm(
-        f"restore {name!r} from {prompt_target!r}? "
-        "compose, .env, and the agent's data dir will be overwritten.",
+        f"restore {name!r} from {prompt_target!r}{f' (taken {age})' if age else ''}? "
+        + (
+            "The data of EVERY agent in the VM reverts to the VM snapshot. "
+            if vm_reverts_all_data
+            else "compose, .env, and the agent's data dir will be overwritten — "
+            "everything it learned or changed since then is replaced. "
+        )
+        + f"The current state is saved first under {_PRE_ROLLBACK_DIR}/. Restored "
+        "credentials may be stale (OAuth refresh tokens are single-use): expect "
+        "to re-authenticate providers that rotated since the snapshot.",
         default=False,
     ):
         raise UserError("aborted by user")
@@ -604,19 +631,27 @@ def rollback(
         # an outage. Track the stop and best-effort restart the service
         # before re-raising the original error.
         stopped_svc: str | None = None
+        safety: list[Path] = []
         try:
+            if archive is not None and svc is not None:
+                # Extracting over a LIVE container's SQLite/WAL files
+                # (state.db, kanban.db, ...) is a straight corruption
+                # path — stop the container first. Stopped BEFORE the
+                # safety export, so that archive is consistent too.
+                ui.progress(f"stopping {svc} before restore...")
+                compose_runner.stop(cfg, svc)
+                stopped_svc = svc
+            safety = _save_pre_rollback_state(
+                cfg,
+                name,
+                all_agents=vm_reverts_all_data,
+                agent_exists=svc is not None,
+                config_path=config_path,
+            )
             if archive is not None:
-                if svc is not None:
-                    # Extracting over a LIVE container's SQLite/WAL files
-                    # (state.db, kanban.db, ...) is a straight corruption
-                    # path — stop the container first.
-                    ui.progress(f"stopping {svc} before restore...")
-                    compose_runner.stop(cfg, svc)
-                    stopped_svc = svc
                 ui.progress(f"restoring host data from {archive.name}...")
                 _restore_host_snapshot(cfg, archive)
 
-            vm_snap_name = snapshot_id if vm_only else _latest_vm_snapshot(cfg.vm.name, name)
             if vm_snap_name:
                 ui.progress(
                     f"restoring VM snapshot {vm_snap_name} "
@@ -659,13 +694,62 @@ def rollback(
                 "host": str(archive) if archive else None,
                 "vm_snapshot": vm_snap_name,
             },
+            "pre_rollback_archives": [str(p) for p in safety],
         },
         human=(
             f"rolled back {name!r}\n"
             f"  host: {archive or '(skipped — vm-only)'}\n"
             f"  vm snapshot: {vm_snap_name or '(none found)'}"
+            + "".join(
+                f"\n  state before rollback: {p} (`agents import` to restore)" for p in safety
+            )
         ),
     )
+
+
+# Where rollback parks the state it is about to overwrite. A subdir of
+# ``backups/`` on purpose: outside ``.upgrades/`` (rollback must never
+# pick its own safety copy as the "latest snapshot", and prune must not
+# count it as an upgrade generation), outside export's rolling-window
+# prune (which only touches the top-level ``backups/``), inside what the
+# host backup already covers.
+_PRE_ROLLBACK_DIR = "backups/pre-rollback"
+
+
+def _save_pre_rollback_state(
+    cfg: AgentsConfig,
+    name: str,
+    *,
+    all_agents: bool,
+    agent_exists: bool,
+    config_path: Path,
+) -> list[Path]:
+    """Export the state a rollback is about to overwrite; see
+    :func:`rollback`. Raises (aborting the rollback) on failure."""
+    from agents_cli import export_cmd
+
+    target = cfg.paths.host_data_dir / _PRE_ROLLBACK_DIR
+    if all_agents:
+        ui.progress(f"saving every agent's current state to {target}/ before the VM restore...")
+        return export_cmd.export_all(to=target, config_path=config_path, emit=False)
+    if not agent_exists:
+        return []  # a removed agent's archive: nothing live to preserve
+    ui.progress(f"saving {name!r}'s current state to {target}/ before overwriting it...")
+    return [export_cmd.export(name, to=target, config_path=config_path, emit=False)]
+
+
+def _snapshot_age(snapshot_name: str) -> str:
+    """Human age of a snapshot from the UTC stamp in its name, or ``""``."""
+    m = re.search(r"(\d{8}T\d{6}Z)", snapshot_name)
+    if not m:
+        return ""
+    taken = datetime.datetime.strptime(m.group(1), "%Y%m%dT%H%M%SZ").replace(tzinfo=datetime.UTC)
+    hours = (datetime.datetime.now(datetime.UTC) - taken).total_seconds() / 3600
+    if hours < 1:
+        return "less than an hour ago"
+    if hours < 48:
+        return f"{hours:.0f} hours ago"
+    return f"{hours / 24:.0f} days ago"
 
 
 # ---------- helpers ----------
@@ -718,14 +802,7 @@ def _persist_default_tag(
     new agents onto a tag that a failed-and-rolled-back upgrade never
     proved out.
     """
-    if latest is None:
-        return
-    if agent_type == "hermes" and cfg.defaults.hermes_image_tag != latest:
-        cfg.defaults.hermes_image_tag = latest
-        cfg_mod.save(cfg, config_path)
-    elif agent_type == "openclaw" and cfg.defaults.openclaw_image_tag != latest:
-        cfg.defaults.openclaw_image_tag = latest
-        cfg_mod.save(cfg, config_path)
+    cfg_mod.persist_default_image_tag(cfg, agent_type, latest, config_path)
 
 
 def _fmt_elapsed(start: float) -> str:

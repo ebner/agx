@@ -57,7 +57,7 @@ To reverse: `agents codex skill-disable <hermes-agent>`. The original `docker_im
 OpenClaw bundles its own Codex plugin. The toolkit does **not** mount Codex into OpenClaw — that would conflict with OpenClaw's plugin management. Run the OpenClaw-native flow inside the container:
 
 ```bash
-agents exec personal -- openclaw models auth login --provider openai-codex --device-code
+agents exec personal -- openclaw models auth login --provider openai --device-code
 ```
 
 ## `CODEX_HOME` lifecycle
@@ -88,4 +88,4 @@ Re-login with `agents codex login` when it expires. **`agents codex refresh` is 
 | Inspect skill-auth state | `agents codex status` |
 | Enable Codex skill on a Hermes agent | `agents codex skill-enable coder` |
 | Disable Codex skill | `agents codex skill-disable coder` |
-| Authenticate OpenClaw's bundled Codex | `agents exec personal -- openclaw models auth login --provider openai-codex --device-code` |
+| Authenticate OpenClaw's bundled Codex | `agents exec personal -- openclaw models auth login --provider openai --device-code` |

@@ -83,7 +83,7 @@ def _agent_data_subpaths(agent_type: str) -> list[str]:
     if agent_type == "hermes":
         return [".data"]
     if agent_type == "openclaw":
-        return [".openclaw", "workspace"]
+        return [sub for sub, _target in compose.OPENCLAW_STATE_MOUNTS]
     return []
 
 
@@ -153,6 +153,7 @@ def create(
     image_tag: str | None = None,
     run_setup: bool = False,
     reuse_data: bool = False,
+    pinned: bool = False,
     config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH,
 ) -> None:
     validate_name(name)
@@ -163,15 +164,9 @@ def create(
     cfg = cfg_mod.load(config_path)
     svc = service_name(name, agent_type)
 
-    # Decide tag (cheap, no race).
-    tag = image_tag or (
-        cfg.defaults.hermes_image_tag if agent_type == "hermes" else cfg.defaults.openclaw_image_tag
-    )
-    if not tag:
-        raise UserError(
-            f"no pinned {agent_type} image tag in config; re-run `agents vm init` "
-            "or pass --image-tag"
-        )
+    # Decide tag before the lock: a network lookup has no business
+    # holding it.
+    tag, resolved_latest = _resolve_create_tag(cfg, agent_type, image_tag, pinned=pinned)
 
     required = ["data_dir_created", "compose_updated", "service_up"]
     if run_setup:
@@ -246,6 +241,8 @@ def create(
                     compose.ensure_cont_init_script(cfg)
                 _add_service_to_compose(cfg, name, agent_type, svc, port, tag)
             elif phase == "service_up":
+                if agent_type == "openclaw":
+                    prepare_openclaw_state(cfg, name, svc)
                 ui.progress(f"starting container {svc}...")
                 compose_runner.up(cfg, svc)
                 if agent_type == "hermes":
@@ -276,6 +273,8 @@ def create(
             journal.advance(phase)
 
         journal.complete()
+        # Success path only: the new agent demonstrably runs this tag.
+        cfg_mod.persist_default_image_tag(cfg, agent_type, resolved_latest, config_path)
 
     ui.emit(
         {
@@ -295,6 +294,73 @@ def create(
             + ("  setup wizard ran" if run_setup else f"  run `agents setup {name}` when ready")
         ),
     )
+
+
+def _resolve_create_tag(
+    cfg: AgentsConfig, agent_type: str, image_tag: str | None, *, pinned: bool
+) -> tuple[str, str | None]:
+    """Image tag for a new agent, plus the resolved upstream-latest tag
+    (``None`` unless it came from GitHub) for the default-tag refresh.
+
+    Precedence: explicit ``--image-tag`` > upstream latest release >
+    ``defaults.<type>_image_tag``. ``pinned`` skips the lookup and uses
+    the config default (offline / reproducible creates). An unreachable
+    GitHub degrades to the default with a warning — unlike ``upgrade
+    --latest``, where silently staying put would defeat the request, a
+    create on the known-good baseline is still what the user asked for.
+    Every tag is normalized to the upstream IMAGE-tag form.
+    """
+    from agents_cli import outdated_cmd
+
+    if image_tag:
+        return outdated_cmd.normalize_image_tag(agent_type, image_tag), None
+    default_raw = (
+        cfg.defaults.hermes_image_tag if agent_type == "hermes" else cfg.defaults.openclaw_image_tag
+    )
+    default = outdated_cmd.normalize_image_tag(agent_type, default_raw) if default_raw else ""
+    if not pinned:
+        ui.progress(f"resolving latest upstream {agent_type} release...")
+        latest = outdated_cmd.fetch_latest_tag(agent_type)
+        if latest:
+            return latest, latest
+        if default:
+            ui.warn(
+                f"could not reach GitHub to resolve the latest {agent_type} release; "
+                f"using the pinned default {default!r}"
+            )
+    if not default:
+        raise UserError(
+            f"no pinned {agent_type} image tag in config and the latest release could not "
+            "be resolved; pass --image-tag or re-run `agents vm init`"
+        )
+    return default, None
+
+
+def prepare_openclaw_state(cfg: AgentsConfig, name: str, svc: str) -> None:
+    """Create OpenClaw's state dirs and hand them to the image's ``node``
+    user (uid 1000) before the container starts.
+
+    The image runs as non-root ``node``, which cannot write to dirs the
+    toolkit creates: those belong to the host user, i.e. container ROOT
+    under rootless Docker, while ``node`` maps to a subuid — so OpenClaw
+    could persist nothing ("Permission denied" on its own state dir,
+    reproduced 2026-10). Upstream's fix is ``chown -R 1000:1000`` on the
+    bind sources; here the chown must happen inside the userns (the host
+    user can't chown to a subuid), so it runs as root in a one-off
+    container of the service, with the service's own mounts. Idempotent —
+    safe on every create/reseat. Missing dirs would otherwise be
+    auto-created by Docker, root-owned, with the same result.
+    """
+    _create_data_dirs(cfg, name, "openclaw")
+    targets = [target for _sub, target in compose.OPENCLAW_STATE_MOUNTS]
+    uid = compose.OPENCLAW_RUNTIME_UID
+    ui.progress(f"handing {svc}'s state dirs to the container's node user (uid {uid})...")
+    result = compose_runner.run_as_root(cfg, svc, "chown", "-R", f"{uid}:{uid}", *targets)
+    if result.returncode != 0:
+        raise RuntimeFailure(
+            f"could not chown {svc}'s state dirs to uid {uid}: "
+            f"{(result.stderr or '').strip() or 'unknown error'}"
+        )
 
 
 def _create_data_dirs(cfg: AgentsConfig, name: str, agent_type: str) -> None:
@@ -911,6 +977,10 @@ def reseat(
             # hook; materialize its source before recreating so the mount
             # resolves to a file (not an auto-created dir).
             compose.ensure_cont_init_script(cfg)
+        else:
+            # The template may mount state dirs the old block didn't
+            # (2026-10: .config / .local) — create + hand them to `node`.
+            prepare_openclaw_state(cfg, name, svc)
         fixperms_cmd.force_recreate(cfg, svc)
         if agent_type == "hermes":
             huid = fixperms_cmd.container_hermes_uid(cfg, svc)
@@ -935,7 +1005,7 @@ def reseat(
             + (
                 "  /opt/data ownership re-aligned"
                 if agent_type == "hermes"
-                else "  (no chown step for non-Hermes agents)"
+                else "  state dirs handed to the container's node user"
             )
         ),
     )

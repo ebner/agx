@@ -126,6 +126,39 @@ def test_write_atomically_leaves_no_temp_files(
     assert not any(parent.glob("config.yaml.*.new"))
 
 
+def test_write_atomically_refuses_when_agent_edited_config_meanwhile(
+    cfg_with_dir: AgentsConfig, vm_fs_mocks: dict
+) -> None:
+    """The agent edits its own config.yaml (migrations, `hermes config
+    set` from a tool call). A toolkit read-modify-write racing such an
+    edit must refuse rather than silently revert it."""
+    p = hermes_config.config_path(cfg_with_dir, "coder")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("model: a\n", encoding="utf-8")
+    doc = hermes_config.read_doc(cfg_with_dir, "coder")
+    doc["toolkit_key"] = "x"
+    p.write_text("model: chosen-by-agent\n", encoding="utf-8")  # the agent's edit
+
+    with pytest.raises(UserError, match="changed while the toolkit was editing it"):
+        hermes_config.write_atomically(cfg_with_dir, "coder", doc)
+    assert p.read_text(encoding="utf-8") == "model: chosen-by-agent\n"
+    assert not any(p.parent.glob("config.yaml.*.new"))
+
+
+def test_write_atomically_allows_repeated_writes_of_one_read(
+    cfg_with_dir: AgentsConfig, vm_fs_mocks: dict
+) -> None:
+    p = hermes_config.config_path(cfg_with_dir, "coder")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("model: a\n", encoding="utf-8")
+    doc = hermes_config.read_doc(cfg_with_dir, "coder")
+    doc["k1"] = 1
+    hermes_config.write_atomically(cfg_with_dir, "coder", doc)
+    doc["k2"] = 2
+    hermes_config.write_atomically(cfg_with_dir, "coder", doc)  # compares against OUR write
+    assert "k2: 2" in p.read_text(encoding="utf-8")
+
+
 # ---------- terminal.docker_image helpers ----------
 
 

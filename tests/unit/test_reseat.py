@@ -333,7 +333,11 @@ def test_reseat_openclaw_preserves_customizations_and_gains_new_keys(
     # Stock volumes stay, exactly once each.
     assert "./personal/.openclaw:/home/node/.openclaw" in volumes
     assert "./personal/workspace:/home/node/.openclaw/workspace" in volumes
-    assert len(volumes) == 3
+    # Gained from the 2026-10 template: OpenClaw's auth-profile key dir
+    # (.config/openclaw) and agent-installed tools (.local) now persist.
+    assert "./personal/.config:/home/node/.config" in volumes
+    assert "./personal/.local:/home/node/.local" in volumes
+    assert len(volumes) == 5
 
 
 def test_reseat_openclaw_stock_is_clean_template_rewrite(

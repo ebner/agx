@@ -494,11 +494,16 @@ def vm_destroy(ctx: click.Context, export_first: bool, yes_local: bool) -> None:
 @click.argument("name")
 @click.option("--type", "agent_type", required=True, type=click.Choice(["hermes", "openclaw"]))
 @click.option("--port", type=int, default=None, help="Host port to bind. Default: auto-allocate.")
-@click.option("--image-tag", default=None, help="Override pinned tag.")
+@click.option("--image-tag", default=None, help="Use this image tag (skips the latest lookup).")
 @click.option(
     "--setup", "run_setup", is_flag=True, help="Run the agent's setup wizard immediately."
 )
 @click.option("--reuse-data", is_flag=True, help="Attach to an existing data dir.")
+@click.option(
+    "--pinned",
+    is_flag=True,
+    help="Use the default tag from config.toml instead of resolving the latest upstream release.",
+)
 def agents_create(
     name: str,
     agent_type: str,
@@ -506,8 +511,9 @@ def agents_create(
     image_tag: str | None,
     run_setup: bool,
     reuse_data: bool,
+    pinned: bool,
 ) -> None:
-    """Create a new agent."""
+    """Create a new agent on the latest upstream release (see --pinned / --image-tag)."""
     _run(
         agents_cmd.create,
         name=name,
@@ -516,6 +522,7 @@ def agents_create(
         image_tag=image_tag,
         run_setup=run_setup,
         reuse_data=reuse_data,
+        pinned=pinned,
     )
 
 

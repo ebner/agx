@@ -39,7 +39,9 @@ agents vm init --backend bare_metal --data-dir /data/agents # Linux only: no VM 
 #    (a Hermes agent's openai-codex LLM provider is authenticated inside the container instead — see "Codex paths")
 agents codex login
 
-# 5. Create your first Hermes agent and run the setup wizard
+# 5. Create your first Hermes agent and run the setup wizard. `create` starts on
+#    the newest upstream release (offline: the configured default; --pinned /
+#    --image-tag to choose) and pins that exact tag.
 agents create coder --type hermes --setup
 
 # 6. Create an OpenClaw agent
@@ -139,7 +141,7 @@ Two distinct ways Hermes can use Codex, both supported — but authenticated dif
 1. **As an LLM provider** (`model.provider: openai-codex`): authenticate **inside the container** — `agents exec <name> -- hermes auth add openai-codex --type oauth --no-browser` (device-code flow; open the URL on any browser logged into your ChatGPT account). Hermes owns that credential and its refresh cycle in the agent's `/opt/data/auth.json`. The toolkit no longer mounts `<data-dir>/.codex` into the runtime container: the old "import bridge" shared one single-use OAuth refresh chain between the host file and the agent, so refreshing either invalidated the other. Expect the subscription chain to die every few weeks anyway (upstream bug) — set `fallback_providers` and `agents doctor-cron install --mail …`.
 2. **As a coding skill** (the bundled `autonomous-ai-agents/codex` skill): opt in with `agents codex skill-enable <name>`. The CLI builds a sandbox image with Codex CLI baked in and points the agent's `terminal.docker_image` at it. The sandbox container — not the Hermes runtime — is where `codex` runs when Hermes delegates coding tasks.
 
-OpenClaw bundles its own Codex plugin; the toolkit does **not** mount Codex into OpenClaw. Run `openclaw models auth login --provider openai-codex --device-code` inside the container after creation.
+OpenClaw bundles its own Codex plugin; the toolkit does **not** mount Codex into OpenClaw. Run `openclaw models auth login --provider openai --device-code` inside the container after creation.
 
 ## Memory backends
 

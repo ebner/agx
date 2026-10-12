@@ -108,9 +108,14 @@ def test_hermes_fragment_has_required_mounts(cfg: AgentsConfig) -> None:
     # the rootless socket.
     assert s["environment"]["DOCKER_HOST"] == "unix:///run/user/1000/docker.sock"
 
-    # HOME must be pinned in env so the Codex auth import bridge resolves
-    # to the same path we mount, regardless of the image's USER/HOME drift.
-    assert s["environment"]["HOME"] == "/home/hermes"
+    # HOME is the runtime user's persisted passwd home — never the
+    # container overlay, where everything written under ~ by `agents exec`
+    # sessions vanished on each recreate (the old /home/hermes pin).
+    assert s["environment"]["HOME"] == "/opt/data"
+    # PATH mirrors the image's Config.Env, incl. the /opt/hermes/bin
+    # wrapper the old pin skipped; the venv stays for pre-env images.
+    path = s["environment"]["PATH"].split(":")
+    assert path[:2] == ["/opt/hermes/bin", "/opt/hermes/.venv/bin"]
 
     # HERMES_UID/GID are non-negotiable — the image entrypoint reads them
     # to remap its internal hermes user (default 10000) to host uid 1000

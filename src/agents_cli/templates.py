@@ -22,9 +22,9 @@ from typing import Final
 
 # Hermes + OpenClaw image tags — fallbacks when GitHub Releases query
 # fails at `vm init`. Bump deliberately; let the runtime query handle
-# the moving target.
-FALLBACK_HERMES_IMAGE_TAG: Final = "v1.0.0"
-FALLBACK_OPENCLAW_IMAGE_TAG: Final = "0.1.0"
+# the moving target. IMAGE-tag form (OpenClaw images carry no ``v``).
+FALLBACK_HERMES_IMAGE_TAG: Final = "v0.21.6"
+FALLBACK_OPENCLAW_IMAGE_TAG: Final = "2026.10.1"
 
 # Hermes' default sandbox image (`terminal.docker_image`). Used as the
 # FROM base for `agents codex skill-enable` unless the agent has set
@@ -317,10 +317,11 @@ if [ -n "$HUID" ] && [ -n "$HGID" ]; then
     if [ -e /opt/hermes/scripts ]; then
         find /opt/hermes/scripts -exec chown "$HUID:$HGID" {} + 2>/dev/null
     fi
-    # HOME is pinned to /home/hermes by the compose fragment but the
+    # Fragments written before 2026-10 pin HOME=/home/hermes, but the
     # image never creates it (it used to appear only as the parent of the
     # retired .codex bridge mount). npm needs it for cache/logs, or the
-    # WhatsApp bridge's dependency install fails half-way.
+    # WhatsApp bridge's dependency install fails half-way. Current
+    # fragments pin HOME=/opt/data; this stays for un-reseated agents.
     mkdir -p /home/hermes 2>/dev/null
     if [ -e /home/hermes ]; then
         find /home/hermes -path /home/hermes/.codex -prune -o -exec chown "$HUID:$HGID" {} + 2>/dev/null

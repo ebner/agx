@@ -227,3 +227,83 @@ def test_check_filters_to_single_agent_when_name_given(
     payload = outdated_cmd.check("backup", config_path=saved_config)
     agents = [r["agent"] for r in payload["agents"]]
     assert agents == ["backup"]
+
+
+# ---------- release tag -> image tag ----------
+
+
+@pytest.mark.parametrize(
+    ("agent_type", "release", "image"),
+    [
+        ("hermes", "v0.21.6", "v0.21.6"),
+        ("hermes", "v2026.9.24", "v2026.9.24"),
+        ("openclaw", "v2026.10.1", "2026.10.1"),
+        ("openclaw", "v2026.10.5-beta.1", "2026.10.5-beta.1"),
+        ("openclaw", "v2026.7.1-2", "2026.7.1-2"),
+        ("openclaw", "linux-stable", None),
+        ("hermes", "nightly", None),
+    ],
+)
+def test_image_tag_from_release(agent_type: str, release: str, image: str | None) -> None:
+    """OpenClaw images drop the release tag's `v` (`openclaw/openclaw:
+    v2026.10.1` does not exist); non-version release tags have no image."""
+    assert outdated_cmd.image_tag_from_release(agent_type, release) == image
+
+
+def test_normalize_image_tag_repairs_legacy_openclaw_pins() -> None:
+    assert outdated_cmd.normalize_image_tag("openclaw", "v2026.5.12") == "2026.5.12"
+    assert outdated_cmd.normalize_image_tag("openclaw", "2026.10.1") == "2026.10.1"
+    assert outdated_cmd.normalize_image_tag("hermes", "v0.21.6") == "v0.21.6"
+
+
+def _github(
+    monkeypatch: pytest.MonkeyPatch, *, latest: str, releases: list[dict[str, Any]]
+) -> None:
+    def fake(url: str) -> Any:
+        return {"tag_name": latest} if url.endswith("/releases/latest") else releases
+
+    monkeypatch.setattr(outdated_cmd, "_fetch_json", fake)
+
+
+def test_fetch_latest_tag_returns_image_form(monkeypatch: pytest.MonkeyPatch) -> None:
+    _github(monkeypatch, latest="v2026.10.1", releases=[])
+    assert outdated_cmd.fetch_latest_tag("openclaw") == "2026.10.1"
+
+
+def test_fetch_latest_prerelease_skips_maintenance_and_channel_tags(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Newest-CREATED first, as GitHub lists them: a channel tag and a
+    maintenance release of an older line precede the real newest beta."""
+    _github(
+        monkeypatch,
+        latest="v2026.10.1",
+        releases=[
+            {"tag_name": "linux-stable", "prerelease": True},
+            {"tag_name": "v2026.8.35", "prerelease": False},
+            {"tag_name": "v2026.10.5-beta.1", "prerelease": True},
+            {"tag_name": "v2026.10.1", "prerelease": False},
+        ],
+    )
+    assert outdated_cmd.fetch_latest_tag("openclaw", include_prerelease=True) == "2026.10.5-beta.1"
+
+
+def test_fetch_latest_prerelease_falls_back_to_newer_stable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _github(
+        monkeypatch,
+        latest="v2026.10.1",
+        releases=[
+            {"tag_name": "v2026.8.35", "prerelease": False},
+            {"tag_name": "v2026.10.1", "prerelease": False},
+            {"tag_name": "v2026.10.1-beta.2", "prerelease": True},
+        ],
+    )
+    assert outdated_cmd.fetch_latest_tag("openclaw", include_prerelease=True) == "2026.10.1"
+
+
+def test_fetch_latest_tag_unreachable_is_none() -> None:
+    # The autouse no-network fixture makes every lookup "unreachable".
+    assert outdated_cmd.fetch_latest_tag("hermes") is None
+    assert outdated_cmd.fetch_latest_tag("hermes", include_prerelease=True) is None

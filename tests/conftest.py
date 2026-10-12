@@ -24,6 +24,19 @@ def tmp_data_dir(tmp_path: Path) -> Iterator[Path]:
     yield tmp_path
 
 
+@pytest.fixture(autouse=True)
+def _no_github(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unit tests never reach GitHub: every upstream release lookup
+    (create / vm init / upgrade / outdated) reads as "unreachable" unless
+    a test stubs ``fetch_latest_tag`` or ``_fetch_json`` itself. Without
+    this, results would depend on the network and on what upstream
+    released today. The integration suite drives the real CLI and is
+    exempt."""
+    if request.node.get_closest_marker("multipass"):
+        return
+    monkeypatch.setattr("agents_cli.outdated_cmd._fetch_json", lambda url: None)
+
+
 def _ok(stdout: str = "") -> MpResult:
     return MpResult(stdout=stdout, stderr="", returncode=0)
 

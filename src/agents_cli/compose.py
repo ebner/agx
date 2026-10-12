@@ -53,6 +53,29 @@ from agents_cli.errors import RuntimeFailure, UserError
 HERMES_IMAGE_BASE: Final = "nousresearch/hermes-agent"
 OPENCLAW_IMAGE_BASE: Final = "openclaw/openclaw"
 
+# Hermes runtime env pins (see hermes_service_fragment).
+HERMES_HOME_DIR: Final = "/opt/data"
+HERMES_PATH: Final = (
+    "/opt/hermes/bin:/opt/hermes/.venv/bin:/opt/data/.local/bin:"
+    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+)
+
+# OpenClaw: the image runs as ``node`` (uid 1000). Its state lives in
+# these per-agent dirs (relative to ``<data-dir>/<name>/``) mounted under
+# /home/node. ``.config`` carries OpenClaw's auth-profile secret key
+# (``.config/openclaw``, part of upstream's official compose since 2.0)
+# plus gh/git/... config; ``.local`` carries tools the agent installs
+# (``~/.local/bin`` is on the image PATH, pnpm's global dir lives under
+# ``.local/share``). The rest of /home/node stays image-owned on purpose:
+# bind-mounting over it would hide files the image ships there.
+OPENCLAW_RUNTIME_UID: Final = 1000
+OPENCLAW_STATE_MOUNTS: Final = (
+    (".openclaw", "/home/node/.openclaw"),
+    ("workspace", "/home/node/.openclaw/workspace"),
+    (".config", "/home/node/.config"),
+    (".local", "/home/node/.local"),
+)
+
 # Toolkit-managed s6 cont-init.d perms hook (see templates.HERMES_CONT_INIT_FIXPERMS).
 # Lives in the project dir (shared across all Hermes agents — it reads the
 # runtime uid from the live container, so it's agent-independent) and is
@@ -479,9 +502,16 @@ def hermes_service_fragment(
     ``-u 1000:1000`` mapping is the host user owning the data dir on
     the host. Setting ``user: 1000:1000`` would force the container into
     a subuid that does NOT match the multipass mount ownership, breaking
-    every write into ``/opt/data``. HOME is pinned in env so paths under
-    the runtime user's home are stable independent of image USER/HOME
-    drift between Hermes releases.
+    every write into ``/opt/data``.
+
+    HOME and PATH mirror the image instead of fighting it: ``docker
+    exec`` (``agents exec``/``doctor``) bypasses the entrypoint, so both
+    are pinned, but to the image's own values — HOME is the runtime
+    user's passwd home ``/opt/data`` (persisted: anything a shell, the
+    gateway or ``gh``/``git``/``npm`` writes under ``~`` survives every
+    recreate), PATH the image ``Config.Env`` PATH (incl. the
+    ``/opt/hermes/bin`` wrapper). Tool subprocesses get Hermes'
+    per-profile ``$HERMES_HOME/home`` on top of that.
     """
     socket_path = cfg.vm_runtime.docker_socket_path
     return {
@@ -508,13 +538,17 @@ def hermes_service_fragment(
         "env_file": [f"./{name}/.env"],
         "environment": {
             "DOCKER_HOST": f"unix://{socket_path}",
-            "HOME": "/home/hermes",
-            # The image entrypoint prepends /opt/hermes/.venv/bin to PATH
-            # internally, but `docker exec` bypasses the entrypoint, so
-            # `agents doctor` (which exec's `hermes doctor` in the container)
-            # would otherwise hit "executable file not found". Set the full
-            # PATH explicitly to mirror the image default plus the venv.
-            "PATH": "/opt/hermes/.venv/bin:/opt/data/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            # The runtime user's passwd home — ON the bind mount. The old
+            # pin to /home/hermes (container overlay) existed for the
+            # retired Codex bridge and silently dropped everything written
+            # under ~ by `docker exec` processes (`agents exec` sessions)
+            # on every recreate. The gateway is unaffected either way: s6
+            # resets HOME from passwd.
+            "HOME": HERMES_HOME_DIR,
+            # Mirrors the image's Config.Env PATH. Pinned because images
+            # predating that env relied on the entrypoint to add the venv,
+            # which `docker exec` bypasses ("executable file not found").
+            "PATH": HERMES_PATH,
             # The Hermes image entrypoint reads HERMES_UID/GID to remap
             # its internal `hermes` user (default uid 10000) and chown
             # /opt/data before `gosu hermes`. WITHOUT these vars the
@@ -605,10 +639,7 @@ def openclaw_service_fragment(
         "container_name": f"openclaw-{name}",
         "restart": "unless-stopped",
         "ports": [f"127.0.0.1:{port}:18789"],
-        "volumes": [
-            f"./{name}/.openclaw:/home/node/.openclaw",
-            f"./{name}/workspace:/home/node/.openclaw/workspace",
-        ],
+        "volumes": [f"./{name}/{sub}:{target}" for sub, target in OPENCLAW_STATE_MOUNTS],
         "environment": {
             "OPENCLAW_DISABLE_BONJOUR": "1",
             # Firecrawl self-host wiring (project-level, set by

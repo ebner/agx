@@ -7,14 +7,21 @@ are behind upstream short of visiting GitHub manually. This module
 provides that surface.
 
 Read-only: fetches the agent's pinned tag from compose, fetches the
-latest upstream tag via the GitHub Releases API (same mechanism as
-``vm._fetch_latest_tag``), and classifies each agent as ``current`` /
+latest upstream tag via the GitHub Releases API (the one fetch path
+``vm init``, ``create`` and ``upgrade`` use too), and classifies each agent as ``current`` /
 ``outdated`` / ``unknown`` (network fetch failed).
 
 Pre-release filtering: the GitHub ``/releases/latest`` endpoint already
 hides pre-releases by upstream policy. Users who pin to a beta on
 purpose can pass ``--include-prerelease`` to compare against the
-absolute newest tag from ``/releases?per_page=10`` instead.
+newest pre-release instead (see :func:`fetch_latest_tag`).
+
+Release tag != image tag: GitHub release tags and Docker image tags
+follow different conventions per upstream — Hermes publishes
+``nousresearch/hermes-agent:v0.21.6`` (same as the release tag),
+OpenClaw publishes ``openclaw/openclaw:2026.10.1`` for release
+``v2026.10.1``. Every tag this module returns is already in IMAGE form
+(:func:`image_tag_from_release`), so callers can pin it directly.
 
 Hermes and OpenClaw both report here. Service prefixes (``hermes-`` /
 ``openclaw-``) drive the repo lookup; firecrawl-* and other project-
@@ -25,6 +32,7 @@ based, and re-pin via ``agents firecrawl up --upgrade``).
 from __future__ import annotations
 
 import json
+import re
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -33,15 +41,40 @@ from typing import Any
 from agents_cli import compose, ui
 from agents_cli import config as cfg_mod
 
-# Same source of truth as vm._fetch_latest_tag — duplicated here as a
-# top-level constant so this module can also fetch via /releases (the
-# "all releases" form, used when --include-prerelease is on).
+# GitHub Releases is the version source of truth for every agent type.
 GITHUB_API: dict[str, str] = {
     "hermes": "https://api.github.com/repos/NousResearch/hermes-agent",
     "openclaw": "https://api.github.com/repos/openclaw/openclaw",
 }
 
 FETCH_TIMEOUT_S: float = 5.0
+
+# A release tag that names a version: ``v0.21.6``, ``v2026.9.24``,
+# ``v2026.10.1``, ``v2026.10.5-beta.1``, ``v2026.7.1-2``. Non-version
+# release tags upstream also publishes (OpenClaw's ``linux-stable``
+# desktop channel) have no matching image and must never be pinned.
+_VERSION_TAG_RE = re.compile(r"v?\d+(\.\d+)+([-.][0-9A-Za-z.-]+)?")
+
+# Upstreams whose Docker tags drop the release tag's leading ``v``.
+_IMAGE_TAG_STRIPS_V = frozenset({"openclaw"})
+
+
+def image_tag_from_release(agent_type: str, release_tag: str) -> str | None:
+    """Docker image tag for an upstream GitHub release tag, or ``None``
+    when the release tag doesn't name a version (no image exists)."""
+    if not _VERSION_TAG_RE.fullmatch(release_tag):
+        return None
+    return normalize_image_tag(agent_type, release_tag)
+
+
+def normalize_image_tag(agent_type: str, tag: str) -> str:
+    """Map a user- or config-supplied tag to the upstream's image-tag
+    form: OpenClaw images are ``2026.10.1``, never ``v2026.10.1`` (the
+    release-tag form older toolkit versions pinned, which 404s on pull).
+    Other tags pass through unchanged."""
+    if agent_type in _IMAGE_TAG_STRIPS_V and re.fullmatch(r"v\d.*", tag):
+        return tag[1:]
+    return tag
 
 
 def check(
@@ -81,7 +114,7 @@ def check(
             continue
 
         image = svc.get("image") or ""
-        current_tag = _tag_from_image(image)
+        current_tag = normalize_image_tag(agent_type, _tag_from_image(image))
 
         if agent_type not in latest_cache:
             latest_cache[agent_type] = fetch_latest_tag(
@@ -151,39 +184,46 @@ def _status_rank(status: str) -> int:
 
 
 def fetch_latest_tag(agent_type: str, *, include_prerelease: bool = False) -> str | None:
-    """Best-effort upstream lookup.
+    """Best-effort upstream lookup; returns an IMAGE tag (see
+    :func:`image_tag_from_release`) or ``None`` when unreachable.
 
-    Default path uses ``/releases/latest`` which upstream auto-filters
-    pre-releases. With ``--include-prerelease`` we hit ``/releases``
-    and take the first entry (most recent by GitHub's ordering).
+    Default: ``/releases/latest`` — the release upstream marks latest,
+    which excludes pre-releases. With ``include_prerelease`` the newest
+    pre-release wins when it is newer than that stable: walk
+    ``/releases`` (newest-created first) and take the first version tag
+    that is a pre-release or IS the latest stable. Taking ``data[0]``
+    blindly is wrong — OpenClaw cuts maintenance releases of older lines
+    (``v2026.6.35`` published after ``v2026.9.x``) and non-version tags
+    (``linux-stable``), either of which can be the newest-created entry.
+    Versions are never compared numerically: Hermes switched from calver
+    (``v2026.9.24``) to semver (``v0.21.6``), so ordering by version
+    would rank the newest release last.
     """
     base = GITHUB_API.get(agent_type)
     if base is None:
         return None
-    if include_prerelease:
-        url = f"{base}/releases?per_page=10"
-        return _fetch_first_tag(url)
-    return _fetch_single_tag(f"{base}/releases/latest")
-
-
-def _fetch_single_tag(url: str) -> str | None:
-    try:
-        with urllib.request.urlopen(url, timeout=FETCH_TIMEOUT_S) as resp:
-            data: dict[str, Any] = json.loads(resp.read().decode("utf-8"))
-            tag = data.get("tag_name")
-            return str(tag) if tag else None
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
+    latest = _fetch_json(f"{base}/releases/latest")
+    stable = latest.get("tag_name") if isinstance(latest, dict) else None
+    if not include_prerelease:
+        return image_tag_from_release(agent_type, stable) if isinstance(stable, str) else None
+    releases = _fetch_json(f"{base}/releases?per_page=30")
+    if not isinstance(releases, list):
         return None
+    for rel in releases:
+        if not isinstance(rel, dict):
+            continue
+        tag = rel.get("tag_name")
+        if not isinstance(tag, str) or image_tag_from_release(agent_type, tag) is None:
+            continue
+        if rel.get("prerelease") or tag == stable:
+            return image_tag_from_release(agent_type, tag)
+    return None
 
 
-def _fetch_first_tag(url: str) -> str | None:
+def _fetch_json(url: str) -> Any:
     try:
         with urllib.request.urlopen(url, timeout=FETCH_TIMEOUT_S) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            if isinstance(data, list) and data:
-                tag = data[0].get("tag_name")
-                return str(tag) if tag else None
-            return None
+            return json.loads(resp.read().decode("utf-8"))
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
         return None
 

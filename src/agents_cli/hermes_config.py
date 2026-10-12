@@ -27,6 +27,7 @@ security invariants from the plan.
 
 from __future__ import annotations
 
+import hashlib
 import io
 import os
 import re
@@ -41,6 +42,15 @@ from agents_cli.config import AgentsConfig
 from agents_cli.errors import UserError
 
 ALLOWED_DASHBOARD_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+# What ``read_doc`` saw, per returned doc: id(doc) -> (doc, (agent,
+# profile), sha256 of the file text or None when absent). The doc itself
+# is held so its id can't be recycled. ``write_atomically`` compares the
+# file against this right before its rename — the agents edit their own
+# config.yaml (Hermes migrations, `hermes config set` from a tool call,
+# the curator), and a toolkit read-modify-write must not silently revert
+# such a change that landed in between.
+_READ_STATE: dict[int, tuple[Any, tuple[str, str | None], str | None]] = {}
 
 # Hermes stores named profiles lowercase under ``$HERMES_HOME/profiles/<id>/``,
 # each a full HERMES_HOME of its own (config.yaml, .env, state.db, ...).
@@ -152,6 +162,21 @@ def read_doc(cfg: AgentsConfig, agent_name: str, profile: str | None = None) -> 
     ``service_up``) or the file doesn't exist yet — same fallback the
     old SFTP path had.
     """
+    text = _read_text(cfg, agent_name, profile)
+    parsed = _yaml().load(text) if text is not None else None
+    # Defensive: ``cat`` may return non-YAML output if the file is
+    # empty or the stub in tests returns a generic OK. Callers index
+    # ``doc.get("model")`` etc. which would AttributeError on a str.
+    # Match the rc != 0 fallback shape.
+    if not isinstance(parsed, dict):
+        parsed = _yaml().load("{}\n")
+    _READ_STATE[id(parsed)] = (parsed, (agent_name, normalize_profile(profile)), _digest(text))
+    return parsed
+
+
+def _read_text(cfg: AgentsConfig, agent_name: str, profile: str | None) -> str | None:
+    """config.yaml's text via ``docker compose exec cat``; ``None`` when
+    unreadable (container down, file not created yet)."""
     from agents_cli.ops import _compose_exec_in_vm_argv
 
     svc = f"hermes-{agent_name}"
@@ -160,16 +185,27 @@ def read_doc(cfg: AgentsConfig, agent_name: str, profile: str | None = None) -> 
         *_compose_exec_in_vm_argv(cfg, svc, "cat", container_config_path(profile), no_tty=True),
         check=False,
     )
-    if result.returncode != 0:
-        return _yaml().load("{}\n")
-    parsed = _yaml().load(result.stdout)
-    # Defensive: ``cat`` may return non-YAML output if the file is
-    # empty or the stub in tests returns a generic OK. Callers index
-    # ``doc.get("model")`` etc. which would AttributeError on a str.
-    # Match the rc != 0 fallback shape.
-    if not isinstance(parsed, dict):
-        return _yaml().load("{}\n")
-    return parsed
+    return result.stdout if result.returncode == 0 else None
+
+
+def _digest(text: str | None) -> str | None:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest() if text is not None else None
+
+
+def _refuse_if_changed_since_read(
+    cfg: AgentsConfig, agent_name: str, doc: Any, profile: str | None
+) -> None:
+    """Raise when config.yaml no longer matches what ``read_doc`` returned
+    for ``doc``. Docs not obtained from ``read_doc`` are not checked."""
+    seen = _READ_STATE.get(id(doc))
+    if seen is None or seen[0] is not doc or seen[1] != (agent_name, normalize_profile(profile)):
+        return
+    if _digest(_read_text(cfg, agent_name, profile)) != seen[2]:
+        raise UserError(
+            f"{agent_name}'s config.yaml changed while the toolkit was editing it "
+            "(the agent or another process wrote it) — nothing was written, so that "
+            "change is kept. Re-run the command to apply yours on top of it."
+        )
 
 
 def dump(doc: Any) -> str:
@@ -249,12 +285,23 @@ def write_atomically(
 
     try:
         _validate_in_container(cfg, agent_name, stage, profile=profile)
+        # Last moment before the rename (validation can take seconds):
+        # optimistic concurrency against the agent's own edits.
+        _refuse_if_changed_since_read(cfg, agent_name, doc, profile)
         mv_argv = _compose_exec_in_vm_argv(cfg, svc, "mv", stage, target, no_tty=True)
         mp.exec_in_vm(cfg.vm.name, *mv_argv)
     except Exception:
         rm_argv = _compose_exec_in_vm_argv(cfg, svc, "rm", "-f", stage, no_tty=True)
         mp.exec_in_vm(cfg.vm.name, *rm_argv, check=False)
         raise
+    # The file now holds this doc: a later write of the same doc in this
+    # process compares against what WE wrote.
+    if id(doc) in _READ_STATE:
+        _READ_STATE[id(doc)] = (
+            doc,
+            (agent_name, normalize_profile(profile)),
+            _digest(content.decode("utf-8")),
+        )
 
 
 def _validate_in_container(

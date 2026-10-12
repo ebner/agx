@@ -9,8 +9,6 @@ from __future__ import annotations
 
 import json
 import os
-import urllib.error
-import urllib.request
 import uuid
 from pathlib import Path
 from typing import Any
@@ -20,12 +18,6 @@ from agents_cli import mp, templates, ui
 from agents_cli.config import AgentsConfig, ExportCronConfig, HostConfig, PathsConfig, VmConfig
 from agents_cli.errors import CliError, HealthCheckFailure, RuntimeFailure, UserError
 from agents_cli.mp import BootstrapStatus
-
-GITHUB_LATEST_URLS = {
-    "hermes": "https://api.github.com/repos/NousResearch/hermes-agent/releases/latest",
-    "openclaw": "https://api.github.com/repos/openclaw/openclaw/releases/latest",
-}
-
 
 # ---------- init ----------
 
@@ -1374,17 +1366,11 @@ def _unique_snapshot_name(vm: str, requested: str) -> str:
 
 
 def _fetch_latest_tag(repo_key: str) -> str | None:
-    """Best-effort fetch from GitHub Releases. 3-second timeout, no exceptions out."""
-    url = GITHUB_LATEST_URLS.get(repo_key)
-    if not url:
-        return None
-    try:
-        with urllib.request.urlopen(url, timeout=3.0) as resp:
-            data: dict[str, Any] = json.loads(resp.read().decode("utf-8"))
-            tag = data.get("tag_name")
-            return str(tag) if tag else None
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
-        return None
+    """Latest upstream IMAGE tag (``outdated_cmd.fetch_latest_tag``);
+    ``None`` when GitHub is unreachable. No exceptions out."""
+    from agents_cli import outdated_cmd
+
+    return outdated_cmd.fetch_latest_tag(repo_key)
 
 
 def _resolve_gpu_list(requested: list[str]) -> list[str]:

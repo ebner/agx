@@ -347,7 +347,7 @@ OpenClaw uses its own bundled Codex plugin and onboarding flow:
 
 ```bash
 agents create personal --type openclaw --setup
-agents exec personal openclaw models auth login --provider openai-codex --device-code
+agents exec personal openclaw models auth login --provider openai --device-code
 agents exec personal openclaw chat
 agents logs personal -f
 agents remove personal

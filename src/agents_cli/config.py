@@ -378,6 +378,22 @@ def load(path: Path = DEFAULT_CONFIG_PATH) -> AgentsConfig:
         raise UserError(f"Config at {path} failed schema validation: {e}") from e
 
 
+def persist_default_image_tag(
+    cfg: AgentsConfig, agent_type: str, tag: str | None, path: Path = DEFAULT_CONFIG_PATH
+) -> None:
+    """Make ``tag`` the ``defaults.<type>_image_tag`` baseline (saved only
+    on change). Callers invoke it on SUCCESS paths only — a tag becomes
+    the baseline once an agent demonstrably runs it."""
+    if tag is None:
+        return
+    if agent_type == "hermes" and cfg.defaults.hermes_image_tag != tag:
+        cfg.defaults.hermes_image_tag = tag
+        save(cfg, path)
+    elif agent_type == "openclaw" and cfg.defaults.openclaw_image_tag != tag:
+        cfg.defaults.openclaw_image_tag = tag
+        save(cfg, path)
+
+
 def save(cfg: AgentsConfig, path: Path = DEFAULT_CONFIG_PATH) -> None:
     """Write the config, preserving any existing comments via tomlkit round-trip."""
     path.parent.mkdir(parents=True, exist_ok=True)

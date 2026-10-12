@@ -66,6 +66,27 @@ def rm(cfg: AgentsConfig, *services: str, force: bool = True, stop: bool = True)
     return mp.exec_in_vm(cfg.vm.name, *argv)
 
 
+def run_as_root(cfg: AgentsConfig, service: str, *cmd: str) -> MpResult:
+    """One-off ``compose run --rm --no-deps --user 0`` of ``cmd`` in a
+    fresh container of ``service`` (its volumes, override included),
+    entrypoint bypassed. Root here is the rootless daemon's userns root,
+    which can chown within the subuid range on the service's mounts."""
+    return mp.exec_in_vm(
+        cfg.vm.name,
+        *_base_argv(cfg),
+        "run",
+        "--rm",
+        "--no-deps",
+        "--user",
+        "0",
+        "--entrypoint",
+        cmd[0],
+        service,
+        *cmd[1:],
+        check=False,
+    )
+
+
 def stop(cfg: AgentsConfig, *services: str) -> MpResult:
     return mp.exec_in_vm(cfg.vm.name, *_base_argv(cfg), "stop", *services)
 

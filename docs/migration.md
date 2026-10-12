@@ -15,7 +15,7 @@ the realistic path: **side-by-side cutover with archival**.
 | Field | Portable? | How |
 |---|---|---|
 | Personality / `SOUL.md` | Yes (plain text) | Hand-port into the new agent's system-prompt slot |
-| LLM provider (Codex auth) | Yes | `openclaw models auth login --provider openai-codex` (or `hermes auth add openai-codex` going the other way) |
+| LLM provider (Codex auth) | Yes | `openclaw models auth login --provider openai` (or `hermes auth add openai-codex` going the other way) |
 | Other LLM API keys (OpenRouter, etc.) | Yes (bare strings) | Re-enter in the destination agent's wizard |
 | Conversation history | **Lossy** — text only | `agents conversations export <name> --to <dir>` produces Markdown transcripts |
 | Bot tokens (Slack, Mattermost, email) | Yes if same bot | The tokens themselves are bare strings; bot apps don't care which client connects |

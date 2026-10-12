@@ -520,7 +520,10 @@ def _check_container_logs(cfg: AgentsConfig, report: DoctorReport) -> None:
     if unbounded:
         problems.append(
             f"{len(unbounded)} container(s) log without rotation ({', '.join(sorted(unbounded))}) "
-            "— log-opts apply at create time; recreate them (`agents reseat <agent>` for agents)"
+            "— log-opts apply at create time, so recreate them: agents via "
+            "`agents reseat <name>`, other services via `docker compose up -d "
+            "--force-recreate <service>` from the project dir (`agents vm shell`, "
+            f"then `cd {cfg.paths.vm_agents_root}`)"
         )
 
     if problems:

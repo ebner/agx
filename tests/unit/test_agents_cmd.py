@@ -267,6 +267,89 @@ def test_create_respects_explicit_image_tag(
     assert doc["services"]["hermes-coder"]["image"].endswith(":v2.0.0-rc1")
 
 
+def test_create_uses_latest_release_and_rebaselines_default(
+    cfg: AgentsConfig, saved_config: Path, stub_runners, mocker
+) -> None:
+    """A plain create starts on the newest upstream release, and on
+    success that release becomes the config default."""
+    mocker.patch("agents_cli.outdated_cmd.fetch_latest_tag", return_value="v9.9.9")
+    create(name="coder", agent_type="hermes", config_path=saved_config)
+    doc = compose.load_compose(cfg.paths.host_data_dir / "docker-compose.yml")
+    assert doc["services"]["hermes-coder"]["image"].endswith(":v9.9.9")
+    assert cfg_mod.load(saved_config).defaults.hermes_image_tag == "v9.9.9"
+
+
+def test_create_pinned_skips_the_lookup(
+    cfg: AgentsConfig, saved_config: Path, stub_runners, mocker
+) -> None:
+    fetch = mocker.patch("agents_cli.outdated_cmd.fetch_latest_tag", return_value="v9.9.9")
+    create(name="coder", agent_type="hermes", pinned=True, config_path=saved_config)
+    fetch.assert_not_called()
+    doc = compose.load_compose(cfg.paths.host_data_dir / "docker-compose.yml")
+    assert doc["services"]["hermes-coder"]["image"].endswith(":v1.0.0")
+
+
+def test_create_falls_back_to_default_when_github_unreachable(
+    cfg: AgentsConfig, saved_config: Path, stub_runners, mocker
+) -> None:
+    warn = mocker.patch("agents_cli.ui.warn")
+    create(name="coder", agent_type="hermes", config_path=saved_config)
+    doc = compose.load_compose(cfg.paths.host_data_dir / "docker-compose.yml")
+    assert doc["services"]["hermes-coder"]["image"].endswith(":v1.0.0")
+    assert any("could not reach GitHub" in c.args[0] for c in warn.call_args_list)
+    assert cfg_mod.load(saved_config).defaults.hermes_image_tag == "v1.0.0"
+
+
+def test_create_openclaw_normalizes_release_style_tag(
+    cfg: AgentsConfig, saved_config: Path, stub_runners, mocker
+) -> None:
+    """`openclaw/openclaw:v2026.10.1` doesn't exist — the image is `2026.10.1`."""
+    mocker.patch("agents_cli.compose_runner.run_as_root", return_value=_ok())
+    create(name="personal", agent_type="openclaw", image_tag="v2026.10.1", config_path=saved_config)
+    doc = compose.load_compose(cfg.paths.host_data_dir / "docker-compose.yml")
+    assert doc["services"]["openclaw-personal"]["image"] == "openclaw/openclaw:2026.10.1"
+
+
+def test_create_openclaw_hands_state_dirs_to_node_before_start(
+    cfg: AgentsConfig, saved_config: Path, stub_runners, mocker
+) -> None:
+    """The image runs as non-root `node`; toolkit-created dirs are
+    container-root-owned under rootless Docker, so without the chown the
+    agent can't persist anything. It must run before the first `up`."""
+    order: list[str] = []
+    chown = mocker.patch(
+        "agents_cli.compose_runner.run_as_root",
+        side_effect=lambda *a, **k: order.append("chown") or _ok(),
+    )
+    stub_runners["compose_up"].side_effect = lambda *a, **k: order.append("up") or _ok()
+    create(name="personal", agent_type="openclaw", config_path=saved_config)
+
+    assert order == ["chown", "up"]
+    args = chown.call_args.args
+    assert args[1] == "openclaw-personal"
+    assert args[2:5] == ("chown", "-R", "1000:1000")
+    assert set(args[5:]) == {
+        "/home/node/.openclaw",
+        "/home/node/.openclaw/workspace",
+        "/home/node/.config",
+        "/home/node/.local",
+    }
+    for sub in (".openclaw", "workspace", ".config", ".local"):
+        assert (cfg.paths.host_data_dir / "personal" / sub).is_dir()
+
+
+def test_create_openclaw_fails_loudly_when_chown_fails(
+    cfg: AgentsConfig, saved_config: Path, stub_runners, mocker
+) -> None:
+    mocker.patch(
+        "agents_cli.compose_runner.run_as_root",
+        return_value=MpResult(stdout="", stderr="chown: denied", returncode=1),
+    )
+    with pytest.raises(RuntimeFailure, match="chown: denied"):
+        create(name="personal", agent_type="openclaw", config_path=saved_config)
+    stub_runners["compose_up"].assert_not_called()
+
+
 def test_create_completes_journal(cfg: AgentsConfig, saved_config: Path, stub_runners) -> None:
     create(name="coder", agent_type="hermes", config_path=saved_config)
     assert Journal.find_resumable(cfg.paths.host_data_dir, "create", "coder") is None
