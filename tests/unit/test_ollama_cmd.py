@@ -7,9 +7,9 @@ from typing import Any
 
 import pytest
 
-from agents_cli import config as cfg_mod
-from agents_cli import ollama_cmd
-from agents_cli.config import (
+from agx_cli import config as cfg_mod
+from agx_cli import ollama_cmd
+from agx_cli.config import (
     AgentsConfig,
     DefaultsConfig,
     HostConfig,
@@ -17,8 +17,8 @@ from agents_cli.config import (
     PathsConfig,
     VmRuntimeConfig,
 )
-from agents_cli.errors import UserError
-from agents_cli.mp import MpResult
+from agx_cli.errors import UserError
+from agx_cli.mp import MpResult
 
 
 def _ok(stdout: str = "") -> MpResult:
@@ -88,7 +88,7 @@ def test_valid_url_accepted() -> None:
 def test_configure_writes_block_to_config(
     cfg: AgentsConfig, saved_config: Path, mocker: Any
 ) -> None:
-    mocker.patch("agents_cli.ollama_cmd._probe_reachability", return_value=[])
+    mocker.patch("agx_cli.ollama_cmd._probe_reachability", return_value=[])
     ollama_cmd.configure(
         url="http://10.20.30.1:11434",
         embed_model="nomic-embed-text",
@@ -104,7 +104,7 @@ def test_configure_writes_block_to_config(
 def test_configure_with_api_key_writes_to_env_only(
     cfg: AgentsConfig, saved_config: Path, mocker: Any
 ) -> None:
-    mocker.patch("agents_cli.ollama_cmd._probe_reachability", return_value=[])
+    mocker.patch("agx_cli.ollama_cmd._probe_reachability", return_value=[])
     ollama_cmd.configure(
         url="https://groq.example/v1",
         api_key="gsk_secret",
@@ -135,7 +135,7 @@ def test_configure_rejects_bad_env_name(saved_config: Path) -> None:
 def test_configure_clears_api_key_on_empty_string(
     cfg: AgentsConfig, saved_config: Path, mocker: Any
 ) -> None:
-    mocker.patch("agents_cli.ollama_cmd._probe_reachability", return_value=[])
+    mocker.patch("agx_cli.ollama_cmd._probe_reachability", return_value=[])
     ollama_cmd.configure(url="http://10.20.30.1:11434", api_key="initial", config_path=saved_config)
     env_text = (cfg.paths.host_data_dir / ".env").read_text(encoding="utf-8")
     assert "OLLAMA_API_KEY=initial" in env_text
@@ -148,7 +148,7 @@ def test_configure_clears_api_key_on_empty_string(
 def test_clear_removes_config_and_env_secret(
     cfg: AgentsConfig, saved_config: Path, mocker: Any
 ) -> None:
-    mocker.patch("agents_cli.ollama_cmd._probe_reachability", return_value=[])
+    mocker.patch("agx_cli.ollama_cmd._probe_reachability", return_value=[])
     ollama_cmd.configure(url="http://10.20.30.1:11434", api_key="x", config_path=saved_config)
     ollama_cmd.clear(yes=True, config_path=saved_config)
 
@@ -162,9 +162,9 @@ def test_clear_removes_config_and_env_secret(
 def test_clear_requires_confirmation(cfg: AgentsConfig, saved_config: Path, mocker: Any) -> None:
     """clear wipes the stored API key + [ollama] block — destructive, so
     it must confirm (default False) like the sibling wipe commands."""
-    mocker.patch("agents_cli.ollama_cmd._probe_reachability", return_value=[])
+    mocker.patch("agx_cli.ollama_cmd._probe_reachability", return_value=[])
     ollama_cmd.configure(url="http://10.20.30.1:11434", api_key="x", config_path=saved_config)
-    confirm = mocker.patch("agents_cli.ui.confirm", return_value=False)
+    confirm = mocker.patch("agx_cli.ui.confirm", return_value=False)
 
     with pytest.raises(UserError, match="aborted"):
         ollama_cmd.clear(config_path=saved_config)
@@ -179,9 +179,9 @@ def test_clear_requires_confirmation(cfg: AgentsConfig, saved_config: Path, mock
 
 
 def test_clear_proceeds_when_confirmed(cfg: AgentsConfig, saved_config: Path, mocker: Any) -> None:
-    mocker.patch("agents_cli.ollama_cmd._probe_reachability", return_value=[])
+    mocker.patch("agx_cli.ollama_cmd._probe_reachability", return_value=[])
     ollama_cmd.configure(url="http://10.20.30.1:11434", api_key="x", config_path=saved_config)
-    mocker.patch("agents_cli.ui.confirm", return_value=True)
+    mocker.patch("agx_cli.ui.confirm", return_value=True)
 
     ollama_cmd.clear(config_path=saved_config)
 
@@ -203,7 +203,7 @@ def test_status_includes_probes_when_configured(
     def fake_probe(cfg_: Any, *, agent_filter: Any) -> list[dict[str, str]]:
         return [{"from": "vm", "status": "ok", "detail": "/api/tags reachable"}]
 
-    mocker.patch("agents_cli.ollama_cmd._probe_reachability", side_effect=fake_probe)
+    mocker.patch("agx_cli.ollama_cmd._probe_reachability", side_effect=fake_probe)
 
     info = ollama_cmd.status(config_path=saved_config)
     assert info["configured"] is True
@@ -230,8 +230,8 @@ def test_probe_ok_when_curl_succeeds(saved_config: Path, mocker: Any) -> None:
     cfg = cfg_mod.load(saved_config)
     cfg.ollama = OllamaConfig(url="http://10.20.30.1:11434")
     cfg_mod.save(cfg, saved_config)
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok())
-    mocker.patch("agents_cli.compose.read_compose_doc", return_value={"services": {}})
+    mocker.patch("agx_cli.mp.exec_in_vm", return_value=_ok())
+    mocker.patch("agx_cli.compose.read_compose_doc", return_value={"services": {}})
 
     probes = ollama_cmd._probe_reachability(cfg, agent_filter=None)
     assert any(p["status"] == "ok" for p in probes)
@@ -241,8 +241,8 @@ def test_probe_fail_on_curl_error(saved_config: Path, mocker: Any) -> None:
     cfg = cfg_mod.load(saved_config)
     cfg.ollama = OllamaConfig(url="http://10.20.30.1:11434")
     cfg_mod.save(cfg, saved_config)
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_fail())
-    mocker.patch("agents_cli.compose.read_compose_doc", return_value={"services": {}})
+    mocker.patch("agx_cli.mp.exec_in_vm", return_value=_fail())
+    mocker.patch("agx_cli.compose.read_compose_doc", return_value={"services": {}})
 
     probes = ollama_cmd._probe_reachability(cfg, agent_filter=None)
     assert any(p["status"] == "fail" for p in probes)
@@ -256,7 +256,7 @@ def test_probe_uses_bearer_when_api_key_env_present(
     env_path = cfg.paths.host_data_dir / ".env"
     env_path.write_text(env_path.read_text() + "OLLAMA_API_KEY=gsk_test\n", encoding="utf-8")
 
-    spy = mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok())
+    spy = mocker.patch("agx_cli.mp.exec_in_vm", return_value=_ok())
     ollama_cmd._probe_from_vm(cfg_mod.load(saved_config))
 
     args = spy.call_args.args
@@ -321,12 +321,12 @@ def test_configure_holds_mutation_lock_around_env_write(
         yield
         events.append("lock:exit")
 
-    mocker.patch("agents_cli.compose.acquire_lock", side_effect=fake_lock)
+    mocker.patch("agx_cli.compose.acquire_lock", side_effect=fake_lock)
     mocker.patch(
-        "agents_cli.sidecar.write_project_env",
+        "agx_cli.sidecar.write_project_env",
         side_effect=lambda *a, **k: events.append("env:write"),
     )
-    mocker.patch("agents_cli.ollama_cmd._probe_reachability", return_value=[])
+    mocker.patch("agx_cli.ollama_cmd._probe_reachability", return_value=[])
 
     ollama_cmd.configure(
         url="http://10.20.30.1:11434", api_key="gsk_secret", config_path=saved_config
@@ -348,14 +348,14 @@ def test_clear_holds_mutation_lock_around_env_write(
         yield
         events.append("lock:exit")
 
-    mocker.patch("agents_cli.ollama_cmd._probe_reachability", return_value=[])
+    mocker.patch("agx_cli.ollama_cmd._probe_reachability", return_value=[])
     ollama_cmd.configure(
         url="http://10.20.30.1:11434", api_key="gsk_secret", config_path=saved_config
     )
 
-    mocker.patch("agents_cli.compose.acquire_lock", side_effect=fake_lock)
+    mocker.patch("agx_cli.compose.acquire_lock", side_effect=fake_lock)
     mocker.patch(
-        "agents_cli.sidecar.write_project_env",
+        "agx_cli.sidecar.write_project_env",
         side_effect=lambda *a, **k: events.append("env:write"),
     )
     ollama_cmd.clear(yes=True, config_path=saved_config)
@@ -375,7 +375,7 @@ def test_configure_writes_api_key_to_vm_env_in_data_dir_in_vm_mode(
     cfg.paths.data_dir_in_vm = True
     cfg_mod.save(cfg, saved_config)
     mocks = install_vm_fs_simulation(mocker, cfg)
-    mocker.patch("agents_cli.ollama_cmd._probe_reachability", return_value=[])
+    mocker.patch("agx_cli.ollama_cmd._probe_reachability", return_value=[])
 
     ollama_cmd.configure(
         url="http://10.20.30.1:11434", api_key="gsk_secret", config_path=saved_config

@@ -1,4 +1,4 @@
-"""``agents mount`` — add/remove/list, per-backend dispatch, rollback.
+"""``agx mount`` — add/remove/list, per-backend dispatch, rollback.
 
 Tests are mocked at the ``mp`` boundary like the rest of the suite:
 ``mp.mount`` / ``mp.umount`` are stubbed so we exercise the toolkit's
@@ -15,12 +15,12 @@ from pathlib import Path
 import pytest
 from ruamel.yaml import YAML
 
-from agents_cli import config as cfg_mod
-from agents_cli import mounts_cmd
-from agents_cli.config import AgentsConfig, DefaultsConfig, HostConfig, PathsConfig, VmRuntimeConfig
-from agents_cli.errors import UserError
-from agents_cli.mounts_cmd import MountEntry
-from agents_cli.mp import MpResult
+from agx_cli import config as cfg_mod
+from agx_cli import mounts_cmd
+from agx_cli.config import AgentsConfig, DefaultsConfig, HostConfig, PathsConfig, VmRuntimeConfig
+from agx_cli.errors import UserError
+from agx_cli.mounts_cmd import MountEntry
+from agx_cli.mp import MpResult
 
 # ---------- fixtures ----------
 
@@ -97,21 +97,21 @@ def mounts_mocked(mocker, cfg_with_agent: AgentsConfig):
 
     install_vm_fs_simulation(mocker, cfg_with_agent)
     mounts = {
-        "mp_mount": mocker.patch("agents_cli.mp.mount", return_value=_ok()),
-        "mp_umount": mocker.patch("agents_cli.mp.umount", return_value=_ok()),
+        "mp_mount": mocker.patch("agx_cli.mp.mount", return_value=_ok()),
+        "mp_umount": mocker.patch("agx_cli.mp.umount", return_value=_ok()),
         # hermes_config.write_atomically goes through `docker compose exec`
         # which the unit tests stub out — replace it with a direct file
         # write so the test can read the resulting config.yaml back.
         "hermes_write": mocker.patch(
-            "agents_cli.hermes_config.write_atomically",
+            "agx_cli.hermes_config.write_atomically",
             side_effect=_fake_hermes_write,
         ),
         "acl_probe": mocker.patch(
-            "agents_cli.permissions.probe_acl_support", return_value=(True, None)
+            "agx_cli.permissions.probe_acl_support", return_value=(True, None)
         ),
-        "acl_run_owned": mocker.patch("agents_cli.permissions.run_owned"),
+        "acl_run_owned": mocker.patch("agx_cli.permissions.run_owned"),
         "acl_subuid": mocker.patch(
-            "agents_cli.permissions.compute_container_subuid", return_value=100999
+            "agx_cli.permissions.compute_container_subuid", return_value=100999
         ),
     }
     return mounts
@@ -124,7 +124,7 @@ def _fake_hermes_write(cfg, agent_name, doc):
     """
     import io
 
-    from agents_cli import hermes_config
+    from agx_cli import hermes_config
 
     p = cfg.paths.host_data_dir / agent_name / ".data" / "config.yaml"
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -444,7 +444,7 @@ def test_add_rolls_back_vm_mount_on_compose_failure(
     we MUST call mp.umount to roll back — otherwise the next add (or a
     later prune) trips over the orphan."""
     mocker.patch(
-        "agents_cli.compose.write_override_atomically",
+        "agx_cli.compose.write_override_atomically",
         side_effect=OSError("simulated disk full"),
     )
     with pytest.raises(OSError, match="disk full"):
@@ -562,7 +562,7 @@ def test_add_failure_rollback_preserves_preexisting_override_entry(
     mounts_mocked,
 ) -> None:
     """The user may have hand-added the IDENTICAL volume entry to
-    docker-compose.override.yml before running `agents mount add`. The
+    docker-compose.override.yml before running `agx mount add`. The
     override is sacred (rule #10): a later-phase failure must roll back
     only entries THIS call inserted — the pre-existing one stays."""
     volume = _coder_volume("/workspace/x", readonly=True)
@@ -671,7 +671,7 @@ def test_add_failure_rollback_preserves_preexisting_sandbox_entry(
         encoding="utf-8",
     )
     mocker.patch(
-        "agents_cli.mounts_cmd.save_manifest",
+        "agx_cli.mounts_cmd.save_manifest",
         side_effect=OSError("simulated manifest failure"),
     )
     with pytest.raises(OSError, match="manifest failure"):
@@ -701,7 +701,7 @@ def test_add_failure_rollback_preserves_preexisting_acl_grant(
     outside any manifest) must survive the rollback even though no other
     manifest references the folder. The apply still runs (setfacl is
     idempotent and converges recursion/mask) but the strip must not."""
-    mocker.patch("agents_cli.permissions.has_user_acl", return_value=True)
+    mocker.patch("agx_cli.permissions.has_user_acl", return_value=True)
     mounts_mocked["hermes_write"].side_effect = OSError("simulated config write failure")
     with pytest.raises(OSError, match="config write failure"):
         mounts_cmd.add(
@@ -754,8 +754,8 @@ def test_add_restart_recreates_via_compose_up(
     --restart through it silently left the new mount unapplied. It must
     go through `compose up -d <svc>`, which recreates on config drift
     (same trap secrets_cmd documents for env_file changes)."""
-    up = mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
-    restart = mocker.patch("agents_cli.compose_runner.restart", return_value=_ok())
+    up = mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
+    restart = mocker.patch("agx_cli.compose_runner.restart", return_value=_ok())
     mounts_cmd.add(
         agent="coder",
         host=str(host_folder),
@@ -782,8 +782,8 @@ def test_remove_restart_recreates_via_compose_up(
         restart=False,
         config_path=saved_config,
     )
-    up = mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
-    restart = mocker.patch("agents_cli.compose_runner.restart", return_value=_ok())
+    up = mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
+    restart = mocker.patch("agx_cli.compose_runner.restart", return_value=_ok())
     mounts_cmd.remove(
         agent="coder",
         container="/workspace/x",
@@ -798,7 +798,7 @@ def test_remove_restart_recreates_via_compose_up(
 def test_add_without_restart_warns_with_recreate_hint(
     host_folder: Path, saved_config: Path, mounts_mocked, mocker
 ) -> None:
-    """The manual hint must not point at `agents restart` as the fix —
+    """The manual hint must not point at `agx restart` as the fix —
     that command doesn't reload compose config either."""
     warn = mocker.spy(mounts_cmd.ui, "warn")
     mounts_cmd.add(

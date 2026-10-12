@@ -7,9 +7,9 @@ from pathlib import Path
 import pytest
 import tomlkit
 
-from agents_cli import config as cfg_mod
-from agents_cli.config import AgentsConfig, PathsConfig, load, save
-from agents_cli.errors import UserError
+from agx_cli import config as cfg_mod
+from agx_cli.config import AgentsConfig, PathsConfig, load, save
+from agx_cli.errors import UserError
 
 
 def test_minimal_config_loads(tmp_path: Path) -> None:
@@ -77,13 +77,13 @@ def test_data_dir_normal_absolute_path_ok(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("bad", ["/", "/agents", "/home/ubuntu/../../etc"])
 def test_vm_agents_root_too_shallow_or_climbing_rejected(tmp_path: Path, bad: str) -> None:
-    """`agents remove` deletes `<vm_agents_root>/<name>` as root in the VM."""
+    """`agx remove` deletes `<vm_agents_root>/<name>` as root in the VM."""
     with pytest.raises(ValueError):
         PathsConfig(host_data_dir=str(tmp_path / "data"), vm_agents_root=bad)
 
 
 def test_vm_backend_accepts_three_backends() -> None:
-    from agents_cli.config import VmConfig
+    from agx_cli.config import VmConfig
 
     for backend in ("multipass", "libvirt", "bare_metal"):
         cfg = VmConfig(backend=backend)
@@ -91,14 +91,14 @@ def test_vm_backend_accepts_three_backends() -> None:
 
 
 def test_vm_backend_rejects_unknown() -> None:
-    from agents_cli.config import VmConfig
+    from agx_cli.config import VmConfig
 
     with pytest.raises(ValueError, match="bare_metal"):
         VmConfig(backend="podman")
 
 
 def test_export_cron_time_validation() -> None:
-    from agents_cli.config import ExportCronConfig
+    from agx_cli.config import ExportCronConfig
 
     ExportCronConfig(time="02:30")
     ExportCronConfig(time="23:59")
@@ -183,7 +183,7 @@ def test_round_trip_preserves_comments(tmp_path: Path) -> None:
     ],
 )
 def test_ollama_url_loopback_variants_refused(url: str) -> None:
-    from agents_cli.config import OllamaConfig
+    from agx_cli.config import OllamaConfig
 
     with pytest.raises(ValueError, match="not reachable from inside the VM"):
         OllamaConfig(url=url)
@@ -199,7 +199,7 @@ def test_ollama_url_loopback_variants_refused(url: str) -> None:
     ],
 )
 def test_ollama_url_reachable_forms_accepted(url: str) -> None:
-    from agents_cli.config import OllamaConfig
+    from agx_cli.config import OllamaConfig
 
     assert OllamaConfig(url=url).url == url
 
@@ -220,5 +220,37 @@ def test_save_creates_parent_dir(tmp_path: Path) -> None:
 
 
 def test_default_config_path_is_user_config_dir() -> None:
-    expected = Path.home() / ".config" / "agents" / "config.toml"
+    expected = Path.home() / ".config" / "agx" / "config.toml"
     assert expected == cfg_mod.DEFAULT_CONFIG_PATH
+
+
+def test_migrate_legacy_config_dir_moves_once_and_links(tmp_path: Path) -> None:
+    legacy = tmp_path / "agents" / "config.toml"
+    new = tmp_path / "agx" / "config.toml"
+    legacy.parent.mkdir()
+    legacy.write_text("x = 1\n")
+    assert cfg_mod.migrate_legacy_config_dir(new, legacy) is True
+    assert new.read_text() == "x = 1\n"
+    assert (tmp_path / "agents").is_symlink()
+    assert legacy.read_text() == "x = 1\n"  # via the compat link
+    # second run: nothing to do
+    assert cfg_mod.migrate_legacy_config_dir(new, legacy) is False
+
+
+def test_migrate_legacy_config_dir_never_overwrites(tmp_path: Path) -> None:
+    legacy = tmp_path / "agents" / "config.toml"
+    new = tmp_path / "agx" / "config.toml"
+    legacy.parent.mkdir()
+    new.parent.mkdir()
+    legacy.write_text("old\n")
+    new.write_text("new\n")
+    assert cfg_mod.migrate_legacy_config_dir(new, legacy) is False
+    assert new.read_text() == "new\n"
+    assert legacy.read_text() == "old\n"
+
+
+def test_migrate_legacy_config_dir_noop_without_legacy(tmp_path: Path) -> None:
+    assert not cfg_mod.migrate_legacy_config_dir(
+        tmp_path / "agx" / "c.toml", tmp_path / "agents" / "c.toml"
+    )
+    assert not (tmp_path / "agx").exists()

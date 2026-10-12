@@ -7,18 +7,18 @@ from typing import Any
 
 import pytest
 
-from agents_cli import compose, hermes_config, secrets_cmd
-from agents_cli import config as cfg_mod
-from agents_cli.agents_cmd import create
-from agents_cli.config import (
+from agx_cli import compose, hermes_config, secrets_cmd
+from agx_cli import config as cfg_mod
+from agx_cli.agents_cmd import create
+from agx_cli.config import (
     AgentsConfig,
     DefaultsConfig,
     HostConfig,
     PathsConfig,
     VmRuntimeConfig,
 )
-from agents_cli.errors import UserError
-from agents_cli.mp import MpResult
+from agx_cli.errors import UserError
+from agx_cli.mp import MpResult
 
 
 def _ok(stdout: str = "") -> MpResult:
@@ -61,7 +61,7 @@ def vm_fs_mocks(cfg: AgentsConfig, mocker: Any) -> dict[str, Any]:
 def with_coder(
     cfg: AgentsConfig, saved_config: Path, mocker: Any, vm_fs_mocks: dict[str, Any]
 ) -> Path:
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     create(name="coder", agent_type="hermes", config_path=saved_config)
     return saved_config
 
@@ -98,7 +98,7 @@ def test_set_refuses_unknown_agent(saved_config: Path) -> None:
 
 
 def test_set_writes_per_agent_env(with_coder: Path, cfg: AgentsConfig, mocker: Any) -> None:
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     secrets_cmd.set_secret("coder", "FIRECRAWL_API_KEY", "fc-test", config_path=with_coder)
 
     env_path = cfg.paths.host_data_dir / "coder" / ".env"
@@ -111,7 +111,7 @@ def test_set_writes_per_agent_env(with_coder: Path, cfg: AgentsConfig, mocker: A
 
 
 def test_set_replaces_existing_value(with_coder: Path, cfg: AgentsConfig, mocker: Any) -> None:
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     secrets_cmd.set_secret("coder", "KEY", "old", config_path=with_coder)
     secrets_cmd.set_secret("coder", "KEY", "new", config_path=with_coder)
     env_path = cfg.paths.host_data_dir / "coder" / ".env"
@@ -121,7 +121,7 @@ def test_set_replaces_existing_value(with_coder: Path, cfg: AgentsConfig, mocker
 
 
 def test_set_preserves_other_secrets(with_coder: Path, cfg: AgentsConfig, mocker: Any) -> None:
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     secrets_cmd.set_secret("coder", "A", "1", config_path=with_coder)
     secrets_cmd.set_secret("coder", "B", "2", config_path=with_coder)
     env_path = cfg.paths.host_data_dir / "coder" / ".env"
@@ -131,7 +131,7 @@ def test_set_preserves_other_secrets(with_coder: Path, cfg: AgentsConfig, mocker
 
 
 def test_unset_removes_key(with_coder: Path, cfg: AgentsConfig, mocker: Any) -> None:
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     secrets_cmd.set_secret("coder", "KEEP", "yes", config_path=with_coder)
     secrets_cmd.set_secret("coder", "DROP", "yes", config_path=with_coder)
     secrets_cmd.unset_secret("coder", "DROP", config_path=with_coder)
@@ -142,13 +142,13 @@ def test_unset_removes_key(with_coder: Path, cfg: AgentsConfig, mocker: Any) -> 
 
 
 def test_unset_refuses_unknown_key(with_coder: Path, cfg: AgentsConfig, mocker: Any) -> None:
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     with pytest.raises(UserError, match="not set"):
         secrets_cmd.unset_secret("coder", "NEVER_SET", config_path=with_coder)
 
 
 def test_list_returns_keys_only(with_coder: Path, cfg: AgentsConfig, mocker: Any) -> None:
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     secrets_cmd.set_secret("coder", "ALPHA", "sensitive-a", config_path=with_coder)
     secrets_cmd.set_secret("coder", "BETA", "sensitive-b", config_path=with_coder)
     keys = secrets_cmd.list_secrets("coder", config_path=with_coder)
@@ -158,7 +158,7 @@ def test_list_returns_keys_only(with_coder: Path, cfg: AgentsConfig, mocker: Any
 
 
 def test_clear_wipes_all_secrets(with_coder: Path, cfg: AgentsConfig, mocker: Any) -> None:
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     secrets_cmd.set_secret("coder", "A", "1", config_path=with_coder)
     secrets_cmd.set_secret("coder", "B", "2", config_path=with_coder)
     secrets_cmd.clear_secrets("coder", yes=True, config_path=with_coder)
@@ -170,7 +170,7 @@ def test_clear_wipes_all_secrets(with_coder: Path, cfg: AgentsConfig, mocker: An
 
 
 def test_set_calls_compose_up(with_coder: Path, cfg: AgentsConfig, mocker: Any) -> None:
-    up_spy = mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    up_spy = mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     secrets_cmd.set_secret("coder", "X", "y", config_path=with_coder)
     # compose up was called with the agent's service name so env_file
     # changes propagate to a recreated container.
@@ -178,9 +178,9 @@ def test_set_calls_compose_up(with_coder: Path, cfg: AgentsConfig, mocker: Any) 
 
 
 def test_unset_calls_compose_up(with_coder: Path, cfg: AgentsConfig, mocker: Any) -> None:
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     secrets_cmd.set_secret("coder", "X", "y", config_path=with_coder)
-    up_spy = mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    up_spy = mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     secrets_cmd.unset_secret("coder", "X", config_path=with_coder)
     assert any("hermes-coder" in c.args for c in up_spy.call_args_list)
 
@@ -203,7 +203,7 @@ def test_backfill_adds_env_file_when_missing(
     """Agents created before this command existed have no env_file
     clause. First `secret set` repairs the compose entry idempotently.
     """
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     # Hand-build an "old-style" service entry without env_file.
     doc = compose.read_compose_doc(cfg)
     doc["services"] = {
@@ -214,7 +214,7 @@ def test_backfill_adds_env_file_when_missing(
         }
     }
     compose.write_compose_atomically(cfg, doc)
-    # Touch the per-agent .env (would normally be created by `agents create`).
+    # Touch the per-agent .env (would normally be created by `agx create`).
     (cfg.paths.host_data_dir / "old").mkdir(exist_ok=True)
     (cfg.paths.host_data_dir / "old" / ".env").write_text("", encoding="utf-8")
 
@@ -226,7 +226,7 @@ def test_backfill_adds_env_file_when_missing(
 
 def test_backfill_is_idempotent(with_coder: Path, cfg: AgentsConfig, mocker: Any) -> None:
     """Already-wired env_file must not be duplicated."""
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     secrets_cmd.set_secret("coder", "K1", "v1", config_path=with_coder)
     secrets_cmd.set_secret("coder", "K2", "v2", config_path=with_coder)
     doc = compose.read_compose_doc(cfg)
@@ -256,7 +256,7 @@ def test_render_empty_env_file_is_empty_string() -> None:
 def test_all_secret_keys_lists_every_agent(
     with_coder: Path, cfg: AgentsConfig, mocker: Any
 ) -> None:
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     secrets_cmd.set_secret("coder", "FIRECRAWL_API_KEY", "fc-x", config_path=with_coder)
     summary = secrets_cmd.all_secret_keys(cfg)
     assert summary["coder"] == ["FIRECRAWL_API_KEY"]
@@ -276,14 +276,14 @@ def test_list_refuses_unknown_agent(saved_config: Path) -> None:
 # subprocesses (terminal.env_passthrough defaults to []). Without this,
 # secrets are visible to Hermes' built-in tools (which read os.environ
 # directly) but NOT to the LLM's shell-based diagnostics — leading to
-# false-negative "not configured" reports. agents secret set must
+# false-negative "not configured" reports. agx secret set must
 # allowlist each key so the full execution surface sees it.
 
 
 def test_set_adds_key_to_terminal_env_passthrough(
     with_coder: Path, cfg: AgentsConfig, mocker: Any
 ) -> None:
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     secrets_cmd.set_secret("coder", "FIRECRAWL_API_KEY", "fc-test", config_path=with_coder)
     doc = hermes_config.load(hermes_config.config_path(cfg, "coder"))
     passthrough = doc["terminal"]["env_passthrough"]
@@ -292,7 +292,7 @@ def test_set_adds_key_to_terminal_env_passthrough(
 
 def test_set_passthrough_is_idempotent(with_coder: Path, cfg: AgentsConfig, mocker: Any) -> None:
     """Setting the same secret twice must NOT duplicate the passthrough entry."""
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     secrets_cmd.set_secret("coder", "KEY", "v1", config_path=with_coder)
     secrets_cmd.set_secret("coder", "KEY", "v2", config_path=with_coder)
     doc = hermes_config.load(hermes_config.config_path(cfg, "coder"))
@@ -304,7 +304,7 @@ def test_set_passthrough_appends_to_existing_entries(
     with_coder: Path, cfg: AgentsConfig, mocker: Any
 ) -> None:
     """User-managed entries (e.g. via `hermes setup`) must survive."""
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     # Pre-populate config.yaml with a manually-added passthrough entry.
     doc = hermes_config.load(hermes_config.config_path(cfg, "coder"))
     hermes_config.add_env_passthrough(doc, "TAVILY_API_KEY")
@@ -321,7 +321,7 @@ def test_set_passthrough_appends_to_existing_entries(
 def test_unset_removes_key_from_passthrough(
     with_coder: Path, cfg: AgentsConfig, mocker: Any
 ) -> None:
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     secrets_cmd.set_secret("coder", "DROPME", "v", config_path=with_coder)
     secrets_cmd.unset_secret("coder", "DROPME", config_path=with_coder)
     doc = hermes_config.load(hermes_config.config_path(cfg, "coder"))
@@ -333,7 +333,7 @@ def test_unset_leaves_unrelated_passthrough_entries(
     with_coder: Path, cfg: AgentsConfig, mocker: Any
 ) -> None:
     """Removing one secret must not strip others' passthrough entries."""
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     secrets_cmd.set_secret("coder", "KEEPME", "a", config_path=with_coder)
     secrets_cmd.set_secret("coder", "DROPME", "b", config_path=with_coder)
     secrets_cmd.unset_secret("coder", "DROPME", config_path=with_coder)
@@ -371,7 +371,7 @@ def test_clear_removes_passthrough_keys_for_hermes(
     """`set` mirrors each key into terminal.env_passthrough; `clear`
     must drop those entries too (mirroring unset's mechanics) or they
     linger forever. Unrelated user-managed entries survive."""
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     # A pre-existing user-managed entry that is NOT a toolkit secret.
     doc = hermes_config.load(hermes_config.config_path(cfg, "coder"))
     hermes_config.add_env_passthrough(doc, "TAVILY_API_KEY")
@@ -389,7 +389,7 @@ def test_clear_removes_passthrough_keys_for_hermes(
 
 
 def test_clear_is_idempotent(with_coder: Path, cfg: AgentsConfig, mocker: Any) -> None:
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     secrets_cmd.set_secret("coder", "A_KEY", "1", config_path=with_coder)
     secrets_cmd.clear_secrets("coder", yes=True, config_path=with_coder)
     # Second clear finds no keys — must not raise or touch config.
@@ -402,9 +402,9 @@ def test_clear_openclaw_skips_passthrough_editing(
 ) -> None:
     """OpenClaw has no terminal.env_passthrough — clear wipes the env
     file only and never touches a Hermes config (same posture as unset)."""
-    from agents_cli.agents_cmd import create as create_agent
+    from agx_cli.agents_cmd import create as create_agent
 
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     create_agent(name="personal", agent_type="openclaw", config_path=saved_config)
     secrets_cmd.set_secret("personal", "SOME_KEY", "v", config_path=saved_config)
 

@@ -35,7 +35,7 @@ Your instinct will be "one agent per topic" — *finance*, *family*, *health*, e
 For most home/family deployments, the right starting point is **one toolkit agent**:
 
 ```bash
-agents create home --type hermes --setup
+agx create home --type hermes --setup
 ```
 
 One Mattermost bot. One `SOUL.md`. One neutral voice that replies in family chat. Cheaper to run, easier to back up, and easier to reason about than anything more.
@@ -58,7 +58,7 @@ If none of those apply, you probably don't need a second container.
 
 …you want a *cheap, state-isolated* second `$HERMES_HOME` inside one container, used **interactively** (not gateway-exposed — see §6). Real use cases:
 
-1. **Scratch persona.** `hermes profile create scratch --clone default` → experiment → `hermes profile delete scratch`. Faster than `agents create`/`agents remove`.
+1. **Scratch persona.** `hermes profile create scratch --clone default` → experiment → `hermes profile delete scratch`. Faster than `agx create`/`agx remove`.
 2. **Contain an experiment's state.** Clone to `experiment`, test a new `SOUL.md`, a rewritten config, or an unfamiliar skill without polluting your main profile's config, sessions, or memories — then promote (`hermes profile use experiment`) or discard. This contains *state*, not *privileges*: the experiment still runs with the same filesystem access as the default profile.
 3. **A/B test personalities** without container churn.
 4. **Try a profile distribution.** `hermes profile install <git-url>` installs a packaged agent (personality + skills + cron jobs + config, distributed as a git repo) as a new profile — evaluate it in isolation before adopting its pieces into your main profile.
@@ -94,10 +94,10 @@ The rest of this tutorial assumes the default — one toolkit agent named `coder
 ### 4.1 Create the agent
 
 ```bash
-agents create coder --type hermes --setup
+agx create coder --type hermes --setup
 ```
 
-`--setup` chains `hermes setup`, which is the interactive wizard for model provider, terminal backend, gateway, etc. If you pick `openai-codex` as the model provider, authenticate it inside the container afterwards: `agents exec coder -- hermes auth add openai-codex --type oauth --no-browser` (device-code URL + code, any browser logged into your ChatGPT account). `agents codex login` is unrelated — it only feeds the optional Codex *sandbox skill*.
+`--setup` chains `hermes setup`, which is the interactive wizard for model provider, terminal backend, gateway, etc. If you pick `openai-codex` as the model provider, authenticate it inside the container afterwards: `agx exec coder -- hermes auth add openai-codex --type oauth --no-browser` (device-code URL + code, any browser logged into your ChatGPT account). `agx codex login` is unrelated — it only feeds the optional Codex *sandbox skill*.
 
 ### 4.2 Customize the personality
 
@@ -110,13 +110,13 @@ $EDITOR <data-dir>/coder/.data/SOUL.md
 Or run the wizard:
 
 ```bash
-agents exec coder hermes setup --section agent
+agx exec coder hermes setup --section agent
 ```
 
 For a session-only experiment, drop into the agent and use the built-in presets:
 
 ```bash
-agents exec coder hermes chat
+agx exec coder hermes chat
 > /personality concise
 > /personality technical
 ```
@@ -138,46 +138,46 @@ Then `/personality codereviewer` inside the session.
 Browse or search the registry from inside the agent:
 
 ```bash
-agents exec coder hermes skills browse
-agents exec coder hermes skills search kubernetes
+agx exec coder hermes skills browse
+agx exec coder hermes skills search kubernetes
 ```
 
 Install from any of the supported sources:
 
 ```bash
 # bundled / official
-agents exec coder hermes skills install official/security/1password
+agx exec coder hermes skills install official/security/1password
 
 # GitHub path
-agents exec coder hermes skills install openai/skills/k8s
+agx exec coder hermes skills install openai/skills/k8s
 
 # direct URL
-agents exec coder hermes skills install https://example.com/path/SKILL.md
+agx exec coder hermes skills install https://example.com/path/SKILL.md
 ```
 
 Skills land in `<data-dir>/coder/.data/skills/<skill-id>/` on the host, so duplicity backs them up alongside the rest of the agent. List, update, uninstall:
 
 ```bash
-agents exec coder hermes skills list
-agents exec coder hermes skills check        # any upstream changes?
-agents exec coder hermes skills update
-agents exec coder hermes skills uninstall <skill-id>
+agx exec coder hermes skills list
+agx exec coder hermes skills check        # any upstream changes?
+agx exec coder hermes skills update
+agx exec coder hermes skills uninstall <skill-id>
 ```
 
 Skills are **profile-scoped** inside Hermes. With Strategy A (one container per agent) you don't have to think about this — each toolkit agent has its own skill set. With Strategy B you'd run `hermes -p <profile> skills install ...`.
 
-Most skills that talk to a third-party service need an API key. Wire one in per-agent — never in the project-level `.env`. (Exception: Firecrawl can be self-hosted via `agents firecrawl up` — see `docs/runbook.md`. No per-agent setup needed, every agent picks it up automatically.)
+Most skills that talk to a third-party service need an API key. Wire one in per-agent — never in the project-level `.env`. (Exception: Firecrawl can be self-hosted via `agx firecrawl up` — see `docs/runbook.md`. No per-agent setup needed, every agent picks it up automatically.)
 
 ```bash
 # prompts for the value (hidden, never printed back)
-agents secret set coder FIRECRAWL_API_KEY
+agx secret set coder FIRECRAWL_API_KEY
 
 # or pass it on the command line (visible in shell history)
-agents secret set coder FIRECRAWL_API_KEY fc-xxxxx
+agx secret set coder FIRECRAWL_API_KEY fc-xxxxx
 
-agents secret list coder         # names only
-agents secret unset coder FIRECRAWL_API_KEY
-agents secret clear coder        # wipe all
+agx secret list coder         # names only
+agx secret unset coder FIRECRAWL_API_KEY
+agx secret clear coder        # wipe all
 ```
 
 Secrets land in `<data-dir>/coder/.env` and become container env vars on the next restart (which `secret set` handles automatically). The Firecrawl skill — like every skill following the standard convention — reads `os.environ['FIRECRAWL_API_KEY']`, no further configuration needed.
@@ -188,7 +188,7 @@ By default Hermes uses built-in memory (`MEMORY.md` / `USER.md`). For
 longer-lived semantic recall the toolkit ships three managed backends:
 
 ```bash
-agents memory list
+agx memory list
 ```
 
 | Plugin       | Tier             | What it needs                                                |
@@ -201,7 +201,7 @@ agents memory list
 credentials, no network calls.
 
 ```bash
-agents memory enable holographic coder
+agx memory enable holographic coder
 ```
 
 `mem0` and `openviking` need an embeddings + LLM provider. The toolkit
@@ -211,22 +211,22 @@ service) you already run — it does not start one for you:
 ```bash
 # point the toolkit at an Ollama you already run (host, LAN, Tailscale,
 # or a hosted vendor — but not `localhost`, which the VM can't reach)
-agents ollama configure --url http://10.20.30.1:11434
+agx ollama configure --url http://10.20.30.1:11434
 
 # now use it
-agents memory enable mem0 coder           # in-process inside Hermes
-agents memory enable openviking coder     # sibling docker service
+agx memory enable mem0 coder           # in-process inside Hermes
+agx memory enable openviking coder     # sibling docker service
 ```
 
 For a hosted OpenAI-compatible endpoint with bearer-token auth, pass
 `--api-key` — it lands in `<data-dir>/.env`, never in `config.toml`:
 
 ```bash
-agents ollama configure --url https://api.groq.example/v1 --api-key gsk_…
+agx ollama configure --url https://api.groq.example/v1 --api-key gsk_…
 ```
 
-Switch backends with `agents memory disable coder` followed by another
-`enable`. `agents memory status` shows what's wired and (for
+Switch backends with `agx memory disable coder` followed by another
+`enable`. `agx memory status` shows what's wired and (for
 holographic) flags the SQLite-on-9p / missing-NumPy risks described in
 `CLAUDE.md`.
 
@@ -238,28 +238,28 @@ Hermes ships a *messaging gateway* (`hermes gateway`) plus a few platform-specif
 
 ```bash
 # generate a Slack app manifest you paste into api.slack.com → Create an app
-agents exec coder hermes slack
+agx exec coder hermes slack
 
 # configure the gateway with the bot token from your new Slack app
-agents exec coder hermes setup --section gateway
+agx exec coder hermes setup --section gateway
 
 # start the gateway as a background service inside the container
-agents exec coder hermes gateway start
-agents exec coder hermes gateway          # status / live runtime
+agx exec coder hermes gateway start
+agx exec coder hermes gateway          # status / live runtime
 ```
 
 **WhatsApp** (officially supported):
 
 ```bash
-agents exec coder hermes whatsapp         # pairing code flow
+agx exec coder hermes whatsapp         # pairing code flow
 ```
 
 **Mattermost / Matrix / Discord / IRC / Rocket.Chat / Teams** — *not first-class as of Hermes v1.x*. Two viable paths:
 
 1. Check the skill registry — community skills may exist:
    ```bash
-   agents exec coder hermes skills search mattermost
-   agents exec coder hermes skills search matrix
+   agx exec coder hermes skills search mattermost
+   agx exec coder hermes skills search matrix
    ```
 2. Or write/find a custom gateway adapter and drop it under `$HERMES_HOME/gateway/adapters/`. See the Hermes Developer Guide section *Extending the gateway*.
 
@@ -285,22 +285,22 @@ services:
 ### 4.5 Use the agent
 
 ```bash
-agents exec coder hermes chat                           # interactive
-agents exec coder hermes chat -q "summarize today's PRs"  # one-shot, no TTY
-agents exec coder hermes dashboard --no-open            # open the web UI URL
+agx exec coder hermes chat                           # interactive
+agx exec coder hermes chat -q "summarize today's PRs"  # one-shot, no TTY
+agx exec coder hermes dashboard --no-open            # open the web UI URL
 ```
 
-Dashboards are reachable from the host at `http://127.0.0.1:<port>/` — the port is what `agents list` prints for that agent. The dashboard is only ever bound to loopback (toolkit enforces this).
+Dashboards are reachable from the host at `http://127.0.0.1:<port>/` — the port is what `agx list` prints for that agent. The dashboard is only ever bound to loopback (toolkit enforces this).
 
 ### 4.6 Monitor, debug
 
 ```bash
-agents logs coder -f                  # follow container stdout/stderr
-agents doctor coder                   # health: VM, mount, socket, Hermes itself
-agents exec coder hermes status       # Hermes' own view of auth, gateway, model
-agents exec coder hermes doctor       # Hermes' deeper diagnostics
-agents exec coder hermes sessions     # list / export / delete past chats
-agents exec coder hermes insights     # token/cost/activity report
+agx logs coder -f                  # follow container stdout/stderr
+agx doctor coder                   # health: VM, mount, socket, Hermes itself
+agx exec coder hermes status       # Hermes' own view of auth, gateway, model
+agx exec coder hermes doctor       # Hermes' deeper diagnostics
+agx exec coder hermes sessions     # list / export / delete past chats
+agx exec coder hermes insights     # token/cost/activity report
 ```
 
 ### 4.7 Back up
@@ -308,9 +308,9 @@ agents exec coder hermes insights     # token/cost/activity report
 If you trust your host backup (duplicity, restic, …) over `<data-dir>`, you're already covered. For an explicit crash-consistent point-in-time:
 
 ```bash
-agents export coder                    # → <data-dir>/backups/coder-<utc>.tar.zst
-agents export --all
-agents export-cron install --time 02:30
+agx export coder                    # → <data-dir>/backups/coder-<utc>.tar.zst
+agx export --all
+agx export-cron install --time 02:30
 ```
 
 Heads-up on retention: the default backups dir is a rolling window — each export prunes the agent's archives down to the newest `[export_cron].keep_last` (default 14). Long-term history is your host backup's job; see the [runbook's retention section](runbook.md#backup-retention).
@@ -318,25 +318,25 @@ Heads-up on retention: the default backups dir is a rolling window — each expo
 ### 4.8 Upgrade
 
 ```bash
-agents outdated                  # who's behind upstream? (read-only)
-agents upgrade coder             # bring coder to the latest upstream release
-agents upgrade coder --tag v1.2.4   # or pin an explicit tag
-agents upgrade coder --recreate  # force-refresh at the current pin (no version change)
+agx outdated                  # who's behind upstream? (read-only)
+agx upgrade coder             # bring coder to the latest upstream release
+agx upgrade coder --tag v1.2.4   # or pin an explicit tag
+agx upgrade coder --recreate  # force-refresh at the current pin (no version change)
 ```
 
-Bare `agents upgrade <name>` implicitly resolves the latest upstream tag from GitHub Releases (like `apt upgrade`) and no-ops — no snapshots, no downtime — when the agent is already there. When there is work to do, it takes both a VM snapshot and a host-side `.tar.zst` of the agent's state before touching anything, then pulls, recreates, runs `hermes config migrate`, and runs `agents doctor`. If doctor fails, the toolkit auto-rolls-back. An interrupted upgrade resumes on re-run from its journal, targeting the tags recorded when it began. To roll back manually later:
+Bare `agx upgrade <name>` implicitly resolves the latest upstream tag from GitHub Releases (like `apt upgrade`) and no-ops — no snapshots, no downtime — when the agent is already there. When there is work to do, it takes both a VM snapshot and a host-side `.tar.zst` of the agent's state before touching anything, then pulls, recreates, runs `hermes config migrate`, and runs `agx doctor`. If doctor fails, the toolkit auto-rolls-back. An interrupted upgrade resumes on re-run from its journal, targeting the tags recorded when it began. To roll back manually later:
 
 ```bash
-agents rollback coder --yes
-agents rollback coder --snapshot coder-20260512T120000Z.tar.zst
+agx rollback coder --yes
+agx rollback coder --snapshot coder-20260512T120000Z.tar.zst
 ```
 
 ### 4.9 Rename, remove, tear down
 
 ```bash
-agents rename coder reviewer           # container + data-dir move atomically
-agents remove coder                    # prompts; --export-first to bag it first
-agents vm destroy --yes                # whole VM gone; <data-dir> on host untouched
+agx rename coder reviewer           # container + data-dir move atomically
+agx remove coder                    # prompts; --export-first to bag it first
+agx vm destroy --yes                # whole VM gone; <data-dir> on host untouched
 ```
 
 `vm destroy` is intentionally non-destructive of host state — `<data-dir>` and your personal `~/.codex/` survive. If you want to wipe everything, `rm -rf <data-dir>` after destroying the VM.
@@ -346,11 +346,11 @@ agents vm destroy --yes                # whole VM gone; <data-dir> on host untou
 OpenClaw uses its own bundled Codex plugin and onboarding flow:
 
 ```bash
-agents create personal --type openclaw --setup
-agents exec personal openclaw models auth login --provider openai --device-code
-agents exec personal openclaw chat
-agents logs personal -f
-agents remove personal
+agx create personal --type openclaw --setup
+agx exec personal openclaw models auth login --provider openai --device-code
+agx exec personal openclaw chat
+agx logs personal -f
+agx remove personal
 ```
 
 The toolkit does **not** mount Codex auth into OpenClaw — OpenClaw's plugin manages it itself. Don't try to "share" your toolkit-scoped Codex with OpenClaw via mounts; you'll end up with two managers fighting over the same `auth.json`.
@@ -361,25 +361,25 @@ Upstream Hermes treats profiles as full production agents — each one a complet
 
 ```bash
 # create a profile that clones the default's config, .env, SOUL.md and skills, then diverges
-agents exec coder hermes profile create scratch --clone default
+agx exec coder hermes profile create scratch --clone default
 
 # use it
-agents exec coder hermes -p scratch chat
-agents exec coder hermes -p scratch skills install official/codereview/standards
-agents exec coder hermes -p scratch setup --section agent      # different SOUL.md
+agx exec coder hermes -p scratch chat
+agx exec coder hermes -p scratch skills install official/codereview/standards
+agx exec coder hermes -p scratch setup --section agent      # different SOUL.md
 
 # day-to-day
-agents exec coder hermes profile list
-agents exec coder hermes profile rename scratch reviewer
-agents exec coder hermes profile export reviewer -o /opt/data/reviewer.zip
-agents exec coder hermes profile delete reviewer
+agx exec coder hermes profile list
+agx exec coder hermes profile rename scratch reviewer
+agx exec coder hermes profile export reviewer -o /opt/data/reviewer.zip
+agx exec coder hermes profile delete reviewer
 ```
 
 Worth knowing before you lean on them:
 
-- **Backups cover profiles automatically.** Profile data lives at `<data-dir>/coder/.data/profiles/<profile-name>/` on the host, so `agents export coder` and your host backup cover all profiles inside that container.
+- **Backups cover profiles automatically.** Profile data lives at `<data-dir>/coder/.data/profiles/<profile-name>/` on the host, so `agx export coder` and your host backup cover all profiles inside that container.
 - **Two clone flavors.** `--clone` copies config, `.env`, `SOUL.md`, and skills. `--clone-all` additionally copies memories, cron jobs, and plugins — but never per-profile history (`state.db`, `backups/`, `checkpoints/`), which can reach tens of GB. Because `--clone` copies `.env`, a cloned profile inherits the default's bot token — harmless, since Hermes refuses to start a second gateway on a token already in use.
-- **The toolkit manages the default profile only.** `agents secret set` (the `terminal.env_passthrough` half), `agents model use`, `agents ollama configure`, `agents conversations`, `agents memory`, the dashboard `0.0.0.0` refusal, and doctor's per-agent Hermes probes all read/write the *default* profile's `config.yaml` and `state.db`. Secondary profiles are yours to manage by hand via `agents exec <agent> hermes -p <profile> …` — the toolkit neither sees nor validates them.
+- **The toolkit manages the default profile only.** `agx secret set` (the `terminal.env_passthrough` half), `agx model use`, `agx ollama configure`, `agx conversations`, `agx memory`, the dashboard `0.0.0.0` refusal, and doctor's per-agent Hermes probes all read/write the *default* profile's `config.yaml` and `state.db`. Secondary profiles are yours to manage by hand via `agx exec <agent> hermes -p <profile> …` — the toolkit neither sees nor validates them.
 - **No privilege isolation between profiles.** Same container, same uid, same filesystem access; tool subprocesses share the real `HOME` across profiles by default (`terminal.home_mode: profile` opts a profile's tools into `$HERMES_HOME/home` instead). The container is the security boundary, not the profile.
 - **`hermes update` upgrades all profiles at once.** Profiles share the installation, so there's no per-profile version pinning or canarying — that's a per-container property (§3 criterion 3).
 
@@ -392,15 +392,15 @@ A 2026-07 spike (Hermes v2026.7.7.2, libvirt backend, virtiofs-mounted data dir)
 The toolkit backs this with two guardrails (GH #6 tier 1):
 
 - The cont-init hook pre-creates **every existing profile's** gateway log dir on each container boot, not just the default's. This covers restored or imported data dirs, which arrive without the log tree and would otherwise hot-loop the log service. Restart the agent after restoring an archive (or after creating a profile you plan to gateway-expose) so the hook runs.
-- `agents doctor` warns when a profile whose `gateway_state.json` wants `running` has its s6 service down or its log service flapping, with the remediation in the message.
+- `agx doctor` warns when a profile whose `gateway_state.json` wants `running` has its s6 service down or its log service flapping, with the remediation in the message.
 
 Still, a gateway-exposed secondary profile remains **mostly unmanaged** (GH #6 tier 2):
 
 1. **One bot token per gateway, enforced.** Each profile needs its own Slack/Mattermost/Discord bot account. If you're provisioning a second bot anyway, a profile saves you almost nothing over a second toolkit agent.
-2. **Config stays outside the toolkit.** No `agents conversations`, no secrets/`env_passthrough` wiring, no config validation (including the `0.0.0.0` dashboard refusal) for secondary profiles — you manage them by hand via `agents exec <agent> hermes -p <profile> …`.
+2. **Config stays outside the toolkit.** No `agx conversations`, no secrets/`env_passthrough` wiring, no config validation (including the `0.0.0.0` dashboard refusal) for secondary profiles — you manage them by hand via `agx exec <agent> hermes -p <profile> …`.
 3. **The dashboard isn't reachable.** The compose fragment publishes only the default profile's dashboard port to the host loopback; a secondary profile's dashboard binds a port nothing forwards.
 
-If a second gateway-exposed persona is worth a bot token, it's usually worth a container: `agents create <name> --type hermes` buys full doctor coverage, independent upgrade/rollback, resource caps, and a real isolation boundary. The sweet spot for profile gateways is a **pod**: several same-trust-domain personas sharing one container, with containers still separating trust domains.
+If a second gateway-exposed persona is worth a bot token, it's usually worth a container: `agx create <name> --type hermes` buys full doctor coverage, independent upgrade/rollback, resource caps, and a real isolation boundary. The sweet spot for profile gateways is a **pod**: several same-trust-domain personas sharing one container, with containers still separating trust domains.
 
 ## 7. Common questions
 
@@ -415,7 +415,7 @@ Not natively in Hermes — each profile that runs a gateway needs its own bot to
 If you want true auto-routing by channel, you'd need a custom gateway adapter that selects an LLM + skill set per message — not a profile-switching trick.
 
 **Q: Where does Codex auth live for a Hermes agent that uses Codex as its LLM?**
-In Hermes' own pooled auth store at `<data-dir>/coder/.data/auth.json` (`/opt/data/auth.json` in the container), written by `agents exec coder -- hermes auth add openai-codex --type oauth --no-browser`. The toolkit-scoped `<data-dir>/.codex/` is NOT involved any more — it used to be bind-mounted as an "import bridge", which tied the agent's credential to the host file's single-use OAuth refresh chain and got agents' tokens invalidated whenever the host copy refreshed. The subscription chain still dies every few weeks on its own (upstream Hermes #65346): set `fallback_providers` in the agent's `config.yaml` so it keeps answering, and `agents doctor-cron install --mail you@…` so you hear about it within 15 minutes; re-auth is the same one-liner, from any device with a browser (phone + `agents tailscale` + SSH works).
+In Hermes' own pooled auth store at `<data-dir>/coder/.data/auth.json` (`/opt/data/auth.json` in the container), written by `agx exec coder -- hermes auth add openai-codex --type oauth --no-browser`. The toolkit-scoped `<data-dir>/.codex/` is NOT involved any more — it used to be bind-mounted as an "import bridge", which tied the agent's credential to the host file's single-use OAuth refresh chain and got agents' tokens invalidated whenever the host copy refreshed. The subscription chain still dies every few weeks on its own (upstream Hermes #65346): set `fallback_providers` in the agent's `config.yaml` so it keeps answering, and `agx doctor-cron install --mail you@…` so you hear about it within 15 minutes; re-auth is the same one-liner, from any device with a browser (phone + `agx tailscale` + SSH works).
 
 **Q: My agent needs an inbound webhook for Slack/Discord/Mattermost.**
 Prefer the platform's outbound mode (Slack Socket Mode, Discord gateway, Mattermost websocket) — no inbound port required. If you truly need a webhook, terminate it on the host with a tunnel (Cloudflare Tunnel, tailscale-funnel) that forwards to `127.0.0.1:<vm-forwarded-port>`. Avoid binding `0.0.0.0` directly on the VM.
@@ -424,4 +424,4 @@ Prefer the platform's outbound mode (Slack Socket Mode, Discord gateway, Matterm
 `rm <data-dir>/coder/.data/SOUL.md` — Hermes auto-creates a fresh one on next start. Existing files are never overwritten.
 
 **Q: How do I migrate from a stand-alone Hermes install into a toolkit agent?**
-Inside the agent: `hermes import <path-to-backup.zip>`. Put the backup somewhere visible to the container — e.g. drop it in `<data-dir>/coder/.data/` on the host, then `agents exec coder hermes import /opt/data/backup.zip`.
+Inside the agent: `hermes import <path-to-backup.zip>`. Put the backup somewhere visible to the container — e.g. drop it in `<data-dir>/coder/.data/` on the host, then `agx exec coder hermes import /opt/data/backup.zip`.

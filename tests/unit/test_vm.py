@@ -12,11 +12,11 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from agents_cli import config as cfg_mod
-from agents_cli import vm
-from agents_cli.config import AgentsConfig, HostConfig, PathsConfig, VmRuntimeConfig
-from agents_cli.errors import HealthCheckFailure, RuntimeFailure, UserError
-from agents_cli.mp import MpResult
+from agx_cli import config as cfg_mod
+from agx_cli import vm
+from agx_cli.config import AgentsConfig, HostConfig, PathsConfig, VmRuntimeConfig
+from agx_cli.errors import HealthCheckFailure, RuntimeFailure, UserError
+from agx_cli.mp import MpResult
 
 # ---------- helpers ----------
 
@@ -46,23 +46,23 @@ def _make_config(tmp_path: Path) -> AgentsConfig:
 
 def test_select_ubuntu_image_returns_requested_when_listed(mocker) -> None:
     catalog = {"images": {"x": {"aliases": ["26.04", "noble"]}}}
-    mocker.patch("agents_cli.mp.find", return_value=_ok(json.dumps(catalog)))
+    mocker.patch("agx_cli.mp.find", return_value=_ok(json.dumps(catalog)))
     assert vm._select_ubuntu_image("26.04") == "26.04"
 
 
 def test_select_ubuntu_image_falls_back_to_24_04_when_missing(mocker) -> None:
     catalog = {"images": {"x": {"aliases": ["24.04", "noble"]}}}
-    mocker.patch("agents_cli.mp.find", return_value=_ok(json.dumps(catalog)))
+    mocker.patch("agx_cli.mp.find", return_value=_ok(json.dumps(catalog)))
     assert vm._select_ubuntu_image("26.04") == "24.04"
 
 
 def test_select_ubuntu_image_returns_requested_when_find_fails(mocker) -> None:
-    mocker.patch("agents_cli.mp.find", side_effect=RuntimeFailure("network"))
+    mocker.patch("agx_cli.mp.find", side_effect=RuntimeFailure("network"))
     assert vm._select_ubuntu_image("26.04") == "26.04"
 
 
 def test_select_ubuntu_image_handles_bad_json(mocker) -> None:
-    mocker.patch("agents_cli.mp.find", return_value=_ok("not json"))
+    mocker.patch("agx_cli.mp.find", return_value=_ok("not json"))
     assert vm._select_ubuntu_image("26.04") == "26.04"
 
 
@@ -71,18 +71,18 @@ def test_select_ubuntu_image_handles_bad_json(mocker) -> None:
 
 def test_vm_exists_true(mocker) -> None:
     listing = {"list": [{"name": "agents"}, {"name": "other"}]}
-    mocker.patch("agents_cli.mp.list_vms", return_value=_ok(json.dumps(listing)))
+    mocker.patch("agx_cli.mp.list_vms", return_value=_ok(json.dumps(listing)))
     assert vm._vm_exists("agents") is True
 
 
 def test_vm_exists_false(mocker) -> None:
     listing = {"list": [{"name": "other"}]}
-    mocker.patch("agents_cli.mp.list_vms", return_value=_ok(json.dumps(listing)))
+    mocker.patch("agx_cli.mp.list_vms", return_value=_ok(json.dumps(listing)))
     assert vm._vm_exists("agents") is False
 
 
 def test_vm_exists_handles_list_failure(mocker) -> None:
-    mocker.patch("agents_cli.mp.list_vms", side_effect=RuntimeFailure("x"))
+    mocker.patch("agx_cli.mp.list_vms", side_effect=RuntimeFailure("x"))
     assert vm._vm_exists("agents") is False
 
 
@@ -91,18 +91,18 @@ def test_vm_exists_handles_list_failure(mocker) -> None:
 
 def test_unique_snapshot_name_returns_base_when_no_collision(mocker) -> None:
     info = {"info": {"agents": {"snapshots": {"foo": {}}}}}
-    mocker.patch("agents_cli.mp.info_vm", return_value=_ok(json.dumps(info)))
+    mocker.patch("agx_cli.mp.info_vm", return_value=_ok(json.dumps(info)))
     assert vm._unique_snapshot_name("agents", "bar") == "bar"
 
 
 def test_unique_snapshot_name_appends_counter_on_collision(mocker) -> None:
     info = {"info": {"agents": {"snapshots": {"snap": {}, "snap-2": {}}}}}
-    mocker.patch("agents_cli.mp.info_vm", return_value=_ok(json.dumps(info)))
+    mocker.patch("agx_cli.mp.info_vm", return_value=_ok(json.dumps(info)))
     assert vm._unique_snapshot_name("agents", "snap") == "snap-3"
 
 
 def test_unique_snapshot_name_handles_info_failure(mocker) -> None:
-    mocker.patch("agents_cli.mp.info_vm", side_effect=RuntimeFailure("x"))
+    mocker.patch("agx_cli.mp.info_vm", side_effect=RuntimeFailure("x"))
     assert vm._unique_snapshot_name("agents", "snap") == "snap"
 
 
@@ -137,16 +137,16 @@ def test_seed_data_dir_in_vm_repushes_host_override(mocker, tmp_path: Path) -> N
     """--data-dir-in-vm: the host override file survives `vm rebuild`
     (and keeps the extra -f armed) while its in-VM mirror dies with the
     VM disk. Seeding the fresh VM must push it back or every compose
-    verb fails on the missing file (bit `agents mount` users)."""
+    verb fails on the missing file (bit `agx mount` users)."""
     cfg = _make_config(tmp_path)
     cfg.paths.data_dir_in_vm = True
     cfg.paths.host_data_dir.mkdir()
     (cfg.paths.host_data_dir / ".journal").mkdir()
     override = cfg.paths.host_data_dir / "docker-compose.override.yml"
     override.write_text("services:\n  hermes-a:\n    volumes: [/x:/y:ro]\n", encoding="utf-8")
-    mocker.patch("agents_cli.mp.exec_bash", return_value=_ok())
-    transfer = mocker.patch("agents_cli.mp.transfer_to_vm", return_value=_ok())
-    exec_in_vm = mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok())
+    mocker.patch("agx_cli.mp.exec_bash", return_value=_ok())
+    transfer = mocker.patch("agx_cli.mp.transfer_to_vm", return_value=_ok())
+    exec_in_vm = mocker.patch("agx_cli.mp.exec_in_vm", return_value=_ok())
 
     vm._seed_data_dir(cfg)
 
@@ -161,8 +161,8 @@ def test_seed_data_dir_in_vm_without_override_transfers_nothing(mocker, tmp_path
     cfg = _make_config(tmp_path)
     cfg.paths.data_dir_in_vm = True
     cfg.paths.host_data_dir.mkdir()
-    mocker.patch("agents_cli.mp.exec_bash", return_value=_ok())
-    transfer = mocker.patch("agents_cli.mp.transfer_to_vm", return_value=_ok())
+    mocker.patch("agx_cli.mp.exec_bash", return_value=_ok())
+    transfer = mocker.patch("agx_cli.mp.transfer_to_vm", return_value=_ok())
     vm._seed_data_dir(cfg)
     transfer.assert_not_called()
 
@@ -179,23 +179,23 @@ def test_start_in_vm_mode_heals_missing_override_mirror(mocker, tmp_path: Path) 
     )
     config_path = _saved_config(tmp_path)
     cfg_mod.save(cfg, config_path)
-    mocker.patch("agents_cli.mp.start_vm", return_value=_ok())
-    mocker.patch("agents_cli.compose.cleanup_stale_temps")
-    mocker.patch("agents_cli.ui.emit")
-    transfer = mocker.patch("agents_cli.mp.transfer_to_vm", return_value=_ok())
+    mocker.patch("agx_cli.mp.start_vm", return_value=_ok())
+    mocker.patch("agx_cli.compose.cleanup_stale_temps")
+    mocker.patch("agx_cli.ui.emit")
+    transfer = mocker.patch("agx_cli.mp.transfer_to_vm", return_value=_ok())
 
     def exec_in_vm(vm_name: str, *argv: str, **kw: object) -> MpResult:
         if argv[0] == "test":
             return MpResult(stdout="", stderr="", returncode=1)  # mirror missing
         return _ok()
 
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=exec_in_vm)
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=exec_in_vm)
     vm.start(config_path=config_path)
     transfer.assert_called_once()
 
     # Mirror present → no push.
     transfer.reset_mock()
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok())
+    mocker.patch("agx_cli.mp.exec_in_vm", return_value=_ok())
     vm.start(config_path=config_path)
     transfer.assert_not_called()
 
@@ -236,7 +236,7 @@ def test_mount_probe_round_trips_through_mount(mocker, tmp_path: Path) -> None:
         filename = cmd[1].split("/")[-1]
         return _ok(stdout=(cfg.paths.host_data_dir / filename).read_text())
 
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=fake_runner)
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=fake_runner)
     vm._mount_probe(cfg)
 
 
@@ -244,7 +244,7 @@ def test_mount_probe_raises_when_round_trip_fails(mocker, tmp_path: Path) -> Non
     cfg = _make_config(tmp_path)
     cfg.paths.host_data_dir.mkdir()
     mocker.patch(
-        "agents_cli.mp.exec_in_vm",
+        "agx_cli.mp.exec_in_vm",
         return_value=MpResult(stdout="", stderr="cat: no such file", returncode=1),
     )
     with pytest.raises(HealthCheckFailure, match="mount probe"):
@@ -264,20 +264,18 @@ _GOOD_BOOTSTRAP = (
 def _stub_all_mp(mocker, *, bootstrap_output: str = _GOOD_BOOTSTRAP) -> dict[str, MagicMock]:
     catalog = json.dumps({"images": {"x": {"aliases": ["26.04"]}}})
     return {
-        "find": mocker.patch("agents_cli.mp.find", return_value=_ok(catalog)),
-        "list_vms": mocker.patch(
-            "agents_cli.mp.list_vms", return_value=_ok(json.dumps({"list": []}))
-        ),
-        "launch": mocker.patch("agents_cli.mp.launch", return_value=_ok()),
+        "find": mocker.patch("agx_cli.mp.find", return_value=_ok(catalog)),
+        "list_vms": mocker.patch("agx_cli.mp.list_vms", return_value=_ok(json.dumps({"list": []}))),
+        "launch": mocker.patch("agx_cli.mp.launch", return_value=_ok()),
         "info_vm": mocker.patch(
-            "agents_cli.mp.info_vm",
+            "agx_cli.mp.info_vm",
             return_value=_ok(json.dumps({"info": {"agents": {"mounts": {}}}})),
         ),
-        "mount": mocker.patch("agents_cli.mp.mount", return_value=_ok()),
+        "mount": mocker.patch("agx_cli.mp.mount", return_value=_ok()),
         "bootstrap": mocker.patch(
-            "agents_cli.mp.exec_bash", return_value=_ok(stdout=bootstrap_output)
+            "agx_cli.mp.exec_bash", return_value=_ok(stdout=bootstrap_output)
         ),
-        "fetch": mocker.patch("agents_cli.vm._fetch_latest_tag", return_value=None),
+        "fetch": mocker.patch("agx_cli.vm._fetch_latest_tag", return_value=None),
     }
 
 
@@ -321,7 +319,7 @@ def test_init_uses_baked_in_fallback_tags_when_github_unreachable(mocker, tmp_pa
     config_path = _saved_config(tmp_path)
     vm.init(data_dir=tmp_path / "data", config_path=config_path)
     cfg = cfg_mod.load(config_path)
-    from agents_cli.templates import FALLBACK_HERMES_IMAGE_TAG, FALLBACK_OPENCLAW_IMAGE_TAG
+    from agx_cli.templates import FALLBACK_HERMES_IMAGE_TAG, FALLBACK_OPENCLAW_IMAGE_TAG
 
     assert cfg.defaults.hermes_image_tag == FALLBACK_HERMES_IMAGE_TAG
     assert cfg.defaults.openclaw_image_tag == FALLBACK_OPENCLAW_IMAGE_TAG
@@ -390,8 +388,8 @@ def test_init_emits_exactly_one_object_and_narrates_stages(mocker, tmp_path: Pat
     narration (ui.progress, stderr) — only the final "ready" payload is
     emitted. The genuinely slow phases (bootstrap, mount, seed) narrate."""
     _stub_all_mp(mocker)
-    emit = mocker.patch("agents_cli.ui.emit")
-    progress = mocker.patch("agents_cli.ui.progress")
+    emit = mocker.patch("agx_cli.ui.emit")
+    progress = mocker.patch("agx_cli.ui.progress")
 
     vm.init(data_dir=tmp_path / "data", config_path=_saved_config(tmp_path))
 
@@ -409,7 +407,7 @@ def test_init_emit_false_suppresses_final_object(mocker, tmp_path: Path) -> None
     """vm rebuild embeds init and owns the command's single stdout
     object — init's "ready" payload must be suppressible."""
     _stub_all_mp(mocker)
-    emit = mocker.patch("agents_cli.ui.emit")
+    emit = mocker.patch("agx_cli.ui.emit")
     vm.init(data_dir=tmp_path / "data", config_path=_saved_config(tmp_path), emit=False)
     emit.assert_not_called()
 
@@ -436,8 +434,8 @@ def test_init_hints_at_ubuntu_release_when_net_fails_on_non_24_04(mocker, tmp_pa
 def test_destroy_requires_confirmation(mocker, tmp_path: Path) -> None:
     config_path = _saved_config(tmp_path)
     cfg_mod.save(_make_config(tmp_path), config_path)
-    mocker.patch("agents_cli.ui.confirm", return_value=False)
-    delete = mocker.patch("agents_cli.mp.delete_vm")
+    mocker.patch("agx_cli.ui.confirm", return_value=False)
+    delete = mocker.patch("agx_cli.mp.delete_vm")
     with pytest.raises(UserError, match="aborted"):
         vm.destroy(config_path=config_path)
     delete.assert_not_called()
@@ -446,7 +444,7 @@ def test_destroy_requires_confirmation(mocker, tmp_path: Path) -> None:
 def test_destroy_with_yes_skips_prompt_and_purges(mocker, tmp_path: Path) -> None:
     config_path = _saved_config(tmp_path)
     cfg_mod.save(_make_config(tmp_path), config_path)
-    delete = mocker.patch("agents_cli.mp.delete_vm", return_value=_ok())
+    delete = mocker.patch("agx_cli.mp.delete_vm", return_value=_ok())
     vm.destroy(yes=True, config_path=config_path)
     delete.assert_called_once()
     _, kwargs = delete.call_args
@@ -458,11 +456,11 @@ def test_destroy_with_yes_skips_prompt_and_purges(mocker, tmp_path: Path) -> Non
 
 def _stub_resize_mp(mocker) -> dict:
     return {
-        "stop": mocker.patch("agents_cli.mp.stop_vm", return_value=_ok()),
-        "start": mocker.patch("agents_cli.mp.start_vm", return_value=_ok()),
-        "set": mocker.patch("agents_cli.mp.set_config", return_value=_ok()),
+        "stop": mocker.patch("agx_cli.mp.stop_vm", return_value=_ok()),
+        "start": mocker.patch("agx_cli.mp.start_vm", return_value=_ok()),
+        "set": mocker.patch("agx_cli.mp.set_config", return_value=_ok()),
         "info_vm": mocker.patch(
-            "agents_cli.mp.info_vm",
+            "agx_cli.mp.info_vm",
             return_value=_ok(
                 json.dumps(
                     {
@@ -476,7 +474,7 @@ def _stub_resize_mp(mocker) -> dict:
             ),
         ),
         "exec_in_vm": mocker.patch(
-            "agents_cli.mp.exec_in_vm",
+            "agx_cli.mp.exec_in_vm",
             return_value=MpResult(stdout="ok\n", stderr="", returncode=0),
         ),
     }
@@ -551,7 +549,7 @@ def test_resize_starts_vm_even_if_set_raises(mocker, tmp_path: Path) -> None:
     cfg_mod.save(cfg, config_path)
     cfg.paths.host_data_dir.mkdir(exist_ok=True)
 
-    from agents_cli.errors import RuntimeFailure
+    from agx_cli.errors import RuntimeFailure
 
     mocks = _stub_resize_mp(mocker)
     mocks["set"].side_effect = RuntimeFailure("multipass set failed")
@@ -586,15 +584,15 @@ def _stub_rebuild(mocker, cfg: AgentsConfig, services: dict[str, str]):
 
     return {
         "export": mocker.patch(
-            "agents_cli.export_cmd.export",
+            "agx_cli.export_cmd.export",
             side_effect=lambda name, **kw: kw["to"] / f"{name}-stamp.tar.zst",
         ),
-        "import_archive": mocker.patch("agents_cli.export_cmd.import_archive"),
-        "init": mocker.patch("agents_cli.vm.init"),
-        "delete_vm": mocker.patch("agents_cli.mp.delete_vm", return_value=_ok()),
-        "_vm_exists": mocker.patch("agents_cli.vm._vm_exists", return_value=True),
-        "up": mocker.patch("agents_cli.compose_runner.up", return_value=_ok()),
-        "confirm": mocker.patch("agents_cli.ui.confirm", return_value=True),
+        "import_archive": mocker.patch("agx_cli.export_cmd.import_archive"),
+        "init": mocker.patch("agx_cli.vm.init"),
+        "delete_vm": mocker.patch("agx_cli.mp.delete_vm", return_value=_ok()),
+        "_vm_exists": mocker.patch("agx_cli.vm._vm_exists", return_value=True),
+        "up": mocker.patch("agx_cli.compose_runner.up", return_value=_ok()),
+        "confirm": mocker.patch("agx_cli.ui.confirm", return_value=True),
     }
 
 
@@ -713,23 +711,23 @@ def _stub_snapshot_mp(
     """
     info = {"info": {"agents": {"state": "Running" if running else "Stopped", "snapshots": {}}}}
     return {
-        "info_vm": mocker.patch("agents_cli.mp.info_vm", return_value=_ok(json.dumps(info))),
+        "info_vm": mocker.patch("agx_cli.mp.info_vm", return_value=_ok(json.dumps(info))),
         "snapshot": mocker.patch(
-            "agents_cli.mp.snapshot",
+            "agx_cli.mp.snapshot",
             return_value=MpResult(
                 stdout="", stderr="snapshot boom" if snapshot_rc else "", returncode=snapshot_rc
             ),
         ),
         "restore": mocker.patch(
-            "agents_cli.mp.restore",
+            "agx_cli.mp.restore",
             return_value=MpResult(
                 stdout="", stderr="revert boom" if restore_rc else "", returncode=restore_rc
             ),
         ),
-        "stop": mocker.patch("agents_cli.mp.stop_vm", return_value=_ok()),
-        "start": mocker.patch("agents_cli.mp.start_vm", return_value=_ok()),
-        "wait_stopped": mocker.patch("agents_cli.vm._wait_for_vm_stopped"),
-        "wait_ssh": mocker.patch("agents_cli.backends.libvirt.wait_for_ssh"),
+        "stop": mocker.patch("agx_cli.mp.stop_vm", return_value=_ok()),
+        "start": mocker.patch("agx_cli.mp.start_vm", return_value=_ok()),
+        "wait_stopped": mocker.patch("agx_cli.vm._wait_for_vm_stopped"),
+        "wait_ssh": mocker.patch("agx_cli.backends.libvirt.wait_for_ssh"),
     }
 
 
@@ -759,7 +757,7 @@ def test_take_snapshot_emit_false_suppresses_stdout_object(mocker, tmp_path: Pat
     own emit would land a second JSON object mid-upgrade."""
     config_path = _saved_snapshot_config(tmp_path)
     _stub_snapshot_mp(mocker)
-    emit = mocker.patch("agents_cli.ui.emit")
+    emit = mocker.patch("agx_cli.ui.emit")
 
     name = vm.take_snapshot("pre-upgrade", emit=False, config_path=config_path)
 
@@ -770,7 +768,7 @@ def test_take_snapshot_emit_false_suppresses_stdout_object(mocker, tmp_path: Pat
 def test_take_snapshot_emits_by_default(mocker, tmp_path: Path) -> None:
     config_path = _saved_snapshot_config(tmp_path)
     _stub_snapshot_mp(mocker)
-    emit = mocker.patch("agents_cli.ui.emit")
+    emit = mocker.patch("agx_cli.ui.emit")
     vm.take_snapshot("pre-upgrade", config_path=config_path)
     emit.assert_called_once()
 
@@ -835,7 +833,7 @@ def test_restore_snapshot_emit_false_suppresses_stdout_object(mocker, tmp_path: 
     suppressible."""
     config_path = _saved_snapshot_config(tmp_path)
     _stub_snapshot_mp(mocker)
-    emit = mocker.patch("agents_cli.ui.emit")
+    emit = mocker.patch("agx_cli.ui.emit")
 
     vm.restore_snapshot("pre-upgrade", emit=False, config_path=config_path)
 
@@ -845,7 +843,7 @@ def test_restore_snapshot_emit_false_suppresses_stdout_object(mocker, tmp_path: 
 def test_restore_snapshot_emits_by_default(mocker, tmp_path: Path) -> None:
     config_path = _saved_snapshot_config(tmp_path)
     _stub_snapshot_mp(mocker)
-    emit = mocker.patch("agents_cli.ui.emit")
+    emit = mocker.patch("agx_cli.ui.emit")
     vm.restore_snapshot("pre-upgrade", config_path=config_path)
     emit.assert_called_once()
 
@@ -909,8 +907,8 @@ def test_rebuild_emits_one_object_and_narrates_stages(mocker, tmp_path: Path) ->
     staging = cfg.paths.host_data_dir / ".rebuild-staging"
     staging.mkdir(parents=True, exist_ok=True)
     (staging / "coder-stamp.tar.zst").write_bytes(b"")
-    emit = mocker.patch("agents_cli.ui.emit")
-    progress = mocker.patch("agents_cli.ui.progress")
+    emit = mocker.patch("agx_cli.ui.emit")
+    progress = mocker.patch("agx_cli.ui.progress")
 
     vm.rebuild(yes=True, config_path=config_path)
 
@@ -933,7 +931,7 @@ def test_rebuild_resumes_from_journal(mocker, tmp_path: Path) -> None:
     a crash mid-init doesn't re-export (which could overwrite the staged
     archives) nor re-destroy (no-op anyway, but the test pins behaviour).
     """
-    from agents_cli.journal import Journal
+    from agx_cli.journal import Journal
 
     cfg = _make_config(tmp_path)
     config_path = _saved_config(tmp_path)
@@ -964,15 +962,15 @@ def _stub_sidecar_reups(mocker) -> dict[str, MagicMock]:
     """Stub the sidecar entry points rebuild's last phase calls."""
     return {
         "firecrawl_up": mocker.patch(
-            "agents_cli.firecrawl_cmd.up",
+            "agx_cli.firecrawl_cmd.up",
             return_value={"running": True, "wired_agents": ["coder"]},
         ),
         "inference_up": mocker.patch(
-            "agents_cli.inference_cmd.up",
+            "agx_cli.inference_cmd.up",
             return_value={"engine": "ollama", "running": True},
         ),
         "reup_llamacpp": mocker.patch(
-            "agents_cli.inference_cmd.reup_llamacpp_services",
+            "agx_cli.inference_cmd.reup_llamacpp_services",
             return_value={"started": [], "failed": []},
         ),
     }
@@ -1000,7 +998,7 @@ def test_rebuild_reups_sidecars_when_installed(mocker, tmp_path: Path) -> None:
     (staging / "coder-stamp.tar.zst").write_bytes(b"")
     sidecars = _stub_sidecar_reups(mocker)
     sidecars["reup_llamacpp"].return_value = {"started": ["llama-cpp-tiny"], "failed": []}
-    emit = mocker.patch("agents_cli.ui.emit")
+    emit = mocker.patch("agx_cli.ui.emit")
 
     vm.rebuild(yes=True, config_path=config_path)
 
@@ -1031,7 +1029,7 @@ def test_rebuild_skips_sidecars_cleanly_when_absent(mocker, tmp_path: Path) -> N
     staging.mkdir(parents=True, exist_ok=True)
     (staging / "coder-stamp.tar.zst").write_bytes(b"")
     sidecars = _stub_sidecar_reups(mocker)
-    emit = mocker.patch("agents_cli.ui.emit")
+    emit = mocker.patch("agx_cli.ui.emit")
 
     vm.rebuild(yes=True, config_path=config_path)
 
@@ -1052,7 +1050,7 @@ def test_rebuild_sidecar_failure_warns_but_rebuild_succeeds(mocker, tmp_path: Pa
     command; the journal still completes and exactly one object is
     emitted.
     """
-    from agents_cli.journal import Journal
+    from agx_cli.journal import Journal
 
     cfg = _make_config(tmp_path)
     cfg.inference.ollama_enabled = True
@@ -1065,8 +1063,8 @@ def test_rebuild_sidecar_failure_warns_but_rebuild_succeeds(mocker, tmp_path: Pa
     sidecars = _stub_sidecar_reups(mocker)
     sidecars["firecrawl_up"].side_effect = RuntimeFailure("firecrawl did not start: probe timeout")
     sidecars["inference_up"].side_effect = RuntimeFailure("compose up failed (exit 1)")
-    emit = mocker.patch("agents_cli.ui.emit")
-    warn = mocker.patch("agents_cli.ui.warn")
+    emit = mocker.patch("agx_cli.ui.emit")
+    warn = mocker.patch("agx_cli.ui.warn")
 
     vm.rebuild(yes=True, config_path=config_path)  # must NOT raise
 
@@ -1076,8 +1074,8 @@ def test_rebuild_sidecar_failure_warns_but_rebuild_succeeds(mocker, tmp_path: Pa
     assert payload["sidecars"]["firecrawl"] == "failed"
     assert payload["sidecars"]["ollama"] == "failed"
     warnings = [c.args[0] for c in warn.call_args_list]
-    assert any("agents firecrawl up" in w for w in warnings)
-    assert any("agents inference up ollama" in w for w in warnings)
+    assert any("agx firecrawl up" in w for w in warnings)
+    assert any("agx inference up ollama" in w for w in warnings)
     # Journal completed despite the sidecar failures — nothing resumable left.
     assert Journal.find_resumable(cfg.paths.host_data_dir, "rebuild", cfg.vm.name) is None
 
@@ -1087,7 +1085,7 @@ def test_rebuild_resume_skips_already_done_sidecars(mocker, tmp_path: Path) -> N
     sidecars on resume (firecrawl up force-recreates nothing, but the
     probe window alone is a minute of pointless wait).
     """
-    from agents_cli.journal import Journal
+    from agx_cli.journal import Journal
 
     cfg = _make_config(tmp_path)
     config_path = _saved_config(tmp_path)
@@ -1097,7 +1095,7 @@ def test_rebuild_resume_skips_already_done_sidecars(mocker, tmp_path: Path) -> N
     staging.mkdir(parents=True, exist_ok=True)
     (staging / "coder-stamp.tar.zst").write_bytes(b"")
     sidecars = _stub_sidecar_reups(mocker)
-    emit = mocker.patch("agents_cli.ui.emit")
+    emit = mocker.patch("agx_cli.ui.emit")
 
     j = Journal.begin(cfg.paths.host_data_dir, "rebuild", cfg.vm.name, vm.REBUILD_PHASES)
     for phase in vm.REBUILD_PHASES:
@@ -1126,7 +1124,7 @@ def test_rebuild_reups_ollama_on_compose_presence_with_flag_false(mocker, tmp_pa
     staging.mkdir(parents=True, exist_ok=True)
     (staging / "coder-stamp.tar.zst").write_bytes(b"")
     sidecars = _stub_sidecar_reups(mocker)
-    emit = mocker.patch("agents_cli.ui.emit")
+    emit = mocker.patch("agx_cli.ui.emit")
 
     vm.rebuild(yes=True, config_path=config_path)
 
@@ -1174,7 +1172,7 @@ def test_rebuild_data_dir_in_vm_stages_and_restores_sidecar_fragments(
     pins, and warn that the bulk state (postgres, model weights) did
     not survive.
     """
-    from agents_cli import compose as compose_mod
+    from agx_cli import compose as compose_mod
     from tests.conftest import install_vm_fs_simulation
 
     cfg = _make_config(tmp_path)
@@ -1206,8 +1204,8 @@ def test_rebuild_data_dir_in_vm_stages_and_restores_sidecar_fragments(
     staging.mkdir(parents=True, exist_ok=True)
     (staging / "coder-stamp.tar.zst").write_bytes(b"")
     sidecars = _stub_sidecar_reups(mocker)
-    mocker.patch("agents_cli.ui.emit")
-    warn = mocker.patch("agents_cli.ui.warn")
+    mocker.patch("agx_cli.ui.emit")
+    warn = mocker.patch("agx_cli.ui.warn")
 
     vm.rebuild(yes=True, config_path=config_path)
 
@@ -1234,7 +1232,7 @@ def test_bare_metal_init_warns_when_daemon_json_lacks_rotation(
     the VM bootstrap does, so init must point out the gap before agents
     (and their unbounded logs) exist."""
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
-    warn = mocker.patch("agents_cli.ui.warn")
+    warn = mocker.patch("agx_cli.ui.warn")
     vm._warn_bare_metal_log_rotation()
     assert warn.call_count == 1
     assert "max-size" in warn.call_args.args[0]
@@ -1249,6 +1247,6 @@ def test_bare_metal_init_quiet_when_daemon_json_rotates(
         encoding="utf-8",
     )
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
-    warn = mocker.patch("agents_cli.ui.warn")
+    warn = mocker.patch("agx_cli.ui.warn")
     vm._warn_bare_metal_log_rotation()
     warn.assert_not_called()

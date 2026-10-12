@@ -7,9 +7,9 @@ from pathlib import Path
 
 import pytest
 
-from agents_cli import agents_cmd, compose
-from agents_cli import config as cfg_mod
-from agents_cli.agents_cmd import (
+from agx_cli import agents_cmd, compose
+from agx_cli import config as cfg_mod
+from agx_cli.agents_cmd import (
     create,
     list_agents,
     remove,
@@ -17,10 +17,10 @@ from agents_cli.agents_cmd import (
     service_name,
     validate_name,
 )
-from agents_cli.config import AgentsConfig, DefaultsConfig, HostConfig, PathsConfig, VmRuntimeConfig
-from agents_cli.errors import RuntimeFailure, UserError
-from agents_cli.journal import Journal
-from agents_cli.mp import MpResult
+from agx_cli.config import AgentsConfig, DefaultsConfig, HostConfig, PathsConfig, VmRuntimeConfig
+from agx_cli.errors import RuntimeFailure, UserError
+from agx_cli.journal import Journal
+from agx_cli.mp import MpResult
 
 
 def _ok(stdout: str = "") -> MpResult:
@@ -65,9 +65,9 @@ def stub_runners(mocker, cfg: AgentsConfig):
     from tests.conftest import install_vm_fs_simulation
 
     mocks = dict(install_vm_fs_simulation(mocker, cfg))
-    mocks["compose_up"] = mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
-    mocks["compose_down"] = mocker.patch("agents_cli.compose_runner.down", return_value=_ok())
-    mocks["compose_stop"] = mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())
+    mocks["compose_up"] = mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
+    mocks["compose_down"] = mocker.patch("agx_cli.compose_runner.down", return_value=_ok())
+    mocks["compose_stop"] = mocker.patch("agx_cli.compose_runner.stop", return_value=_ok())
     return mocks
 
 
@@ -86,7 +86,7 @@ def _build_pull_runner(inspect_rc: int, pull_rc: int, pull_stderr: str = ""):
     """Stub for mp.exec_in_vm that fakes a `docker image inspect` then
     `docker pull` sequence. Other docker subcommands return success.
     """
-    from agents_cli.mp import MpResult
+    from agx_cli.mp import MpResult
 
     def runner(vm_name: str, *cmd: str, check: bool = True):
         if "image" in cmd and "inspect" in cmd:
@@ -101,29 +101,29 @@ def _build_pull_runner(inspect_rc: int, pull_rc: int, pull_stderr: str = ""):
 def test_ensure_hermes_image_pulled_skips_if_already_local(cfg: AgentsConfig, mocker) -> None:
     """`docker image inspect` succeeding means the image is already cached;
     no `docker pull` should be issued."""
-    from agents_cli.agents_cmd import _ensure_hermes_image_pulled
+    from agx_cli.agents_cmd import _ensure_hermes_image_pulled
 
     calls: list[tuple[str, ...]] = []
 
     def runner(vm_name: str, *cmd: str, check: bool = True):
-        from agents_cli.mp import MpResult
+        from agx_cli.mp import MpResult
 
         calls.append(cmd)
         if "image" in cmd and "inspect" in cmd:
             return MpResult(stdout="", stderr="", returncode=0)
         return MpResult(stdout="", stderr="", returncode=0)
 
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=runner)
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=runner)
     _ensure_hermes_image_pulled(cfg, "v1.0.0")
     assert not any("pull" in c for c in calls), "pull should be skipped when inspect succeeds"
 
 
 def test_ensure_hermes_image_pulled_pulls_when_missing(cfg: AgentsConfig, mocker) -> None:
     """Inspect rc=1 (missing) triggers a pull. Success is silent."""
-    from agents_cli.agents_cmd import _ensure_hermes_image_pulled
+    from agx_cli.agents_cmd import _ensure_hermes_image_pulled
 
     mocker.patch(
-        "agents_cli.mp.exec_in_vm",
+        "agx_cli.mp.exec_in_vm",
         side_effect=_build_pull_runner(inspect_rc=1, pull_rc=0),
     )
     _ensure_hermes_image_pulled(cfg, "v1.0.0")  # no raise
@@ -131,10 +131,10 @@ def test_ensure_hermes_image_pulled_pulls_when_missing(cfg: AgentsConfig, mocker
 
 def test_ensure_hermes_image_pulled_raises_on_pull_failure(cfg: AgentsConfig, mocker) -> None:
     """Inspect rc=1, pull rc=1 -> UserError with the stderr."""
-    from agents_cli.agents_cmd import _ensure_hermes_image_pulled
+    from agx_cli.agents_cmd import _ensure_hermes_image_pulled
 
     mocker.patch(
-        "agents_cli.mp.exec_in_vm",
+        "agx_cli.mp.exec_in_vm",
         side_effect=_build_pull_runner(inspect_rc=1, pull_rc=1, pull_stderr="rate limit"),
     )
     with pytest.raises(UserError, match="could not pull"):
@@ -247,7 +247,7 @@ def test_create_refuses_when_service_already_in_compose(
 def test_create_picks_next_free_port_when_none_given(
     cfg: AgentsConfig, saved_config: Path, stub_runners, mocker
 ) -> None:
-    mocker.patch("agents_cli.compose.used_ports", return_value={8642, 8643})
+    mocker.patch("agx_cli.compose.used_ports", return_value={8642, 8643})
     create(name="coder", agent_type="hermes", config_path=saved_config)
     doc = compose.load_compose(cfg.paths.host_data_dir / "docker-compose.yml")
     assert doc["services"]["hermes-coder"]["ports"] == ["127.0.0.1:8644:8642"]
@@ -272,7 +272,7 @@ def test_create_uses_latest_release_and_rebaselines_default(
 ) -> None:
     """A plain create starts on the newest upstream release, and on
     success that release becomes the config default."""
-    mocker.patch("agents_cli.outdated_cmd.fetch_latest_tag", return_value="v9.9.9")
+    mocker.patch("agx_cli.outdated_cmd.fetch_latest_tag", return_value="v9.9.9")
     create(name="coder", agent_type="hermes", config_path=saved_config)
     doc = compose.load_compose(cfg.paths.host_data_dir / "docker-compose.yml")
     assert doc["services"]["hermes-coder"]["image"].endswith(":v9.9.9")
@@ -282,17 +282,44 @@ def test_create_uses_latest_release_and_rebaselines_default(
 def test_create_pinned_skips_the_lookup(
     cfg: AgentsConfig, saved_config: Path, stub_runners, mocker
 ) -> None:
-    fetch = mocker.patch("agents_cli.outdated_cmd.fetch_latest_tag", return_value="v9.9.9")
+    fetch = mocker.patch("agx_cli.outdated_cmd.fetch_latest_tag", return_value="v9.9.9")
     create(name="coder", agent_type="hermes", pinned=True, config_path=saved_config)
     fetch.assert_not_called()
     doc = compose.load_compose(cfg.paths.host_data_dir / "docker-compose.yml")
     assert doc["services"]["hermes-coder"]["image"].endswith(":v1.0.0")
 
 
+def test_create_falls_back_when_latest_release_has_no_image(
+    cfg: AgentsConfig, saved_config: Path, stub_runners, mocker
+) -> None:
+    """Hermes v0.21.7 (2026-10-12): GitHub release without a `v0.21.7`
+    image. Create must stay on the pinned default, not fail at pull,
+    and must not re-baseline the default onto the unpullable tag."""
+    mocker.patch("agx_cli.outdated_cmd.fetch_latest_tag", return_value="v9.9.9")
+    probe = mocker.patch("agx_cli.outdated_cmd.image_tag_published", return_value=False)
+    warn = mocker.patch("agx_cli.ui.warn")
+    create(name="coder", agent_type="hermes", config_path=saved_config)
+    probe.assert_called_once_with("hermes", "v9.9.9")
+    doc = compose.load_compose(cfg.paths.host_data_dir / "docker-compose.yml")
+    assert doc["services"]["hermes-coder"]["image"].endswith(":v1.0.0")
+    assert any("no published image" in c.args[0] for c in warn.call_args_list)
+    assert cfg_mod.load(saved_config).defaults.hermes_image_tag == "v1.0.0"
+
+
+def test_create_uses_latest_when_image_check_inconclusive(
+    cfg: AgentsConfig, saved_config: Path, stub_runners, mocker
+) -> None:
+    mocker.patch("agx_cli.outdated_cmd.fetch_latest_tag", return_value="v9.9.9")
+    mocker.patch("agx_cli.outdated_cmd.image_tag_published", return_value=None)
+    create(name="coder", agent_type="hermes", config_path=saved_config)
+    doc = compose.load_compose(cfg.paths.host_data_dir / "docker-compose.yml")
+    assert doc["services"]["hermes-coder"]["image"].endswith(":v9.9.9")
+
+
 def test_create_falls_back_to_default_when_github_unreachable(
     cfg: AgentsConfig, saved_config: Path, stub_runners, mocker
 ) -> None:
-    warn = mocker.patch("agents_cli.ui.warn")
+    warn = mocker.patch("agx_cli.ui.warn")
     create(name="coder", agent_type="hermes", config_path=saved_config)
     doc = compose.load_compose(cfg.paths.host_data_dir / "docker-compose.yml")
     assert doc["services"]["hermes-coder"]["image"].endswith(":v1.0.0")
@@ -304,7 +331,7 @@ def test_create_openclaw_normalizes_release_style_tag(
     cfg: AgentsConfig, saved_config: Path, stub_runners, mocker
 ) -> None:
     """`openclaw/openclaw:v2026.10.1` doesn't exist — the image is `2026.10.1`."""
-    mocker.patch("agents_cli.compose_runner.run_as_root", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.run_as_root", return_value=_ok())
     create(name="personal", agent_type="openclaw", image_tag="v2026.10.1", config_path=saved_config)
     doc = compose.load_compose(cfg.paths.host_data_dir / "docker-compose.yml")
     assert doc["services"]["openclaw-personal"]["image"] == "openclaw/openclaw:2026.10.1"
@@ -318,7 +345,7 @@ def test_create_openclaw_hands_state_dirs_to_node_before_start(
     agent can't persist anything. It must run before the first `up`."""
     order: list[str] = []
     chown = mocker.patch(
-        "agents_cli.compose_runner.run_as_root",
+        "agx_cli.compose_runner.run_as_root",
         side_effect=lambda *a, **k: order.append("chown") or _ok(),
     )
     stub_runners["compose_up"].side_effect = lambda *a, **k: order.append("up") or _ok()
@@ -342,7 +369,7 @@ def test_create_openclaw_fails_loudly_when_chown_fails(
     cfg: AgentsConfig, saved_config: Path, stub_runners, mocker
 ) -> None:
     mocker.patch(
-        "agents_cli.compose_runner.run_as_root",
+        "agx_cli.compose_runner.run_as_root",
         return_value=MpResult(stdout="", stderr="chown: denied", returncode=1),
     )
     with pytest.raises(RuntimeFailure, match="chown: denied"):
@@ -377,7 +404,7 @@ def test_create_resumes_from_partial_journal(
 
     create_data_spy = mocker.spy(agents_cmd, "_create_data_dirs")
     add_service_spy = mocker.spy(agents_cmd, "_add_service_to_compose")
-    up_spy = mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    up_spy = mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
 
     create(name="coder", agent_type="hermes", reuse_data=True, config_path=saved_config)
 
@@ -411,9 +438,9 @@ def test_create_with_setup_raises_on_wizard_failure(
     cfg: AgentsConfig, saved_config: Path, stub_runners
 ) -> None:
     # Non-zero exit from the wizard must surface as a UserError pointing
-    # at `agents setup <name>` for retry — not silent success.
+    # at `agx setup <name>` for retry — not silent success.
     stub_runners["exec_in_vm_interactive"].return_value = 1
-    with pytest.raises(UserError, match="agents setup"):
+    with pytest.raises(UserError, match="agx setup"):
         create(name="coder", agent_type="hermes", run_setup=True, config_path=saved_config)
 
 
@@ -474,7 +501,7 @@ def test_remove_aborts_without_confirmation(
     cfg: AgentsConfig, saved_config: Path, stub_runners, mocker
 ) -> None:
     create(name="coder", agent_type="hermes", config_path=saved_config)
-    mocker.patch("agents_cli.ui.confirm", return_value=False)
+    mocker.patch("agx_cli.ui.confirm", return_value=False)
     with pytest.raises(UserError, match="aborted"):
         remove("coder", config_path=saved_config)
 
@@ -487,7 +514,7 @@ def test_remove_resumes_after_crash_between_compose_update_and_data_delete(
     (recovering the type from its meta), not refuse with "not found"."""
     create(name="coder", agent_type="hermes", config_path=saved_config)
     boom = mocker.patch(
-        "agents_cli.agents_cmd._delete_data_dir",
+        "agx_cli.agents_cmd._delete_data_dir",
         side_effect=RuntimeFailure("disk on fire"),
     )
     with pytest.raises(RuntimeFailure, match="disk on fire"):
@@ -649,7 +676,7 @@ def _deny_rmtree(mocker, target: Path) -> None:
             raise PermissionError(13, "Permission denied", str(path))
         return real_rmtree(path, *args, **kwargs)
 
-    mocker.patch("agents_cli.agents_cmd.shutil.rmtree", side_effect=denying)
+    mocker.patch("agx_cli.agents_cmd.shutil.rmtree", side_effect=denying)
 
 
 def test_delete_data_dir_bare_metal_uses_rootlesskit_without_sudo(
@@ -661,7 +688,7 @@ def test_delete_data_dir_bare_metal_uses_rootlesskit_without_sudo(
     target = cfg.paths.host_data_dir / "coder"
     (target / ".data").mkdir(parents=True)
     _deny_rmtree(mocker, target)
-    mocker.patch("agents_cli.agents_cmd.shutil.which", return_value="/usr/bin/rootlesskit")
+    mocker.patch("agx_cli.agents_cmd.shutil.which", return_value="/usr/bin/rootlesskit")
 
     def fake_run(argv, **kwargs):
         assert argv == [
@@ -676,8 +703,8 @@ def test_delete_data_dir_bare_metal_uses_rootlesskit_without_sudo(
         target.rmdir()
         return mocker.Mock(returncode=0)
 
-    mocker.patch("agents_cli.agents_cmd.subprocess.run", side_effect=fake_run)
-    sudo = mocker.patch("agents_cli.agents_cmd.permissions.run_with_sudo")
+    mocker.patch("agx_cli.agents_cmd.subprocess.run", side_effect=fake_run)
+    sudo = mocker.patch("agx_cli.agents_cmd.permissions.run_with_sudo")
     agents_cmd._delete_data_dir(cfg, "coder", yes=True)
     assert not target.exists()
     sudo.assert_not_called()
@@ -690,9 +717,9 @@ def test_delete_data_dir_bare_metal_falls_back_to_confirmed_sudo(
     target = cfg.paths.host_data_dir / "coder"
     target.mkdir()
     _deny_rmtree(mocker, target)
-    mocker.patch("agents_cli.agents_cmd.shutil.which", return_value=None)
+    mocker.patch("agx_cli.agents_cmd.shutil.which", return_value=None)
     sudo = mocker.patch(
-        "agents_cli.agents_cmd.permissions.run_with_sudo",
+        "agx_cli.agents_cmd.permissions.run_with_sudo",
         side_effect=UserError("aborted by user"),
     )
     with pytest.raises(RuntimeFailure, match="sudo rm -rf"):
@@ -721,9 +748,7 @@ def test_create_refuses_while_a_remove_is_pending(
     """A stranded remove journal resumes straight at the data delete; a
     re-created agent of the same name must not walk into that."""
     create(name="coder", agent_type="hermes", config_path=saved_config)
-    mocker.patch(
-        "agents_cli.agents_cmd._delete_data_dir", side_effect=RuntimeFailure("disk on fire")
-    )
+    mocker.patch("agx_cli.agents_cmd._delete_data_dir", side_effect=RuntimeFailure("disk on fire"))
     with pytest.raises(RuntimeFailure):
         remove("coder", yes=True, config_path=saved_config)
     with pytest.raises(UserError, match="did not finish"):
@@ -805,7 +830,7 @@ def test_rename_renames_dir_before_compose_write(
         new_env_present_at_write.append((cfg.paths.host_data_dir / "writer" / ".env").exists())
         return real_write(cfg_arg, doc)
 
-    mocker.patch("agents_cli.compose.write_compose_atomically", side_effect=wrapper)
+    mocker.patch("agx_cli.compose.write_compose_atomically", side_effect=wrapper)
     rename("coder", "writer", yes=True, config_path=saved_config)
     assert new_env_present_at_write and all(new_env_present_at_write)
 
@@ -885,7 +910,7 @@ def test_rename_aborts_without_confirmation(
     """Rename force-recreates a running container — it must confirm the
     downtime like reseat does."""
     create(name="coder", agent_type="hermes", config_path=saved_config)
-    mocker.patch("agents_cli.ui.confirm", return_value=False)
+    mocker.patch("agx_cli.ui.confirm", return_value=False)
     with pytest.raises(UserError, match="aborted"):
         rename("coder", "writer", config_path=saved_config)
     doc = compose.load_compose(cfg.paths.host_data_dir / "docker-compose.yml")
@@ -905,13 +930,13 @@ def test_rename_yes_skips_confirmation(
 def test_rename_cli_yes_flag_wires_through(
     cfg: AgentsConfig, saved_config: Path, stub_runners, mocker
 ) -> None:
-    """`agents rename -y old new` must skip the prompt (cli.py wiring)."""
+    """`agx rename -y old new` must skip the prompt (cli.py wiring)."""
     from click.testing import CliRunner
 
-    from agents_cli import cli as cli_mod
+    from agx_cli import cli as cli_mod
 
     create(name="coder", agent_type="hermes", config_path=saved_config)
-    mocker.patch("agents_cli.config.load", return_value=cfg)
+    mocker.patch("agx_cli.config.load", return_value=cfg)
     confirm_spy = mocker.spy(agents_cmd.ui, "confirm")
     result = CliRunner().invoke(cli_mod.main, ["rename", "coder", "writer", "-y"])
     assert result.exit_code == 0, result.output
@@ -962,7 +987,7 @@ def test_rename_vm_mode_mv_failure_raises_and_resume_retries_move(
             return MpResult(stdout="", stderr="mv: cannot move: I/O error", returncode=1)
         return _local_bash(vm_name, script, check=check, timeout=timeout)
 
-    mocker.patch("agents_cli.mp.exec_bash", side_effect=failing_bash)
+    mocker.patch("agx_cli.mp.exec_bash", side_effect=failing_bash)
     with pytest.raises(RuntimeFailure, match="could not move VM data dir"):
         rename("coder", "writer", yes=True, config_path=saved_config)
 
@@ -982,7 +1007,7 @@ def test_rename_vm_mode_mv_failure_raises_and_resume_retries_move(
         executed.append(script)
         return _local_bash(vm_name, script, check=check, timeout=timeout)
 
-    mocker.patch("agents_cli.mp.exec_bash", side_effect=working_bash)
+    mocker.patch("agx_cli.mp.exec_bash", side_effect=working_bash)
     rename("coder", "writer", yes=True, config_path=saved_config)
     assert any("mv " in s for s in executed), "resume must retry the move"
     assert (cfg.paths.host_data_dir / "writer").is_dir()
@@ -1016,7 +1041,7 @@ def test_rename_vm_mode_resume_skips_mv_when_move_already_landed(
             stdout=proc.stdout.decode(), stderr=proc.stderr.decode(), returncode=proc.returncode
         )
 
-    mocker.patch("agents_cli.mp.exec_bash", side_effect=tracing_bash)
+    mocker.patch("agx_cli.mp.exec_bash", side_effect=tracing_bash)
     rename("coder", "writer", yes=True, config_path=saved_config)
 
     assert (cfg.paths.host_data_dir / "writer").is_dir()
@@ -1038,7 +1063,7 @@ def test_rename_vm_mode_missing_source_fails_loudly(
     _flip_to_vm_mode(cfg, saved_config)
     shutil.rmtree(cfg.paths.host_data_dir / "coder")
 
-    mocker.patch("agents_cli.mp.exec_bash", side_effect=_local_bash)
+    mocker.patch("agx_cli.mp.exec_bash", side_effect=_local_bash)
     with pytest.raises(RuntimeFailure, match="is missing"):
         rename("coder", "writer", yes=True, config_path=saved_config)
     journal = Journal.find_resumable(cfg.paths.host_data_dir, "rename", "coder")
@@ -1096,10 +1121,10 @@ def test_ensure_hermes_image_pulled_narrates_pull(cfg: AgentsConfig, mocker) -> 
     """A first-create pull is multi-GB; the narration must be always-on
     (ui.progress, not --verbose-gated ui.info) with a duration hint,
     plus a completion line."""
-    from agents_cli.agents_cmd import _ensure_hermes_image_pulled
+    from agx_cli.agents_cmd import _ensure_hermes_image_pulled
 
     mocker.patch(
-        "agents_cli.mp.exec_in_vm",
+        "agx_cli.mp.exec_in_vm",
         side_effect=_build_pull_runner(inspect_rc=1, pull_rc=0),
     )
     spy = mocker.spy(agents_cmd.ui, "progress")
@@ -1114,10 +1139,10 @@ def test_ensure_hermes_image_pulled_narrates_pull(cfg: AgentsConfig, mocker) -> 
 def test_ensure_hermes_image_pulled_silent_when_cached(cfg: AgentsConfig, mocker) -> None:
     """Image already local (inspect rc=0): nothing slow happens, so no
     pull narration should appear."""
-    from agents_cli.agents_cmd import _ensure_hermes_image_pulled
+    from agx_cli.agents_cmd import _ensure_hermes_image_pulled
 
     mocker.patch(
-        "agents_cli.mp.exec_in_vm",
+        "agx_cli.mp.exec_in_vm",
         side_effect=_build_pull_runner(inspect_rc=0, pull_rc=0),
     )
     spy = mocker.spy(agents_cmd.ui, "progress")
@@ -1158,7 +1183,7 @@ def test_reseat_narrates_rewrite_recreate_and_perms(
             return _ok("1000\n")
         return sim_runner(vm_name, *cmd, check=check)
 
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=runner)
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=runner)
     spy = mocker.spy(agents_cmd.ui, "progress")
 
     agents_cmd.reseat("coder", yes=True, config_path=saved_config)

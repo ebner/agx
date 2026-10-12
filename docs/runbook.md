@@ -11,73 +11,88 @@ pipx install -e .                 # macOS: brew install pipx first if missing
 npm install -g @openai/codex
 
 # Bring up the VM. Pick any path your duplicity (or other host backup) covers.
-agents vm init --data-dir /data/agents
+agx vm init --data-dir /data/agents
 
 # (Optional) Authenticate the toolkit-scoped Codex account (only for the Codex sandbox skill;
 # an agent's openai-codex LLM provider is authenticated in-container with `hermes auth add`)
-agents codex login
+agx codex login
 
 # Create your first Hermes agent, run the wizard
-agents create coder --type hermes --setup
+agx create coder --type hermes --setup
 ```
+
+## Upgrading from the `agents` command name
+
+The CLI was renamed `agents` → `agx` in 2026-10. On an existing install:
+
+```bash
+pipx uninstall agents-cli && pipx install -e .   # package is now agx-cli
+agx config                                        # first run moves ~/.config/agents -> ~/.config/agx
+agx export-cron install --time 02:30,08:30,14:30,20:30   # your times; rewrites the lines to call agx
+agx doctor-cron install                           # likewise (keeps [doctor_cron] settings)
+```
+
+- `agents` stays installed as a deprecated alias of `agx`, so crontab lines you haven't reinstalled keep working.
+- The first run moves the config dir and leaves a symlink `~/.config/agents -> agx`. It never overwrites an existing `~/.config/agx/config.toml`.
+- Nothing about the running deployment changes: the VM name, data dir, `.agents.lock`, journals, cron markers and container names keep their old names on purpose (they identify live state).
 
 ## Day-to-day
 
 ```bash
-agents list                      # what's running
-agents doctor                    # health
-agents logs coder -f             # follow logs
-agents exec coder                # TTY shell in the container
-agents exec coder hermes shell   # straight into Hermes
-agents export coder              # archive into <data-dir>/backups/
+agx list                      # what's running
+agx doctor                    # health
+agx logs coder -f             # follow logs
+agx exec coder                # TTY shell in the container
+agx exec coder hermes shell   # straight into Hermes
+agx export coder              # archive into <data-dir>/backups/
 ```
 
 ## Upgrades
 
 ```bash
 # Who's behind upstream? Read-only, no lock, safe any time.
-agents outdated                        # every agent: current / outdated / unknown
-agents outdated coder
-agents outdated --include-prerelease   # compare against beta/rc tags too
+agx outdated                        # every agent: current / outdated / unknown
+agx outdated coder
+agx outdated --include-prerelease   # compare against beta/rc tags too
 
 # Bring one agent to the latest upstream release. Bare `upgrade`
 # implicitly resolves the newest tag from GitHub Releases (same
 # convention as `apt upgrade` / `brew upgrade`) and no-ops — no
 # snapshots, no downtime — when the agent is already there.
-agents upgrade coder
+agx upgrade coder
 
 # Pin an explicit tag instead (skips the upstream check). Auto-rollback
 # on doctor failure.
-agents upgrade coder --tag v1.2.4
+agx upgrade coder --tag v1.2.4
 
 # Force-refresh at the current pin (no version change): full
 # snapshot + recreate + doctor cycle. Picks up env-file edits,
 # recovers a wedged container.
-agents upgrade coder --recreate
+agx upgrade coder --recreate
 
 # Upgrade everything; canary first
-agents upgrade --all --canary coder
+agx upgrade --all --canary coder
 
 # Restore from the latest pre-upgrade snapshot if something went sideways
-agents rollback coder --yes
+agx rollback coder --yes
 
 # Or pick a specific snapshot id (filename, suffix-match, or pre-upgrade-*
 # multipass snapshot name to restore only the VM):
-agents rollback coder --snapshot coder-20260512T120000Z.tar.zst
-agents rollback coder --snapshot pre-upgrade-coder-20260512T120000Z
+agx rollback coder --snapshot coder-20260512T120000Z.tar.zst
+agx rollback coder --snapshot pre-upgrade-coder-20260512T120000Z
 ```
 
 Semantics worth knowing:
 
-- **Bare `agents upgrade <name>` needs network** (GitHub Releases API). It *refuses* — rather than silently no-oping — when the latest tag can't be resolved; pass `--tag <T>` to pin explicitly or `--recreate` to refresh at the current pin. `--latest` is the explicit spelling of the same default behavior.
+- **Bare `agx upgrade <name>` needs network** (GitHub Releases API). It *refuses* — rather than silently no-oping — when the latest tag can't be resolved; pass `--tag <T>` to pin explicitly or `--recreate` to refresh at the current pin. `--latest` is the explicit spelling of the same default behavior.
 - **No-op short-circuit**: when the target tag equals the current pin (and `--recreate` isn't set), the command reports "already at X — nothing to do" and exits without snapshots or downtime.
-- **Successful upgrades re-baseline `defaults.<type>_image_tag`** in `~/.config/agents/config.toml`. A failed-and-rolled-back upgrade never re-baselines.
-- **`agents create` also starts on the newest upstream release** (GitHub's "latest", never a pre-release) and re-baselines the default once the agent is up. Offline, it falls back to the configured default with a warning; `--pinned` uses the default without asking GitHub, `--image-tag <T>` names one. Tags are always pinned concretely in compose — never `:latest`.
+- **Successful upgrades re-baseline `defaults.<type>_image_tag`** in `~/.config/agx/config.toml`. A failed-and-rolled-back upgrade never re-baselines.
+- **`agx create` also starts on the newest upstream release** (GitHub's "latest", never a pre-release) and re-baselines the default once the agent is up. Offline, it falls back to the configured default with a warning; `--pinned` uses the default without asking GitHub, `--image-tag <T>` names one. Tags are always pinned concretely in compose — never `:latest`.
 - **Release tag ≠ image tag.** Hermes images carry the release tag verbatim (`v0.21.6`); OpenClaw images drop the `v` (release `v2026.10.1` → `openclaw/openclaw:2026.10.1`). The toolkit converts automatically, including tags you pass with `--image-tag` / `--tag`, and ignores non-version release tags such as OpenClaw's `linux-stable` desktop channel.
-- **Rollback never silently discards the present.** It overwrites the agent's data dir with the pre-upgrade snapshot, so everything the agent learned or changed since (skills, memories, sessions, config) would be lost. Before overwriting, the current state is exported to `<data-dir>/backups/pre-rollback/` (never auto-pruned; restore with `agents import`); the rollback aborts if that export fails. Under `--data-dir-in-vm` a VM-snapshot restore rewinds *every* agent's data, so every agent is exported first. The prompt shows the snapshot's age. Restored credentials may be stale — OAuth refresh tokens are single-use, so expect to re-authenticate providers that rotated since the snapshot.
-- **Interrupted upgrades resume faithfully.** The journal records the original old→new tags at begin time; re-running `agents upgrade <name>` completes *that* upgrade (skipping done phases) instead of re-resolving latest — a release that appeared upstream mid-crash can't silently retarget the resume.
+- **Rollback never silently discards the present.** It overwrites the agent's data dir with the pre-upgrade snapshot, so everything the agent learned or changed since (skills, memories, sessions, config) would be lost. Before overwriting, the current state is exported to `<data-dir>/backups/pre-rollback/` (never auto-pruned; restore with `agx import`); the rollback aborts if that export fails. Under `--data-dir-in-vm` a VM-snapshot restore rewinds *every* agent's data, so every agent is exported first. The prompt shows the snapshot's age. Restored credentials may be stale — OAuth refresh tokens are single-use, so expect to re-authenticate providers that rotated since the snapshot.
+- **Interrupted upgrades resume faithfully.** The journal records the original old→new tags at begin time; re-running `agx upgrade <name>` completes *that* upgrade (skipping done phases) instead of re-resolving latest — a release that appeared upstream mid-crash can't silently retarget the resume.
 
-`agents upgrade` takes two snapshots before touching anything: a host-data `.tar.zst` at `<data-dir>/.upgrades/<name>-<utc>.tar.zst` and a multipass VM snapshot `pre-upgrade-<name>-<utc>`. Both are listed in the upgrade outcome JSON / human output. Legacy `.tar.gz` archives from pre-v0.1.1 versions still work for rollback.
+`agx upgrade` takes two snapshots before touching anything: a host-data `.tar.zst` at `<data-dir>/.upgrades/<name>-<utc>.tar.zst` and a multipass VM snapshot `pre-upgrade-<name>-<utc>`. Both are listed in the upgrade outcome JSON / human output. Legacy `.tar.gz` archives from pre-v0.1.1 versions still work for rollback.
 
 ### What survives restarts, recreates and upgrades
 
@@ -85,20 +100,20 @@ Agents modify themselves: they write skills, memories, config, cron jobs, plugin
 
 | Event | Bind-mounted state (below) | Container writable layer |
 |---|---|---|
-| `agents restart` / `stop` + `start`, VM or host reboot | kept | kept |
+| `agx restart` / `stop` + `start`, VM or host reboot | kept | kept |
 | any recreate — `upgrade`, `reseat`, `fix-perms`, `secret set`, `mount --restart`, `memory`, `codex skill-*`, `vm rebuild` | kept | **lost** |
-| `agents rollback` | replaced by the snapshot — current state saved to `backups/pre-rollback/` first | lost |
+| `agx rollback` | replaced by the snapshot — current state saved to `backups/pre-rollback/` first | lost |
 
 What is bind-mounted:
 
-- **Hermes:** all of `/opt/data` (`$HERMES_HOME`): `config.yaml`, `SOUL.md`, `skills/`, `memories/`, `plugins/`, `cron/`, `hooks/`, sessions, `auth.json`, `installs/` (dependencies Hermes installs on demand), `home/` (HOME of the agent's tool subprocesses — `git`, `gh`, `npm`, skill CLIs). The gateway always ran with HOME=`/opt/data`; `agents exec` sessions do too for agents created or `reseat`ed since 2026-10 (before that they got the ephemeral `/home/hermes`), so `agents exec <name> -- gh auth login` and friends persist.
+- **Hermes:** all of `/opt/data` (`$HERMES_HOME`): `config.yaml`, `SOUL.md`, `skills/`, `memories/`, `plugins/`, `cron/`, `hooks/`, sessions, `auth.json`, `installs/` (dependencies Hermes installs on demand), `home/` (HOME of the agent's tool subprocesses — `git`, `gh`, `npm`, skill CLIs). The gateway always ran with HOME=`/opt/data`; `agx exec` sessions do too for agents created or `reseat`ed since 2026-10 (before that they got the ephemeral `/home/hermes`), so `agx exec <name> -- gh auth login` and friends persist.
 - **OpenClaw:** `/home/node/.openclaw` (`openclaw.json`, SQLite state, agents, downloaded plugins, skills), `/home/node/.openclaw/workspace`, `/home/node/.config` (incl. the auth-profile key in `.config/openclaw`), `/home/node/.local` (`~/.local/bin` is on the image PATH; pnpm's global dir). The toolkit hands these dirs to the image's `node` user (uid 1000) at create and reseat — without that, OpenClaw cannot write its own state under rootless Docker.
 
-Lost on recreate, by design: anything installed into the image (`apt`, `pip` into the image venv, edits under `/opt/hermes` — Hermes' `hermes update` refuses in Docker anyway; replace the image with `agents upgrade`), caches outside the mounts (OpenClaw `~/.cache`, Playwright browsers, `/tmp/openclaw` logs). For tools an agent needs permanently, have it use `npx`/`uvx` and remember that in its memory, or bake them into a derived image.
+Lost on recreate, by design: anything installed into the image (`apt`, `pip` into the image venv, edits under `/opt/hermes` — Hermes' `hermes update` refuses in Docker anyway; replace the image with `agx upgrade`), caches outside the mounts (OpenClaw `~/.cache`, Playwright browsers, `/tmp/openclaw` logs). For tools an agent needs permanently, have it use `npx`/`uvx` and remember that in its memory, or bake them into a derived image.
 
-**Agents created before 2026-10:** run `agents reseat <name>` once to pick up the Hermes HOME change and OpenClaw's new mounts. OpenClaw's own config and skills edits are safe as-is; the toolkit's own `config.yaml` writes (`secret`, `model use`, `memory`, `firecrawl`) refuse instead of overwriting when the agent changed the file in the meantime — re-run the command.
+**Agents created before 2026-10:** run `agx reseat <name>` once to pick up the Hermes HOME change and OpenClaw's new mounts. OpenClaw's own config and skills edits are safe as-is; the toolkit's own `config.yaml` writes (`secret`, `model use`, `memory`, `firecrawl`) refuse instead of overwriting when the agent changed the file in the meantime — re-run the command.
 
-`agents doctor` also reports each agent's version: the `<agent>.version` check shows the running tag and warns when the compose pin and the live container's image diverge (e.g. a hand-edited compose file without a restart) — the fix is `agents restart <name>`.
+`agx doctor` also reports each agent's version: the `<agent>.version` check shows the running tag and warns when the compose pin and the live container's image diverge (e.g. a hand-edited compose file without a restart) — the fix is `agx restart <name>`.
 
 ## Recovery from a crashed operation
 
@@ -117,19 +132,19 @@ re-resolving "latest" (see the Upgrades section above). The
 `config_migrated` phase runs `hermes config migrate` inside the
 container (silent no-op for OpenClaw).
 
-`remove`'s `data_dir_deleted` phase deletes `<name>/` **as root inside the VM** (on bare-metal: via `rootlesskit`, falling back to a printed + confirmed `sudo rm -rf`), because the agent's state is owned by a rootless-Docker subuid the host user can't traverse. It refuses — leaving the journal resumable — if the data share isn't mounted in the VM (`agents vm start` fixes that) or if anything is still mounted beneath the agent's directory. While a `remove` journal is pending, `agents create <same-name>` is refused: finish the removal first (`agents remove <name>`, with `--keep-data` if the data should survive). `backups`, `firecrawl` and `models` are reserved and can't be used as agent names.
+`remove`'s `data_dir_deleted` phase deletes `<name>/` **as root inside the VM** (on bare-metal: via `rootlesskit`, falling back to a printed + confirmed `sudo rm -rf`), because the agent's state is owned by a rootless-Docker subuid the host user can't traverse. It refuses — leaving the journal resumable — if the data share isn't mounted in the VM (`agx vm start` fixes that) or if anything is still mounted beneath the agent's directory. While a `remove` journal is pending, `agx create <same-name>` is refused: finish the removal first (`agx remove <name>`, with `--keep-data` if the data should survive). `backups`, `firecrawl` and `models` are reserved and can't be used as agent names.
 
-`agents doctor` warns about any journal older than 24 hours. To clear a stuck journal once you've manually reconciled state, simply delete the file from `<data-dir>/.journal/`.
+`agx doctor` warns about any journal older than 24 hours. To clear a stuck journal once you've manually reconciled state, simply delete the file from `<data-dir>/.journal/`.
 
 ## Reseating an agent after a toolkit upgrade
 
-Compose service blocks are written once at `agents create` time and not
+Compose service blocks are written once at `agx create` time and not
 touched afterwards. If a toolkit version adds a new env var to the
 service fragment (e.g. `HERMES_UID`), pre-existing agents keep their
 stale block until you reseat them.
 
 ```bash
-agents reseat coder
+agx reseat coder
 ```
 
 What it does:
@@ -144,10 +159,10 @@ What it does:
    effect (a plain `docker compose up -d` often decides "no drift, keep
    the running container" and skips the entrypoint).
 5. For Hermes agents, additionally re-aligns `/opt/data` ownership
-   (same chown/chmod dance as `agents fix-perms`).
+   (same chown/chmod dance as `agx fix-perms`).
 
-When to run it: after upgrading the toolkit, if `agents doctor` flags
-something or if `agents exec <name> …` starts misbehaving. Safe to
+When to run it: after upgrading the toolkit, if `agx doctor` flags
+something or if `agx exec <name> …` starts misbehaving. Safe to
 run any time — preserves all stateful agent data.
 
 ## Hermes ignores WhatsApp group messages after an upgrade
@@ -212,13 +227,13 @@ has to exist first.
 
 General lesson: upstream security waves can flip *defaults* under an
 env-only config, and this class of change produces no error — the
-feature just stops. After every `agents upgrade`, exercise each
+feature just stops. After every `agx upgrade`, exercise each
 connected platform's inbound path (a test message per platform,
 groups included), not just "the agent responds somewhere".
 
-## /opt/data permission drift (and how `agents fix-perms` resolves it)
+## /opt/data permission drift (and how `agx fix-perms` resolves it)
 
-Symptom: `agents exec coder hermes <anything>` crashes on import with
+Symptom: `agx exec coder hermes <anything>` crashes on import with
 `PermissionError: '/opt/data/.env'` (or similar files under
 `/opt/data`).
 
@@ -227,17 +242,17 @@ hermes` on container start so the in-container `hermes` user matches
 the toolkit's runtime uid (1000). When it doesn't (entrypoint skipped
 on a stale running container, image-level changes, env-var
 interpolation failure), `/opt/data` ends up owned by uid 10000 with
-mode 700. `agents exec` runs as uid 1000 → falls to "other" perms on
+mode 700. `agx exec` runs as uid 1000 → falls to "other" perms on
 a 700 dir → EACCES on every traversal.
 
-Detection: `agents doctor` runs a per-Hermes-agent probe that stats
+Detection: `agx doctor` runs a per-Hermes-agent probe that stats
 `/opt/data` as the runtime uid and flags failures or owner mismatches
 with the precise remediation command.
 
-Remediation: `agents fix-perms <agent>`.
+Remediation: `agx fix-perms <agent>`.
 
 ```bash
-agents fix-perms coder
+agx fix-perms coder
 ```
 
 This is the one-shot fix:
@@ -250,7 +265,7 @@ This is the one-shot fix:
    entrypoint did or didn't honour HERMES_UID).
 5. `chown -R <huid>:<huid> /opt/data` so files line up with the live
    runtime user.
-6. `chmod 755 /opt/data` so the toolkit's `agents exec` at uid 1000
+6. `chmod 755 /opt/data` so the toolkit's `agx exec` at uid 1000
    can traverse the dir even when the entrypoint failed to align
    hermes (band-aid for the worst case). Per-file modes are untouched
    — secrets at mode 600 (`auth.json`, `auth.lock`) stay private.
@@ -278,14 +293,14 @@ The two known targets:
   denied, mkdir '/opt/hermes/scripts/whatsapp-bridge/node_modules'`.
 - `/home/hermes/` — the runtime user's HOME in fragments written
   before 2026-10 (current ones pin HOME to the persisted `/opt/data`;
-  `agents reseat` migrates). npm cache, pip cache, browser cache,
+  `agx reseat` migrates). npm cache, pip cache, browser cache,
   dotfiles. The image's `usermod -u 1000 hermes` doesn't migrate the
   existing home dir, so it stays at the image-baked ownership.
 
 The toolkit auto-chowns both after every container recreate (in
 `fixperms_cmd.chown_hermes_install_paths`) from three code paths:
-`agents create` (service_up phase), `agents fix-perms`, and
-`agents reseat`. The recursive chown still prunes `/home/hermes/.codex`:
+`agx create` (service_up phase), `agx fix-perms`, and
+`agx reseat`. The recursive chown still prunes `/home/hermes/.codex`:
 that is the RETIRED Codex import bridge, which agents not yet `reseat`ed
 carry mounted `:ro` (it would emit "Read-only file system" on every
 entry); once the mount is gone the prune matches nothing.
@@ -297,7 +312,7 @@ ro bind-mounts under it) rather than chowning manually.
 
 ## Observability
 
-### VM health — `agents doctor`
+### VM health — `agx doctor`
 
 The doctor surface is binary (ok / warn / fail) — drop it in cron and
 alert on warn+ exit codes. Currently checks:
@@ -310,11 +325,11 @@ alert on warn+ exit codes. Currently checks:
   Hermes' auth store — the "Provider authentication failed" class; detail
   carries the in-container re-auth one-liner) +
   data-dir-access + version (compose-pin vs running-image drift) +
-  host_view (a registered `agents access mount` view that isn't mounted, or is stale).
+  host_view (a registered `agx access mount` view that isn't mounted, or is stale).
 - `firecrawl_running` — warns when firecrawl is defined in compose and
   agents are still wired to it but the containers aren't running (the
   state a VM rebuild/migration leaves behind). A stack that's stopped
-  *and* unwired reads as a deliberate `agents firecrawl down` and
+  *and* unwired reads as a deliberate `agx firecrawl down` and
   stays quiet.
 - `inference_ollama` / `inference_llamacpp` health probes and the
   `arm64_emulation` check fire when the respective stacks are
@@ -327,7 +342,7 @@ alert on warn+ exit codes. Currently checks:
 
 Exit codes: 0 (all ok), 3 (any fail).
 
-### Firecrawl observability — `agents firecrawl status`
+### Firecrawl observability — `agx firecrawl status`
 
 Snapshot of the running stack: per-container state + cpu% + memory
 use, API health probe (via netcat from a sibling container), redis
@@ -359,13 +374,13 @@ One Firecrawl deployment per VM, shared across every Hermes agent the
 toolkit manages — no per-agent setup needed.
 
 ```bash
-agents firecrawl up                # first-time install + start
-agents firecrawl up --upgrade      # re-resolve floating tags into fresh digests
-agents firecrawl down              # stop; postgres data preserved
-agents firecrawl status            # running? which agents are wired?
-agents firecrawl logs              # tail api logs
-agents firecrawl logs playwright -f
-agents firecrawl destroy --yes     # nuke everything including postgres data
+agx firecrawl up                # first-time install + start
+agx firecrawl up --upgrade      # re-resolve floating tags into fresh digests
+agx firecrawl down              # stop; postgres data preserved
+agx firecrawl status            # running? which agents are wired?
+agx firecrawl logs              # tail api logs
+agx firecrawl logs playwright -f
+agx firecrawl destroy --yes     # nuke everything including postgres data
 ```
 
 What `up` does:
@@ -404,15 +419,15 @@ What `up` does:
    shell-based diagnostics also see the config.
 
 If the stack never comes up healthy, `up` exits 2 with the digests
-still pinned; re-running `agents firecrawl up` retries with the same
+still pinned; re-running `agx firecrawl up` retries with the same
 pins and no agents are wired to a dead stack in the meantime.
 
-Agents created **after** `firecrawl up`: `agents create` checks
+Agents created **after** `firecrawl up`: `agx create` checks
 firecrawl state during the `service_up` phase and adds the
 passthrough entries automatically. Zero extra steps.
 
 Storage: `<data-dir>/firecrawl/postgres/` is the only durable volume
-(captured by duplicity / `agents export`). Redis and RabbitMQ are
+(captured by duplicity / `agx export`). Redis and RabbitMQ are
 ephemeral — losing in-flight scrape jobs on restart is acceptable
 for a single-user setup.
 
@@ -422,41 +437,41 @@ others 512 MB each. Idle target ~1.5–2 GB total.
 
 Networking: only `firecrawl-api` is reachable, and only over the
 docker network as `http://firecrawl-api:3002`. No host port is
-published; debug via `agents firecrawl logs` or `agents vm shell`.
+published; debug via `agx firecrawl logs` or `agx vm shell`.
 
-## Editing an agent's files (`agents edit`)
+## Editing an agent's files (`agx edit`)
 
-An agent's state (`<data-dir>/<name>/.data/`) is owned by a rootless-Docker subuid under mode 700, so you can't just open `SOUL.md` from the host. `agents edit` goes through the running container instead — no sudo, no host-side access, and it works the same under `--data-dir-in-vm`:
+An agent's state (`<data-dir>/<name>/.data/`) is owned by a rootless-Docker subuid under mode 700, so you can't just open `SOUL.md` from the host. `agx edit` goes through the running container instead — no sudo, no host-side access, and it works the same under `--data-dir-in-vm`:
 
 ```bash
-agents edit coder SOUL.md
-agents edit coder skills/my-skill/SKILL.md
-agents edit coder config.yaml                 # validated like every toolkit config write
-agents edit coder SOUL.md --profile work      # path relative to the profile's home
+agx edit coder SOUL.md
+agx edit coder skills/my-skill/SKILL.md
+agx edit coder config.yaml                 # validated like every toolkit config write
+agx edit coder SOUL.md --profile work      # path relative to the profile's home
 ```
 
-- Hermes only; the container must be running (`agents start <name>`). For a stopped agent or OpenClaw, use `agents exec` / `agents export`.
+- Hermes only; the container must be running (`agx start <name>`). For a stopped agent or OpenClaw, use `agx exec` / `agx export`.
 - `PATH` is relative to `/opt/data` (or the `--profile` home). It is resolved once inside the container and must stay inside that home; regular UTF-8 text files up to 1 MiB only — it will refuse `state.db` and friends.
 - Anything that *resolves* to a `config.yaml` (default or profile, including through a symlink) is written by the same validated writer as the rest of the toolkit: a `0.0.0.0` dashboard bind is refused and `hermes config validate` runs. A YAML error re-opens the editor.
 - The edit buffer lives in a private directory under `$XDG_RUNTIME_DIR` (tmpfs), never in the VM-shared data dir. If the write is refused — the file changed inside the agent meanwhile, validation failed, the editor crashed after saving — the buffer is **kept** and its path printed.
-- The conflict check is optimistic: the file is re-read under the toolkit lock right before writing. That protects against other `agents` commands, not against Hermes rewriting the same file in that instant.
-- `/opt/data/.env` is Hermes' own env file. Toolkit-managed per-agent secrets live in `<data-dir>/<name>/.env` — use `agents secret` for those.
+- The conflict check is optimistic: the file is re-read under the toolkit lock right before writing. That protects against other `agx` commands, not against Hermes rewriting the same file in that instant.
+- `/opt/data/.env` is Hermes' own env file. Toolkit-managed per-agent secrets live in `<data-dir>/<name>/.env` — use `agx secret` for those.
 - Needs an interactive terminal; uses `$VISUAL`, then `$EDITOR`.
 
-## Reading agent files from the host (`agents access`)
+## Reading agent files from the host (`agx access`)
 
 The agent's runtime container writes its state into the bind-mounted data dir as a rootless-Docker subuid (typically host uid `100999`, mapped from container uid `1000`) under mode 700. `ls ~/agents/coder/.data` fails with permission denied, and that can't be fixed at the source: the container's uid map is one-to-one and your host uid is already taken by *container root*.
 
-`agents access mount` gives you a second path to the same directory — an **idmapped bind mount** under `~/agents-view/` in which the owner ids are swapped, so through the view you simply *are* the owner. Mode bits, the entrypoint's `chmod`s and ACL masks stop mattering. Nothing in the data dir changes.
+`agx access mount` gives you a second path to the same directory — an **idmapped bind mount** under `~/agents-view/` in which the owner ids are swapped, so through the view you simply *are* the owner. Mode bits, the entrypoint's `chmod`s and ACL masks stop mattering. Nothing in the data dir changes.
 
 ```bash
-agents access mount coder          # read-only view at ~/agents-view/coder
-agents access mount coder --rw     # read-write (files you create are owned by the agent)
-agents access list                  # registered views + mounted / not-mounted / stale
-agents access unmount coder
+agx access mount coder          # read-only view at ~/agents-view/coder
+agx access mount coder --rw     # read-write (files you create are owned by the agent)
+agx access list                  # registered views + mounted / not-mounted / stale
+agx access unmount coder
 ```
 
-For a quick edit you don't need a view at all — see [`agents edit`](#editing-an-agents-files-agents-edit).
+For a quick edit you don't need a view at all — see [`agx edit`](#editing-an-agents-files-agents-edit).
 
 ### What it does
 
@@ -467,10 +482,10 @@ For a quick edit you don't need a view at all — see [`agents edit`](#editing-a
 
 ### Surviving reboots
 
-Mounts don't persist. `access mount` prints a ready-made `/etc/fstab` line (also in `agents --json access list` as `fstab_line`); add it yourself — the toolkit never edits `/etc`. It carries `nofail`, so a missing agent directory can't block boot. Until you add it, `agents doctor` warns after a reboot:
+Mounts don't persist. `access mount` prints a ready-made `/etc/fstab` line (also in `agx --json access list` as `fstab_line`); add it yourself — the toolkit never edits `/etc`. It carries `nofail`, so a missing agent directory can't block boot. Until you add it, `agx doctor` warns after a reboot:
 
 ```
-WARN  coder.host_view  host view /home/user/agents-view/coder is not-mounted — add its fstab line … or re-run `agents access mount coder`.
+WARN  coder.host_view  host view /home/user/agents-view/coder is not-mounted — add its fstab line … or re-run `agx access mount coder`.
 ```
 
 Doctor is silent if you never registered a view. Drop the fstab line again when you `unmount`.
@@ -478,62 +493,62 @@ Doctor is silent if you never registered a view. Drop the fstab line again when 
 ### Caveats
 
 - **The view is a second path to the same data, secrets included.** Exclude `~/agents-view` from host backups (`duplicity --exclude`) — otherwise it's archived twice — and remember that anything allowed to read your home can read it while mounted.
-- **Don't open `*.db` files through the view while the agent runs.** The host and the VM share no locks or shared memory; a host-side SQLite client on a live WAL database is a corruption risk. Use `agents conversations export` or stop the agent first.
+- **Don't open `*.db` files through the view while the agent runs.** The host and the VM share no locks or shared memory; a host-side SQLite client on a live WAL database is a corruption risk. Use `agx conversations export` or stop the agent first.
 - `nosymfollow` is deliberate: the view carries agent-written content into your host namespace, and a planted `notes.md -> ~/.bashrc` must not resolve there. Symlinks inside the view show up but can't be followed.
-- `agents remove`, `agents rename` and `agents vm migrate-data` refuse while a view is registered for the agent — `agents access unmount <agent>` first. A view whose directory was deleted underneath it shows as `stale`.
+- `agx remove`, `agx rename` and `agx vm migrate-data` refuse while a view is registered for the agent — `agx access unmount <agent>` first. A view whose directory was deleted underneath it shows as `stale`.
 - View location: `[paths].host_view_dir` in `config.toml` (default `~/agents-view`). It must not be inside the data dir (it would be shared into the VM) nor contain it.
 
 ### Backend differences
 
-| Backend | `agents access mount` |
+| Backend | `agx access mount` |
 |---|---|
 | `multipass` / `libvirt`, host-mounted data dir | works |
 | `bare_metal` | works — rootless Docker runs on the host, so agent files are subuid-owned there too |
-| `--data-dir-in-vm` | refused — nothing on the host to view; use `agents edit`, `agents exec` or `agents export` |
+| `--data-dir-in-vm` | refused — nothing on the host to view; use `agx edit`, `agx exec` or `agx export` |
 
-Requirements: Linux ≥ 5.12 with a filesystem that supports idmapped mounts (ext4, xfs, btrfs, …) and util-linux ≥ 2.39. On hosts without it (macOS, old kernels) the `mount` error is shown as-is; `agents edit` works everywhere.
+Requirements: Linux ≥ 5.12 with a filesystem that supports idmapped mounts (ext4, xfs, btrfs, …) and util-linux ≥ 2.39. On hosts without it (macOS, old kernels) the `mount` error is shown as-is; `agx edit` works everywhere.
 
-### Coming from `agents access grant`
+### Coming from `agx access grant`
 
-The ACL-based `grant`/`revoke` were retired: a directory or file created with a restrictive mode (`mkdir 0700`, `open 0600`) under a default ACL is *born* with an all-zero ACL mask, so the grant never held for the files that matter, and every entrypoint `chmod` re-masked the rest. `agents create` no longer sets ACLs either. Existing ACL entries on older agents are harmless but keep propagating to new files; `access mount` / `access list` print the one-liner to drop them (`sudo setfacl -R -b -k <dir>`).
+The ACL-based `grant`/`revoke` were retired: a directory or file created with a restrictive mode (`mkdir 0700`, `open 0600`) under a default ACL is *born* with an all-zero ACL mask, so the grant never held for the files that matter, and every entrypoint `chmod` re-masked the rest. `agx create` no longer sets ACLs either. Existing ACL entries on older agents are harmless but keep propagating to new files; `access mount` / `access list` print the one-liner to drop them (`sudo setfacl -R -b -k <dir>`).
 
-## Sharing host folders with an agent (`agents mount`)
+## Sharing host folders with an agent (`agx mount`)
 
 Give an agent access to a specific folder on the host. The toolkit handles the two hops the folder needs to traverse before the agent container sees it: host → VM mount → docker bind volume. On `bare_metal` there is only one hop: the Docker daemon runs on the host and binds the folder directly.
 
 ```bash
 # Default: ro, target both runtime + sandbox on Hermes
-agents mount add coder --host ~/projects/x --container /workspace/x
+agx mount add coder --host ~/projects/x --container /workspace/x
 
 # Read-write (will prompt; --yes to skip the warning)
-agents mount add coder --host ~/data --container /workspace/data --rw
+agx mount add coder --host ~/data --container /workspace/data --rw
 
 # Sandbox-only (visible to the LLM's shell tools, NOT the runtime container)
-agents mount add coder --host ~/scripts --container /workspace/scripts --target sandbox
+agx mount add coder --host ~/scripts --container /workspace/scripts --target sandbox
 
 # OpenClaw — runtime only (sandbox concept is Hermes-specific)
-agents mount add bob --host ~/projects --container /workspace/projects
+agx mount add bob --host ~/projects --container /workspace/projects
 
 # List, then remove
-agents mount list coder
-agents mount remove coder --container /workspace/x
+agx mount list coder
+agx mount remove coder --container /workspace/x
 
 # Apply immediately rather than reminding you to restart
-agents mount add coder --host ~/projects/x --container /workspace/x --restart
+agx mount add coder --host ~/projects/x --container /workspace/x --restart
 ```
 
 ### Defaults
 
 - **Read-only** unless `--rw`. The CLAUDE.md threat model is explicit: a prompt-injected agent can be persuaded into destructive ops on any writable mount.
 - **`--target`** defaults per agent type: **Hermes → `both`** (runtime container + Hermes sandbox via `terminal.docker_volumes`), **OpenClaw → `runtime`** (sandbox is Hermes-only).
-- **Per-agent isolation.** On the VM backends each agent gets its own VM-side mount target at `/home/ubuntu/host-extras/<agent>/<hash>-<basename>` — no cross-agent sharing. Two agents wanting the same host folder both run `agents mount add`. On `bare_metal` the bind source is the host folder itself.
+- **Per-agent isolation.** On the VM backends each agent gets its own VM-side mount target at `/home/ubuntu/host-extras/<agent>/<hash>-<basename>` — no cross-agent sharing. Two agents wanting the same host folder both run `agx mount add`. On `bare_metal` the bind source is the host folder itself.
 
 ### What lives where
 
 | File | Owner | Purpose |
 |---|---|---|
 | `<data-dir>/<agent>/.mounts.json` | toolkit | Source of truth for that agent's extra mounts. |
-| `<data-dir>/docker-compose.override.yml` | toolkit + user | Toolkit appends `volumes:` entries here; the main `docker-compose.yml` is left alone so `agents reseat` / `agents upgrade` don't clobber the additions. |
+| `<data-dir>/docker-compose.override.yml` | toolkit + user | Toolkit appends `volumes:` entries here; the main `docker-compose.yml` is left alone so `agx reseat` / `agx upgrade` don't clobber the additions. |
 | `<data-dir>/<agent>/.data/config.yaml` (`terminal.docker_volumes`) | toolkit | Hermes sandbox mount list. |
 
 ### Backend differences
@@ -552,13 +567,13 @@ The toolkit refuses container paths that would shadow its own bind mounts: `/opt
 
 Both add and remove leave the running container with stale state until the next restart. The output reminds you:
 ```
-agent restart required: agents restart coder
+agent restart required: agx restart coder
 ```
 …or pass `--restart` to apply immediately.
 
 ### Export / import semantics
 
-`agents export <agent>` includes the agent's `.mounts.json` in the tarball as metadata. `agents import <agent>` deliberately does NOT re-apply those mounts (host paths likely differ on the destination machine) — instead, it surfaces them as `agents mount add ...` commands you can copy-paste and edit.
+`agx export <agent>` includes the agent's `.mounts.json` in the tarball as metadata. `agx import <agent>` deliberately does NOT re-apply those mounts (host paths likely differ on the destination machine) — instead, it surfaces them as `agx mount add ...` commands you can copy-paste and edit.
 
 ### Safety knobs
 
@@ -567,14 +582,14 @@ agent restart required: agents restart coder
 
 ### Auto-ACL: how the user and the agent both see the folder
 
-The agent (uid 1000 inside the container, which maps to host subuid 100999) and you (uid 1000 on the host) are *different uids* under rootless Docker. Without intervention, files would land owned by 100999 with the agent's umask — you wouldn't be able to read what the agent wrote, and the agent wouldn't be able to read your mode-600 files. `agents mount add` solves this automatically:
+The agent (uid 1000 inside the container, which maps to host subuid 100999) and you (uid 1000 on the host) are *different uids* under rootless Docker. Without intervention, files would land owned by 100999 with the agent's umask — you wouldn't be able to read what the agent wrote, and the agent wouldn't be able to read your mode-600 files. `agx mount add` solves this automatically:
 
 - **Read-only mount** (default): grants the agent's subuid `rX` on existing files + sets a default ACL so future files you add inherit the grant.
 - **`--rw` mount**: grants the agent's subuid `rwX` for both directions, AND adds a default ACL granting your uid `rwx` so files the agent writes back are readable by you.
 
 This applies on every backend, `bare_metal` included — rootless Docker maps the container uid to a subuid there as well. No sudo needed (you own the host folder). Probed first — if the filesystem doesn't support ACLs (FAT/exFAT/network mount), the mount still works but you'll see a warning about likely permission errors on mode-restrictive files.
 
-`agents mount remove` strips the toolkit-added ACL entries; any unrelated entries you added by hand are left in place.
+`agx mount remove` strips the toolkit-added ACL entries; any unrelated entries you added by hand are left in place.
 
 ## Per-agent secrets
 
@@ -584,11 +599,11 @@ file that the toolkit wires into the container via compose
 project-level file shared across every container.
 
 ```bash
-agents secret set coder FIRECRAWL_API_KEY            # hidden prompt
-agents secret set coder GITHUB_TOKEN ghp_xxxx        # arg form
-agents secret list coder                             # names only
-agents secret unset coder FIRECRAWL_API_KEY
-agents secret clear coder                            # nuke them all
+agx secret set coder FIRECRAWL_API_KEY            # hidden prompt
+agx secret set coder GITHUB_TOKEN ghp_xxxx        # arg form
+agx secret list coder                             # names only
+agx secret unset coder FIRECRAWL_API_KEY
+agx secret clear coder                            # nuke them all
 ```
 
 Storage: `<data-dir>/<name>/.env`. Duplicity already covers it because
@@ -609,12 +624,12 @@ The toolkit manages three memory plugins for Hermes agents. Pick based
 on what credentials / infrastructure you already have:
 
 ```bash
-agents memory list                          # show what's available
-agents memory enable holographic coder     # zero-dep, works with Codex alone
-agents memory enable mem0 coder            # in-process, needs Ollama or OPENAI_API_KEY
-agents memory enable openviking coder      # sibling docker service, needs Ollama
-agents memory disable coder                # back to built-in
-agents memory status coder                 # what's wired
+agx memory list                          # show what's available
+agx memory enable holographic coder     # zero-dep, works with Codex alone
+agx memory enable mem0 coder            # in-process, needs Ollama or OPENAI_API_KEY
+agx memory enable openviking coder      # sibling docker service, needs Ollama
+agx memory disable coder                # back to built-in
+agx memory status coder                 # what's wired
 ```
 
 Backends that need an embeddings + LLM provider read it from the
@@ -622,10 +637,10 @@ toolkit's `[ollama]` config. The toolkit does NOT run Ollama for you —
 point it at an existing one:
 
 ```bash
-agents ollama configure --url http://10.20.30.1:11434
-agents ollama configure --url https://hosted.example/v1 --api-key sk_…
-agents ollama status                        # probe reachability from VM + containers
-agents ollama clear
+agx ollama configure --url http://10.20.30.1:11434
+agx ollama configure --url https://hosted.example/v1 --api-key sk_…
+agx ollama status                        # probe reachability from VM + containers
+agx ollama clear
 ```
 
 `localhost` / `127.0.0.1` / `0.0.0.0` URLs are refused — they resolve
@@ -637,49 +652,49 @@ multipass NAT gateway (`multipass info <vm>` shows it; typically
 
 - `holographic` + default host-mount: the SQLite WAL on 9p risk
   (matches the Hermes kanban/sessions trap). Switch to
-  `agents vm init --data-dir-in-vm` if you're seeing `database is
+  `agx vm init --data-dir-in-vm` if you're seeing `database is
   locked` errors.
 - `holographic` requires NumPy inside the Hermes container — without
   it, the plugin silently degrades to FTS5-only (upstream issue
   #17350). The status command probes this.
-- `mem0` and `openviking` need a reachable Ollama URL — `agents ollama
+- `mem0` and `openviking` need a reachable Ollama URL — `agx ollama
   status` is the fastest way to confirm.
 
 ## Codex skill (Hermes only)
 
 ```bash
-agents codex skill-enable coder    # build sandbox image with Codex baked in
-agents codex skill-disable coder   # restore original sandbox image
+agx codex skill-enable coder    # build sandbox image with Codex baked in
+agx codex skill-disable coder   # restore original sandbox image
 ```
 
-The first call slugifies the agent's current `terminal.docker_image` and builds `agents/hermes-sandbox-codex:<sha256[:12]>`. The state file at `<data-dir>/.codex-skill/<name>.json` remembers the original image so `skill-disable` can restore it exactly. The skill reads the toolkit-scoped `<data-dir>/.codex` (`agents codex login`); this is the ONLY thing that file is for.
+The first call slugifies the agent's current `terminal.docker_image` and builds `agents/hermes-sandbox-codex:<sha256[:12]>`. The state file at `<data-dir>/.codex-skill/<name>.json` remembers the original image so `skill-disable` can restore it exactly. The skill reads the toolkit-scoped `<data-dir>/.codex` (`agx codex login`); this is the ONLY thing that file is for.
 
 ## Codex as a Hermes agent's LLM provider — auth, expiry, recovery
 
 Authenticate the `openai-codex` provider **inside the container**; the toolkit-scoped `.codex` is not involved:
 
 ```bash
-agents exec coder -- hermes auth add openai-codex --type oauth --no-browser   # prints URL + code
-agents exec coder -- hermes auth list openai-codex                            # shows pooled credentials
-agents exec coder -- hermes auth remove openai-codex 1                        # drop an exhausted one
+agx exec coder -- hermes auth add openai-codex --type oauth --no-browser   # prints URL + code
+agx exec coder -- hermes auth list openai-codex                            # shows pooled credentials
+agx exec coder -- hermes auth remove openai-codex 1                        # drop an exhausted one
 ```
 
-Symptom of a dead credential: the agent answers *"Provider authentication failed. Check the configured credentials; raw provider details are in the gateway logs."*, `agents logs coder` shows `HTTP 401 … token_expired` / `token_invalidated`, and `agents doctor` reports `coder.credential_pool: fail`. ChatGPT-subscription OAuth chains die every 1–3 weeks (upstream Hermes #65346, unresolved) — plan for it rather than around it:
+Symptom of a dead credential: the agent answers *"Provider authentication failed. Check the configured credentials; raw provider details are in the gateway logs."*, `agx logs coder` shows `HTTP 401 … token_expired` / `token_invalidated`, and `agx doctor` reports `coder.credential_pool: fail`. ChatGPT-subscription OAuth chains die every 1–3 weeks (upstream Hermes #65346, unresolved) — plan for it rather than around it:
 
 - **Keep answering:** `fallback_providers` in the agent's `config.yaml` (a cheap OpenRouter model; Hermes fails over immediately on 401/403).
-- **Hear about it within 15 min:** `agents doctor-cron install --mail you@example.org` (below).
-- **Re-auth from anywhere:** the device-code URL works from a phone browser; with `agents tailscale up` + an SSH app you can run the `hermes auth add` line from the phone too.
-- **Never** `agents codex refresh` / `agents codex login` "for the agent" — the retired import bridge is why that used to invalidate agents' tokens; `agents reseat <name>` removes the bridge mount from agents created before 2026-09.
+- **Hear about it within 15 min:** `agx doctor-cron install --mail you@example.org` (below).
+- **Re-auth from anywhere:** the device-code URL works from a phone browser; with `agx tailscale up` + an SSH app you can run the `hermes auth add` line from the phone too.
+- **Never** `agx codex refresh` / `agx codex login` "for the agent" — the retired import bridge is why that used to invalidate agents' tokens; `agx reseat <name>` removes the bridge mount from agents created before 2026-09.
 
 ## doctor-cron
 
-Host cron that runs `agents doctor` every N minutes and mails **on state change only** — one mail when a check turns red (with every failing check's detail and the fix one-liner), one when everything is green again; warnings are listed for context but never trigger a mail. Delivery is through the host's `sendmail` (postfix, msmtp, …): the toolkit carries no SMTP config, and `install` refuses when no `sendmail` is on PATH.
+Host cron that runs `agx doctor` every N minutes and mails **on state change only** — one mail when a check turns red (with every failing check's detail and the fix one-liner), one when everything is green again; warnings are listed for context but never trigger a mail. Delivery is through the host's `sendmail` (postfix, msmtp, …): the toolkit carries no SMTP config, and `install` refuses when no `sendmail` is on PATH.
 
 ```bash
-agents doctor-cron install --mail you@example.org [--every 15]
-agents doctor-cron status      # installed?, last run, currently failing checks, last mail
-agents doctor-cron run         # one poll by hand (what cron calls)
-agents doctor-cron uninstall
+agx doctor-cron install --mail you@example.org [--every 15]
+agx doctor-cron status      # installed?, last run, currently failing checks, last mail
+agx doctor-cron run         # one poll by hand (what cron calls)
+agx doctor-cron uninstall
 ```
 
 State lives at `<data-dir>/.doctor-cron/state.json`; the cron log at `<data-dir>/.doctor-cron.log`. A red doctor never makes the cron line exit non-zero (that would trigger cron's own MAILTO spam) — only a failed run itself (config missing, sendmail rejected) does.
@@ -687,32 +702,32 @@ State lives at `<data-dir>/.doctor-cron/state.json`; the cron log at `<data-dir>
 OpenClaw bundles its own Codex plugin — run `openclaw models auth login --provider openai --device-code` *inside* the OpenClaw container instead:
 
 ```bash
-agents exec personal -- openclaw models auth login --provider openai --device-code
+agx exec personal -- openclaw models auth login --provider openai --device-code
 ```
 
 ## Backups (host-side)
 
 Whatever host backup you run over `<data-dir>` (duplicity, restic, borg, …) covers everything: per-agent state, compose, .env, Codex auth, journals, upgrade tarballs. There is no internal backup engine.
 
-For crash-consistent snapshots, run `agents export <name>` first — that writes a clean tarball into `<data-dir>/backups/` that the host backup will pick up on its next run.
+For crash-consistent snapshots, run `agx export <name>` first — that writes a clean tarball into `<data-dir>/backups/` that the host backup will pick up on its next run.
 
 ```bash
-agents export coder              # one agent
-agents export --all              # all agents
-agents export --all --to ~/elsewhere/  # send archives somewhere other than <data-dir>/backups/
+agx export coder              # one agent
+agx export --all              # all agents
+agx export --all --to ~/elsewhere/  # send archives somewhere other than <data-dir>/backups/
 
 # Schedule one or more daily runs via host cron. Comma-separated times
 # install one crontab line per time — re-running install replaces all
 # prior toolkit-managed entries (clean idempotent).
-agents export-cron install --time 02:30                       # once a day at 02:30
-agents export-cron install --time 02:30,08:30,14:30,20:30     # four times a day
-agents export-cron status
-agents export-cron uninstall
+agx export-cron install --time 02:30                       # once a day at 02:30
+agx export-cron install --time 02:30,08:30,14:30,20:30     # four times a day
+agx export-cron status
+agx export-cron uninstall
 ```
 
 ### Picking a schedule for SQLite-heavy use
 
-Hermes' kanban/sessions/insights databases use SQLite WAL. In `--data-dir-in-vm` mode they live on the VM's ext4 disk and work normally (WAL doesn't function over the host shared-FS share — see [architecture.md](architecture.md) for the why). The trade-off is that those files are not directly host-visible — your only host-side view of recent agent state is the most recent `agents export` archive.
+Hermes' kanban/sessions/insights databases use SQLite WAL. In `--data-dir-in-vm` mode they live on the VM's ext4 disk and work normally (WAL doesn't function over the host shared-FS share — see [architecture.md](architecture.md) for the why). The trade-off is that those files are not directly host-visible — your only host-side view of recent agent state is the most recent `agx export` archive.
 
 A reasonable cadence:
 
@@ -723,13 +738,13 @@ A reasonable cadence:
 | Heavy SQLite write (kanban, sessions, insights) | `02:30,08:30,14:30,20:30` | ≤6 h. Each archive is a few MB; disk cost is trivial. |
 | You really care | `*/2` (every two hours, hand-installed) | The toolkit's HH:MM cron syntax doesn't express step intervals; use `crontab -e` and add `0 */2 * * * /usr/local/bin/agents --yes export --all` with the `# agents toolkit — managed export-cron entry` marker omitted (the toolkit won't manage it, but it won't trip over it either). |
 
-`agents export` runs `tar --zstd` over the agent's per-agent data dir **inside the VM** in both modes, then transfers the archive out to `<data-dir>/backups/`. For Hermes, this captures `state.db`, `kanban.db`, sessions, skills, SOUL.md, config.yaml. Under `--data-dir-in-vm` that's where the data lives anyway (ext4); in host-mount mode the tar runs VM-side as root because the agent's files are owned by a rootless-Docker subuid under mode 700 — a host-side walk can't read them and would silently produce archives containing only directory stubs. tar isn't aware of SQLite WAL mid-flight, so each individual run is *near-consistent* rather than guaranteed crash-consistent — if a write is in progress at the exact moment tar copies the file, the captured `.db` may be missing the corresponding WAL entries. SQLite's recovery on next open handles most such cases, and frequent backups give you many fallback points.
+`agx export` runs `tar --zstd` over the agent's per-agent data dir **inside the VM** in both modes, then transfers the archive out to `<data-dir>/backups/`. For Hermes, this captures `state.db`, `kanban.db`, sessions, skills, SOUL.md, config.yaml. Under `--data-dir-in-vm` that's where the data lives anyway (ext4); in host-mount mode the tar runs VM-side as root because the agent's files are owned by a rootless-Docker subuid under mode 700 — a host-side walk can't read them and would silently produce archives containing only directory stubs. tar isn't aware of SQLite WAL mid-flight, so each individual run is *near-consistent* rather than guaranteed crash-consistent — if a write is in progress at the exact moment tar copies the file, the captured `.db` may be missing the corresponding WAL entries. SQLite's recovery on next open handles most such cases, and frequent backups give you many fallback points.
 
-For strict crash consistency on a specific agent, stop it first: `agents stop coder && agents export coder && agents start coder` — but that's rarely necessary in practice given how cheap the multi-archive approach is.
+For strict crash consistency on a specific agent, stop it first: `agx stop coder && agx export coder && agx start coder` — but that's rarely necessary in practice given how cheap the multi-archive approach is.
 
 ### Backup retention
 
-**`agents export` auto-prunes.** After every successful export to the
+**`agx export` auto-prunes.** After every successful export to the
 default `<data-dir>/backups/` directory, the toolkit deletes that
 agent's oldest archives, keeping only the newest `keep_last`
 (default **14**). Only files matching the toolkit's own naming pattern
@@ -739,7 +754,7 @@ candidates — user files, other agents' archives, and the
 `--to <path>` destination are **never** pruned; custom destinations
 are user-managed.
 
-Tune the window in `~/.config/agents/config.toml`:
+Tune the window in `~/.config/agx/config.toml`:
 
 ```toml
 [export_cron]
@@ -759,33 +774,33 @@ not assume the toolkit keeps history for you.
 
 ## Rebuilding the VM (disk shrink, Ubuntu bump, wedged-VM recovery)
 
-`agents vm resize` handles grow operations in place. The cases it can't:
+`agx vm resize` handles grow operations in place. The cases it can't:
 
 - **Disk shrink** — multipass refuses; the only way to a smaller disk is destroy + re-init.
 - **Bump the Ubuntu release** (e.g. 24.04 → 26.04 once Docker CE supports it).
 - **The VM is wedged** — bootstrap stuck, kernel borked, network plumbing wrong — and you want a clean slate without losing agent state.
 
-`agents vm rebuild` is the journaled, non-destructive flow for all three:
+`agx vm rebuild` is the journaled, non-destructive flow for all three:
 
 ```bash
-agents vm rebuild --disk 30                         # shrink (or grow) disk; keep other sizing
-agents vm rebuild --ubuntu-release 26.04            # try a newer release
-agents vm rebuild --cpus 4 --memory 4               # downsize the whole VM
-agents vm rebuild                                   # same sizing as today (effectively a clean-room reboot)
+agx vm rebuild --disk 30                         # shrink (or grow) disk; keep other sizing
+agx vm rebuild --ubuntu-release 26.04            # try a newer release
+agx vm rebuild --cpus 4 --memory 4               # downsize the whole VM
+agx vm rebuild                                   # same sizing as today (effectively a clean-room reboot)
 ```
 
 Phases (each idempotent, journaled at `<data-dir>/.journal/rebuild-<vm>-<utc>.json`):
 
 | phase | what it does |
 |---|---|
-| `staged_exports` | `agents export` every agent into `<data-dir>/.rebuild-staging/` |
+| `staged_exports` | `agx export` every agent into `<data-dir>/.rebuild-staging/` |
 | `vm_destroyed` | `multipass delete --purge` the old VM |
-| `vm_initted` | fresh `agents vm init` with the (overridden or kept) sizing |
-| `state_restored` | `agents import` each agent from its staging archive |
+| `vm_initted` | fresh `agx vm init` with the (overridden or kept) sizing |
+| `state_restored` | `agx import` each agent from its staging archive |
 | `services_started` | `docker compose up -d` each service |
 | `sidecars_started` | re-up the project-scoped sidecar stacks (firecrawl, ollama, llama-cpp model services) — their containers lived only in the old VM's engine. Best-effort: a sidecar that fails to come back warns with the manual command and never fails the rebuild |
 
-If something crashes mid-rebuild, re-running `agents vm rebuild` picks up where the journal left off. The staging dir is left in place after success so you can inspect; safe to `rm -rf <data-dir>/.rebuild-staging/` once `agents doctor` is green.
+If something crashes mid-rebuild, re-running `agx vm rebuild` picks up where the journal left off. The staging dir is left in place after success so you can inspect; safe to `rm -rf <data-dir>/.rebuild-staging/` once `agx doctor` is green.
 
 ## Local inference (Ollama, llama.cpp)
 
@@ -795,28 +810,28 @@ The toolkit can run local LLMs inside the VM as sibling Docker services. Hermes 
 
 ```bash
 # Start the Ollama service (auto-resolves and pins the image digest)
-agents inference up ollama
+agx inference up ollama
 
 # Pull a model — accepts both Ollama Hub refs and HuggingFace
-agents model pull ollama llama3.2:3b
-agents model pull ollama hf.co/bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M
+agx model pull ollama llama3.2:3b
+agx model pull ollama hf.co/bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M
 
 # Wire it into an agent (writes the model: block in config.yaml)
-agents model use coder --engine ollama --model llama3.2:3b
+agx model use coder --engine ollama --model llama3.2:3b
 
 # Or route compression + vision through it too (free, no cloud cost)
-agents model use coder --engine ollama --model llama3.2:3b --aux all
+agx model use coder --engine ollama --model llama3.2:3b --aux all
 
 # Restart so the gateway picks up the new config
-agents restart coder
+agx restart coder
 ```
 
 Status + introspection:
 
 ```bash
-agents inference status            # what's running, models loaded
-agents model list                  # disk inventory (both engines)
-agents doctor coder               # includes inference_ollama check
+agx inference status            # what's running, models loaded
+agx model list                  # disk inventory (both engines)
+agx doctor coder               # includes inference_ollama check
 ```
 
 ### Phase 2: llama.cpp (HF GGUFs, per-model serving)
@@ -825,23 +840,23 @@ llama.cpp is one-model-per-process by design, so each loaded model becomes its o
 
 ```bash
 # Pin the llama.cpp image (no service started yet)
-agents inference up llama-cpp
+agx inference up llama-cpp
 
 # GGUF pulls use the running ollama container as the download host
 # (it has Python for huggingface_hub) — start it first if it isn't up
-agents inference up ollama
+agx inference up ollama
 
 # Download a GGUF from HuggingFace into <data-dir>/models/llama-cpp/
-agents model pull llama-cpp bartowski/Llama-3.2-3B-Instruct-GGUF:Llama-3.2-3B-Instruct-Q4_K_M.gguf
+agx model pull llama-cpp bartowski/Llama-3.2-3B-Instruct-GGUF:Llama-3.2-3B-Instruct-Q4_K_M.gguf
 
 # Spawn a llama-server bound to that file
-agents inference load llama-cpp llama-3-2-3b --gguf Llama-3.2-3B-Instruct-Q4_K_M.gguf --port 8080
+agx inference load llama-cpp llama-3-2-3b --gguf Llama-3.2-3B-Instruct-Q4_K_M.gguf --port 8080
 
 # Wire an agent
-agents model use coder --engine llama-cpp --model llama-3-2-3b
+agx model use coder --engine llama-cpp --model llama-3-2-3b
 
 # Unload when done (frees RAM)
-agents inference unload llama-cpp llama-3-2-3b
+agx inference unload llama-cpp llama-3-2-3b
 ```
 
 ### vLLM
@@ -869,16 +884,16 @@ Models live under `<data-dir>/models/{ollama,llama-cpp}/`. Rough RAM budget per 
 | 7B Q4_K_M | ~4 GB | ~6 GB | Workstation only |
 | 13B Q4_K_M | ~8 GB | ~10 GB | Workstation only |
 
-Disk caveat: download multiple 7B variants and you'll burn 20+ GB fast. Default VM disk is 25 GB total. Run `agents vm resize --disk 80` (or higher) before going model-shopping.
+Disk caveat: download multiple 7B variants and you'll burn 20+ GB fast. Default VM disk is 25 GB total. Run `agx vm resize --disk 80` (or higher) before going model-shopping.
 
 ### OpenClaw
 
-The toolkit doesn't write OpenClaw's config. `agents model use` refuses on OpenClaw agents but prints the exact `base_url` to paste into `openclaw configure` manually.
+The toolkit doesn't write OpenClaw's config. `agx model use` refuses on OpenClaw agents but prints the exact `base_url` to paste into `openclaw configure` manually.
 
 ### Two `[ollama]` blocks aren't a typo
 
-- `[ollama]` (and `agents ollama configure/status`) — points the toolkit at an **external** Ollama (separate GPU box, hosted, etc.). Localhost is refused because it would resolve to the VM itself, not where you actually run Ollama.
-- `[inference]` (managed by `agents inference up/down`) — **in-VM** Ollama. Lives inside the Multipass guest, served at the Docker DNS name `ollama:11434`.
+- `[ollama]` (and `agx ollama configure/status`) — points the toolkit at an **external** Ollama (separate GPU box, hosted, etc.). Localhost is refused because it would resolve to the VM itself, not where you actually run Ollama.
+- `[inference]` (managed by `agx inference up/down`) — **in-VM** Ollama. Lives inside the Multipass guest, served at the Docker DNS name `ollama:11434`.
 
 Both can coexist — e.g. heavy LLM on the external GPU box, lightweight embedding model on the in-VM Ollama.
 
@@ -894,9 +909,9 @@ The toolkit works on arm64 Linux hosts (RPi5, Apple Silicon under Multipass, gen
 
 ### What runs under qemu-user emulation on arm64
 
-- `ghcr.io/firecrawl/nuq-postgres:latest` — Firecrawl publishes amd64-only for this one. Postgres runs fine under emulation, just slower at init and on heavy queries. `agents doctor` flags this with an `arm64_emulation=warn` check when firecrawl is installed.
+- `ghcr.io/firecrawl/nuq-postgres:latest` — Firecrawl publishes amd64-only for this one. Postgres runs fine under emulation, just slower at init and on heavy queries. `agx doctor` flags this with an `arm64_emulation=warn` check when firecrawl is installed.
 
-The toolkit auto-detects host arch at `agents firecrawl up` time and picks `ghcr.io/firecrawl/firecrawl:linux-arm64` (the api image ships per-arch tags, not a multi-arch manifest). No flag needed.
+The toolkit auto-detects host arch at `agx firecrawl up` time and picks `ghcr.io/firecrawl/firecrawl:linux-arm64` (the api image ships per-arch tags, not a multi-arch manifest). No flag needed.
 
 If `nuq-postgres` performance bites, override it via `docker-compose.override.yml` with a stock `postgres:16` and run Firecrawl's schema migrations against it. Out of scope for the toolkit to automate; document if you do this so the next maintainer knows why the override exists.
 
@@ -904,12 +919,12 @@ If `nuq-postgres` performance bites, override it via `docker-compose.override.ym
 
 The toolkit defaults (4 CPU, 8 GiB RAM, 25 GiB disk) assume a workstation host. On RPi5 you'll want to scale down — the VM competes with everything else on the host.
 
-| RPi5 board | Recommended `agents vm init` flags |
+| RPi5 board | Recommended `agx vm init` flags |
 |---|---|
 | RPi5 8 GiB | `--cpus 3 --memory 5 --disk 25` (leaves 3 GiB for host) |
 | RPi5 4 GiB | Don't. The VM defaults eat too much of the board; run Hermes directly on the host instead. |
 
-Resize an existing VM with `agents vm resize --cpus N --memory NG --disk NG` rather than reinstalling.
+Resize an existing VM with `agx vm resize --cpus N --memory NG --disk NG` rather than reinstalling.
 
 ### `--data-dir-in-vm` is strongly recommended on arm64
 
@@ -919,11 +934,11 @@ The default mount layout puts the agent data dir on the host filesystem, shared 
 - 9p over QEMU on arm64 is measurably slower than on amd64.
 - Hermes' `state.db` (sessions/messages), `kanban.db`, and any memory-backend SQLite use WAL mode, which interacts poorly with 9p.
 
-The opt-out keeps agent state on the VM's ext4 filesystem and exposes it to host backups via the `agents export-cron` archive flow:
+The opt-out keeps agent state on the VM's ext4 filesystem and exposes it to host backups via the `agx export-cron` archive flow:
 
 ```bash
-agents vm init --data-dir /data/agents --data-dir-in-vm
-agents export-cron install --time 02:30,08:30,14:30,20:30
+agx vm init --data-dir /data/agents --data-dir-in-vm
+agx export-cron install --time 02:30,08:30,14:30,20:30
 ```
 
 duplicity (or whatever you back up with) picks up the 6-hourly archives natively. You lose direct host-side inspection of the data dir but gain measurably better DB performance.
@@ -1007,13 +1022,13 @@ Memory capacity for LLMs is **not** affected by IOMMU — only your BIOS GPU-car
 
 ```bash
 # CPU-only (no GPU passthrough)
-agents vm init --backend libvirt --data-dir /data/agents
+agx vm init --backend libvirt --data-dir /data/agents
 
 # With autodetect (picks every vfio-pci-bound GPU it finds via lspci)
-agents vm init --backend libvirt --gpu auto --data-dir /data/agents
+agx vm init --backend libvirt --gpu auto --data-dir /data/agents
 
 # With explicit PCI ID(s); repeat --gpu to pass multiple devices
-agents vm init --backend libvirt --gpu 0000:01:00.0 --gpu 0000:01:00.1 \
+agx vm init --backend libvirt --gpu 0000:01:00.0 --gpu 0000:01:00.1 \
     --data-dir /data/agents
 ```
 
@@ -1028,7 +1043,7 @@ agents vm init --backend libvirt --gpu 0000:01:00.0 --gpu 0000:01:00.1 \
 ### Verifying GPU passthrough
 
 ```bash
-agents vm shell                              # ssh into the VM
+agx vm shell                              # ssh into the VM
 nvidia-smi                                   # NVIDIA: should list the GPU
 lspci | grep -E "VGA|3D"                     # AMD/Intel: card visible
 ```
@@ -1054,7 +1069,7 @@ If the card isn't there: the device isn't bound to vfio-pci. `lspci -k -d <vendo
 A virtiofs mount on a libvirt domain blocks `snapshot-create-as` on a running VM (vhost-user backend lacks `VHOST_USER_PROTOCOL_F_LOG_SHMFD`). The toolkit handles this transparently:
 
 ```
-$ agents vm snapshot pre-upgrade
+$ agx vm snapshot pre-upgrade
 Snapshotting a libvirt VM with an active virtiofs mount requires
 briefly stopping the VM (~30s downtime). Any running Docker
 containers (Hermes agents, Firecrawl, Ollama, etc.) will be
@@ -1063,23 +1078,23 @@ afterwards.
 Proceed? [y/N]:
 ```
 
-Confirm → toolkit stops the VM via ACPI, snapshots, restarts, re-waits for SSH. Mount auto-remounts via the fstab `_netdev` entry. Same logic applies to `agents vm restore`. `-y` / global `--yes` skips the prompt (used by `agents upgrade`'s pre-upgrade snapshot path).
+Confirm → toolkit stops the VM via ACPI, snapshots, restarts, re-waits for SSH. Mount auto-remounts via the fstab `_netdev` entry. Same logic applies to `agx vm restore`. `-y` / global `--yes` skips the prompt (used by `agx upgrade`'s pre-upgrade snapshot path).
 
 Why this over the alternatives:
 
 - *Detach virtiofs, snapshot, reattach*: would let containers keep running, but the underlying `umount /home/ubuntu/agents` is either refused (`device is busy` due to Docker bind mounts) or, with `umount -l`, leaves running containers with stale fd handles to deleted mount points — high risk of SQLite-WAL corruption for Hermes' state.db / kanban.db.
 - *External (`--disk-only`) snapshots*: work with virtiofs but **aren't revertible** via `snapshot-revert`. The earlier toolkit version used them and silently broke restore.
 
-The ~30s downtime is the right trade-off: same lifecycle as a normal `agents vm stop`, no container-state risk.
+The ~30s downtime is the right trade-off: same lifecycle as a normal `agx vm stop`, no container-state risk.
 
 ### Migration between backends
 
 Not automated. If you want to switch backends on an existing deployment:
 
-1. `agents export --all` to capture every agent's data dir into `<data-dir>/backups/`.
-2. `agents vm destroy --yes`.
-3. `agents vm init --backend <new-backend> --data-dir <same-path>`.
-4. `agents import <name> <archive>` for each archived agent.
+1. `agx export --all` to capture every agent's data dir into `<data-dir>/backups/`.
+2. `agx vm destroy --yes`.
+3. `agx vm init --backend <new-backend> --data-dir <same-path>`.
+4. `agx import <name> <archive>` for each archived agent.
 
 The host data dir is backend-agnostic; only the VM provisioning changes.
 
@@ -1088,13 +1103,13 @@ inference) containers live only in the *old* VM's Docker engine; the
 compose blocks, project `.env`, postgres data, and per-agent wiring all
 survive in the data dir, but the containers themselves don't — wired
 agents' scrape calls fail connection-refused until you re-run
-`agents firecrawl up` (and `agents inference up …`) in the new VM.
-`agents doctor`'s `firecrawl_running` check flags exactly this state.
+`agx firecrawl up` (and `agx inference up …`) in the new VM.
+`agx doctor`'s `firecrawl_running` check flags exactly this state.
 `up` reuses the digests pinned in `.firecrawl-state.json`; if the
 state file was lost in the move, `up` reconstructs the pins from the
 `@sha256:…` digests still in the compose `firecrawl-*` service blocks
 rather than re-resolving upstream floating tags — a plain `up` never
-turns into an unintended upgrade. (`agents vm rebuild` automates all
+turns into an unintended upgrade. (`agx vm rebuild` automates all
 of this via its `sidecars_started` phase.)
 
 ### Known limitations
@@ -1102,16 +1117,16 @@ of this via its `sidecars_started` phase.)
 - **GPU attach not yet end-to-end validated.** XML emission verified via dry-run (matches libvirt's hostdev schema). Actual `virsh attach-device` + guest-driver visibility hasn't been exercised — needs a discrete GPU separable from the host display (typical workstation: integrated graphics for host, discrete card on vfio-pci).
 - **9p mount fallback is documented, not coded.** If `virtiofsd` is unavailable, edit the domain XML manually via `virsh edit <vm>` to use 9p instead of virtiofs.
 - **Internal snapshots accumulate inside the qcow2.** No automated pruning. Periodic `virsh snapshot-delete <vm> <name>` keeps the disk file lean on long-running hosts.
-- **`agents vm list` schema isn't as rich as `multipass list`** — both return `{"list": [{"name": ...}]}` but multipass also surfaces IPs, mounts, release info that the libvirt path doesn't (yet) emit.
+- **`agx vm list` schema isn't as rich as `multipass list`** — both return `{"list": [{"name": ...}]}` but multipass also surfaces IPs, mounts, release info that the libvirt path doesn't (yet) emit.
 - **Doctor checks don't probe libvirt-daemon health.** Check `systemctl status libvirtd` manually if a VM seems wedged.
 
 ## Tearing down
 
 ```bash
-agents export --all               # bag everything
-agents vm destroy                 # prompts to run `export --all` first unless --yes
-agents vm destroy --yes           # skip both the export offer and the destroy prompt
-agents vm destroy --export-first  # always export before destroying
+agx export --all               # bag everything
+agx vm destroy                 # prompts to run `export --all` first unless --yes
+agx vm destroy --yes           # skip both the export offer and the destroy prompt
+agx vm destroy --export-first  # always export before destroying
 ```
 
 `vm destroy` does not touch `<data-dir>` or `~/.codex`. To reset completely, manually `rm -rf <data-dir>` afterward (irreversible).
@@ -1127,8 +1142,8 @@ Bare-metal runs agent containers directly on the host with rootless Docker — n
 ### What you trade away
 
 - **The VM trust boundary.** A compromised agent that escapes a container is on your host, period. CLAUDE.md's defense-in-depth rationale leans on the VM to absorb skill-marketplace malware; bare-metal forfeits that. Only use bare-metal where the host is *already* trusted.
-- **Full-state rollback during upgrades.** `agents upgrade` still snapshots the host data-dir via tarball (so agent state can be reverted), but there's no VM snapshot of the rootless-Docker engine or OS state.
-- **Snapshots in general.** `agents vm snapshot` / `restore` refuse on bare-metal — use `agents export` for data archives, and host-level tools (duplicity, restic, btrfs/zfs) for full-host snapshots.
+- **Full-state rollback during upgrades.** `agx upgrade` still snapshots the host data-dir via tarball (so agent state can be reverted), but there's no VM snapshot of the rootless-Docker engine or OS state.
+- **Snapshots in general.** `agx vm snapshot` / `restore` refuse on bare-metal — use `agx export` for data archives, and host-level tools (duplicity, restic, btrfs/zfs) for full-host snapshots.
 
 ### Prerequisites
 
@@ -1159,7 +1174,7 @@ systemctl --user enable --now docker.service
 docker version
 ```
 
-If you already have a `daemon.json`, merge the `log-driver` / `log-opts` keys into it by hand. `agents vm init` warns when rotation is missing, and `agents doctor`'s `container_logs` check keeps warning — it also names containers created before rotation was set up (recreate them with `agents reseat <name>`). Without it, one chatty container fills your **host** root fs (the 2026-08 outage class, see CLAUDE.md).
+If you already have a `daemon.json`, merge the `log-driver` / `log-opts` keys into it by hand. `agx vm init` warns when rotation is missing, and `agx doctor`'s `container_logs` check keeps warning — it also names containers created before rotation was set up (recreate them with `agx reseat <name>`). Without it, one chatty container fills your **host** root fs (the 2026-08 outage class, see CLAUDE.md).
 
 If `/var/run/docker.sock` already exists (rootful Docker), the toolkit will refuse to run on top of it — uninstall rootful first or migrate via `dockerd-rootless-setuptool.sh install`. The toolkit's security model assumes the rootless user namespace; running on rootful would put compromised containers' processes as effective root on the host.
 
@@ -1167,10 +1182,10 @@ If `/var/run/docker.sock` already exists (rootful Docker), the toolkit will refu
 
 ```bash
 # Bare-metal defaults the data-dir to ~/.local/share/agents
-agents vm init --backend bare_metal
+agx vm init --backend bare_metal
 
 # Or pick your own path
-agents vm init --backend bare_metal --data-dir /data/agents
+agx vm init --backend bare_metal --data-dir /data/agents
 
 # init re-runs are safe — the verify loop is idempotent
 ```
@@ -1178,7 +1193,7 @@ agents vm init --backend bare_metal --data-dir /data/agents
 The init step does not provision a VM. It:
 
 1. Probes every rootless-Docker prerequisite, surfaces the exact missing-package commands if any fail
-2. Captures `[vm_runtime]` (socket path, host uid/gid) into `~/.config/agents/config.toml`
+2. Captures `[vm_runtime]` (socket path, host uid/gid) into `~/.config/agx/config.toml`
 3. Pins Hermes / OpenClaw image tags from GitHub releases
 4. Seeds the data-dir with `docker-compose.yml` + `.env`
 
@@ -1188,18 +1203,18 @@ Output ends with a `bare_metal runtime ready (no VM)` line plus the standard tru
 
 | Command | Bare-metal behavior |
 |---|---|
-| `agents vm start` / `vm stop` | No-op (informational message). The host is always 'on'; stop individual agents via `agents stop <name>`. |
-| `agents vm shell` | Spawns a subshell with `CWD=<data-dir>` and `DOCKER_HOST=unix://<rootless socket>` already exported — `docker compose ...` and `agents exec ...` work immediately. |
-| `agents vm status` | Reports the host kernel and a synthesized "Running" state (consistent with VM-mode output for scripting). |
-| `agents vm snapshot` / `restore` | Refuse. Use `agents export` archives + a host snapshot tool. |
-| `agents vm resize` / `rebuild` | Refuse — host sizing is real hardware. |
-| `agents vm destroy` | Stops and removes all toolkit-managed containers (`docker compose down --remove-orphans`). Host data-dir is preserved; `rm -rf <data-dir>` manually for a complete reset. |
-| `agents create/start/stop/restart/logs/exec/setup/doctor/upgrade/rollback` | Work transparently — every host↔runtime call goes through the same backend dispatcher. Every `docker` call is pinned to the rootless socket recorded at init (`DOCKER_HOST` is forced; your shell's `DOCKER_HOST` / docker context is ignored), so cron jobs and shells pointing at another daemon can't redirect the toolkit. |
-| `agents upgrade` | Rollback point is the data-dir tarball only (no VM snapshot). |
-| `agents mount add/remove` | Binds the host folder directly; ACLs as on the VM backends. |
-| `agents access mount` | Works (agent files are subuid-owned on the host too). |
-| `agents tailscale ...` | Refuses — the toolkit never mutates the host OS. Install Tailscale on the host yourself. |
-| `agents vm migrate-data` | Refuses — the data dir is already on the host fs. |
+| `agx vm start` / `vm stop` | No-op (informational message). The host is always 'on'; stop individual agents via `agx stop <name>`. |
+| `agx vm shell` | Spawns a subshell with `CWD=<data-dir>` and `DOCKER_HOST=unix://<rootless socket>` already exported — `docker compose ...` and `agx exec ...` work immediately. |
+| `agx vm status` | Reports the host kernel and a synthesized "Running" state (consistent with VM-mode output for scripting). |
+| `agx vm snapshot` / `restore` | Refuse. Use `agx export` archives + a host snapshot tool. |
+| `agx vm resize` / `rebuild` | Refuse — host sizing is real hardware. |
+| `agx vm destroy` | Stops and removes all toolkit-managed containers (`docker compose down --remove-orphans`). Host data-dir is preserved; `rm -rf <data-dir>` manually for a complete reset. |
+| `agx create/start/stop/restart/logs/exec/setup/doctor/upgrade/rollback` | Work transparently — every host↔runtime call goes through the same backend dispatcher. Every `docker` call is pinned to the rootless socket recorded at init (`DOCKER_HOST` is forced; your shell's `DOCKER_HOST` / docker context is ignored), so cron jobs and shells pointing at another daemon can't redirect the toolkit. |
+| `agx upgrade` | Rollback point is the data-dir tarball only (no VM snapshot). |
+| `agx mount add/remove` | Binds the host folder directly; ACLs as on the VM backends. |
+| `agx access mount` | Works (agent files are subuid-owned on the host too). |
+| `agx tailscale ...` | Refuses — the toolkit never mutates the host OS. Install Tailscale on the host yourself. |
+| `agx vm migrate-data` | Refuses — the data dir is already on the host fs. |
 
 ### Host reboot recovery
 
@@ -1214,17 +1229,17 @@ systemctl --user status docker.service            # should be active
 
 ### Local inference on bare-metal
 
-`agents inference up ollama` works the same on bare-metal — Ollama runs as a sibling Docker service. The win is GPU access: Ollama in a bare-metal container can use `--device /dev/kfd --device /dev/dri/renderD128` (ROCm/AMD) or `--gpus all` (NVIDIA Container Toolkit) to talk to the host GPU directly, while the host's X session keeps sharing the same GPU. No vfio-pci, no libvirt vGPU. The toolkit's `inference up` doesn't yet auto-wire those flags — add them via `docker-compose.override.yml` for now (tracked as a Phase 2 follow-up to issue #5).
+`agx inference up ollama` works the same on bare-metal — Ollama runs as a sibling Docker service. The win is GPU access: Ollama in a bare-metal container can use `--device /dev/kfd --device /dev/dri/renderD128` (ROCm/AMD) or `--gpus all` (NVIDIA Container Toolkit) to talk to the host GPU directly, while the host's X session keeps sharing the same GPU. No vfio-pci, no libvirt vGPU. The toolkit's `inference up` doesn't yet auto-wire those flags — add them via `docker-compose.override.yml` for now (tracked as a Phase 2 follow-up to issue #5).
 
 ### Running a VM deployment and bare-metal side by side
 
-Not as one user. The toolkit reads exactly one config (`~/.config/agents/config.toml`, one `vm.backend`), and the `export-cron` / `doctor-cron` entries are per-user singletons in that user's crontab — a second install would replace the first.
+Not as one user. The toolkit reads exactly one config (`~/.config/agx/config.toml`, one `vm.backend`), and the `export-cron` / `doctor-cron` entries are per-user singletons in that user's crontab — a second install would replace the first.
 
 Two Linux users on the same host can each run one deployment, because everything the toolkit owns is per-user: config, data dir, crontab, host view dir, and the rootless Docker daemon (each user has its own socket under `/run/user/<uid>/` and its own subuid range). Things to watch, none of which the toolkit coordinates across users:
 
 - **Loopback ports.** Bare-metal agents publish dashboard/API ports on the host's `127.0.0.1`; the port allocator only knows its own compose file. Keep tunnels/forwards from the VM deployment off those ports.
-- **Disk and RAM.** The VM's disk image, the bare-metal Docker image cache, and both sets of containers share the host. `agents doctor` in each deployment only sees its own share.
-- **multipass VM name.** Only relevant if both users run a VM backend: `vm.name` (default `agents`) must differ.
+- **Disk and RAM.** The VM's disk image, the bare-metal Docker image cache, and both sets of containers share the host. `agx doctor` in each deployment only sees its own share.
+- **multipass VM name.** Only relevant if both users run a VM backend: `vm.name` (default `agx`) must differ.
 
 This layout is not covered by the test suite.
 
@@ -1232,10 +1247,10 @@ This layout is not covered by the test suite.
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `agents vm init` errors with `bootstrap failed: docker_host=fail` | Rootless Docker setup didn't finish (often a transient network issue mid-install) | Re-run `agents vm init` — it's idempotent. |
-| `agents create` fails with `operation not supported` on container start | The host data-dir mount is a `classic` (fuse.sshfs) multipass mount; rootless Docker can't bind-mount from sshfs. Pre-v0.1.2 VMs are affected. | Stop the VM, drop the classic mount, let `agents vm start` re-create it as native: `agents vm stop && multipass umount agents:/home/ubuntu/agents && agents vm start`. |
-| `agents doctor` reports `user_docker_service=fail` | systemd-user died (lingering disabled, OOM, …) | `agents vm shell` then `loginctl enable-linger ubuntu && systemctl --user start docker.service`. |
-| `agents doctor` reports `<agent>.docker_socket=fail` | Hermes container can't reach the rootless socket | Container UID drift. Stop the agent, `cat <data-dir>/.env` to confirm `HERMES_UID/GID` match the VM's `ubuntu` user, recreate. |
-| `agents codex skill-enable` fails on `docker build` | Network from VM blocked, base image missing, or `nodejs`/`npm` apt repo blocked | Run `agents doctor`; check `agents vm shell` then `docker info`. The Dockerfile lives at `<data-dir>/.codex-sandbox-*.Dockerfile` if you want to inspect it. |
-| `agents create` refuses with "data directory already exists" | Previous run was interrupted, dir is on disk | `agents create coder --type hermes --reuse-data` if you intend to attach, or `rm -rf <data-dir>/coder` then re-create. |
-| Mount on host has files owned by root or unknown UID | host UID/GID mapping wrong | `agents vm stop && agents vm start` — the start step verifies and remounts with `-u`/`-g` derived from the current host user. |
+| `agx vm init` errors with `bootstrap failed: docker_host=fail` | Rootless Docker setup didn't finish (often a transient network issue mid-install) | Re-run `agx vm init` — it's idempotent. |
+| `agx create` fails with `operation not supported` on container start | The host data-dir mount is a `classic` (fuse.sshfs) multipass mount; rootless Docker can't bind-mount from sshfs. Pre-v0.1.2 VMs are affected. | Stop the VM, drop the classic mount, let `agx vm start` re-create it as native: `agx vm stop && multipass umount agents:/home/ubuntu/agents && agx vm start`. |
+| `agx doctor` reports `user_docker_service=fail` | systemd-user died (lingering disabled, OOM, …) | `agx vm shell` then `loginctl enable-linger ubuntu && systemctl --user start docker.service`. |
+| `agx doctor` reports `<agent>.docker_socket=fail` | Hermes container can't reach the rootless socket | Container UID drift. Stop the agent, `cat <data-dir>/.env` to confirm `HERMES_UID/GID` match the VM's `ubuntu` user, recreate. |
+| `agx codex skill-enable` fails on `docker build` | Network from VM blocked, base image missing, or `nodejs`/`npm` apt repo blocked | Run `agx doctor`; check `agx vm shell` then `docker info`. The Dockerfile lives at `<data-dir>/.codex-sandbox-*.Dockerfile` if you want to inspect it. |
+| `agx create` refuses with "data directory already exists" | Previous run was interrupted, dir is on disk | `agx create coder --type hermes --reuse-data` if you intend to attach, or `rm -rf <data-dir>/coder` then re-create. |
+| Mount on host has files owned by root or unknown UID | host UID/GID mapping wrong | `agx vm stop && agx vm start` — the start step verifies and remounts with `-u`/`-g` derived from the current host user. |

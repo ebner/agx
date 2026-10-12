@@ -17,11 +17,11 @@ from typing import Any
 import pytest
 from click.testing import CliRunner, Result
 
-from agents_cli import cli as cli_mod
-from agents_cli import ui
-from agents_cli import vm as vm_mod
-from agents_cli.config import AgentsConfig, HostConfig, PathsConfig, VmRuntimeConfig
-from agents_cli.mp import MpResult
+from agx_cli import cli as cli_mod
+from agx_cli import ui
+from agx_cli import vm as vm_mod
+from agx_cli.config import AgentsConfig, HostConfig, PathsConfig, VmRuntimeConfig
+from agx_cli.mp import MpResult
 
 
 def _make_cfg(tmp_path: Path) -> AgentsConfig:
@@ -46,7 +46,7 @@ def invoke(
     input: str | None = None,
 ) -> Result:
     """Invoke the real command tree with the root callback's config load
-    neutralized, so tests never read (or write) ``~/.config/agents/``.
+    neutralized, so tests never read (or write) ``~/.config/agx/``.
 
     Pass ``cfg`` when the command under test loads config itself; the
     default raises like a first-run machine with no config, which the
@@ -54,11 +54,11 @@ def invoke(
     """
     if cfg is None:
         mocker.patch(
-            "agents_cli.config.load",
+            "agx_cli.config.load",
             side_effect=FileNotFoundError("no config in tests"),
         )
     else:
-        mocker.patch("agents_cli.config.load", return_value=cfg)
+        mocker.patch("agx_cli.config.load", return_value=cfg)
     return CliRunner().invoke(cli_mod.main, args, input=input)
 
 
@@ -143,7 +143,7 @@ def test_version_exits_0(mocker: Any) -> None:
 
 
 def test_keyboard_interrupt_in_command_exits_130(mocker: Any) -> None:
-    mocker.patch("agents_cli.ops.doctor", side_effect=KeyboardInterrupt)
+    mocker.patch("agx_cli.ops.doctor", side_effect=KeyboardInterrupt)
     result = invoke(mocker, ["doctor"])
     assert result.exit_code == 130
 
@@ -152,7 +152,7 @@ def test_prompt_eof_inside_run_body_exits_130_as_interrupt(mocker: Any) -> None:
     """Ctrl-C/EOF at a prompt inside a _run-wrapped body surfaces as
     click.Abort (click converts it before the prompt call returns) —
     that's an interruption (130), not an unexpected runtime failure (2)."""
-    set_secret = mocker.patch("agents_cli.secrets_cmd.set_secret")
+    set_secret = mocker.patch("agx_cli.secrets_cmd.set_secret")
     # Empty stdin -> the hidden prompt hits EOF -> click.Abort.
     result = invoke(mocker, ["secret", "set", "coder", "API_KEY"], input="")
     assert result.exit_code == 130
@@ -163,9 +163,9 @@ def test_prompt_eof_inside_run_body_exits_130_as_interrupt(mocker: Any) -> None:
 def test_cli_error_exit_codes_pass_through(mocker: Any) -> None:
     """CliError semantics are untouched by the non-standalone switch:
     a HealthCheckFailure still maps to its declared exit code 3."""
-    from agents_cli.errors import HealthCheckFailure
+    from agx_cli.errors import HealthCheckFailure
 
-    mocker.patch("agents_cli.ops.doctor", side_effect=HealthCheckFailure("2 checks failed"))
+    mocker.patch("agx_cli.ops.doctor", side_effect=HealthCheckFailure("2 checks failed"))
     result = invoke(mocker, ["doctor"])
     assert result.exit_code == 3
 
@@ -174,7 +174,7 @@ def test_cli_error_exit_codes_pass_through(mocker: Any) -> None:
 
 
 def test_secret_set_json_without_value_errors_instead_of_prompting(mocker: Any) -> None:
-    set_secret = mocker.patch("agents_cli.secrets_cmd.set_secret")
+    set_secret = mocker.patch("agx_cli.secrets_cmd.set_secret")
     # input="" means an accidental prompt would hit EOF instead of
     # hanging — belt and suspenders for the regression this test pins.
     result = invoke(mocker, ["--json", "secret", "set", "coder", "API_KEY"], input="")
@@ -185,14 +185,14 @@ def test_secret_set_json_without_value_errors_instead_of_prompting(mocker: Any) 
 
 
 def test_secret_set_with_value_argument_works_under_json(mocker: Any) -> None:
-    set_secret = mocker.patch("agents_cli.secrets_cmd.set_secret")
+    set_secret = mocker.patch("agx_cli.secrets_cmd.set_secret")
     result = invoke(mocker, ["--json", "secret", "set", "coder", "API_KEY", "sk-x"])
     assert result.exit_code == 0
     set_secret.assert_called_once_with("coder", "API_KEY", "sk-x", profile=None)
 
 
 def test_secret_set_human_mode_prompts_hidden_when_value_omitted(mocker: Any) -> None:
-    set_secret = mocker.patch("agents_cli.secrets_cmd.set_secret")
+    set_secret = mocker.patch("agx_cli.secrets_cmd.set_secret")
     result = invoke(mocker, ["secret", "set", "coder", "API_KEY"], input="sk-typed\n")
     assert result.exit_code == 0
     set_secret.assert_called_once_with("coder", "API_KEY", "sk-typed", profile=None)
@@ -213,9 +213,9 @@ def test_remove_export_first_emits_exactly_one_json_object(mocker: Any) -> None:
             ui.emit({"name": name, "archive": "/backups/x.tar.zst"})
         return Path("/backups/x.tar.zst")
 
-    export = mocker.patch("agents_cli.export_cmd.export", side_effect=fake_export)
+    export = mocker.patch("agx_cli.export_cmd.export", side_effect=fake_export)
     mocker.patch(
-        "agents_cli.agents_cmd.remove",
+        "agx_cli.agents_cmd.remove",
         side_effect=lambda name, **kw: ui.emit({"removed": name}),
     )
 
@@ -246,16 +246,16 @@ def _ok(stdout: str = "") -> MpResult:
 def _stub_init_mp(mocker: Any) -> None:
     """Stub every mp primitive vm.init touches (mirrors test_vm's stub)."""
     catalog = json.dumps({"images": {"x": {"aliases": ["24.04"]}}})
-    mocker.patch("agents_cli.mp.find", return_value=_ok(catalog))
-    mocker.patch("agents_cli.mp.list_vms", return_value=_ok(json.dumps({"list": []})))
-    mocker.patch("agents_cli.mp.launch", return_value=_ok())
+    mocker.patch("agx_cli.mp.find", return_value=_ok(catalog))
+    mocker.patch("agx_cli.mp.list_vms", return_value=_ok(json.dumps({"list": []})))
+    mocker.patch("agx_cli.mp.launch", return_value=_ok())
     mocker.patch(
-        "agents_cli.mp.info_vm",
+        "agx_cli.mp.info_vm",
         return_value=_ok(json.dumps({"info": {"agents": {"mounts": {}}}})),
     )
-    mocker.patch("agents_cli.mp.mount", return_value=_ok())
-    mocker.patch("agents_cli.mp.exec_bash", return_value=_ok(stdout=_GOOD_BOOTSTRAP))
-    mocker.patch("agents_cli.vm._fetch_latest_tag", return_value=None)
+    mocker.patch("agx_cli.mp.mount", return_value=_ok())
+    mocker.patch("agx_cli.mp.exec_bash", return_value=_ok(stdout=_GOOD_BOOTSTRAP))
+    mocker.patch("agx_cli.vm._fetch_latest_tag", return_value=None)
 
 
 def test_vm_init_emits_exactly_one_json_object(mocker: Any, tmp_path: Path) -> None:
@@ -264,12 +264,12 @@ def test_vm_init_emits_exactly_one_json_object(mocker: Any, tmp_path: Path) -> N
     payload."""
     _stub_init_mp(mocker)
     # Re-target the real init at a throwaway config so the test never
-    # touches ~/.config/agents/config.toml (the CLI command can't take
+    # touches ~/.config/agx/config.toml (the CLI command can't take
     # a config path).
     real_init = vm_mod.init
     config_path = tmp_path / "config.toml"
     mocker.patch(
-        "agents_cli.vm.init",
+        "agx_cli.vm.init",
         side_effect=lambda **kw: real_init(**{**kw, "config_path": config_path}),
     )
 
@@ -289,7 +289,7 @@ def test_vm_init_emits_exactly_one_json_object(mocker: Any, tmp_path: Path) -> N
 
 def test_ollama_clear_json_without_yes_refuses(mocker: Any, tmp_path: Path) -> None:
     cfg = _make_cfg(tmp_path)
-    save = mocker.patch("agents_cli.config.save")
+    save = mocker.patch("agx_cli.config.save")
 
     result = invoke(mocker, ["--json", "ollama", "clear"], cfg=cfg)
 
@@ -301,7 +301,7 @@ def test_ollama_clear_json_without_yes_refuses(mocker: Any, tmp_path: Path) -> N
 
 def test_ollama_clear_with_yes_proceeds(mocker: Any, tmp_path: Path) -> None:
     cfg = _make_cfg(tmp_path)
-    save = mocker.patch("agents_cli.config.save")
+    save = mocker.patch("agx_cli.config.save")
 
     result = invoke(mocker, ["--json", "ollama", "clear", "--yes"], cfg=cfg)
 
@@ -319,7 +319,7 @@ def test_vm_migrate_data_is_wired_under_vm_group_and_emits_one_object(mocker: An
     keyword the backend expects, and stdout carries exactly one JSON
     object (the backend's own emit)."""
     migrate = mocker.patch(
-        "agents_cli.migrate_cmd.migrate_data",
+        "agx_cli.migrate_cmd.migrate_data",
         side_effect=lambda **kw: ui.emit({"migrated": True}),
     )
 
@@ -332,14 +332,14 @@ def test_vm_migrate_data_is_wired_under_vm_group_and_emits_one_object(mocker: An
 
 
 def test_vm_migrate_data_local_yes_flag_parses(mocker: Any) -> None:
-    migrate = mocker.patch("agents_cli.migrate_cmd.migrate_data")
+    migrate = mocker.patch("agx_cli.migrate_cmd.migrate_data")
     result = invoke(mocker, ["vm", "migrate-data", "-y"])
     assert result.exit_code == 0, result.output
     assert migrate.call_args.kwargs["yes"] is True
 
 
 def test_vm_migrate_data_without_yes_passes_yes_false(mocker: Any) -> None:
-    migrate = mocker.patch("agents_cli.migrate_cmd.migrate_data")
+    migrate = mocker.patch("agx_cli.migrate_cmd.migrate_data")
     result = invoke(mocker, ["vm", "migrate-data"])
     assert result.exit_code == 0, result.output
     assert migrate.call_args.kwargs["yes"] is False
@@ -352,8 +352,8 @@ def test_vm_migrate_data_json_emits_one_object_with_doctor_summary(
     with emit=False (its table render would be a second top-level JSON
     document on stdout), and its per-check summary rides inside the
     single migration object instead."""
-    from agents_cli import config as cfg_mod
-    from agents_cli import migrate_cmd
+    from agx_cli import config as cfg_mod
+    from agx_cli import migrate_cmd
     from tests.unit.test_migrate_cmd import _make_cfg, _stub_happy_migration
 
     cfg = _make_cfg(tmp_path)
@@ -365,7 +365,7 @@ def test_vm_migrate_data_json_emits_one_object_with_doctor_summary(
     # never touches ~/.config/agents/ (same trick as the vm-init test).
     real = migrate_cmd.migrate_data
     mocker.patch(
-        "agents_cli.migrate_cmd.migrate_data",
+        "agx_cli.migrate_cmd.migrate_data",
         side_effect=lambda **kw: real(**{**kw, "config_path": config_path}),
     )
 
@@ -383,10 +383,10 @@ def test_vm_migrate_data_json_emits_one_object_with_doctor_summary(
 def test_vm_migrate_data_maps_cli_error_exit_codes(mocker: Any) -> None:
     """UserError → 1 and HealthCheckFailure → 3 pass through _run
     untouched (the doctor-gate failure mode of the migration)."""
-    from agents_cli.errors import HealthCheckFailure, UserError
+    from agx_cli.errors import HealthCheckFailure, UserError
 
     mocker.patch(
-        "agents_cli.migrate_cmd.migrate_data",
+        "agx_cli.migrate_cmd.migrate_data",
         side_effect=UserError("data_dir_in_vm is already enabled"),
     )
     result = invoke(mocker, ["--json", "vm", "migrate-data", "--yes"])
@@ -394,7 +394,7 @@ def test_vm_migrate_data_maps_cli_error_exit_codes(mocker: Any) -> None:
     assert "already enabled" in single_json_object(result)["error"]
 
     mocker.patch(
-        "agents_cli.migrate_cmd.migrate_data",
+        "agx_cli.migrate_cmd.migrate_data",
         side_effect=HealthCheckFailure("doctor found 2 failures"),
     )
     result = invoke(mocker, ["vm", "migrate-data", "--yes"])
@@ -405,7 +405,7 @@ def test_vm_migrate_data_maps_cli_error_exit_codes(mocker: Any) -> None:
 
 
 def test_mount_add_rw_json_without_yes_refuses_cleanly(mocker: Any, tmp_path: Path) -> None:
-    add = mocker.patch("agents_cli.mounts_cmd.add")
+    add = mocker.patch("agx_cli.mounts_cmd.add")
 
     result = invoke(
         mocker,
@@ -431,7 +431,7 @@ def test_mount_add_rw_json_without_yes_refuses_cleanly(mocker: Any, tmp_path: Pa
 def test_mount_add_rw_declined_exits_1_as_user_error(mocker: Any, tmp_path: Path) -> None:
     """Declining the --rw prompt is a user decision → UserError exit 1
     (previously click.Abort)."""
-    add = mocker.patch("agents_cli.mounts_cmd.add")
+    add = mocker.patch("agx_cli.mounts_cmd.add")
 
     result = invoke(
         mocker,

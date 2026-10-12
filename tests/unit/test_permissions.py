@@ -8,9 +8,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from agents_cli import permissions
-from agents_cli.errors import RuntimeFailure, UserError
-from agents_cli.permissions import AclRecipient
+from agx_cli import permissions
+from agx_cli.errors import RuntimeFailure, UserError
+from agx_cli.permissions import AclRecipient
 
 
 @pytest.fixture(autouse=True)
@@ -214,7 +214,7 @@ def test_run_owned_executes_each_argv_and_raises_on_nonzero(mocker: Any) -> None
 
 def test_run_with_sudo_skips_confirmation_with_yes_true(mocker: Any) -> None:
     mocker.patch("shutil.which", return_value="/usr/bin/sudo")
-    confirm = mocker.patch("agents_cli.ui.confirm")
+    confirm = mocker.patch("agx_cli.ui.confirm")
     run = mocker.patch("subprocess.run", return_value=MagicMock(returncode=0))
     permissions.run_with_sudo([["setfacl", "-m", "u:1000:rwX", "/x"]], yes=True)
     confirm.assert_not_called()
@@ -223,7 +223,7 @@ def test_run_with_sudo_skips_confirmation_with_yes_true(mocker: Any) -> None:
 
 def test_run_with_sudo_aborts_on_negative_confirmation(mocker: Any) -> None:
     mocker.patch("shutil.which", return_value="/usr/bin/sudo")
-    mocker.patch("agents_cli.ui.confirm", return_value=False)
+    mocker.patch("agx_cli.ui.confirm", return_value=False)
     run = mocker.patch("subprocess.run")
     with pytest.raises(UserError, match="aborted by user"):
         permissions.run_with_sudo([["setfacl", "-m", "u:1000:rwX", "/x"]], yes=False)
@@ -247,7 +247,7 @@ def test_run_with_sudo_empty_argvs_is_noop(mocker: Any) -> None:
 
 def test_has_user_acl_recognizes_access_and_default_entries(mocker: Any, tmp_path: Path) -> None:
     mocker.patch(
-        "agents_cli.permissions.getfacl",
+        "agx_cli.permissions.getfacl",
         return_value=(
             "user::rwx\nuser:1000:rwx\ngroup::r-x\nmask::rwx\nother::r-x\n"
             "default:user::rwx\ndefault:user:1000:rwx\n"
@@ -310,7 +310,7 @@ def test_host_user_recipient_ro_vs_rw() -> None:
 
 
 def test_container_recipient_uses_subuid_mapping(mocker: Any) -> None:
-    mocker.patch("agents_cli.permissions.compute_container_subuid", return_value=100999)
+    mocker.patch("agx_cli.permissions.compute_container_subuid", return_value=100999)
     r = permissions.container_recipient(1000, writable=True)
     assert r.to_spec() == "u:100999:rwX"
 
@@ -332,7 +332,7 @@ def test_run_with_sudo_prints_each_argv_via_progress_before_confirm(mocker: Any)
         progress_count_at_confirm.append(progress_spy.call_count)
         return True
 
-    mocker.patch("agents_cli.ui.confirm", side_effect=fake_confirm)
+    mocker.patch("agx_cli.ui.confirm", side_effect=fake_confirm)
 
     argvs = [
         ["setfacl", "-R", "-m", "u:1000:rX,m::rwx", "/data/coder/.data"],

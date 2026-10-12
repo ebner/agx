@@ -7,18 +7,18 @@ from typing import Any
 
 import pytest
 
-from agents_cli import agents_cmd, compose
-from agents_cli import config as cfg_mod
-from agents_cli.agents_cmd import create
-from agents_cli.config import (
+from agx_cli import agents_cmd, compose
+from agx_cli import config as cfg_mod
+from agx_cli.agents_cmd import create
+from agx_cli.config import (
     AgentsConfig,
     DefaultsConfig,
     HostConfig,
     PathsConfig,
     VmRuntimeConfig,
 )
-from agents_cli.errors import UserError
-from agents_cli.mp import MpResult
+from agx_cli.errors import UserError
+from agx_cli.mp import MpResult
 
 
 def _ok(stdout: str = "") -> MpResult:
@@ -79,7 +79,7 @@ def with_coder_stale_fragment(
     compose env block to simulate "agent created before those vars were
     added to the toolkit fragment".
     """
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     create(name="coder", agent_type="hermes", config_path=saved_config)
 
     doc = compose.read_compose_doc(cfg)
@@ -104,9 +104,9 @@ def test_reseat_restores_hermes_uid_in_env(
     reseat regenerates the block from the current fragment which DOES
     include HERMES_UID, and the env var reappears.
     """
-    mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_stub_in_vm(vm_fs_mocks, "1000"))
+    mocker.patch("agx_cli.compose_runner.stop", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=_stub_in_vm(vm_fs_mocks, "1000"))
 
     # Pre-condition: stale entry has no HERMES_UID
     doc = compose.read_compose_doc(cfg)
@@ -130,9 +130,9 @@ def test_reseat_preserves_port(
     """Reseat must NOT silently change the port allocation. The host port
     from the existing service block is carried through to the new one.
     """
-    mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_stub_in_vm(vm_fs_mocks, "1000"))
+    mocker.patch("agx_cli.compose_runner.stop", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=_stub_in_vm(vm_fs_mocks, "1000"))
 
     pre_doc = compose.read_compose_doc(cfg)
     pre_ports = pre_doc["services"]["hermes-coder"]["ports"]
@@ -153,9 +153,9 @@ def test_reseat_preserves_image_tag(
     """User may have pinned a specific tag on this agent; reseat must
     keep it.
     """
-    mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_stub_in_vm(vm_fs_mocks, "1000"))
+    mocker.patch("agx_cli.compose_runner.stop", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=_stub_in_vm(vm_fs_mocks, "1000"))
 
     doc = compose.read_compose_doc(cfg)
     doc["services"]["hermes-coder"]["image"] = "nousresearch/hermes-agent:v9.9.9"
@@ -176,9 +176,9 @@ def test_reseat_preserves_env_file(
     """The secrets command writes ``env_file: ./<name>/.env`` into the
     service entry. Reseat must not drop that — would break every secret.
     """
-    mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_stub_in_vm(vm_fs_mocks, "1000"))
+    mocker.patch("agx_cli.compose_runner.stop", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=_stub_in_vm(vm_fs_mocks, "1000"))
 
     # The new fragment already includes env_file. Set it to a non-default
     # value to be sure reseat preserves user-modified env_file (e.g. multi-file).
@@ -202,9 +202,9 @@ def test_reseat_preserves_depends_on(
     vm_fs_mocks: dict[str, Any],
 ) -> None:
     """OpenViking sibling adds a depends_on entry; reseat must preserve it."""
-    mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_stub_in_vm(vm_fs_mocks, "1000"))
+    mocker.patch("agx_cli.compose_runner.stop", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=_stub_in_vm(vm_fs_mocks, "1000"))
 
     doc = compose.read_compose_doc(cfg)
     doc["services"]["hermes-coder"]["depends_on"] = ["openviking-coder"]
@@ -226,11 +226,9 @@ def test_reseat_force_recreates(
     take effect — which requires a force-recreate (stop + docker rm + up),
     not just `compose up -d`.
     """
-    stop_spy = mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())
-    up_spy = mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
-    in_vm_spy = mocker.patch(
-        "agents_cli.mp.exec_in_vm", side_effect=_stub_in_vm(vm_fs_mocks, "1000")
-    )
+    stop_spy = mocker.patch("agx_cli.compose_runner.stop", return_value=_ok())
+    up_spy = mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
+    in_vm_spy = mocker.patch("agx_cli.mp.exec_in_vm", side_effect=_stub_in_vm(vm_fs_mocks, "1000"))
 
     agents_cmd.reseat("coder", yes=True, config_path=with_coder_stale_fragment)
 
@@ -255,11 +253,9 @@ def test_reseat_runs_chown_chmod_for_hermes(
     files, but stale files from before the fragment change are still at
     the old uid.
     """
-    mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
-    in_vm_spy = mocker.patch(
-        "agents_cli.mp.exec_in_vm", side_effect=_stub_in_vm(vm_fs_mocks, "10000")
-    )
+    mocker.patch("agx_cli.compose_runner.stop", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
+    in_vm_spy = mocker.patch("agx_cli.mp.exec_in_vm", side_effect=_stub_in_vm(vm_fs_mocks, "10000"))
 
     agents_cmd.reseat("coder", yes=True, config_path=with_coder_stale_fragment)
 
@@ -278,7 +274,7 @@ def test_reseat_runs_chown_chmod_for_hermes(
 def with_personal_openclaw(
     cfg: AgentsConfig, saved_config: Path, mocker: Any, vm_fs_mocks: dict[str, Any]
 ) -> Path:
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     create(name="personal", agent_type="openclaw", config_path=saved_config)
     return saved_config
 
@@ -313,8 +309,8 @@ def test_reseat_openclaw_preserves_customizations_and_gains_new_keys(
     pinned tag, extra env_file, depends_on addition, extra volume)
     survives, and stock entries are not duplicated.
     """
-    mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.stop", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
 
     agents_cmd.reseat("personal", yes=True, config_path=with_personal_stale_customized)
 
@@ -346,8 +342,8 @@ def test_reseat_openclaw_stock_is_clean_template_rewrite(
     """An uncustomized OpenClaw agent reseats to exactly what the current
     template would produce — no leftovers, no additions.
     """
-    mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.stop", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
 
     pre = compose.read_compose_doc(cfg)
     port = agents_cmd._extract_host_port(pre["services"]["openclaw-personal"])
@@ -366,9 +362,9 @@ def test_reseat_openclaw_skips_chown_chmod(
     """OpenClaw reseat regenerates compose + force-recreates, but doesn't
     chown /opt/data (that's a Hermes-specific path).
     """
-    mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
-    in_vm_spy = mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.stop", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
+    in_vm_spy = mocker.patch("agx_cli.mp.exec_in_vm", return_value=_ok())
 
     agents_cmd.reseat("personal", yes=True, config_path=with_personal_openclaw)
 
@@ -382,8 +378,8 @@ def test_reseat_openclaw_skips_cont_init_hook(
     """The s6 cont-init perms hook is Hermes-only: OpenClaw reseat must
     neither materialize the script nor mount it into the container.
     """
-    mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.stop", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     cont_init_spy = mocker.spy(compose, "ensure_cont_init_script")
 
     agents_cmd.reseat("personal", yes=True, config_path=with_personal_openclaw)
@@ -400,7 +396,7 @@ def test_reseat_openclaw_aborts_without_yes(
     """Same confirmation semantics as the Hermes path: no --yes and a
     declined prompt means no compose mutation and no recreate.
     """
-    mocker.patch("agents_cli.ui.confirm", return_value=False)
+    mocker.patch("agx_cli.ui.confirm", return_value=False)
     pre = compose.read_compose_doc(cfg)["services"]["openclaw-personal"]
 
     with pytest.raises(UserError, match="aborted by user"):
@@ -413,9 +409,9 @@ def test_reseat_openclaw_aborts_without_yes(
 def test_reseat_openclaw_yes_skips_confirmation(
     with_personal_openclaw: Path, cfg: AgentsConfig, mocker: Any
 ) -> None:
-    mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
-    confirm_spy = mocker.patch("agents_cli.ui.confirm", return_value=False)
+    mocker.patch("agx_cli.compose_runner.stop", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
+    confirm_spy = mocker.patch("agx_cli.ui.confirm", return_value=False)
 
     agents_cmd.reseat("personal", yes=True, config_path=with_personal_openclaw)
 
@@ -435,10 +431,10 @@ def test_reseat_refuses_without_yes(
     mocker: Any,
     vm_fs_mocks: dict[str, Any],
 ) -> None:
-    mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_stub_in_vm(vm_fs_mocks, "1000"))
-    mocker.patch("agents_cli.ui.confirm", return_value=False)
+    mocker.patch("agx_cli.compose_runner.stop", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=_stub_in_vm(vm_fs_mocks, "1000"))
+    mocker.patch("agx_cli.ui.confirm", return_value=False)
 
     with pytest.raises(UserError, match="aborted by user"):
         agents_cmd.reseat("coder", yes=False, config_path=with_coder_stale_fragment)
@@ -486,9 +482,9 @@ def test_reseat_preserves_extra_user_volume_hermes(
     """A hand-added volume in the main compose survives Hermes reseat too
     (same classifier as OpenClaw); stock volumes are not duplicated.
     """
-    mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_stub_in_vm(vm_fs_mocks, "1000"))
+    mocker.patch("agx_cli.compose_runner.stop", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=_stub_in_vm(vm_fs_mocks, "1000"))
 
     doc = compose.read_compose_doc(cfg)
     svc = doc["services"]["hermes-coder"]
@@ -520,9 +516,9 @@ def test_reseat_drops_retired_codex_import_bridge_but_keeps_user_volumes(
     host copy's single-use refresh chain) while still keeping genuine
     user volumes.
     """
-    mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_stub_in_vm(vm_fs_mocks, "1000"))
+    mocker.patch("agx_cli.compose_runner.stop", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=_stub_in_vm(vm_fs_mocks, "1000"))
 
     doc = compose.read_compose_doc(cfg)
     svc = doc["services"]["hermes-coder"]
@@ -612,9 +608,9 @@ def test_reseat_preserves_udp_twin_of_stock_port(
     TCP publication and a user UDP publication on the same host port
     keeps both after reseat, each exactly once.
     """
-    mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_stub_in_vm(vm_fs_mocks, "1000"))
+    mocker.patch("agx_cli.compose_runner.stop", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=_stub_in_vm(vm_fs_mocks, "1000"))
 
     doc = compose.read_compose_doc(cfg)
     svc = doc["services"]["hermes-coder"]

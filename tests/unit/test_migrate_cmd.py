@@ -14,12 +14,12 @@ from typing import Any
 
 import pytest
 
-from agents_cli import config as cfg_mod
-from agents_cli import migrate_cmd, ui
-from agents_cli.config import AgentsConfig, HostConfig, PathsConfig, VmRuntimeConfig
-from agents_cli.errors import HealthCheckFailure, RuntimeFailure, UserError
-from agents_cli.journal import Journal
-from agents_cli.mp import MpResult
+from agx_cli import config as cfg_mod
+from agx_cli import migrate_cmd, ui
+from agx_cli.config import AgentsConfig, HostConfig, PathsConfig, VmRuntimeConfig
+from agx_cli.errors import HealthCheckFailure, RuntimeFailure, UserError
+from agx_cli.journal import Journal
+from agx_cli.mp import MpResult
 
 VM_ROOT = "/home/ubuntu/agents"
 STAGING = f"{VM_ROOT}.migrating"
@@ -139,23 +139,23 @@ def _stub_happy_migration(
 
     def doctor(**kwargs: Any) -> Any:
         calls.append(("doctor", kwargs))
-        from agents_cli.ops import DoctorReport
+        from agx_cli.ops import DoctorReport
 
         report = DoctorReport()
         report.add("vm_reachable", "ok")
         report.add("disk_space", "warn", "14.0% free")
         return report
 
-    mocker.patch("agents_cli.mp.info_vm", side_effect=info_vm)
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=exec_in_vm)
-    mocker.patch("agents_cli.mp.exec_bash", side_effect=exec_bash)
-    mocker.patch("agents_cli.mp.umount", side_effect=umount)
-    mocker.patch("agents_cli.mp.stop_vm", return_value=_ok())
-    mocker.patch("agents_cli.mp.start_vm", return_value=_ok())
-    mocker.patch("agents_cli.export_cmd.export", side_effect=fake_export)
-    mocker.patch("agents_cli.compose_runner.stop", side_effect=compose_stop)
-    mocker.patch("agents_cli.compose_runner.up", side_effect=compose_up)
-    mocker.patch("agents_cli.ops.doctor", side_effect=doctor)
+    mocker.patch("agx_cli.mp.info_vm", side_effect=info_vm)
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=exec_in_vm)
+    mocker.patch("agx_cli.mp.exec_bash", side_effect=exec_bash)
+    mocker.patch("agx_cli.mp.umount", side_effect=umount)
+    mocker.patch("agx_cli.mp.stop_vm", return_value=_ok())
+    mocker.patch("agx_cli.mp.start_vm", return_value=_ok())
+    mocker.patch("agx_cli.export_cmd.export", side_effect=fake_export)
+    mocker.patch("agx_cli.compose_runner.stop", side_effect=compose_stop)
+    mocker.patch("agx_cli.compose_runner.up", side_effect=compose_up)
+    mocker.patch("agx_cli.ops.doctor", side_effect=doctor)
     return calls
 
 
@@ -399,7 +399,7 @@ def test_consent_declined_before_downtime_aborts_and_clears_journal(
     mocker: Any, cfg: AgentsConfig, saved_config: Path
 ) -> None:
     calls = _stub_happy_migration(mocker, cfg)
-    confirm = mocker.patch("agents_cli.ui.confirm", return_value=False)
+    confirm = mocker.patch("agx_cli.ui.confirm", return_value=False)
     with pytest.raises(UserError, match="aborted by user"):
         migrate_cmd.migrate_data(yes=False, config_path=saved_config)
     confirm.assert_called_once()
@@ -415,7 +415,7 @@ def test_consent_declined_before_downtime_aborts_and_clears_journal(
 
 def test_yes_bypasses_consent(mocker: Any, cfg: AgentsConfig, saved_config: Path) -> None:
     _stub_happy_migration(mocker, cfg)
-    confirm = mocker.patch("agents_cli.ui.confirm")
+    confirm = mocker.patch("agx_cli.ui.confirm")
     migrate_cmd.migrate_data(yes=True, config_path=saved_config)
     confirm.assert_not_called()
 
@@ -432,7 +432,7 @@ def test_doctor_failure_leaves_config_flipped_prints_rollback_keeps_journal(
     HealthCheckFailure propagates (exit 3 via the CLI).
     """
     _stub_happy_migration(mocker, cfg)
-    mocker.patch("agents_cli.ops.doctor", side_effect=HealthCheckFailure("2 checks failed"))
+    mocker.patch("agx_cli.ops.doctor", side_effect=HealthCheckFailure("2 checks failed"))
 
     with pytest.raises(HealthCheckFailure):
         migrate_cmd.migrate_data(yes=True, config_path=saved_config)
@@ -446,7 +446,7 @@ def test_doctor_failure_leaves_config_flipped_prints_rollback_keeps_journal(
     assert not journal.is_phase_done("doctor_passed")
     # ...and the printed instructions match that state exactly. The
     # container lifecycle must sandwich the remount: stop BEFORE
-    # `agents vm start` (libvirt live-attaches the share under running
+    # `agx vm start` (libvirt live-attaches the share under running
     # containers), force-recreate AFTER (a plain start can keep the
     # pre-rollback bind-mount view).
     err = capsys.readouterr().err
@@ -454,12 +454,12 @@ def test_doctor_failure_leaves_config_flipped_prints_rollback_keeps_journal(
     assert str(saved_config) in err
     assert "never modified" in err
     for agent in ("coder", "scout"):
-        i_stop = err.index(f"agents stop {agent}")
-        i_remount = err.index("agents vm start")
-        i_recreate = err.index(f"agents upgrade {agent} --recreate")
+        i_stop = err.index(f"agx stop {agent}")
+        i_remount = err.index("agx vm start")
+        i_recreate = err.index(f"agx upgrade {agent} --recreate")
         assert i_stop < i_remount < i_recreate
-    # A plain `agents start` must NOT be advertised as the rollback.
-    assert "agents start coder" not in err
+    # A plain `agx start` must NOT be advertised as the rollback.
+    assert "agx start coder" not in err
 
 
 def test_pre_flip_failure_prints_resume_guidance_and_keeps_journal(
@@ -481,7 +481,7 @@ def test_pre_flip_failure_prints_resume_guidance_and_keeps_journal(
             raise RuntimeFailure("disk exploded mid-copy")
         return _ok()
 
-    mocker.patch("agents_cli.mp.exec_bash", side_effect=failing_exec_bash)
+    mocker.patch("agx_cli.mp.exec_bash", side_effect=failing_exec_bash)
 
     with pytest.raises(RuntimeFailure, match="disk exploded"):
         migrate_cmd.migrate_data(yes=True, config_path=saved_config)
@@ -494,10 +494,10 @@ def test_pre_flip_failure_prints_resume_guidance_and_keeps_journal(
     assert not journal.is_phase_done("data_copied")
     err = capsys.readouterr().err
     assert "before the config flip" in err
-    assert "re-run `agents vm migrate-data`" in err
+    assert "re-run `agx vm migrate-data`" in err
     # Abandoning also sandwiches the remount with stop + force-recreate.
-    assert err.index("agents stop coder") < err.index("agents vm start")
-    assert err.index("agents vm start") < err.index("agents upgrade coder --recreate")
+    assert err.index("agx stop coder") < err.index("agx vm start")
+    assert err.index("agx vm start") < err.index("agx upgrade coder --recreate")
 
 
 # ---------- resume ----------
@@ -553,7 +553,7 @@ def test_resume_after_config_flip_never_recopies(
         host_path.write_text(compose_file.read_text(encoding="utf-8"), encoding="utf-8")
         return _ok()
 
-    mocker.patch("agents_cli.mp.transfer_from_vm", side_effect=transfer_from)
+    mocker.patch("agx_cli.mp.transfer_from_vm", side_effect=transfer_from)
 
     journal = Journal.begin(
         flipped.paths.host_data_dir,
@@ -631,7 +631,7 @@ def test_stale_journal_after_rollback_is_invalidated_and_run_starts_fresh(
 def test_stale_journal_mount_divergence_is_invalidated(
     mocker: Any, cfg: AgentsConfig, saved_config: Path, capsys: Any
 ) -> None:
-    """Partial rollback: the user abandoned pre-flip and `agents vm start`
+    """Partial rollback: the user abandoned pre-flip and `agx vm start`
     re-added the mount, but the journal still claims mount_detached. The
     mountpoint probe exposes the divergence → fresh start (re-copy from
     the remounted share, re-detach)."""
@@ -682,10 +682,10 @@ def test_umount_refusal_on_multipass_falls_back_to_stop_start_dance(
         mounted["state"] = False
         return _ok()
 
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=exec_in_vm)
-    mocker.patch("agents_cli.mp.umount", side_effect=umount)
-    stop_vm = mocker.patch("agents_cli.mp.stop_vm", return_value=_ok())
-    start_vm = mocker.patch("agents_cli.mp.start_vm", return_value=_ok())
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=exec_in_vm)
+    mocker.patch("agx_cli.mp.umount", side_effect=umount)
+    stop_vm = mocker.patch("agx_cli.mp.stop_vm", return_value=_ok())
+    start_vm = mocker.patch("agx_cli.mp.start_vm", return_value=_ok())
 
     migrate_cmd.migrate_data(yes=True, config_path=saved_config)
 

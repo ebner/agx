@@ -17,7 +17,7 @@ The toolkit assumes:
 
 ## The outer boundary depends on the backend
 
-`agents vm init --backend …` picks how much isolation sits between a
+`agx vm init --backend …` picks how much isolation sits between a
 compromised agent and the host. The inner layers (rootless Docker →
 per-agent container → nested sandbox) are identical across backends;
 only the outer boundary changes:
@@ -67,13 +67,13 @@ For Hermes' nested-sandbox feature to work, the rootless Docker socket (`/run/us
 
 ### 3. Codex auth mount
 
-`<data-dir>/.codex/auth.json` is mounted, only when `agents codex skill-enable` is invoked, into the Hermes nested sandbox at `/codex:ro`. It is **not** mounted into the Hermes runtime container any more (the `/home/hermes/.codex` "import bridge" was retired 2026-09); a Hermes agent's `openai-codex` LLM-provider credential is created in-container via `hermes auth add` and lives in the agent's own `/opt/data/auth.json`, so a compromised agent holds only its own chain. The derived sandbox image bakes in `ENV CODEX_HOME=/codex`, so the Codex CLI reads auth from there regardless of which user the sandbox image runs as (root, `pn`, `node`, …) — see [codex-integration.md](codex-integration.md).
+`<data-dir>/.codex/auth.json` is mounted, only when `agx codex skill-enable` is invoked, into the Hermes nested sandbox at `/codex:ro`. It is **not** mounted into the Hermes runtime container any more (the `/home/hermes/.codex` "import bridge" was retired 2026-09); a Hermes agent's `openai-codex` LLM-provider credential is created in-container via `hermes auth add` and lives in the agent's own `/opt/data/auth.json`, so a compromised agent holds only its own chain. The derived sandbox image bakes in `ENV CODEX_HOME=/codex`, so the Codex CLI reads auth from there regardless of which user the sandbox image runs as (root, `pn`, `node`, …) — see [codex-integration.md](codex-integration.md).
 
 **Mitigations:**
 
 - The toolkit-scoped Codex auth is **separate** from the user's personal `~/.codex/`. Use a dedicated Codex account for the agents; compromise of that account doesn't leak the user's personal Codex.
 - The auth is bind-mounted, never baked into a Docker image, so a token rotation propagates immediately.
-- `agents codex status` warns when the skill's OAuth token expires within 7 days; `agents doctor`'s `credential_pool` check (and `agents doctor-cron`'s mail) flags an agent whose provider credential died. Token expiry is a routine event, not a security event, but stale tokens block work and should be re-authenticated.
+- `agx codex status` warns when the skill's OAuth token expires within 7 days; `agx doctor`'s `credential_pool` check (and `agx doctor-cron`'s mail) flags an agent whose provider credential died. Token expiry is a routine event, not a security event, but stale tokens block work and should be re-authenticated.
 
 ### 4. Image source
 
@@ -85,7 +85,7 @@ Hermes' web dashboard always binds `127.0.0.1` only. The CLI refuses any `dashbo
 
 ### 6. Compose-file mutation
 
-The compose file is the CLI's, not the user's. Any external write would be overwritten on the next `agents create`/`remove`/`upgrade`. Users with legitimate customizations use `docker-compose.override.yml`, which the CLI leaves untouched and which `docker compose` merges automatically.
+The compose file is the CLI's, not the user's. Any external write would be overwritten on the next `agx create`/`remove`/`upgrade`. Users with legitimate customizations use `docker-compose.override.yml`, which the CLI leaves untouched and which `docker compose` merges automatically.
 
 The atomic-write contract (flock + stage in project dir + `docker compose config -q` validate + same-filesystem `os.replace`) ensures partial writes never appear in the live file even on a host crash mid-mutation. `cleanup_stale_temps` sweeps temp files left by prior crashes on startup.
 

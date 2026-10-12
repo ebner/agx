@@ -1,4 +1,4 @@
-"""Unit tests for `agents doctor-cron` — host cron that runs doctor and
+"""Unit tests for `agx doctor-cron` — host cron that runs doctor and
 mails on state change."""
 
 from __future__ import annotations
@@ -8,11 +8,11 @@ from pathlib import Path
 
 import pytest
 
-from agents_cli import config as cfg_mod
-from agents_cli import doctor_cron
-from agents_cli.config import AgentsConfig, HostConfig, PathsConfig, VmRuntimeConfig
-from agents_cli.errors import RuntimeFailure, UserError
-from agents_cli.ops import DoctorReport
+from agx_cli import config as cfg_mod
+from agx_cli import doctor_cron
+from agx_cli.config import AgentsConfig, HostConfig, PathsConfig, VmRuntimeConfig
+from agx_cli.errors import RuntimeFailure, UserError
+from agx_cli.ops import DoctorReport
 
 
 @pytest.fixture
@@ -44,20 +44,20 @@ class FakeCrontab:
 @pytest.fixture
 def fake_crontab(mocker) -> FakeCrontab:
     ct = FakeCrontab()
-    mocker.patch("agents_cli.export_cmd._read_crontab", side_effect=lambda: ct.body)
+    mocker.patch("agx_cli.export_cmd._read_crontab", side_effect=lambda: ct.body)
 
     def _write(content: str) -> None:
         ct.body = content
 
-    mocker.patch("agents_cli.export_cmd._write_crontab", side_effect=_write)
+    mocker.patch("agx_cli.export_cmd._write_crontab", side_effect=_write)
     return ct
 
 
 @pytest.fixture
 def sendmail(mocker):
-    mocker.patch("agents_cli.doctor_cron._sendmail_path", return_value="/usr/sbin/sendmail")
+    mocker.patch("agx_cli.doctor_cron._sendmail_path", return_value="/usr/sbin/sendmail")
     proc = mocker.MagicMock(returncode=0, stderr=b"")
-    return mocker.patch("agents_cli.doctor_cron.subprocess.run", return_value=proc)
+    return mocker.patch("agx_cli.doctor_cron.subprocess.run", return_value=proc)
 
 
 def _report(**checks: str) -> DoctorReport:
@@ -73,12 +73,12 @@ def _report(**checks: str) -> DoctorReport:
 def test_install_writes_marker_line_and_config(
     saved_config: Path, fake_crontab: FakeCrontab, sendmail, mocker
 ) -> None:
-    mocker.patch("agents_cli.ui.emit")
+    mocker.patch("agx_cli.ui.emit")
     doctor_cron.install(
-        every_minutes=10, mail_to=["ops@example.org"], binary="/x/agents", config_path=saved_config
+        every_minutes=10, mail_to=["ops@example.org"], binary="/x/agx", config_path=saved_config
     )
     assert doctor_cron.CRON_MARKER in fake_crontab.body
-    assert "*/10 * * * * /x/agents --yes doctor-cron run" in fake_crontab.body
+    assert "*/10 * * * * /x/agx --yes doctor-cron run" in fake_crontab.body
     reloaded = cfg_mod.load(saved_config)
     assert reloaded.doctor_cron.enabled is True
     assert reloaded.doctor_cron.every_minutes == 10
@@ -88,10 +88,10 @@ def test_install_writes_marker_line_and_config(
 def test_install_is_idempotent_and_keeps_foreign_lines(
     saved_config: Path, fake_crontab: FakeCrontab, sendmail, mocker
 ) -> None:
-    mocker.patch("agents_cli.ui.emit")
+    mocker.patch("agx_cli.ui.emit")
     fake_crontab.body = "0 0 * * * /home/user/other-job\n"
-    doctor_cron.install(mail_to=["a@b.c"], binary="/x/agents", config_path=saved_config)
-    doctor_cron.install(every_minutes=5, binary="/x/agents", config_path=saved_config)
+    doctor_cron.install(mail_to=["a@b.c"], binary="/x/agx", config_path=saved_config)
+    doctor_cron.install(every_minutes=5, binary="/x/agx", config_path=saved_config)
     assert fake_crontab.body.count(doctor_cron.CRON_MARKER) == 1
     assert "other-job" in fake_crontab.body
     assert "*/5 * * * *" in fake_crontab.body
@@ -103,10 +103,10 @@ def test_install_requires_recipient_and_sendmail(
     saved_config: Path, fake_crontab: FakeCrontab, mocker
 ) -> None:
     with pytest.raises(UserError, match="--mail"):
-        doctor_cron.install(binary="/x/agents", config_path=saved_config)
-    mocker.patch("agents_cli.doctor_cron._sendmail_path", return_value=None)
+        doctor_cron.install(binary="/x/agx", config_path=saved_config)
+    mocker.patch("agx_cli.doctor_cron._sendmail_path", return_value=None)
     with pytest.raises(UserError, match="sendmail"):
-        doctor_cron.install(mail_to=["a@b.c"], binary="/x/agents", config_path=saved_config)
+        doctor_cron.install(mail_to=["a@b.c"], binary="/x/agx", config_path=saved_config)
     assert fake_crontab.body == ""
 
 
@@ -120,8 +120,8 @@ def test_install_rejects_bad_address(
 def test_uninstall_and_status(
     saved_config: Path, fake_crontab: FakeCrontab, sendmail, mocker
 ) -> None:
-    mocker.patch("agents_cli.ui.emit")
-    doctor_cron.install(mail_to=["a@b.c"], binary="/x/agents", config_path=saved_config)
+    mocker.patch("agx_cli.ui.emit")
+    doctor_cron.install(mail_to=["a@b.c"], binary="/x/agx", config_path=saved_config)
     assert doctor_cron.status(config_path=saved_config)["installed"] is True
     doctor_cron.uninstall(config_path=saved_config)
     assert doctor_cron.CRON_MARKER not in fake_crontab.body
@@ -136,10 +136,10 @@ def test_uninstall_and_status(
 def test_run_mails_only_on_state_change(
     cfg: AgentsConfig, saved_config: Path, sendmail, mocker
 ) -> None:
-    mocker.patch("agents_cli.ui.emit")
+    mocker.patch("agx_cli.ui.emit")
     cfg.doctor_cron.mail_to = ["ops@example.org"]
     cfg_mod.save(cfg, saved_config)
-    doctor = mocker.patch("agents_cli.ops.doctor")
+    doctor = mocker.patch("agx_cli.ops.doctor")
 
     # 1. Green → no state before, nothing failing → no mail.
     doctor.return_value = _report(vm_reachable="ok")
@@ -189,21 +189,21 @@ def test_run_mails_only_on_state_change(
 def test_run_without_recipients_records_state_but_never_mails(
     saved_config: Path, sendmail, mocker
 ) -> None:
-    mocker.patch("agents_cli.ui.emit")
-    mocker.patch("agents_cli.ops.doctor", return_value=_report(x="fail"))
+    mocker.patch("agx_cli.ui.emit")
+    mocker.patch("agx_cli.ops.doctor", return_value=_report(x="fail"))
     r = doctor_cron.run(config_path=saved_config)
     assert r["changed"] is True and r["notified"] is False
     sendmail.assert_not_called()
 
 
 def test_run_surfaces_sendmail_failure(cfg: AgentsConfig, saved_config: Path, mocker) -> None:
-    mocker.patch("agents_cli.ui.emit")
+    mocker.patch("agx_cli.ui.emit")
     cfg.doctor_cron.mail_to = ["a@b.c"]
     cfg_mod.save(cfg, saved_config)
-    mocker.patch("agents_cli.ops.doctor", return_value=_report(x="fail"))
-    mocker.patch("agents_cli.doctor_cron._sendmail_path", return_value="/usr/sbin/sendmail")
+    mocker.patch("agx_cli.ops.doctor", return_value=_report(x="fail"))
+    mocker.patch("agx_cli.doctor_cron._sendmail_path", return_value="/usr/sbin/sendmail")
     mocker.patch(
-        "agents_cli.doctor_cron.subprocess.run",
+        "agx_cli.doctor_cron.subprocess.run",
         return_value=mocker.MagicMock(returncode=75, stderr=b"deferred"),
     )
     with pytest.raises(RuntimeFailure, match="sendmail failed"):

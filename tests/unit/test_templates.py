@@ -6,9 +6,9 @@ import re
 import subprocess
 from pathlib import Path
 
-from agents_cli import templates
-from agents_cli.mp import parse_bootstrap_ok
-from agents_cli.templates import (
+from agx_cli import templates
+from agx_cli.mp import parse_bootstrap_ok
+from agx_cli.templates import (
     FALLBACK_HERMES_IMAGE_TAG,
     FALLBACK_OPENCLAW_IMAGE_TAG,
     HERMES_DEFAULT_SANDBOX_IMAGE,
@@ -58,7 +58,7 @@ def test_bootstrap_handshake_parses_to_failed_status_when_simulated() -> None:
 
 
 def test_bootstrap_step_3c_destructive_cleanup_guarded_by_docker_info() -> None:
-    """`agents vm init` re-runs the bootstrap on an existing VM. The
+    """`agx vm init` re-runs the bootstrap on an existing VM. The
     uninstall + image-cache rm -rf in step 3c must therefore only run when
     `docker info` fails as ubuntu — otherwise every re-init would wipe all
     containers and the whole image cache."""
@@ -131,7 +131,7 @@ def test_scripts_vm_bootstrap_sh_matches_template_constant() -> None:
     script_path = repo_root / "scripts" / "vm-bootstrap.sh"
     assert script_path.exists(), (
         "scripts/vm-bootstrap.sh is missing; regenerate with: "
-        "python -c 'from agents_cli.templates import VM_BOOTSTRAP_SCRIPT; "
+        "python -c 'from agx_cli.templates import VM_BOOTSTRAP_SCRIPT; "
         "import sys; sys.stdout.write(VM_BOOTSTRAP_SCRIPT)' > scripts/vm-bootstrap.sh"
     )
     on_disk = script_path.read_text(encoding="utf-8")
@@ -152,7 +152,7 @@ def test_scripts_vm_bootstrap_sh_matches_template_constant() -> None:
 def test_cont_init_hook_shebang_and_managed_header() -> None:
     s = templates.HERMES_CONT_INIT_FIXPERMS
     assert s.startswith("#!/command/with-contenv sh")
-    assert "MANAGED BY THE `agents` HOST CLI. DO NOT EDIT." in s
+    assert "MANAGED BY THE `agx` HOST CLI. DO NOT EDIT." in s
 
 
 def test_cont_init_hook_keeps_perms_behaviour() -> None:

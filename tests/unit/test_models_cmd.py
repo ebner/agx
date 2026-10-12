@@ -7,19 +7,19 @@ from typing import Any
 
 import pytest
 
-from agents_cli import config as cfg_mod
-from agents_cli import hermes_config, models_cmd
-from agents_cli.agents_cmd import create
-from agents_cli.compose import OLLAMA_SERVICE_NAME
-from agents_cli.config import (
+from agx_cli import config as cfg_mod
+from agx_cli import hermes_config, models_cmd
+from agx_cli.agents_cmd import create
+from agx_cli.compose import OLLAMA_SERVICE_NAME
+from agx_cli.config import (
     AgentsConfig,
     DefaultsConfig,
     HostConfig,
     PathsConfig,
     VmRuntimeConfig,
 )
-from agents_cli.errors import UserError
-from agents_cli.mp import MpResult
+from agx_cli.errors import UserError
+from agx_cli.mp import MpResult
 
 
 def _ok(stdout: str = "") -> MpResult:
@@ -60,7 +60,7 @@ def with_coder(cfg: AgentsConfig, saved_config: Path, mocker: Any) -> Path:
     from tests.conftest import install_vm_fs_simulation
 
     install_vm_fs_simulation(mocker, cfg)
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     create(name="coder", agent_type="hermes", config_path=saved_config)
     return saved_config
 
@@ -70,7 +70,7 @@ def with_openclaw(cfg: AgentsConfig, saved_config: Path, mocker: Any) -> Path:
     from tests.conftest import install_vm_fs_simulation
 
     install_vm_fs_simulation(mocker, cfg)
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     create(name="personal", agent_type="openclaw", config_path=saved_config)
     return saved_config
 
@@ -79,7 +79,7 @@ def with_openclaw(cfg: AgentsConfig, saved_config: Path, mocker: Any) -> Path:
 
 
 def test_pull_ollama_passes_through_to_ollama_cli(with_coder: Path, mocker: Any) -> None:
-    """`agents model pull ollama X` should exec `ollama pull X` inside
+    """`agx model pull ollama X` should exec `ollama pull X` inside
     the ollama container. Ollama accepts both registry refs and
     `hf.co/<repo>:<quant>` natively — we don't try to parse.
     """
@@ -94,8 +94,8 @@ def test_pull_ollama_passes_through_to_ollama_cli(with_coder: Path, mocker: Any)
             captured.append(cmd)
         return _ok()
 
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=runner)
-    mocker.patch("agents_cli.inference_cmd._service_running", return_value=True)
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=runner)
+    mocker.patch("agx_cli.inference_cmd._service_running", return_value=True)
 
     models_cmd.pull("ollama", "hf.co/bartowski/Llama-3.2-3B:Q4_K_M", config_path=with_coder)
     assert any("hf.co/bartowski/Llama-3.2-3B:Q4_K_M" in c for c in captured)
@@ -105,13 +105,13 @@ def test_pull_ollama_refuses_when_ollama_not_running(with_coder: Path, mocker: A
     """No useful error from `docker exec` against a stopped container —
     surface a clean UserError pointing at the fix.
     """
-    mocker.patch("agents_cli.inference_cmd._service_running", return_value=False)
+    mocker.patch("agx_cli.inference_cmd._service_running", return_value=False)
     with pytest.raises(UserError, match="not running"):
         models_cmd.pull("ollama", "llama3.2:3b", config_path=with_coder)
 
 
 def test_pull_llamacpp_requires_repo_filename_form(with_coder: Path, mocker: Any) -> None:
-    mocker.patch("agents_cli.inference_cmd._service_running", return_value=True)
+    mocker.patch("agx_cli.inference_cmd._service_running", return_value=True)
     with pytest.raises(UserError, match="<hf-repo>:<filename>"):
         models_cmd.pull("llama-cpp", "just-a-name", config_path=with_coder)
 
@@ -156,10 +156,10 @@ def test_pull_llamacpp_downloads_into_bind_mounted_dir(
     """
     captured: list[tuple[str, ...]] = []
     mocker.patch(
-        "agents_cli.mp.exec_in_vm",
+        "agx_cli.mp.exec_in_vm",
         side_effect=_llamacpp_pull_runner(cfg, captured, mount_visible=True),
     )
-    mocker.patch("agents_cli.inference_cmd._service_running", return_value=True)
+    mocker.patch("agx_cli.inference_cmd._service_running", return_value=True)
 
     payload = models_cmd.pull(
         "llama-cpp",
@@ -184,12 +184,12 @@ def test_pull_llamacpp_refuses_when_bind_not_host_visible(
     """
     captured: list[tuple[str, ...]] = []
     mocker.patch(
-        "agents_cli.mp.exec_in_vm",
+        "agx_cli.mp.exec_in_vm",
         side_effect=_llamacpp_pull_runner(cfg, captured, mount_visible=False),
     )
-    mocker.patch("agents_cli.inference_cmd._service_running", return_value=True)
+    mocker.patch("agx_cli.inference_cmd._service_running", return_value=True)
 
-    with pytest.raises(UserError, match="agents inference down ollama && agents inference up"):
+    with pytest.raises(UserError, match="agx inference down ollama && agx inference up"):
         models_cmd.pull("llama-cpp", "some/repo:file.gguf", config_path=saved_config)
     # And the download itself must never have started.
     assert not any(any("hf_hub_download" in a for a in c) for c in captured)
@@ -205,10 +205,10 @@ def test_pull_llamacpp_apt_bootstrap_is_guarded(
     """
     captured: list[tuple[str, ...]] = []
     mocker.patch(
-        "agents_cli.mp.exec_in_vm",
+        "agx_cli.mp.exec_in_vm",
         side_effect=_llamacpp_pull_runner(cfg, captured, mount_visible=True),
     )
-    mocker.patch("agents_cli.inference_cmd._service_running", return_value=True)
+    mocker.patch("agx_cli.inference_cmd._service_running", return_value=True)
 
     models_cmd.pull("llama-cpp", "some/repo:file.gguf", config_path=saved_config)
 
@@ -225,7 +225,7 @@ def test_pull_llamacpp_apt_bootstrap_is_guarded(
 def test_use_writes_structured_model_block(
     with_coder: Path, cfg: AgentsConfig, mocker: Any
 ) -> None:
-    """`agents model use coder --engine ollama --model llama3.2:3b`
+    """`agx model use coder --engine ollama --model llama3.2:3b`
     rewrites the Hermes config.yaml's `model:` block to point at the
     in-VM Ollama service. The structured (dict) form matches what the
     `hermes model` wizard produces, so doctor's model_set check stays
@@ -333,7 +333,7 @@ def test_use_with_aux_compression_only_leaves_vision_alone(
 
 
 def _configure_external_ollama(config_path: Path) -> None:
-    from agents_cli import config as cfg_mod
+    from agx_cli import config as cfg_mod
 
     c = cfg_mod.load(config_path)
     c.ollama.url = "http://192.168.122.1:11434"
@@ -472,7 +472,7 @@ def test_use_refuses_openclaw_with_helpful_hint(
     out the URL the user needs to paste into `openclaw configure`,
     so the rejection is actionable, not just blocking.
     """
-    exec_spy = mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok())
+    exec_spy = mocker.patch("agx_cli.mp.exec_in_vm", return_value=_ok())
 
     with pytest.raises(UserError, match="Hermes-only") as exc:
         models_cmd.use(
@@ -491,7 +491,7 @@ def test_use_for_llamacpp_engine_uses_per_model_dns_name(
     with_coder: Path, cfg: AgentsConfig, mocker: Any
 ) -> None:
     """For llama-cpp the URL encodes the model slug (one service per
-    model). `agents model use coder --engine llama-cpp --model
+    model). `agx model use coder --engine llama-cpp --model
     Llama-3.2-3B-Q4_K_M` should resolve to
     `http://llama-cpp-llama-3-2-3b-q4-k-m:8080/v1`.
     """
@@ -544,8 +544,8 @@ def test_pull_ollama_narrates_without_verbose(
     """The multi-GB duration hint used to go through --verbose-gated
     ui.info, defeating its purpose. It must be always-on ui.progress,
     with a completion line."""
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok())
-    mocker.patch("agents_cli.inference_cmd._service_running", return_value=True)
+    mocker.patch("agx_cli.mp.exec_in_vm", return_value=_ok())
+    mocker.patch("agx_cli.inference_cmd._service_running", return_value=True)
     progress_spy = mocker.spy(models_cmd.ui, "progress")
     info_spy = mocker.spy(models_cmd.ui, "info")
 
@@ -563,10 +563,10 @@ def test_pull_llamacpp_narrates_download(
 ) -> None:
     captured: list[tuple[str, ...]] = []
     mocker.patch(
-        "agents_cli.mp.exec_in_vm",
+        "agx_cli.mp.exec_in_vm",
         side_effect=_llamacpp_pull_runner(cfg, captured, mount_visible=True),
     )
-    mocker.patch("agents_cli.inference_cmd._service_running", return_value=True)
+    mocker.patch("agx_cli.inference_cmd._service_running", return_value=True)
     spy = mocker.spy(models_cmd.ui, "progress")
 
     models_cmd.pull("llama-cpp", "some/repo:file.gguf", config_path=saved_config)

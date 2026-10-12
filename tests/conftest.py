@@ -9,8 +9,8 @@ from pathlib import Path
 
 import pytest
 
-from agents_cli.config import AgentsConfig
-from agents_cli.mp import MpResult
+from agx_cli.config import AgentsConfig
+from agx_cli.mp import MpResult
 
 
 @pytest.fixture
@@ -34,7 +34,36 @@ def _no_github(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) 
     exempt."""
     if request.node.get_closest_marker("multipass"):
         return
-    monkeypatch.setattr("agents_cli.outdated_cmd._fetch_json", lambda url: None)
+    monkeypatch.setattr("agx_cli.outdated_cmd._fetch_json", lambda url: None)
+    monkeypatch.setattr("agx_cli.outdated_cmd._http_status", lambda url: None)
+
+
+@pytest.fixture(autouse=True)
+def _no_vm_view_wait(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`compose.await_vm_view` polls the VM (mocked in unit tests) until
+    a host write is visible there; against a stub it would spin for its
+    full timeout on every write. Tests of the helper itself call the
+    original via ``compose._await_vm_view_impl``."""
+    if request.node.get_closest_marker("multipass"):
+        return
+    from agx_cli import compose
+
+    monkeypatch.setattr(compose, "_await_vm_view_impl", compose.await_vm_view, raising=False)
+    monkeypatch.setattr(compose, "await_vm_view", lambda cfg, host_path: None)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_config_migration(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`cli.main` moves ~/.config/agents -> ~/.config/agx on first run
+    after the rename; CliRunner tests invoke main, so without this a
+    unit-test run would migrate the developer's REAL config dir."""
+    if request.node.get_closest_marker("multipass"):
+        return
+    monkeypatch.setattr(
+        "agx_cli.config.LEGACY_CONFIG_PATH", tmp_path / ".legacy-config" / "agents" / "config.toml"
+    )
 
 
 def _ok(stdout: str = "") -> MpResult:
@@ -218,7 +247,7 @@ def install_vm_fs_simulation(mocker, cfg: AgentsConfig) -> dict:
         import re as _re
         import subprocess as _subprocess
 
-        # Tar EXTRACT (used by `agents import` + `agents rollback`)
+        # Tar EXTRACT (used by `agx import` + `agx rollback`)
         # — matches ``cd <vm_root> && [sudo] tar -xf <archive>``. Run
         # locally with the VM-path translation; ``sudo`` is stripped
         # because the test runner is already the file owner.
@@ -280,19 +309,15 @@ def install_vm_fs_simulation(mocker, cfg: AgentsConfig) -> dict:
         return _ok()
 
     mocks = {
-        "transfer_to_vm": mocker.patch("agents_cli.mp.transfer_to_vm", side_effect=transfer_to),
-        "transfer_from_vm": mocker.patch(
-            "agents_cli.mp.transfer_from_vm", side_effect=transfer_from
-        ),
-        "exec_in_vm": mocker.patch("agents_cli.mp.exec_in_vm", side_effect=in_vm_runner),
+        "transfer_to_vm": mocker.patch("agx_cli.mp.transfer_to_vm", side_effect=transfer_to),
+        "transfer_from_vm": mocker.patch("agx_cli.mp.transfer_from_vm", side_effect=transfer_from),
+        "exec_in_vm": mocker.patch("agx_cli.mp.exec_in_vm", side_effect=in_vm_runner),
         "exec_in_vm_with_stdin": mocker.patch(
-            "agents_cli.mp.exec_in_vm_with_stdin", side_effect=in_vm_with_stdin_runner
+            "agx_cli.mp.exec_in_vm_with_stdin", side_effect=in_vm_with_stdin_runner
         ),
-        "exec_bash": mocker.patch("agents_cli.mp.exec_bash", side_effect=bash_runner),
+        "exec_bash": mocker.patch("agx_cli.mp.exec_bash", side_effect=bash_runner),
         # `_run_agent_setup` uses the interactive variant so the wizard
         # actually sees stdin. The unit-test stub just reports rc=0.
-        "exec_in_vm_interactive": mocker.patch(
-            "agents_cli.mp.exec_in_vm_interactive", return_value=0
-        ),
+        "exec_in_vm_interactive": mocker.patch("agx_cli.mp.exec_in_vm_interactive", return_value=0),
     }
     return mocks

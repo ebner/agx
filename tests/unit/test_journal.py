@@ -8,9 +8,9 @@ from pathlib import Path
 
 import pytest
 
-from agents_cli import journal
-from agents_cli.errors import UserError
-from agents_cli.journal import Journal
+from agx_cli import journal
+from agx_cli.errors import UserError
+from agx_cli.journal import Journal
 
 
 def test_begin_writes_initial_journal(tmp_path: Path) -> None:

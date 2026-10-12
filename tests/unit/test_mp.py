@@ -8,9 +8,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from agents_cli import mp
-from agents_cli.errors import RuntimeFailure
-from agents_cli.mp import BootstrapStatus, parse_bootstrap_ok
+from agx_cli import mp
+from agx_cli.errors import RuntimeFailure
+from agx_cli.mp import BootstrapStatus, parse_bootstrap_ok
 
 # ---------- argv quoting ----------
 

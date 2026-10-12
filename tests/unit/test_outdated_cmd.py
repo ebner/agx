@@ -7,16 +7,16 @@ from typing import Any
 
 import pytest
 
-from agents_cli import compose, outdated_cmd
-from agents_cli import config as cfg_mod
-from agents_cli.config import (
+from agx_cli import compose, outdated_cmd
+from agx_cli import config as cfg_mod
+from agx_cli.config import (
     AgentsConfig,
     DefaultsConfig,
     HostConfig,
     PathsConfig,
     VmRuntimeConfig,
 )
-from agents_cli.errors import UserError
+from agx_cli.errors import UserError
 
 
 @pytest.fixture
@@ -106,7 +106,7 @@ def test_check_reports_current_when_pinned_tag_matches_latest(
         cfg,
         {"hermes-coder": {"image": "nousresearch/hermes-agent:v2026.5.7"}},
     )
-    mocker.patch("agents_cli.outdated_cmd.fetch_latest_tag", return_value="v2026.5.7")
+    mocker.patch("agx_cli.outdated_cmd.fetch_latest_tag", return_value="v2026.5.7")
 
     payload = outdated_cmd.check(config_path=saved_config)
     assert payload["outdated_count"] == 0
@@ -120,7 +120,7 @@ def test_check_reports_outdated_when_tag_lags(
         cfg,
         {"hermes-coder": {"image": "nousresearch/hermes-agent:v2026.4.16"}},
     )
-    mocker.patch("agents_cli.outdated_cmd.fetch_latest_tag", return_value="v2026.5.7")
+    mocker.patch("agx_cli.outdated_cmd.fetch_latest_tag", return_value="v2026.5.7")
 
     payload = outdated_cmd.check(config_path=saved_config)
     assert payload["outdated_count"] == 1
@@ -137,7 +137,7 @@ def test_check_reports_unknown_when_github_unreachable(
         cfg,
         {"hermes-coder": {"image": "nousresearch/hermes-agent:v2026.5.7"}},
     )
-    mocker.patch("agents_cli.outdated_cmd.fetch_latest_tag", return_value=None)
+    mocker.patch("agx_cli.outdated_cmd.fetch_latest_tag", return_value=None)
 
     payload = outdated_cmd.check(config_path=saved_config)
     assert payload["unknown_count"] == 1
@@ -157,7 +157,7 @@ def test_check_caches_latest_per_agent_type(
             "hermes-backup": {"image": "nousresearch/hermes-agent:v2026.4.16"},
         },
     )
-    fetch = mocker.patch("agents_cli.outdated_cmd.fetch_latest_tag", return_value="v2026.5.7")
+    fetch = mocker.patch("agx_cli.outdated_cmd.fetch_latest_tag", return_value="v2026.5.7")
 
     outdated_cmd.check(config_path=saved_config)
     assert fetch.call_count == 1
@@ -175,7 +175,7 @@ def test_check_skips_non_agent_services(cfg: AgentsConfig, saved_config: Path, m
             "firecrawl-redis": {"image": "redis@sha256:" + "b" * 64},
         },
     )
-    mocker.patch("agents_cli.outdated_cmd.fetch_latest_tag", return_value="v2026.5.7")
+    mocker.patch("agx_cli.outdated_cmd.fetch_latest_tag", return_value="v2026.5.7")
 
     payload = outdated_cmd.check(config_path=saved_config)
     agents = [r["agent"] for r in payload["agents"]]
@@ -193,7 +193,7 @@ def test_check_sorts_outdated_first(cfg: AgentsConfig, saved_config: Path, mocke
             "hermes-outdated": {"image": "nousresearch/hermes-agent:v2026.4.16"},
         },
     )
-    mocker.patch("agents_cli.outdated_cmd.fetch_latest_tag", return_value="v2026.5.7")
+    mocker.patch("agx_cli.outdated_cmd.fetch_latest_tag", return_value="v2026.5.7")
 
     payload = outdated_cmd.check(config_path=saved_config)
     assert [r["agent"] for r in payload["agents"]] == ["outdated", "current"]
@@ -206,7 +206,7 @@ def test_check_rejects_unknown_agent_name(
         cfg,
         {"hermes-coder": {"image": "nousresearch/hermes-agent:v2026.5.7"}},
     )
-    mocker.patch("agents_cli.outdated_cmd.fetch_latest_tag", return_value="v2026.5.7")
+    mocker.patch("agx_cli.outdated_cmd.fetch_latest_tag", return_value="v2026.5.7")
 
     with pytest.raises(UserError, match="not in compose"):
         outdated_cmd.check("ghost", config_path=saved_config)
@@ -222,7 +222,7 @@ def test_check_filters_to_single_agent_when_name_given(
             "hermes-backup": {"image": "nousresearch/hermes-agent:v2026.4.16"},
         },
     )
-    mocker.patch("agents_cli.outdated_cmd.fetch_latest_tag", return_value="v2026.5.7")
+    mocker.patch("agx_cli.outdated_cmd.fetch_latest_tag", return_value="v2026.5.7")
 
     payload = outdated_cmd.check("backup", config_path=saved_config)
     agents = [r["agent"] for r in payload["agents"]]
@@ -307,3 +307,21 @@ def test_fetch_latest_tag_unreachable_is_none() -> None:
     # The autouse no-network fixture makes every lookup "unreachable".
     assert outdated_cmd.fetch_latest_tag("hermes") is None
     assert outdated_cmd.fetch_latest_tag("hermes", include_prerelease=True) is None
+
+
+def test_image_tag_published_maps_hub_status(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[str] = []
+
+    def status(url: str) -> int | None:
+        seen.append(url)
+        return {"v0.21.6": 200, "v0.21.7": 404}.get(url.rsplit("/", 1)[1])
+
+    monkeypatch.setattr(outdated_cmd, "_http_status", status)
+    assert outdated_cmd.image_tag_published("hermes", "v0.21.6") is True
+    assert outdated_cmd.image_tag_published("hermes", "v0.21.7") is False
+    assert outdated_cmd.image_tag_published("hermes", "v0.0.1") is None  # unknown/5xx/network
+    assert seen[0] == (
+        "https://hub.docker.com/v2/namespaces/nousresearch/repositories/hermes-agent/tags/v0.21.6"
+    )
+    outdated_cmd.image_tag_published("openclaw", "2026.10.1")
+    assert "/namespaces/openclaw/repositories/openclaw/tags/2026.10.1" in seen[-1]

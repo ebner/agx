@@ -16,8 +16,8 @@ from pathlib import Path
 
 import pytest
 
-from agents_cli.compose import acquire_lock
-from agents_cli.config import AgentsConfig, PathsConfig
+from agx_cli.compose import acquire_lock
+from agx_cli.config import AgentsConfig, PathsConfig
 
 
 @pytest.fixture

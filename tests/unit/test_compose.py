@@ -9,7 +9,8 @@ from pathlib import Path
 
 import pytest
 
-from agents_cli.compose import (
+from agx_cli import compose
+from agx_cli.compose import (
     ALLOWED_IMAGE_BASES,
     CONT_INIT_CONTAINER_PATH,
     CONT_INIT_REL,
@@ -44,9 +45,9 @@ from agents_cli.compose import (
     write_compose_atomically,
     write_override_atomically,
 )
-from agents_cli.config import AgentsConfig, DefaultsConfig, HostConfig, PathsConfig, VmRuntimeConfig
-from agents_cli.errors import UserError
-from agents_cli.mp import MpResult
+from agx_cli.config import AgentsConfig, DefaultsConfig, HostConfig, PathsConfig, VmRuntimeConfig
+from agx_cli.errors import UserError
+from agx_cli.mp import MpResult
 
 
 def _ok(stdout: str = "") -> MpResult:
@@ -109,7 +110,7 @@ def test_hermes_fragment_has_required_mounts(cfg: AgentsConfig) -> None:
     assert s["environment"]["DOCKER_HOST"] == "unix:///run/user/1000/docker.sock"
 
     # HOME is the runtime user's persisted passwd home — never the
-    # container overlay, where everything written under ~ by `agents exec`
+    # container overlay, where everything written under ~ by `agx exec`
     # sessions vanished on each recreate (the old /home/hermes pin).
     assert s["environment"]["HOME"] == "/opt/data"
     # PATH mirrors the image's Config.Env, incl. the /opt/hermes/bin
@@ -230,8 +231,8 @@ def test_ensure_cont_init_script_vm_mode_is_atomic(cfg: AgentsConfig, mocker) ->
         calls.append(("transfer", (vm_dst,)))
         return MpResult(stdout="", stderr="", returncode=0)
 
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=rec_exec)
-    mocker.patch("agents_cli.mp.transfer_to_vm", side_effect=rec_transfer)
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=rec_exec)
+    mocker.patch("agx_cli.mp.transfer_to_vm", side_effect=rec_transfer)
 
     ensure_cont_init_script(cfg)
 
@@ -284,7 +285,7 @@ def test_openclaw_named_agents_dont_collide(cfg: AgentsConfig) -> None:
 
 def test_ollama_fragment_binds_llamacpp_download_dir() -> None:
     """The ollama container doubles as the HF download host for
-    `agents model pull --engine llama-cpp` — without this second bind
+    `agx model pull --engine llama-cpp` — without this second bind
     the multi-GB download lands on the container overlay (invisible to
     `model list`, wiped on recreate).
     """
@@ -482,7 +483,7 @@ def test_write_compose_atomically_validation_failure_keeps_old_file(
     # Validation step (docker compose ... config -q) gets a failing rc. We
     # override the `in_vm_runner` for that one call by routing every exec
     # through a stub that returns failure when "config" is in the cmd.
-    original = mocker.patch("agents_cli.mp.exec_in_vm")
+    original = mocker.patch("agx_cli.mp.exec_in_vm")
 
     def selective(vm_name: str, *cmd: str, check: bool = True):
         joined = " ".join(cmd)
@@ -569,7 +570,7 @@ def test_override_file_args_present_iff_file_exists(cfg: AgentsConfig) -> None:
 def test_write_override_atomically_host_mode_needs_no_transfer(cfg: AgentsConfig, mocker) -> None:
     """Host-mount mode: the host data dir IS the VM project dir (via the
     mount), so the host-side write is the whole job — no transfer."""
-    transfer = mocker.patch("agents_cli.mp.transfer_to_vm")
+    transfer = mocker.patch("agx_cli.mp.transfer_to_vm")
     doc = read_override_doc(cfg)
     doc["services"]["hermes-a"] = {"volumes": ["/x:/y:ro"]}
     write_override_atomically(cfg, doc)
@@ -633,7 +634,7 @@ def test_write_refuses_when_vm_runtime_unpopulated(tmp_path: Path) -> None:
 
 
 def test_cleanup_stale_temps_removes_residue(cfg: AgentsConfig, mocker) -> None:
-    from agents_cli.compose import host_staging_dir
+    from agx_cli.compose import host_staging_dir
     from tests.conftest import install_vm_fs_simulation
 
     d = cfg.paths.host_data_dir
@@ -668,7 +669,7 @@ def test_used_ports_parses_compose_config_json(cfg: AgentsConfig, mocker) -> Non
             }
         }
     )
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok(payload))
+    mocker.patch("agx_cli.mp.exec_in_vm", return_value=_ok(payload))
     assert used_ports(cfg) == {8642, 18789}
 
 
@@ -676,9 +677,7 @@ def test_used_ports_passes_override_flag_iff_present(cfg: AgentsConfig, mocker) 
     """The rendered-config invocation must merge the override — a port
     published only via docker-compose.override.yml would otherwise be
     invisible to the allocator."""
-    runner = mocker.patch(
-        "agents_cli.mp.exec_in_vm", return_value=_ok(json.dumps({"services": {}}))
-    )
+    runner = mocker.patch("agx_cli.mp.exec_in_vm", return_value=_ok(json.dumps({"services": {}})))
     used_ports(cfg)
     argv = list(runner.call_args.args[1:])
     assert argv.count("-f") == 1
@@ -707,8 +706,8 @@ def test_used_ports_falls_back_to_doc_parse_on_compose_failure(cfg: AgentsConfig
         "services:\n  extra:\n    ports:\n      - 127.0.0.1:9100:9100\n",
         encoding="utf-8",
     )
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_fail())
-    warn = mocker.patch("agents_cli.ui.warn")
+    mocker.patch("agx_cli.mp.exec_in_vm", return_value=_fail())
+    warn = mocker.patch("agx_cli.ui.warn")
     assert used_ports(cfg) == {8642, 9100}
     warn.assert_called_once()
 
@@ -720,8 +719,8 @@ def test_used_ports_falls_back_to_doc_parse_on_bad_json(cfg: AgentsConfig, mocke
         "services:\n  hermes-a:\n    ports:\n      - target: 8642\n        published: 8643\n",
         encoding="utf-8",
     )
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok("not json"))
-    warn = mocker.patch("agents_cli.ui.warn")
+    mocker.patch("agx_cli.mp.exec_in_vm", return_value=_ok("not json"))
+    warn = mocker.patch("agx_cli.ui.warn")
     assert used_ports(cfg) == {8643}
     warn.assert_called_once()
 
@@ -730,8 +729,8 @@ def test_used_ports_empty_project_still_returns_empty_on_failure(cfg: AgentsConf
     """A project with genuinely no ports (no compose file yet) may return
     the empty set even when the runner fails — but the degraded path is
     still surfaced via a warning."""
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_fail())
-    warn = mocker.patch("agents_cli.ui.warn")
+    mocker.patch("agx_cli.mp.exec_in_vm", return_value=_fail())
+    warn = mocker.patch("agx_cli.ui.warn")
     assert used_ports(cfg) == set()
     warn.assert_called_once()
 
@@ -751,3 +750,45 @@ def test_next_free_port_finds_gap(cfg: AgentsConfig) -> None:
 
 
 # flock tests moved to test_lock.py
+
+
+def test_await_vm_view_polls_until_vm_hash_matches(cfg, mocker) -> None:
+    import hashlib
+
+    target = cfg.paths.host_data_dir / "docker-compose.override.yml"
+    target.write_text("services: {}\n", encoding="utf-8")
+    want = hashlib.sha256(target.read_bytes()).hexdigest()
+    stale = MpResult(stdout="0" * 64 + "  x\n", stderr="", returncode=0)
+    fresh = MpResult(stdout=f"{want}  x\n", stderr="", returncode=0)
+    run = mocker.patch("agx_cli.mp.exec_in_vm", side_effect=[stale, stale, fresh])
+    mocker.patch("agx_cli.compose.time.sleep")
+    compose._await_vm_view_impl(cfg, target)
+    assert run.call_count == 3
+    assert run.call_args.args[1:] == (
+        "sha256sum",
+        f"{cfg.paths.vm_agents_root}/docker-compose.override.yml",
+    )
+
+
+def test_await_vm_view_gives_up_with_warning(cfg, mocker) -> None:
+    target = cfg.paths.host_data_dir / ".env"
+    target.write_text("A=1\n", encoding="utf-8")
+    mocker.patch("agx_cli.mp.exec_in_vm", return_value=MpResult("", "gone", 1))
+    mocker.patch("agx_cli.compose.time.sleep")
+    clock = iter([0.0, 1.0, 99.0])
+    mocker.patch("agx_cli.compose.time.monotonic", side_effect=lambda: next(clock))
+    warn = mocker.patch("agx_cli.ui.warn")
+    compose._await_vm_view_impl(cfg, target)  # must not raise
+    assert "outdated" in warn.call_args.args[0]
+
+
+def test_await_vm_view_noop_on_bare_metal_and_data_dir_in_vm(cfg, mocker) -> None:
+    target = cfg.paths.host_data_dir / ".env"
+    target.write_text("A=1\n", encoding="utf-8")
+    run = mocker.patch("agx_cli.mp.exec_in_vm")
+    cfg.vm.backend = "bare_metal"
+    compose._await_vm_view_impl(cfg, target)
+    cfg.vm.backend = "multipass"
+    cfg.paths.data_dir_in_vm = True
+    compose._await_vm_view_impl(cfg, target)
+    run.assert_not_called()

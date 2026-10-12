@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Idempotent rootless-Docker bootstrap for the `agents` Multipass VM.
+# Idempotent rootless-Docker bootstrap for the `agx` Multipass VM.
 # Emits a final `BOOTSTRAP_OK ...` line that mp.parse_bootstrap_ok reads.
 #
 # Re-runnable: every step checks before doing. Failures land as
@@ -149,7 +149,7 @@ fi
 echo "[bootstrap] step 3c: setuptool install (clean stale state only if daemon is broken)"
 # The uninstall + rm -rf below wipe every container and the whole image
 # cache. They exist to clear stale state left by a previously FAILED
-# install — but `agents vm init` re-runs this script on an existing VM,
+# install — but `agx vm init` re-runs this script on an existing VM,
 # so the destructive path must be guarded: a working `docker info` means
 # there is nothing stale to clean and everything to lose.
 if as_ubuntu 'docker info >/dev/null 2>&1'; then

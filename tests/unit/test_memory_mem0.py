@@ -15,9 +15,9 @@ from typing import Any
 
 import pytest
 
-from agents_cli import config as cfg_mod
-from agents_cli.agents_cmd import create
-from agents_cli.config import (
+from agx_cli import config as cfg_mod
+from agx_cli.agents_cmd import create
+from agx_cli.config import (
     AgentsConfig,
     DefaultsConfig,
     HostConfig,
@@ -25,8 +25,8 @@ from agents_cli.config import (
     PathsConfig,
     VmRuntimeConfig,
 )
-from agents_cli.memory import mem0
-from agents_cli.mp import MpResult
+from agx_cli.memory import mem0
+from agx_cli.mp import MpResult
 
 
 def _ok(stdout: str = "") -> MpResult:
@@ -69,7 +69,7 @@ def vm_fs_mocks(cfg: AgentsConfig, mocker: Any) -> dict[str, Any]:
 def with_coder(
     cfg: AgentsConfig, saved_config: Path, mocker: Any, vm_fs_mocks: dict[str, Any]
 ) -> Path:
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     create(name="coder", agent_type="hermes", config_path=saved_config)
     return saved_config
 
@@ -79,7 +79,7 @@ def _track_order(mocker: Any) -> list[str]:
     their relative order. write_atomically keeps its real behavior
     (the config edit must actually land); the compose verbs are stubs.
     """
-    import agents_cli.hermes_config as hermes_config_mod
+    import agx_cli.hermes_config as hermes_config_mod
 
     order: list[str] = []
     real_write = hermes_config_mod.write_atomically
@@ -88,13 +88,13 @@ def _track_order(mocker: Any) -> list[str]:
         order.append("config")
         real_write(*a, **k)
 
-    mocker.patch("agents_cli.hermes_config.write_atomically", side_effect=tracked_write)
+    mocker.patch("agx_cli.hermes_config.write_atomically", side_effect=tracked_write)
     mocker.patch(
-        "agents_cli.compose_runner.up",
+        "agx_cli.compose_runner.up",
         side_effect=lambda *a, **k: (order.append("up"), _ok())[1],
     )
     mocker.patch(
-        "agents_cli.compose_runner.restart",
+        "agx_cli.compose_runner.restart",
         side_effect=lambda *a, **k: (order.append("restart"), _ok())[1],
     )
     return order
@@ -120,8 +120,8 @@ def test_enable_restart_targets_the_agent_service(
     with_coder: Path, cfg: AgentsConfig, mocker: Any
 ) -> None:
     cfg.ollama = OllamaConfig(url="http://10.20.30.1:11434")
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
-    restart = mocker.patch("agents_cli.compose_runner.restart", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
+    restart = mocker.patch("agx_cli.compose_runner.restart", return_value=_ok())
 
     mem0.enable(cfg, "coder")
 
@@ -133,8 +133,8 @@ def test_disable_restarts_gateway_after_config_edit(
     with_coder: Path, cfg: AgentsConfig, mocker: Any
 ) -> None:
     cfg.ollama = OllamaConfig(url="http://10.20.30.1:11434")
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
-    mocker.patch("agents_cli.compose_runner.restart", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.restart", return_value=_ok())
     mem0.enable(cfg, "coder")
 
     order = _track_order(mocker)

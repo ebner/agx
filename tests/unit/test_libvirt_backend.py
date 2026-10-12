@@ -28,7 +28,7 @@ def libvirt(mocker: Any, tmp_path: Path) -> Any:
     Returns the module object so tests can call its functions
     and inspect module-level state.
     """
-    from agents_cli.backends import libvirt as mod
+    from agx_cli.backends import libvirt as mod
 
     mod.configure(tmp_path)
     return mod
@@ -65,7 +65,7 @@ def test_launch_rejects_non_release_image(libvirt: Any) -> None:
     multipass image name. Reject anything that doesn't match
     \\d+\\.\\d+ rather than silently downloading a wrong URL.
     """
-    from agents_cli.errors import UserError
+    from agx_cli.errors import UserError
 
     with pytest.raises(UserError, match="Ubuntu release"):
         libvirt.launch("agents", image="lts", cpus=2, memory_gb=4, disk_gb=20)
@@ -119,7 +119,7 @@ def test_exec_in_vm_builds_ssh_argv(libvirt: Any, mocker: Any, tmp_path: Path) -
     (tmp_path / ".ssh" / "id_ed25519").write_text("k")
 
     # Mock _vm_ip to return a fixed IP without going through virsh.
-    mocker.patch("agents_cli.backends.libvirt._vm_ip", return_value="192.168.122.50")
+    mocker.patch("agx_cli.backends.libvirt._vm_ip", return_value="192.168.122.50")
     run_mock = _mock_subprocess(mocker)
 
     libvirt.exec_in_vm("agents", "uptime", check=False)
@@ -136,7 +136,7 @@ def test_exec_in_vm_builds_ssh_argv(libvirt: Any, mocker: Any, tmp_path: Path) -
 def test_transfer_to_vm_uses_scp(libvirt: Any, mocker: Any, tmp_path: Path) -> None:
     (tmp_path / ".ssh").mkdir()
     (tmp_path / ".ssh" / "id_ed25519").write_text("k")
-    mocker.patch("agents_cli.backends.libvirt._vm_ip", return_value="192.168.122.50")
+    mocker.patch("agx_cli.backends.libvirt._vm_ip", return_value="192.168.122.50")
     run_mock = _mock_subprocess(mocker)
 
     libvirt.transfer_to_vm(tmp_path / "src.txt", "agents", "/dst/path.txt")
@@ -285,10 +285,41 @@ def test_import_refuses_on_non_linux(mocker: Any) -> None:
     import importlib
     import sys
 
-    from agents_cli.errors import UserError
+    from agx_cli.errors import UserError
 
     mocker.patch("platform.system", return_value="Darwin")
     # Force re-import.
-    sys.modules.pop("agents_cli.backends.libvirt", None)
+    sys.modules.pop("agx_cli.backends.libvirt", None)
     with pytest.raises(UserError, match="Linux-only"):
-        importlib.import_module("agents_cli.backends.libvirt")
+        importlib.import_module("agx_cli.backends.libvirt")
+
+
+def test_virtiofs_tag_fits_qemu_limit_and_keeps_legacy_short_tags() -> None:
+    from agx_cli.backends import libvirt as libvirt_mod
+
+    # The data-dir share keeps its readable tag (already attached on live VMs).
+    assert libvirt_mod._virtiofs_tag("/home/ubuntu/agents") == "home_ubuntu_agents"
+    # `agx mount` paths exceed QEMU's 36-byte cap in the legacy form.
+    long_path = "/home/ubuntu/host-extras/itest-a45f00d1/0123abcd-somefolder"
+    tag = libvirt_mod._virtiofs_tag(long_path)
+    assert len(tag.encode()) <= libvirt_mod.VIRTIOFS_TAG_MAX
+    assert tag == libvirt_mod._virtiofs_tag(long_path)  # mount/umount agree
+    assert tag != libvirt_mod._virtiofs_tag(long_path + "x")
+
+
+def test_filesystem_element_for_tag_carries_source_for_detach() -> None:
+    from agx_cli.backends import libvirt as libvirt_mod
+
+    domain = (
+        "<domain><devices>"
+        "<filesystem type='mount' accessmode='passthrough'><driver type='virtiofs'/>"
+        "<source dir='/home/u/agents'/><target dir='home_ubuntu_agents'/></filesystem>"
+        "<filesystem type='mount' accessmode='passthrough'><driver type='virtiofs'/>"
+        "<source dir='/srv/shared'/><target dir='agx-abc'/></filesystem>"
+        "</devices></domain>"
+    )
+    el = libvirt_mod._filesystem_element_for_tag(domain, "agx-abc")
+    assert el is not None
+    assert 'dir="/srv/shared"' in el and 'dir="agx-abc"' in el
+    assert "home_ubuntu_agents" not in el
+    assert libvirt_mod._filesystem_element_for_tag(domain, "missing") is None

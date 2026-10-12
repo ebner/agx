@@ -8,16 +8,16 @@ from typing import Any
 
 import pytest
 
-from agents_cli import tailscale_cmd
-from agents_cli.config import (
+from agx_cli import tailscale_cmd
+from agx_cli.config import (
     AgentsConfig,
     HostConfig,
     PathsConfig,
     VmConfig,
     VmRuntimeConfig,
 )
-from agents_cli.errors import RuntimeFailure, UserError
-from agents_cli.mp import MpResult
+from agx_cli.errors import RuntimeFailure, UserError
+from agx_cli.mp import MpResult
 
 
 def _ok(stdout: str = "") -> MpResult:
@@ -50,7 +50,7 @@ def cfg(tmp_path: Path) -> AgentsConfig:
 
 @pytest.fixture
 def saved_config(cfg: AgentsConfig, tmp_path: Path) -> Path:
-    from agents_cli import config as cfg_mod
+    from agx_cli import config as cfg_mod
 
     p = tmp_path / "config.toml"
     cfg_mod.save(cfg, p)
@@ -71,7 +71,7 @@ def _status_json(state: str = "Running") -> str:
 
 
 def test_refuses_on_bare_metal(tmp_path: Path, mocker: Any) -> None:
-    from agents_cli import config as cfg_mod
+    from agx_cli import config as cfg_mod
 
     cfg = _make_cfg(tmp_path, backend="bare_metal")
     p = tmp_path / "config.toml"
@@ -88,9 +88,9 @@ def test_refuses_on_bare_metal(tmp_path: Path, mocker: Any) -> None:
 def test_up_installs_joins_and_writes_state(
     cfg: AgentsConfig, saved_config: Path, mocker: Any
 ) -> None:
-    bash = mocker.patch("agents_cli.mp.exec_bash", return_value=_ok("...\n1.86.2\n"))
+    bash = mocker.patch("agx_cli.mp.exec_bash", return_value=_ok("...\n1.86.2\n"))
     execs = mocker.patch(
-        "agents_cli.mp.exec_in_vm",
+        "agx_cli.mp.exec_in_vm",
         side_effect=[
             _ok(),  # sudo tailscale up
             _ok(_status_json("Running")),  # tailscale status --json
@@ -114,9 +114,9 @@ def test_up_auth_key_rides_stdin_never_argv(
     """The auth key is a reusable credential and both backends echo the
     exec argv under --verbose — it must travel via stdin, not argv
     (codex review 2026-08-27)."""
-    mocker.patch("agents_cli.mp.exec_bash", return_value=_ok("1.86.2\n"))
-    stdin_exec = mocker.patch("agents_cli.mp.exec_in_vm_with_stdin", return_value=_ok())
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok(_status_json("Running")))
+    mocker.patch("agx_cli.mp.exec_bash", return_value=_ok("1.86.2\n"))
+    stdin_exec = mocker.patch("agx_cli.mp.exec_in_vm_with_stdin", return_value=_ok())
+    mocker.patch("agx_cli.mp.exec_in_vm", return_value=_ok(_status_json("Running")))
     tailscale_cmd.up(auth_key="tskey-abc", hostname="agents-lab", config_path=saved_config)
     call = stdin_exec.call_args
     assert all("tskey-abc" not in str(a) for a in call.args)
@@ -131,11 +131,11 @@ def test_up_failed_rc_not_masked_by_already_running(
     up` failed (bad hostname/key) — rc must gate the success path."""
     import pytest as _pytest
 
-    from agents_cli.errors import RuntimeFailure as _RF
+    from agx_cli.errors import RuntimeFailure as _RF
 
-    mocker.patch("agents_cli.mp.exec_bash", return_value=_ok("1.86.2\n"))
+    mocker.patch("agx_cli.mp.exec_bash", return_value=_ok("1.86.2\n"))
     mocker.patch(
-        "agents_cli.mp.exec_in_vm",
+        "agx_cli.mp.exec_in_vm",
         side_effect=[
             _fail(stderr="backend error: invalid hostname"),
             _ok(_status_json("Running")),
@@ -148,23 +148,23 @@ def test_up_failed_rc_not_masked_by_already_running(
 def test_up_without_auth_emits_login_url(
     cfg: AgentsConfig, saved_config: Path, mocker: Any
 ) -> None:
-    mocker.patch("agents_cli.mp.exec_bash", return_value=_ok("1.86.2\n"))
+    mocker.patch("agx_cli.mp.exec_bash", return_value=_ok("1.86.2\n"))
     mocker.patch(
-        "agents_cli.mp.exec_in_vm",
+        "agx_cli.mp.exec_in_vm",
         side_effect=[
             _fail(stderr="To authenticate, visit:\n\nhttps://login.tailscale.com/a/abc123\n"),
             _ok(_status_json("NeedsLogin")),
         ],
     )
     emitted: list[dict[str, Any]] = []
-    mocker.patch("agents_cli.ui.emit", side_effect=lambda p, human=None: emitted.append(dict(p)))
+    mocker.patch("agx_cli.ui.emit", side_effect=lambda p, human=None: emitted.append(dict(p)))
     tailscale_cmd.up(config_path=saved_config)
     assert emitted[0]["auth_url"] == "https://login.tailscale.com/a/abc123"
     assert tailscale_cmd.read_state(cfg).get("pending_auth") is True
 
 
 def test_up_raises_on_install_failure(cfg: AgentsConfig, saved_config: Path, mocker: Any) -> None:
-    mocker.patch("agents_cli.mp.exec_bash", return_value=_fail("apt exploded"))
+    mocker.patch("agx_cli.mp.exec_bash", return_value=_fail("apt exploded"))
     with pytest.raises(RuntimeFailure, match="install failed"):
         tailscale_cmd.up(config_path=saved_config)
 
@@ -173,7 +173,7 @@ def test_up_raises_on_install_failure(cfg: AgentsConfig, saved_config: Path, moc
 
 
 def test_status_parses_running_state(cfg: AgentsConfig, saved_config: Path, mocker: Any) -> None:
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok(_status_json("Running")))
+    mocker.patch("agx_cli.mp.exec_in_vm", return_value=_ok(_status_json("Running")))
     payload = tailscale_cmd.status(config_path=saved_config)
     assert payload["backend_state"] == "Running"
     assert payload["ips"] == ["100.64.0.7"]
@@ -183,7 +183,7 @@ def test_status_parses_running_state(cfg: AgentsConfig, saved_config: Path, mock
 
 def test_status_reports_not_installed(cfg: AgentsConfig, saved_config: Path, mocker: Any) -> None:
     mocker.patch(
-        "agents_cli.mp.exec_in_vm",
+        "agx_cli.mp.exec_in_vm",
         return_value=_fail("bash: tailscale: command not found"),
     )
     payload = tailscale_cmd.status(config_path=saved_config)
@@ -201,7 +201,7 @@ def test_status_lists_non_loopback_published_ports(
         '      - "127.0.0.1:8642:8642"\n',
         encoding="utf-8",
     )
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok(_status_json("Running")))
+    mocker.patch("agx_cli.mp.exec_in_vm", return_value=_ok(_status_json("Running")))
     payload = tailscale_cmd.status(config_path=saved_config)
     assert payload["published_ports"] == ["9119"]
 
@@ -210,7 +210,7 @@ def test_status_lists_non_loopback_published_ports(
 
 
 def test_down_invokes_tailscale_down(cfg: AgentsConfig, saved_config: Path, mocker: Any) -> None:
-    execs = mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok())
+    execs = mocker.patch("agx_cli.mp.exec_in_vm", return_value=_ok())
     tailscale_cmd.down(config_path=saved_config)
     assert execs.call_args.args[1:] == ("sudo", "tailscale", "down")
 
@@ -222,8 +222,8 @@ def test_upgrade_requires_prior_up(cfg: AgentsConfig, saved_config: Path, mocker
 
 def test_upgrade_runs_apt_only_upgrade(cfg: AgentsConfig, saved_config: Path, mocker: Any) -> None:
     tailscale_cmd.write_state(cfg, {"hostname": "agents", "version": "1.80.0"})
-    bash = mocker.patch("agents_cli.mp.exec_bash", return_value=_ok("1.86.2\n"))
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok(_status_json("Running")))
+    bash = mocker.patch("agx_cli.mp.exec_bash", return_value=_ok("1.86.2\n"))
+    mocker.patch("agx_cli.mp.exec_in_vm", return_value=_ok(_status_json("Running")))
     tailscale_cmd.upgrade(config_path=saved_config)
     assert "--only-upgrade tailscale" in bash.call_args.args[1]
     assert tailscale_cmd.read_state(cfg)["version"] == "1.86.2"
@@ -233,9 +233,9 @@ def test_upgrade_runs_apt_only_upgrade(cfg: AgentsConfig, saved_config: Path, mo
 
 
 def test_doctor_check_skips_without_state_file(cfg: AgentsConfig, mocker: Any) -> None:
-    from agents_cli.ops import DoctorReport, _check_tailscale
+    from agx_cli.ops import DoctorReport, _check_tailscale
 
-    probe = mocker.patch("agents_cli.mp.exec_in_vm")
+    probe = mocker.patch("agx_cli.mp.exec_in_vm")
     report = DoctorReport()
     _check_tailscale(cfg, report)
     assert report.checks == []
@@ -243,10 +243,10 @@ def test_doctor_check_skips_without_state_file(cfg: AgentsConfig, mocker: Any) -
 
 
 def test_doctor_check_warns_when_disconnected(cfg: AgentsConfig, mocker: Any) -> None:
-    from agents_cli.ops import DoctorReport, _check_tailscale
+    from agx_cli.ops import DoctorReport, _check_tailscale
 
     tailscale_cmd.write_state(cfg, {"hostname": "agents"})
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok(_status_json("NeedsLogin")))
+    mocker.patch("agx_cli.mp.exec_in_vm", return_value=_ok(_status_json("NeedsLogin")))
     report = DoctorReport()
     _check_tailscale(cfg, report)
     [check] = report.checks
@@ -254,10 +254,10 @@ def test_doctor_check_warns_when_disconnected(cfg: AgentsConfig, mocker: Any) ->
 
 
 def test_doctor_check_ok_when_running(cfg: AgentsConfig, mocker: Any) -> None:
-    from agents_cli.ops import DoctorReport, _check_tailscale
+    from agx_cli.ops import DoctorReport, _check_tailscale
 
     tailscale_cmd.write_state(cfg, {"hostname": "agents"})
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok(_status_json("Running")))
+    mocker.patch("agx_cli.mp.exec_in_vm", return_value=_ok(_status_json("Running")))
     report = DoctorReport()
     _check_tailscale(cfg, report)
     [check] = report.checks

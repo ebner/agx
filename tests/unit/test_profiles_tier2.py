@@ -14,18 +14,18 @@ from typing import Any
 
 import pytest
 
-from agents_cli import config as cfg_mod
-from agents_cli import conversations_cmd, hermes_config, models_cmd, profile_cmd, secrets_cmd
-from agents_cli.agents_cmd import create
-from agents_cli.config import (
+from agx_cli import config as cfg_mod
+from agx_cli import conversations_cmd, hermes_config, models_cmd, profile_cmd, secrets_cmd
+from agx_cli.agents_cmd import create
+from agx_cli.config import (
     AgentsConfig,
     DefaultsConfig,
     HostConfig,
     PathsConfig,
     VmRuntimeConfig,
 )
-from agents_cli.errors import UserError
-from agents_cli.mp import MpResult
+from agx_cli.errors import UserError
+from agx_cli.mp import MpResult
 
 
 def _ok(stdout: str = "") -> MpResult:
@@ -62,7 +62,7 @@ def with_coder(cfg: AgentsConfig, saved_config: Path, mocker: Any) -> Path:
     from tests.conftest import install_vm_fs_simulation
 
     install_vm_fs_simulation(mocker, cfg)
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     create(name="coder", agent_type="hermes", config_path=saved_config)
     return saved_config
 
@@ -173,7 +173,7 @@ def test_secret_profile_refused_for_openclaw(
     from tests.conftest import install_vm_fs_simulation
 
     install_vm_fs_simulation(mocker, cfg)
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     create(name="claw", agent_type="openclaw", config_path=saved_config)
     with pytest.raises(UserError, match="Hermes-only"):
         secrets_cmd.set_secret("claw", "K", "v", profile="work", config_path=saved_config)
@@ -194,7 +194,7 @@ def test_conversations_status_passes_profile_home_env(
         "by_platform": {},
         "active_sessions": [],
     }
-    execs = mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok(json.dumps(payload)))
+    execs = mocker.patch("agx_cli.mp.exec_in_vm", return_value=_ok(json.dumps(payload)))
     out = conversations_cmd.status("coder", profile="work", config_path=with_coder)
     argv = execs.call_args.args
     assert "H_HOME=/opt/data/profiles/work" in argv
@@ -224,10 +224,10 @@ def test_model_use_profile_writes_profile_config(
 def test_memory_holographic_profile_targets_profile_home(
     with_coder: Path, cfg: AgentsConfig, mocker: Any
 ) -> None:
-    from agents_cli import memory as memory_mod
+    from agx_cli import memory as memory_mod
 
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
-    mocker.patch("agents_cli.compose_runner.restart", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.restart", return_value=_ok())
     _seed_default(cfg, "model: 'untouched'\n")
     _seed_profile(cfg, "work")
 
@@ -253,7 +253,7 @@ def test_memory_holographic_profile_targets_profile_home(
 def test_memory_openviking_refuses_profile(
     with_coder: Path, cfg: AgentsConfig, mocker: Any
 ) -> None:
-    from agents_cli import memory as memory_mod
+    from agx_cli import memory as memory_mod
 
     _seed_profile(cfg, "work")
     with pytest.raises(UserError, match="per-profile"):
@@ -264,7 +264,7 @@ def test_memory_openviking_refuses_profile(
 
 
 def test_doctor_profile_dashboards_warns_on_non_loopback(cfg: AgentsConfig, mocker: Any) -> None:
-    from agents_cli.ops import DoctorReport, _check_profile_dashboard_bindings
+    from agx_cli.ops import DoctorReport, _check_profile_dashboard_bindings
 
     probe = {
         "rows": [
@@ -272,7 +272,7 @@ def test_doctor_profile_dashboards_warns_on_non_loopback(cfg: AgentsConfig, mock
             {"profile": "default", "address": "127.0.0.1"},
         ]
     }
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok(json.dumps(probe)))
+    mocker.patch("agx_cli.mp.exec_in_vm", return_value=_ok(json.dumps(probe)))
     report = DoctorReport()
     _check_profile_dashboard_bindings(cfg, "hermes-coder", "coder", report)
     [check] = report.checks
@@ -282,10 +282,10 @@ def test_doctor_profile_dashboards_warns_on_non_loopback(cfg: AgentsConfig, mock
 
 
 def test_doctor_profile_dashboards_quiet_when_loopback(cfg: AgentsConfig, mocker: Any) -> None:
-    from agents_cli.ops import DoctorReport, _check_profile_dashboard_bindings
+    from agx_cli.ops import DoctorReport, _check_profile_dashboard_bindings
 
     probe = {"rows": [{"profile": "default", "address": "127.0.0.1"}]}
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok(json.dumps(probe)))
+    mocker.patch("agx_cli.mp.exec_in_vm", return_value=_ok(json.dumps(probe)))
     report = DoctorReport()
     _check_profile_dashboard_bindings(cfg, "hermes-coder", "coder", report)
     assert report.checks == []
@@ -313,7 +313,7 @@ def test_profile_list_parses_probe(with_coder: Path, cfg: AgentsConfig, mocker: 
             },
         ]
     }
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok(json.dumps(probe)))
+    mocker.patch("agx_cli.mp.exec_in_vm", return_value=_ok(json.dumps(probe)))
     payload = profile_cmd.list_profiles("coder", config_path=with_coder)
     assert [r["profile"] for r in payload["profiles"]] == ["default", "work"]
 
@@ -322,7 +322,7 @@ def test_profile_list_refuses_openclaw(cfg: AgentsConfig, saved_config: Path, mo
     from tests.conftest import install_vm_fs_simulation
 
     install_vm_fs_simulation(mocker, cfg)
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     create(name="claw", agent_type="openclaw", config_path=saved_config)
     with pytest.raises(UserError, match="Hermes-only"):
         profile_cmd.list_profiles("claw", config_path=saved_config)
@@ -333,13 +333,13 @@ def test_profile_list_refuses_openclaw(cfg: AgentsConfig, saved_config: Path, mo
 
 def test_cli_model_use_reaches_backend_with_profile(mocker: Any) -> None:
     """P1 regression: the --profile click option fell off model_use while
-    the callback signature gained the parameter — EVERY `agents model
+    the callback signature gained the parameter — EVERY `agx model
     use` invocation TypeError'd before reaching the backend. Invoking
     through the real command tree catches decorator/signature drift the
     direct-call tests can't see."""
     from tests.unit.test_cli import invoke
 
-    use = mocker.patch("agents_cli.models_cmd.use")
+    use = mocker.patch("agx_cli.models_cmd.use")
     result = invoke(
         mocker,
         ["model", "use", "coder", "--engine", "ollama", "--model", "m", "--profile", "work"],
@@ -354,11 +354,11 @@ def test_cli_model_use_reaches_backend_with_profile(mocker: Any) -> None:
 
 
 def test_cli_prune_honors_root_yes(mocker: Any) -> None:
-    """P2 regression: `agents --yes prune` prompted anyway (callback
+    """P2 regression: `agx --yes prune` prompted anyway (callback
     ignored the root context), hanging automation."""
     from tests.unit.test_cli import invoke
 
-    prune = mocker.patch("agents_cli.prune_cmd.prune")
+    prune = mocker.patch("agx_cli.prune_cmd.prune")
     result = invoke(mocker, ["--yes", "prune"])
     assert result.exit_code == 0, result.output
     assert prune.call_args.kwargs["yes"] is True
@@ -378,10 +378,10 @@ def test_holographic_profile_overrides_cloned_default_db_path(
     """P1 regression: a profile created with `--clone default` inherits
     the DEFAULT profile's db_path; setdefault kept it, silently sharing
     one memory DB across profiles."""
-    from agents_cli import memory as memory_mod
+    from agx_cli import memory as memory_mod
 
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
-    mocker.patch("agents_cli.compose_runner.restart", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.restart", return_value=_ok())
     _seed_profile(
         cfg,
         "work",
@@ -404,7 +404,7 @@ def test_secret_set_profile_restarts_gateway(
     """P2 regression: a profile-only passthrough edit changes config.yaml
     but not compose inputs — `up` no-ops and the running gateway kept
     filtering the var until an unrelated restart."""
-    restart = mocker.patch("agents_cli.compose_runner.restart", return_value=_ok())
+    restart = mocker.patch("agx_cli.compose_runner.restart", return_value=_ok())
     _seed_default(cfg, "terminal:\n  env_passthrough: []\n")
     _seed_profile(cfg, "work", "terminal:\n  env_passthrough: []\n")
 
@@ -425,7 +425,7 @@ def test_clear_sweeps_every_profile_passthrough(
     _seed_default(cfg, "terminal:\n  env_passthrough: [MY_KEY]\n")
     _seed_profile(cfg, "work", "terminal:\n  env_passthrough: [MY_KEY]\n")
     (cfg.paths.host_data_dir / "coder" / ".env").write_text("MY_KEY=v\n", encoding="utf-8")
-    mocker.patch("agents_cli.secrets_cmd._list_profile_names", return_value=["work"])
+    mocker.patch("agx_cli.secrets_cmd._list_profile_names", return_value=["work"])
 
     secrets_cmd.clear_secrets("coder", yes=True, config_path=with_coder)
 
@@ -438,8 +438,8 @@ def test_clear_sweeps_every_profile_passthrough(
 def test_external_ollama_api_key_env_resolution(tmp_path: Path) -> None:
     """P2 regression: authenticated external endpoints ([ollama].api_key_env)
     got the literal dummy key — every Hermes request would 401."""
-    from agents_cli.config import OllamaConfig
-    from agents_cli.models_cmd import _external_ollama_api_key
+    from agx_cli.config import OllamaConfig
+    from agx_cli.models_cmd import _external_ollama_api_key
 
     data_dir = tmp_path / "d"
     data_dir.mkdir()

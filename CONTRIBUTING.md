@@ -17,14 +17,14 @@ Python 3.11 and 3.12:
 
 ```bash
 uv run pytest -q                     # 900+ hermetic unit tests
-uv run mypy --strict src/agents_cli
+uv run mypy --strict src/agx_cli
 uv run ruff check .
 uv run ruff format --check .
 ```
 
 The unit suite is hermetic by design: it must pass with no `multipass`
 binary, no VM, and an empty `$HOME`. If your test needs a backend call,
-stub `agents_cli.mp` — never invoke a real binary or read the developer's
+stub `agx_cli.mp` — never invoke a real binary or read the developer's
 real `~/.config/agents/config.toml` (both classes have bitten before).
 
 ## Integration tests

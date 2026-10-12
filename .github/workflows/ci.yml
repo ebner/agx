@@ -38,7 +38,7 @@ jobs:
         run: uv run --no-sync ruff format --check .
 
       - name: Type check (mypy --strict)
-        run: uv run --no-sync mypy --strict src/agents_cli
+        run: uv run --no-sync mypy --strict src/agx_cli
 
       # Integration tests (tests/integration/, marker `multipass`) are
       # deselected via addopts and must NEVER run in CI — they require a
@@ -47,4 +47,4 @@ jobs:
         run: uv run --no-sync pytest -q
 
       - name: Verify CLI entry point
-        run: uv run --no-sync agents --version && uv run --no-sync agents --help
+        run: uv run --no-sync agx --version && uv run --no-sync agx --help && uv run --no-sync agents --version

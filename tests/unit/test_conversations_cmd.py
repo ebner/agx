@@ -8,18 +8,18 @@ from typing import Any
 
 import pytest
 
-from agents_cli import config as cfg_mod
-from agents_cli import conversations_cmd
-from agents_cli.agents_cmd import create
-from agents_cli.config import (
+from agx_cli import config as cfg_mod
+from agx_cli import conversations_cmd
+from agx_cli.agents_cmd import create
+from agx_cli.config import (
     AgentsConfig,
     DefaultsConfig,
     HostConfig,
     PathsConfig,
     VmRuntimeConfig,
 )
-from agents_cli.errors import RuntimeFailure, UserError
-from agents_cli.mp import MpResult
+from agx_cli.errors import RuntimeFailure, UserError
+from agx_cli.mp import MpResult
 
 
 def _ok(stdout: str = "") -> MpResult:
@@ -56,7 +56,7 @@ def with_coder(cfg: AgentsConfig, saved_config: Path, mocker: Any) -> Path:
     from tests.conftest import install_vm_fs_simulation
 
     install_vm_fs_simulation(mocker, cfg)
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     create(name="coder", agent_type="hermes", config_path=saved_config)
     return saved_config
 
@@ -66,7 +66,7 @@ def with_openclaw_personal(cfg: AgentsConfig, saved_config: Path, mocker: Any) -
     from tests.conftest import install_vm_fs_simulation
 
     install_vm_fs_simulation(mocker, cfg)
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     create(name="personal", agent_type="openclaw", config_path=saved_config)
     return saved_config
 
@@ -93,7 +93,7 @@ def test_conversations_returns_empty_active_when_all_sessions_cold(
         },
         "active_sessions": [],
     }
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok(json.dumps(canned)))
+    mocker.patch("agx_cli.mp.exec_in_vm", return_value=_ok(json.dumps(canned)))
 
     payload = conversations_cmd.status("coder", config_path=with_coder)
     assert payload["agent"] == "coder"
@@ -129,7 +129,7 @@ def test_conversations_renders_active_sessions_when_present(with_coder: Path, mo
             },
         ],
     }
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok(json.dumps(canned)))
+    mocker.patch("agx_cli.mp.exec_in_vm", return_value=_ok(json.dumps(canned)))
     emit_spy = mocker.spy(conversations_cmd.ui, "emit")
 
     payload = conversations_cmd.status("coder", config_path=with_coder)
@@ -169,7 +169,7 @@ def test_conversations_respects_limit(with_coder: Path, mocker: Any) -> None:
         "by_platform": {"whatsapp": {"total": 50, "open": 50, "active": 50}},
         "active_sessions": active,
     }
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok(json.dumps(canned)))
+    mocker.patch("agx_cli.mp.exec_in_vm", return_value=_ok(json.dumps(canned)))
     emit_spy = mocker.spy(conversations_cmd.ui, "emit")
 
     conversations_cmd.status("coder", limit=5, config_path=with_coder)
@@ -191,7 +191,7 @@ def test_conversations_rejects_openclaw(with_openclaw_personal: Path, mocker: An
     Critically: must NOT call into the container, since the schema
     differs and the query would either error or return garbage.
     """
-    exec_spy = mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok())
+    exec_spy = mocker.patch("agx_cli.mp.exec_in_vm", return_value=_ok())
 
     with pytest.raises(UserError, match="Hermes-only"):
         conversations_cmd.status("personal", config_path=with_openclaw_personal)
@@ -214,7 +214,7 @@ def test_conversations_surfaces_container_down_as_user_error(
     with code 1 (user-fixable) instead of 2 (runtime crash).
     """
     mocker.patch(
-        "agents_cli.mp.exec_in_vm",
+        "agx_cli.mp.exec_in_vm",
         return_value=MpResult(stdout="", stderr="service is not running", returncode=1),
     )
     with pytest.raises(UserError, match="not running"):
@@ -228,7 +228,7 @@ def test_conversations_surfaces_unparseable_output_as_runtime_failure(
     should bubble up as RuntimeFailure with a hint, not silently emit
     a corrupt payload.
     """
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok("not json at all\n"))
+    mocker.patch("agx_cli.mp.exec_in_vm", return_value=_ok("not json at all\n"))
     with pytest.raises(RuntimeFailure, match="could not parse"):
         conversations_cmd.status("coder", config_path=with_coder)
 
@@ -294,7 +294,7 @@ def test_export_writes_one_markdown_per_session(
             },
         ]
     }
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok(json.dumps(canned)))
+    mocker.patch("agx_cli.mp.exec_in_vm", return_value=_ok(json.dumps(canned)))
 
     out_dir = tmp_path / "transcripts"
     payload = conversations_cmd.export("coder", to_dir=out_dir, config_path=with_coder)
@@ -314,7 +314,7 @@ def test_export_writes_one_markdown_per_session(
 def test_export_creates_to_dir_if_missing(with_coder: Path, tmp_path: Path, mocker: Any) -> None:
     """Don't make users mkdir first — just create the directory."""
     mocker.patch(
-        "agents_cli.mp.exec_in_vm",
+        "agx_cli.mp.exec_in_vm",
         return_value=_ok(json.dumps({"sessions": []})),
     )
     target = tmp_path / "deep" / "nested" / "transcripts"
@@ -344,7 +344,7 @@ def test_export_is_idempotent(with_coder: Path, tmp_path: Path, mocker: Any) -> 
             },
         ]
     }
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok(json.dumps(canned)))
+    mocker.patch("agx_cli.mp.exec_in_vm", return_value=_ok(json.dumps(canned)))
     target = tmp_path / "out"
     conversations_cmd.export("coder", to_dir=target, config_path=with_coder)
     first = (target / "s1.md").read_text(encoding="utf-8")
@@ -385,7 +385,7 @@ def test_export_skips_hostile_session_ids_but_continues(
             _minimal_session("good_id-1.2"),
         ]
     }
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok(json.dumps(canned)))
+    mocker.patch("agx_cli.mp.exec_in_vm", return_value=_ok(json.dumps(canned)))
     warn_spy = mocker.spy(conversations_cmd.ui, "warn")
 
     out_dir = tmp_path / "transcripts"
@@ -406,14 +406,14 @@ def test_export_without_hostile_ids_omits_skipped_key(
     with_coder: Path, tmp_path: Path, mocker: Any
 ) -> None:
     canned = {"sessions": [_minimal_session("plain")]}
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok(json.dumps(canned)))
+    mocker.patch("agx_cli.mp.exec_in_vm", return_value=_ok(json.dumps(canned)))
     payload = conversations_cmd.export("coder", to_dir=tmp_path / "out", config_path=with_coder)
     assert "skipped_ids" not in payload
     assert payload["sessions_written"] == 1
 
 
 def test_export_rejects_openclaw(with_openclaw_personal: Path, tmp_path: Path, mocker: Any) -> None:
-    exec_spy = mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok())
+    exec_spy = mocker.patch("agx_cli.mp.exec_in_vm", return_value=_ok())
     with pytest.raises(UserError, match="Hermes-only"):
         conversations_cmd.export(
             "personal", to_dir=tmp_path / "out", config_path=with_openclaw_personal

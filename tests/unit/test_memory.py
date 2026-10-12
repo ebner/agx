@@ -7,10 +7,10 @@ from typing import Any
 
 import pytest
 
-from agents_cli import compose, hermes_config, memory
-from agents_cli import config as cfg_mod
-from agents_cli.agents_cmd import create
-from agents_cli.config import (
+from agx_cli import compose, hermes_config, memory
+from agx_cli import config as cfg_mod
+from agx_cli.agents_cmd import create
+from agx_cli.config import (
     AgentsConfig,
     DefaultsConfig,
     HostConfig,
@@ -18,9 +18,9 @@ from agents_cli.config import (
     PathsConfig,
     VmRuntimeConfig,
 )
-from agents_cli.errors import UserError
-from agents_cli.memory import holographic, mem0, openviking
-from agents_cli.mp import MpResult
+from agx_cli.errors import UserError
+from agx_cli.memory import holographic, mem0, openviking
+from agx_cli.mp import MpResult
 
 
 def _ok(stdout: str = "") -> MpResult:
@@ -63,7 +63,7 @@ def vm_fs_mocks(cfg: AgentsConfig, mocker: Any) -> dict[str, Any]:
 def with_coder(
     cfg: AgentsConfig, saved_config: Path, mocker: Any, vm_fs_mocks: dict[str, Any]
 ) -> Path:
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     create(name="coder", agent_type="hermes", config_path=saved_config)
     return saved_config
 
@@ -72,7 +72,7 @@ def with_coder(
 def with_personal_openclaw(
     cfg: AgentsConfig, saved_config: Path, mocker: Any, vm_fs_mocks: dict[str, Any]
 ) -> Path:
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     create(name="personal", agent_type="openclaw", config_path=saved_config)
     return saved_config
 
@@ -107,7 +107,7 @@ def test_enable_refuses_unknown_agent(saved_config: Path) -> None:
 def test_holographic_enable_sets_provider_and_block(
     with_coder: Path, cfg: AgentsConfig, mocker: Any
 ) -> None:
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     result = memory.enable("holographic", "coder", config_path=with_coder)
     assert result["db_path"] == holographic.DEFAULT_DB_PATH
     assert result["hrr_dim"] == holographic.DEFAULT_HRR_DIM
@@ -126,7 +126,7 @@ def test_holographic_enable_sets_provider_and_block(
 def test_holographic_enable_warns_on_9p_when_not_data_dir_in_vm(
     with_coder: Path, cfg: AgentsConfig, mocker: Any
 ) -> None:
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     result = memory.enable("holographic", "coder", config_path=with_coder)
     assert any("9p" in w or "SQLite WAL" in w for w in result["warnings"])
 
@@ -134,7 +134,7 @@ def test_holographic_enable_warns_on_9p_when_not_data_dir_in_vm(
 def test_holographic_disable_restores_config(
     with_coder: Path, cfg: AgentsConfig, mocker: Any
 ) -> None:
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     memory.enable("holographic", "coder", config_path=with_coder)
     memory.disable("coder", config_path=with_coder)
 
@@ -146,7 +146,7 @@ def test_holographic_disable_restores_config(
 def test_holographic_enable_is_idempotent(
     with_coder: Path, cfg: AgentsConfig, mocker: Any
 ) -> None:
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     memory.enable("holographic", "coder", config_path=with_coder)
     # Second call should not duplicate state or change defaults.
     memory.enable("holographic", "coder", config_path=with_coder)
@@ -165,9 +165,9 @@ def test_holographic_enable_ups_then_restarts_container(
     order — same pattern as mem0.
     """
     parent = mocker.Mock()
-    parent.attach_mock(mocker.patch("agents_cli.compose_runner.up", return_value=_ok()), "up")
+    parent.attach_mock(mocker.patch("agx_cli.compose_runner.up", return_value=_ok()), "up")
     parent.attach_mock(
-        mocker.patch("agents_cli.compose_runner.restart", return_value=_ok()), "restart"
+        mocker.patch("agx_cli.compose_runner.restart", return_value=_ok()), "restart"
     )
 
     memory.enable("holographic", "coder", config_path=with_coder)
@@ -184,13 +184,13 @@ def test_holographic_disable_ups_then_restarts_container(
     built-in memory is also a config.yaml-only edit, and the container
     may equally be absent.
     """
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     memory.enable("holographic", "coder", config_path=with_coder)
 
     parent = mocker.Mock()
-    parent.attach_mock(mocker.patch("agents_cli.compose_runner.up", return_value=_ok()), "up")
+    parent.attach_mock(mocker.patch("agx_cli.compose_runner.up", return_value=_ok()), "up")
     parent.attach_mock(
-        mocker.patch("agents_cli.compose_runner.restart", return_value=_ok()), "restart"
+        mocker.patch("agx_cli.compose_runner.restart", return_value=_ok()), "restart"
     )
 
     memory.disable("coder", config_path=with_coder)
@@ -206,7 +206,7 @@ def test_holographic_disable_ups_then_restarts_container(
 def test_mem0_refuses_without_any_provider(
     with_coder: Path, cfg: AgentsConfig, mocker: Any
 ) -> None:
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     # No [ollama] block, no OPENAI_API_KEY in .env → must refuse loudly.
     with pytest.raises(UserError, match=r"neither \[ollama\] nor OPENAI_API_KEY"):
         memory.enable("mem0", "coder", config_path=with_coder)
@@ -215,7 +215,7 @@ def test_mem0_refuses_without_any_provider(
 def test_mem0_picks_ollama_when_configured(
     with_coder: Path, cfg: AgentsConfig, mocker: Any
 ) -> None:
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     cfg.ollama = OllamaConfig(url="http://10.20.30.1:11434")
     cfg_mod.save(cfg, with_coder)
 
@@ -232,7 +232,7 @@ def test_mem0_picks_ollama_when_configured(
 def test_mem0_picks_openai_when_only_key_present(
     with_coder: Path, cfg: AgentsConfig, mocker: Any
 ) -> None:
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     env_path = cfg.paths.host_data_dir / ".env"
     env_path.write_text(env_path.read_text() + "OPENAI_API_KEY=sk-xxx\n", encoding="utf-8")
 
@@ -242,13 +242,13 @@ def test_mem0_picks_openai_when_only_key_present(
 
 
 def test_mem0_explicit_ollama_refused_when_unconfigured(with_coder: Path, mocker: Any) -> None:
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     with pytest.raises(UserError, match=r"--embedder ollama requested but no \[ollama\]"):
         memory.enable("mem0", "coder", embedder="ollama", config_path=with_coder)
 
 
 def test_mem0_disable_strips_config(with_coder: Path, cfg: AgentsConfig, mocker: Any) -> None:
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     cfg.ollama = OllamaConfig(url="http://10.20.30.1:11434")
     cfg_mod.save(cfg, with_coder)
 
@@ -271,15 +271,15 @@ def test_mem0_appends_v1_when_missing(cfg: AgentsConfig) -> None:
 def test_openviking_refuses_without_ollama(
     with_coder: Path, cfg: AgentsConfig, mocker: Any
 ) -> None:
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
-    with pytest.raises(UserError, match="agents ollama configure"):
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
+    with pytest.raises(UserError, match="agx ollama configure"):
         memory.enable("openviking", "coder", config_path=with_coder)
 
 
 def test_openviking_adds_sibling_service_and_wires_hermes(
     with_coder: Path, cfg: AgentsConfig, mocker: Any
 ) -> None:
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     cfg.ollama = OllamaConfig(url="http://10.20.30.1:11434")
     cfg_mod.save(cfg, with_coder)
 
@@ -302,7 +302,7 @@ def test_openviking_adds_sibling_service_and_wires_hermes(
 def test_openviking_hermes_config_points_at_sidecar(
     with_coder: Path, cfg: AgentsConfig, mocker: Any
 ) -> None:
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     cfg.ollama = OllamaConfig(url="http://10.20.30.1:11434")
     cfg_mod.save(cfg, with_coder)
 
@@ -316,9 +316,9 @@ def test_openviking_hermes_config_points_at_sidecar(
 def test_openviking_disable_removes_sidecar(
     with_coder: Path, cfg: AgentsConfig, mocker: Any
 ) -> None:
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
-    mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())
-    mocker.patch("agents_cli.compose_runner.rm", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.stop", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.rm", return_value=_ok())
     cfg.ollama = OllamaConfig(url="http://10.20.30.1:11434")
     cfg_mod.save(cfg, with_coder)
 
@@ -340,7 +340,7 @@ def test_openviking_image_on_allowlist() -> None:
     """The toolkit MUST validate the sidecar image against the plan's
     parsed (registry, repo) tuple check, not a substring match.
     """
-    from agents_cli.compose import validate_image_ref
+    from agx_cli.compose import validate_image_ref
 
     validate_image_ref(f"{openviking.OPENVIKING_IMAGE_BASE}:{openviking.DEFAULT_IMAGE_TAG}")
 
@@ -357,7 +357,7 @@ def test_status_reports_no_backend_initially(
 
 
 def test_status_after_enable(with_coder: Path, cfg: AgentsConfig, mocker: Any) -> None:
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     memory.enable("holographic", "coder", config_path=with_coder)
 
     rows = memory.status("coder", config_path=with_coder)

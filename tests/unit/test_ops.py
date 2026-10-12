@@ -8,13 +8,13 @@ from pathlib import Path
 
 import pytest
 
-from agents_cli import compose, ops
-from agents_cli import config as cfg_mod
-from agents_cli.agents_cmd import create
-from agents_cli.config import AgentsConfig, DefaultsConfig, HostConfig, PathsConfig, VmRuntimeConfig
-from agents_cli.errors import HealthCheckFailure, UserError
-from agents_cli.journal import Journal
-from agents_cli.mp import MpResult
+from agx_cli import compose, ops
+from agx_cli import config as cfg_mod
+from agx_cli.agents_cmd import create
+from agx_cli.config import AgentsConfig, DefaultsConfig, HostConfig, PathsConfig, VmRuntimeConfig
+from agx_cli.errors import HealthCheckFailure, UserError
+from agx_cli.journal import Journal
+from agx_cli.mp import MpResult
 
 
 def _ok(stdout: str = "") -> MpResult:
@@ -59,7 +59,7 @@ def with_coder(cfg: AgentsConfig, saved_config: Path, mocker) -> Path:
     from tests.conftest import install_vm_fs_simulation
 
     install_vm_fs_simulation(mocker, cfg)
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     create(name="coder", agent_type="hermes", config_path=saved_config)
     return saved_config
 
@@ -68,21 +68,21 @@ def with_coder(cfg: AgentsConfig, saved_config: Path, mocker) -> Path:
 
 
 def test_start_calls_compose_runner_start(with_coder: Path, mocker) -> None:
-    spy = mocker.patch("agents_cli.compose_runner.start", return_value=_ok())
+    spy = mocker.patch("agx_cli.compose_runner.start", return_value=_ok())
     ops.start("coder", config_path=with_coder)
     args, _ = spy.call_args
     assert args[1] == "hermes-coder"
 
 
 def test_stop_calls_compose_runner_stop(with_coder: Path, mocker) -> None:
-    spy = mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())
+    spy = mocker.patch("agx_cli.compose_runner.stop", return_value=_ok())
     ops.stop("coder", config_path=with_coder)
     args, _ = spy.call_args
     assert args[1] == "hermes-coder"
 
 
 def test_restart_calls_compose_runner_restart(with_coder: Path, mocker) -> None:
-    spy = mocker.patch("agents_cli.compose_runner.restart", return_value=_ok())
+    spy = mocker.patch("agx_cli.compose_runner.restart", return_value=_ok())
     ops.restart("coder", config_path=with_coder)
     args, _ = spy.call_args
     assert args[1] == "hermes-coder"
@@ -97,20 +97,20 @@ def test_ops_for_unknown_agent_raises(saved_config: Path) -> None:
 
 
 def test_logs_without_follow_dumps_stdout(with_coder: Path, mocker) -> None:
-    mocker.patch("agents_cli.compose_runner.logs", return_value=_ok("hello\nworld\n"))
+    mocker.patch("agx_cli.compose_runner.logs", return_value=_ok("hello\nworld\n"))
     spy_emit = mocker.spy(ops.ui, "emit")
     ops.logs("coder", follow=False, config_path=with_coder)
     spy_emit.assert_called_once()
 
 
 def test_logs_follow_routes_through_backend_dispatcher(with_coder: Path, mocker) -> None:
-    """`agents logs -f` used to os.execvp("multipass", ...), which broke
+    """`agx logs -f` used to os.execvp("multipass", ...), which broke
     under the libvirt and bare_metal backends. It must build the in-VM
     compose argv and stream via mp.exec_in_vm_interactive (backend-
     dispatched), exiting with the child's return code — same fix as
     run_in_agent.
     """
-    interactive = mocker.patch("agents_cli.mp.exec_in_vm_interactive", return_value=3)
+    interactive = mocker.patch("agx_cli.mp.exec_in_vm_interactive", return_value=3)
     with pytest.raises(SystemExit) as exc:
         ops.logs("coder", follow=True, since="10m", config_path=with_coder)
     assert exc.value.code == 3
@@ -134,7 +134,7 @@ def _stub_minimal_doctor(mocker, vm_state: str = "Running") -> None:
     the mount-probe cat (which expects "ok") both pass.
     """
     mocker.patch(
-        "agents_cli.mp.info_vm",
+        "agx_cli.mp.info_vm",
         return_value=_ok(json.dumps({"info": {"agents": {"state": vm_state}}})),
     )
 
@@ -169,7 +169,7 @@ def _stub_minimal_doctor(mocker, vm_state: str = "Running") -> None:
             return MpResult(stdout="", stderr="No such file", returncode=1)
         return _ok("ok\n")
 
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=vm_command)
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=vm_command)
 
 
 def test_doctor_reports_vm_not_running_as_fail(with_coder: Path, mocker) -> None:
@@ -180,7 +180,7 @@ def test_doctor_reports_vm_not_running_as_fail(with_coder: Path, mocker) -> None
 
 def test_doctor_warns_on_dangling_journal(with_coder: Path, mocker, cfg: AgentsConfig) -> None:
     _stub_minimal_doctor(mocker)
-    mocker.patch("agents_cli.compose_runner.ps", return_value=_ok("[]"))
+    mocker.patch("agx_cli.compose_runner.ps", return_value=_ok("[]"))
     j = Journal.begin(cfg.paths.host_data_dir, "create", "ghost", ["a"])
     import datetime
 
@@ -190,7 +190,7 @@ def test_doctor_warns_on_dangling_journal(with_coder: Path, mocker, cfg: AgentsC
     ).isoformat()
     j.path.write_text(json.dumps(old_payload))
 
-    from agents_cli.ops import DoctorReport, _check_journals
+    from agx_cli.ops import DoctorReport, _check_journals
 
     report = DoctorReport()
     _check_journals(cfg, report)
@@ -202,7 +202,7 @@ def test_doctor_override_mirror_check(cfg: AgentsConfig, mocker) -> None:
     """--data-dir-in-vm: a host override with no in-VM mirror breaks every
     compose verb (the -f points at a missing file) — doctor must say so.
     Host-mount mode and no-override are skips."""
-    from agents_cli.ops import DoctorReport, _check_override_mirror
+    from agx_cli.ops import DoctorReport, _check_override_mirror
 
     report = DoctorReport()
     _check_override_mirror(cfg, report)
@@ -215,12 +215,12 @@ def test_doctor_override_mirror_check(cfg: AgentsConfig, mocker) -> None:
     (cfg.paths.host_data_dir / "docker-compose.override.yml").write_text(
         "services: {}\n", encoding="utf-8"
     )
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=MpResult("", "", 1))
+    mocker.patch("agx_cli.mp.exec_in_vm", return_value=MpResult("", "", 1))
     _check_override_mirror(cfg, report)
     assert report.checks[-1].status == "fail"
-    assert "agents vm start" in (report.checks[-1].detail or "")
+    assert "agx vm start" in (report.checks[-1].detail or "")
 
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok())
+    mocker.patch("agx_cli.mp.exec_in_vm", return_value=_ok())
     _check_override_mirror(cfg, report)
     assert report.checks[-1].status == "ok"
 
@@ -236,7 +236,7 @@ def test_doctor_override_mirror_check(cfg: AgentsConfig, mocker) -> None:
 def test_doctor_disk_space_thresholds_classify(
     cfg: AgentsConfig, mocker, free: int, total: int, expected: str
 ) -> None:
-    from agents_cli.ops import DoctorReport, _check_disk_space
+    from agx_cli.ops import DoctorReport, _check_disk_space
 
     fake_usage = type("Usage", (), {"total": total, "free": free, "used": total - free})
     mocker.patch("shutil.disk_usage", return_value=fake_usage)
@@ -256,10 +256,10 @@ def test_doctor_disk_space_thresholds_classify(
 def test_doctor_vm_disk_thresholds_classify(
     cfg: AgentsConfig, mocker, avail_kb: int, total_kb: int, expected: str
 ) -> None:
-    from agents_cli.ops import DoctorReport, _check_vm_disk
+    from agx_cli.ops import DoctorReport, _check_vm_disk
 
     mocker.patch(
-        "agents_cli.mp.exec_in_vm",
+        "agx_cli.mp.exec_in_vm",
         return_value=_ok(
             "Filesystem 1024-blocks Used Available Capacity Mounted on\n"
             f"/dev/vda1 {total_kb} {total_kb - avail_kb} {avail_kb} 50% /\n"
@@ -271,9 +271,9 @@ def test_doctor_vm_disk_thresholds_classify(
 
 
 def test_doctor_vm_disk_degrades_to_warn_on_unparseable_df(cfg: AgentsConfig, mocker) -> None:
-    from agents_cli.ops import DoctorReport, _check_vm_disk
+    from agx_cli.ops import DoctorReport, _check_vm_disk
 
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok("garbage\n"))
+    mocker.patch("agx_cli.mp.exec_in_vm", return_value=_ok("garbage\n"))
     report = DoctorReport()
     _check_vm_disk(cfg, report)
     assert report.checks[0].status == "warn"
@@ -297,7 +297,7 @@ _ROTATING = '{"log-driver": "json-file", "log-opts": {"max-size": "50m", "max-fi
     ],
 )
 def test_daemon_log_rotation_gap(daemon_json: str | None, rotates: bool) -> None:
-    from agents_cli.ops import daemon_log_rotation_gap
+    from agx_cli.ops import daemon_log_rotation_gap
 
     assert (daemon_log_rotation_gap(daemon_json) is None) is rotates
 
@@ -308,7 +308,7 @@ def _stub_log_rotation(
     """Stub the daemon.json read + project container listing/inspect.
     Returns the list the exec_in_vm calls are recorded into."""
     mocker.patch(
-        "agents_cli.mp.exec_bash",
+        "agx_cli.mp.exec_bash",
         return_value=_ok(daemon_json) if daemon_json is not None else _fail(""),
     )
     calls: list[tuple[str, ...]] = []
@@ -321,14 +321,14 @@ def _stub_log_rotation(
             return _ok("".join(f"{line}\n" for line in inspect_lines))
         return _fail()
 
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=vm_command)
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=vm_command)
     return calls
 
 
 def test_doctor_container_logs_ok_when_daemon_and_containers_rotate(
     cfg: AgentsConfig, mocker
 ) -> None:
-    from agents_cli.ops import DoctorReport, _check_container_logs
+    from agx_cli.ops import DoctorReport, _check_container_logs
 
     calls = _stub_log_rotation(
         mocker,
@@ -346,7 +346,7 @@ def test_doctor_container_logs_ok_when_daemon_and_containers_rotate(
 def test_doctor_container_logs_warns_on_missing_daemon_config(cfg: AgentsConfig, mocker) -> None:
     """Bare-metal's verify-only bootstrap never writes daemon.json — doctor
     is the standing guard (2026-08 disk-full outage class)."""
-    from agents_cli.ops import DoctorReport, _check_container_logs
+    from agx_cli.ops import DoctorReport, _check_container_logs
 
     cfg.vm.backend = "bare_metal"
     _stub_log_rotation(mocker, daemon_json=None, inspect_lines=[])
@@ -363,7 +363,7 @@ def test_doctor_container_logs_names_containers_created_before_rotation(
 ) -> None:
     """log-opts bind at create time: a fixed daemon still leaves older
     containers unbounded until they are recreated."""
-    from agents_cli.ops import DoctorReport, _check_container_logs
+    from agx_cli.ops import DoctorReport, _check_container_logs
 
     _stub_log_rotation(
         mocker,
@@ -383,7 +383,7 @@ def test_doctor_port_conflict_detection(cfg: AgentsConfig, mocker) -> None:
     # used_ports first asks the VM's `docker compose config` — stub the
     # backend exec to fail so the check deterministically exercises the
     # host-side doc-parse fallback (and never invokes a real multipass).
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_fail())
+    mocker.patch("agx_cli.mp.exec_in_vm", return_value=_fail())
     doc = compose.load_compose(cfg.paths.host_data_dir / "docker-compose.yml")
     compose.add_service(doc, "hermes-a", {"ports": ["127.0.0.1:8642:8642"]})
     compose.add_service(doc, "hermes-b", {"ports": ["127.0.0.1:8642:8642"]})
@@ -391,7 +391,7 @@ def test_doctor_port_conflict_detection(cfg: AgentsConfig, mocker) -> None:
         compose.dump_compose(doc), encoding="utf-8"
     )
 
-    from agents_cli.ops import DoctorReport, _check_port_conflicts
+    from agx_cli.ops import DoctorReport, _check_port_conflicts
 
     report = DoctorReport()
     _check_port_conflicts(cfg, report)
@@ -413,9 +413,9 @@ def _profile_line(name: str, main: str, log: str, state: dict) -> str:
 
 
 def _run_profile_check(cfg, mocker, result: MpResult):
-    from agents_cli.ops import DoctorReport, _check_profile_gateways
+    from agx_cli.ops import DoctorReport, _check_profile_gateways
 
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=result)
+    mocker.patch("agx_cli.mp.exec_in_vm", return_value=result)
     report = DoctorReport()
     _check_profile_gateways(cfg, "hermes-coder", "coder", report)
     return report
@@ -472,7 +472,7 @@ def test_profile_gateways_warns_on_flapping_log_service(cfg, mocker) -> None:
     report = _run_profile_check(cfg, mocker, _ok(line + "\n"))
     assert [c.status for c in report.checks] == ["warn"]
     assert "log service" in report.checks[0].detail
-    assert "agents restart coder" in report.checks[0].detail
+    assert "agx restart coder" in report.checks[0].detail
 
 
 def test_profile_gateways_stays_ok_for_deliberate_stop(cfg, mocker) -> None:
@@ -505,7 +505,7 @@ def test_profile_gateways_ignores_garbage_state_files(cfg, mocker) -> None:
 def test_doctor_passes_on_healthy_setup(with_coder: Path, mocker) -> None:
     _stub_minimal_doctor(mocker)
     mocker.patch(
-        "agents_cli.compose_runner.ps",
+        "agx_cli.compose_runner.ps",
         return_value=_ok(json.dumps([{"Service": "hermes-coder", "State": "running"}])),
     )
     report = ops.doctor(config_path=with_coder)
@@ -515,14 +515,14 @@ def test_doctor_passes_on_healthy_setup(with_coder: Path, mocker) -> None:
 def test_doctor_emit_false_suppresses_table_but_returns_full_report(
     with_coder: Path, mocker, capsys
 ) -> None:
-    """Composite callers (`agents vm migrate-data`) own their command's
+    """Composite callers (`agx vm migrate-data`) own their command's
     single stdout object — with emit=False the table render (which goes
     to stdout, as a JSON array under --json) is suppressed entirely,
     while the returned report still carries every check for the caller
     to fold into its own payload."""
     _stub_minimal_doctor(mocker)
     mocker.patch(
-        "agents_cli.compose_runner.ps",
+        "agx_cli.compose_runner.ps",
         return_value=_ok(json.dumps([{"Service": "hermes-coder", "State": "running"}])),
     )
     report = ops.doctor(config_path=with_coder, emit=False)
@@ -541,7 +541,7 @@ def test_doctor_emit_false_still_raises_on_failure(with_coder: Path, mocker, cap
 
 def test_doctor_memory_check_warns_under_1g_available(with_coder: Path, mocker) -> None:
     mocker.patch(
-        "agents_cli.mp.info_vm",
+        "agx_cli.mp.info_vm",
         return_value=_ok(json.dumps({"info": {"agents": {"state": "Running"}}})),
     )
 
@@ -559,9 +559,9 @@ def test_doctor_memory_check_warns_under_1g_available(with_coder: Path, mocker) 
             return _ok("0.5 0.3 0.2 1/100 999\n")
         return _ok("ok\n")
 
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=runner)
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=runner)
     mocker.patch(
-        "agents_cli.compose_runner.ps",
+        "agx_cli.compose_runner.ps",
         return_value=_ok(json.dumps([{"Service": "hermes-coder", "State": "running"}])),
     )
     report = ops.doctor(config_path=with_coder)
@@ -572,7 +572,7 @@ def test_doctor_memory_check_warns_under_1g_available(with_coder: Path, mocker) 
 
 def test_doctor_memory_check_fails_under_256m_available(with_coder: Path, mocker) -> None:
     mocker.patch(
-        "agents_cli.mp.info_vm",
+        "agx_cli.mp.info_vm",
         return_value=_ok(json.dumps({"info": {"agents": {"state": "Running"}}})),
     )
 
@@ -590,9 +590,9 @@ def test_doctor_memory_check_fails_under_256m_available(with_coder: Path, mocker
             return _ok("0.5 0.3 0.2 1/100 999\n")
         return _ok("ok\n")
 
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=runner)
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=runner)
     mocker.patch(
-        "agents_cli.compose_runner.ps",
+        "agx_cli.compose_runner.ps",
         return_value=_ok(json.dumps([{"Service": "hermes-coder", "State": "running"}])),
     )
     with pytest.raises(HealthCheckFailure):
@@ -601,7 +601,7 @@ def test_doctor_memory_check_fails_under_256m_available(with_coder: Path, mocker
 
 def test_doctor_load_check_warns_on_saturation(with_coder: Path, mocker) -> None:
     mocker.patch(
-        "agents_cli.mp.info_vm",
+        "agx_cli.mp.info_vm",
         return_value=_ok(json.dumps({"info": {"agents": {"state": "Running"}}})),
     )
 
@@ -619,9 +619,9 @@ def test_doctor_load_check_warns_on_saturation(with_coder: Path, mocker) -> None
             return _ok("5.00 4.50 3.80 5/200 1234\n")
         return _ok("ok\n")
 
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=runner)
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=runner)
     mocker.patch(
-        "agents_cli.compose_runner.ps",
+        "agx_cli.compose_runner.ps",
         return_value=_ok(json.dumps([{"Service": "hermes-coder", "State": "running"}])),
     )
     report = ops.doctor(config_path=with_coder)
@@ -632,7 +632,7 @@ def test_doctor_load_check_warns_on_saturation(with_coder: Path, mocker) -> None
 
 def test_doctor_load_check_fails_on_severe_oversub(with_coder: Path, mocker) -> None:
     mocker.patch(
-        "agents_cli.mp.info_vm",
+        "agx_cli.mp.info_vm",
         return_value=_ok(json.dumps({"info": {"agents": {"state": "Running"}}})),
     )
 
@@ -650,9 +650,9 @@ def test_doctor_load_check_fails_on_severe_oversub(with_coder: Path, mocker) -> 
             return _ok("10.00 9.50 8.80 5/200 1234\n")
         return _ok("ok\n")
 
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=runner)
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=runner)
     mocker.patch(
-        "agents_cli.compose_runner.ps",
+        "agx_cli.compose_runner.ps",
         return_value=_ok(json.dumps([{"Service": "hermes-coder", "State": "running"}])),
     )
     with pytest.raises(HealthCheckFailure):
@@ -665,7 +665,7 @@ def test_doctor_skips_docker_socket_when_backend_local(with_coder: Path, mocker)
     reach it would be a false positive. The check must skip with
     a clear note instead.
     """
-    from agents_cli import hermes_config
+    from agx_cli import hermes_config
 
     cfg = cfg_mod.load(with_coder)
     doc = hermes_config.read_doc(cfg, "coder")
@@ -676,7 +676,7 @@ def test_doctor_skips_docker_socket_when_backend_local(with_coder: Path, mocker)
 
     _stub_minimal_doctor(mocker)
     mocker.patch(
-        "agents_cli.compose_runner.ps",
+        "agx_cli.compose_runner.ps",
         return_value=_ok(json.dumps([{"Service": "hermes-coder", "State": "running"}])),
     )
     report = ops.doctor(config_path=with_coder)
@@ -696,7 +696,7 @@ def test_doctor_table_wraps_long_detail_in_human_mode(with_coder: Path, mocker, 
 
     _stub_minimal_doctor(mocker)
     mocker.patch(
-        "agents_cli.compose_runner.ps",
+        "agx_cli.compose_runner.ps",
         return_value=_ok(json.dumps([{"Service": "hermes-coder", "State": "running"}])),
     )
     mocker.patch.object(shutil, "get_terminal_size", return_value=os_terminal_size(80))
@@ -727,7 +727,7 @@ def test_doctor_table_human_path_goes_through_ui_echo_human(mocker) -> None:
     through ui.py so --json/--yes stay auditable in one module. The
     human table renderer uses the ui.echo_human helper for its custom
     wrapped layout."""
-    echo = mocker.patch("agents_cli.ui.echo_human")
+    echo = mocker.patch("agx_cli.ui.echo_human")
     report = ops.DoctorReport()
     report.add("check_a", "ok", "fine")
     report.add("check_b", "fail", "broken")
@@ -743,9 +743,9 @@ def test_doctor_table_human_path_goes_through_ui_echo_human(mocker) -> None:
 def test_doctor_table_json_path_skips_echo_human(mocker) -> None:
     """Under --json the table goes through ui.table (single JSON array);
     the human renderer must not add stray lines around it."""
-    mocker.patch("agents_cli.ui.is_json", return_value=True)
-    echo = mocker.patch("agents_cli.ui.echo_human")
-    table = mocker.patch("agents_cli.ui.table")
+    mocker.patch("agx_cli.ui.is_json", return_value=True)
+    echo = mocker.patch("agx_cli.ui.echo_human")
+    table = mocker.patch("agx_cli.ui.table")
     report = ops.DoctorReport()
     report.add("check_a", "ok")
 
@@ -756,13 +756,13 @@ def test_doctor_table_json_path_skips_echo_human(mocker) -> None:
 
 
 def test_doctor_flags_data_dir_eacces(with_coder: Path, mocker) -> None:
-    """Reproduce the canonical `agents exec` permission failure: stat
+    """Reproduce the canonical `agx exec` permission failure: stat
     /opt/data returns EACCES because the dir is owned by uid 10000 and
     the toolkit's RUNTIME_UID exec is uid 1000. The doctor check must
-    fail and point the user at `agents fix-perms`.
+    fail and point the user at `agx fix-perms`.
     """
     mocker.patch(
-        "agents_cli.mp.info_vm",
+        "agx_cli.mp.info_vm",
         return_value=_ok(json.dumps({"info": {"agents": {"state": "Running"}}})),
     )
 
@@ -784,9 +784,9 @@ def test_doctor_flags_data_dir_eacces(with_coder: Path, mocker) -> None:
             return _ok("0.42 0.31 0.25 1/123 4567\n")
         return _ok("ok\n")
 
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=runner)
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=runner)
     mocker.patch(
-        "agents_cli.compose_runner.ps",
+        "agx_cli.compose_runner.ps",
         return_value=_ok(json.dumps([{"Service": "hermes-coder", "State": "running"}])),
     )
     with pytest.raises(HealthCheckFailure):
@@ -795,8 +795,8 @@ def test_doctor_flags_data_dir_eacces(with_coder: Path, mocker) -> None:
 
 def test_doctor_warns_on_data_dir_owner_mismatch(with_coder: Path, mocker) -> None:
     """stat succeeds but owner uid != RUNTIME_UID — warns (not fails) with
-    a remediation hint pointing at `agents fix-perms`. The user can still
-    function (e.g. running `agents exec --root`) but real exec at uid 1000
+    a remediation hint pointing at `agx fix-perms`. The user can still
+    function (e.g. running `agx exec --root`) but real exec at uid 1000
     will hit issues, so flag it loudly.
     """
     _stub_minimal_doctor(mocker)
@@ -816,9 +816,9 @@ def test_doctor_warns_on_data_dir_owner_mismatch(with_coder: Path, mocker) -> No
             return _ok("0.42 0.31 0.25 1/123 4567\n")
         return _ok("ok\n")
 
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=runner)
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=runner)
     mocker.patch(
-        "agents_cli.compose_runner.ps",
+        "agx_cli.compose_runner.ps",
         return_value=_ok(json.dumps([{"Service": "hermes-coder", "State": "running"}])),
     )
     report = ops.doctor(config_path=with_coder)
@@ -830,7 +830,7 @@ def test_doctor_warns_on_data_dir_owner_mismatch(with_coder: Path, mocker) -> No
 def test_doctor_flags_hermes_doctor_failure(with_coder: Path, mocker) -> None:
     """Pass every check except the in-container `hermes doctor` call."""
     mocker.patch(
-        "agents_cli.mp.info_vm",
+        "agx_cli.mp.info_vm",
         return_value=_ok(json.dumps({"info": {"agents": {"state": "Running"}}})),
     )
 
@@ -846,9 +846,9 @@ def test_doctor_flags_hermes_doctor_failure(with_coder: Path, mocker) -> None:
             return _ok("0.42 0.31 0.25 1/123 4567\n")
         return _ok(stdout="ok\n")
 
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=conditional_runner)
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=conditional_runner)
     mocker.patch(
-        "agents_cli.compose_runner.ps",
+        "agx_cli.compose_runner.ps",
         return_value=_ok(json.dumps([{"Service": "hermes-coder", "State": "running"}])),
     )
     with pytest.raises(HealthCheckFailure):
@@ -861,7 +861,7 @@ def test_hermes_doctor_issue_report_is_warn_not_fail(cfg: AgentsConfig, mocker) 
     same findings. A completed run that reports issues is a `warn` with
     the flagged lines; only a run that couldn't happen is a `fail`.
     Mapping the former to fail rolled back a healthy upgrade."""
-    from agents_cli.ops import DoctorReport, _check_hermes_doctor
+    from agx_cli.ops import DoctorReport, _check_hermes_doctor
 
     out = (
         "◆ Database\n"
@@ -870,7 +870,7 @@ def test_hermes_doctor_issue_report_is_warn_not_fail(cfg: AgentsConfig, mocker) 
         "  ✓ config.yaml ok\n"
         "Found 2 issue(s) to address:\n"
     )
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=MpResult(out, "", 1))
+    mocker.patch("agx_cli.mp.exec_in_vm", return_value=MpResult(out, "", 1))
     report = DoctorReport()
     _check_hermes_doctor(cfg, "hermes-coder", "coder", report)
     [check] = report.checks
@@ -878,11 +878,11 @@ def test_hermes_doctor_issue_report_is_warn_not_fail(cfg: AgentsConfig, mocker) 
     assert "reported 2 issue(s)" in check.detail
     assert "WAL mode on a cross-VM filesystem" in check.detail
     assert "✓ config.yaml" not in check.detail
-    assert "agents exec coder -- hermes doctor" in check.detail
+    assert "agx exec coder -- hermes doctor" in check.detail
 
     # Could not run at all → still a hard fail.
     mocker.patch(
-        "agents_cli.mp.exec_in_vm",
+        "agx_cli.mp.exec_in_vm",
         return_value=MpResult("", 'exec: "hermes": executable file not found in $PATH', 126),
     )
     report = DoctorReport()
@@ -898,11 +898,11 @@ def test_doctor_arm64_emulation_warns_when_firecrawl_running_on_arm64(
     qemu emulation (upstream ships no arm64 tag). The doctor must
     flag this so users aren't surprised by slow Postgres init.
     """
-    mocker.patch("agents_cli.firecrawl_cmd._docker_arch", return_value="arm64")
-    mocker.patch("agents_cli.firecrawl_cmd.is_installed", return_value=True)
+    mocker.patch("agx_cli.firecrawl_cmd._docker_arch", return_value="arm64")
+    mocker.patch("agx_cli.firecrawl_cmd.is_installed", return_value=True)
     _stub_minimal_doctor(mocker)
     mocker.patch(
-        "agents_cli.compose_runner.ps",
+        "agx_cli.compose_runner.ps",
         return_value=_ok(json.dumps([{"Service": "hermes-coder", "State": "running"}])),
     )
 
@@ -918,11 +918,11 @@ def test_doctor_arm64_emulation_silent_when_firecrawl_absent(
     """Don't warn on arm64 if firecrawl isn't installed — nothing
     is being emulated. Stays at ok with a 'not installed' detail.
     """
-    mocker.patch("agents_cli.firecrawl_cmd._docker_arch", return_value="arm64")
-    mocker.patch("agents_cli.firecrawl_cmd.is_installed", return_value=False)
+    mocker.patch("agx_cli.firecrawl_cmd._docker_arch", return_value="arm64")
+    mocker.patch("agx_cli.firecrawl_cmd.is_installed", return_value=False)
     _stub_minimal_doctor(mocker)
     mocker.patch(
-        "agents_cli.compose_runner.ps",
+        "agx_cli.compose_runner.ps",
         return_value=_ok(json.dumps([{"Service": "hermes-coder", "State": "running"}])),
     )
 
@@ -937,10 +937,10 @@ def test_doctor_arm64_emulation_silent_on_amd64_host(
     """Most hosts are amd64 — the probe should be a quiet ok line,
     not a noisy warn.
     """
-    mocker.patch("agents_cli.firecrawl_cmd._docker_arch", return_value="amd64")
+    mocker.patch("agx_cli.firecrawl_cmd._docker_arch", return_value="amd64")
     _stub_minimal_doctor(mocker)
     mocker.patch(
-        "agents_cli.compose_runner.ps",
+        "agx_cli.compose_runner.ps",
         return_value=_ok(json.dumps([{"Service": "hermes-coder", "State": "running"}])),
     )
 
@@ -957,32 +957,32 @@ def test_doctor_firecrawl_warns_when_installed_and_wired_but_down(
     aren't running (the in-VM Docker state didn't survive the VM
     rebuild). Must warn so the silent scrape failures get surfaced.
     """
-    from agents_cli.ops import DoctorReport, _check_firecrawl_running
+    from agx_cli.ops import DoctorReport, _check_firecrawl_running
 
     mocker.patch(
-        "agents_cli.firecrawl_cmd._firecrawl_services_in_compose",
+        "agx_cli.firecrawl_cmd._firecrawl_services_in_compose",
         return_value=["firecrawl-api", "firecrawl-redis"],
     )
-    mocker.patch("agents_cli.firecrawl_cmd._service_running", return_value=False)
-    mocker.patch("agents_cli.firecrawl_cmd._list_wired_agents", return_value=["coder"])
+    mocker.patch("agx_cli.firecrawl_cmd._service_running", return_value=False)
+    mocker.patch("agx_cli.firecrawl_cmd._list_wired_agents", return_value=["coder"])
 
     report = DoctorReport()
     _check_firecrawl_running(cfg, report)
     [check] = [c for c in report.checks if c.name == "firecrawl_running"]
     assert check.status == "warn"
     assert "coder" in check.detail
-    assert "agents firecrawl up" in check.detail
+    assert "agx firecrawl up" in check.detail
 
 
 def test_doctor_firecrawl_ok_when_running(cfg: AgentsConfig, mocker) -> None:
     """Healthy stack — quiet ok line."""
-    from agents_cli.ops import DoctorReport, _check_firecrawl_running
+    from agx_cli.ops import DoctorReport, _check_firecrawl_running
 
     mocker.patch(
-        "agents_cli.firecrawl_cmd._firecrawl_services_in_compose",
+        "agx_cli.firecrawl_cmd._firecrawl_services_in_compose",
         return_value=["firecrawl-api"],
     )
-    mocker.patch("agents_cli.firecrawl_cmd._service_running", return_value=True)
+    mocker.patch("agx_cli.firecrawl_cmd._service_running", return_value=True)
 
     report = DoctorReport()
     _check_firecrawl_running(cfg, report)
@@ -993,9 +993,9 @@ def test_doctor_firecrawl_ok_when_running(cfg: AgentsConfig, mocker) -> None:
 
 def test_doctor_firecrawl_ok_when_not_installed(cfg: AgentsConfig, mocker) -> None:
     """No firecrawl services in compose — nothing to flag."""
-    from agents_cli.ops import DoctorReport, _check_firecrawl_running
+    from agx_cli.ops import DoctorReport, _check_firecrawl_running
 
-    mocker.patch("agents_cli.firecrawl_cmd._firecrawl_services_in_compose", return_value=[])
+    mocker.patch("agx_cli.firecrawl_cmd._firecrawl_services_in_compose", return_value=[])
 
     report = DoctorReport()
     _check_firecrawl_running(cfg, report)
@@ -1005,18 +1005,18 @@ def test_doctor_firecrawl_ok_when_not_installed(cfg: AgentsConfig, mocker) -> No
 
 
 def test_doctor_firecrawl_quiet_after_deliberate_down(cfg: AgentsConfig, mocker) -> None:
-    """``agents firecrawl down`` leaves the compose blocks but drops the
+    """``agx firecrawl down`` leaves the compose blocks but drops the
     agent wiring. A stopped + unwired stack is an intentional stop, not
     a regression — stay at ok so doctor doesn't nag.
     """
-    from agents_cli.ops import DoctorReport, _check_firecrawl_running
+    from agx_cli.ops import DoctorReport, _check_firecrawl_running
 
     mocker.patch(
-        "agents_cli.firecrawl_cmd._firecrawl_services_in_compose",
+        "agx_cli.firecrawl_cmd._firecrawl_services_in_compose",
         return_value=["firecrawl-api", "firecrawl-redis"],
     )
-    mocker.patch("agents_cli.firecrawl_cmd._service_running", return_value=False)
-    mocker.patch("agents_cli.firecrawl_cmd._list_wired_agents", return_value=[])
+    mocker.patch("agx_cli.firecrawl_cmd._service_running", return_value=False)
+    mocker.patch("agx_cli.firecrawl_cmd._list_wired_agents", return_value=[])
 
     report = DoctorReport()
     _check_firecrawl_running(cfg, report)
@@ -1040,10 +1040,10 @@ def test_doctor_llamacpp_warns_when_defined_but_absent(cfg: AgentsConfig, mocker
     migration, the containers don't. Same gap _check_firecrawl_running
     covers — gate on compose presence, warn with the recovery hint.
     """
-    from agents_cli.ops import DoctorReport, _check_inference_llamacpp
+    from agx_cli.ops import DoctorReport, _check_inference_llamacpp
 
     _seed_llamacpp_service(cfg, "qwen")
-    mocker.patch("agents_cli.compose_runner.ps", return_value=_ok("[]"))
+    mocker.patch("agx_cli.compose_runner.ps", return_value=_ok("[]"))
 
     report = DoctorReport()
     _check_inference_llamacpp(cfg, report)
@@ -1052,18 +1052,18 @@ def test_doctor_llamacpp_warns_when_defined_but_absent(cfg: AgentsConfig, mocker
     assert "llama-cpp-qwen" in check.detail
     assert "not running" in check.detail
     # The recovery hint must name the REAL command — loading lives under
-    # the `inference` group (`agents inference load ...`); the `model`
+    # the `inference` group (`agx inference load ...`); the `model`
     # group has no `load` subcommand.
-    assert "agents inference load llama-cpp" in check.detail
-    assert "agents model load" not in check.detail
+    assert "agx inference load llama-cpp" in check.detail
+    assert "agx model load" not in check.detail
 
 
 def test_doctor_llamacpp_ok_when_running(cfg: AgentsConfig, mocker) -> None:
-    from agents_cli.ops import DoctorReport, _check_inference_llamacpp
+    from agx_cli.ops import DoctorReport, _check_inference_llamacpp
 
     _seed_llamacpp_service(cfg, "qwen")
     mocker.patch(
-        "agents_cli.compose_runner.ps",
+        "agx_cli.compose_runner.ps",
         return_value=_ok(json.dumps([{"Service": "llama-cpp-qwen", "State": "running"}])),
     )
 
@@ -1075,11 +1075,11 @@ def test_doctor_llamacpp_ok_when_running(cfg: AgentsConfig, mocker) -> None:
 
 def test_doctor_llamacpp_warns_on_partial_stranding(cfg: AgentsConfig, mocker) -> None:
     """Two services defined, one exited — only the stranded one is named."""
-    from agents_cli.ops import DoctorReport, _check_inference_llamacpp
+    from agx_cli.ops import DoctorReport, _check_inference_llamacpp
 
     _seed_llamacpp_service(cfg, "qwen", "phi")
     mocker.patch(
-        "agents_cli.compose_runner.ps",
+        "agx_cli.compose_runner.ps",
         return_value=_ok(
             json.dumps(
                 [
@@ -1102,9 +1102,9 @@ def test_doctor_llamacpp_skips_when_none_defined(cfg: AgentsConfig, mocker) -> N
     """Most users won't run local inference — no compose entries means
     an ok/skip, not a probe.
     """
-    from agents_cli.ops import DoctorReport, _check_inference_llamacpp
+    from agx_cli.ops import DoctorReport, _check_inference_llamacpp
 
-    ps_spy = mocker.patch("agents_cli.compose_runner.ps", return_value=_ok("[]"))
+    ps_spy = mocker.patch("agx_cli.compose_runner.ps", return_value=_ok("[]"))
 
     report = DoctorReport()
     _check_inference_llamacpp(cfg, report)
@@ -1119,10 +1119,10 @@ def test_doctor_inference_health_covers_both_engines(cfg: AgentsConfig, mocker) 
     per-model llama-cpp probes — the llama-cpp half was the doctor
     blind spot (docstring claimed it, code skipped it).
     """
-    from agents_cli.ops import DoctorReport, _check_inference_health
+    from agx_cli.ops import DoctorReport, _check_inference_health
 
     _seed_llamacpp_service(cfg, "qwen")
-    mocker.patch("agents_cli.compose_runner.ps", return_value=_ok("[]"))
+    mocker.patch("agx_cli.compose_runner.ps", return_value=_ok("[]"))
 
     report = DoctorReport()
     _check_inference_health(cfg, report)
@@ -1140,7 +1140,7 @@ def test_doctor_version_check_reports_tag_when_running(
     the compose ``image:`` field is universal."""
     _stub_minimal_doctor(mocker)
     mocker.patch(
-        "agents_cli.compose_runner.ps",
+        "agx_cli.compose_runner.ps",
         return_value=_ok(json.dumps([{"Service": "hermes-coder", "State": "running"}])),
     )
 
@@ -1162,7 +1162,7 @@ def test_doctor_version_check_reports_tag_when_running(
             return _ok("nousresearch/hermes-agent:v1.0.0\n")
         return _ok("ok\n")
 
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=runner)
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=runner)
 
     report = ops.doctor(config_path=with_coder)
     [check] = [c for c in report.checks if c.name == "coder.version"]
@@ -1179,7 +1179,7 @@ def test_doctor_version_check_shows_hermes_semver_alongside_tag(
     tag so the user can correlate with upstream release notes."""
     _stub_minimal_doctor(mocker)
     mocker.patch(
-        "agents_cli.compose_runner.ps",
+        "agx_cli.compose_runner.ps",
         return_value=_ok(json.dumps([{"Service": "hermes-coder", "State": "running"}])),
     )
 
@@ -1201,7 +1201,7 @@ def test_doctor_version_check_shows_hermes_semver_alongside_tag(
             return _ok("Hermes Agent v0.18.2 (2026.7.7.2) · upstream 9de9c25f\n")
         return _ok("ok\n")
 
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=runner)
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=runner)
 
     report = ops.doctor(config_path=with_coder)
     [check] = [c for c in report.checks if c.name == "coder.version"]
@@ -1217,7 +1217,7 @@ def test_doctor_version_check_omits_semver_when_probe_fails(
     never block or garble the check."""
     _stub_minimal_doctor(mocker)
     mocker.patch(
-        "agents_cli.compose_runner.ps",
+        "agx_cli.compose_runner.ps",
         return_value=_ok(json.dumps([{"Service": "hermes-coder", "State": "running"}])),
     )
 
@@ -1239,7 +1239,7 @@ def test_doctor_version_check_omits_semver_when_probe_fails(
             return _fail("no such option: --version")
         return _ok("ok\n")
 
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=runner)
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=runner)
 
     report = ops.doctor(config_path=with_coder)
     [check] = [c for c in report.checks if c.name == "coder.version"]
@@ -1252,13 +1252,13 @@ def test_doctor_version_check_warns_on_pin_vs_runtime_drift(
 ) -> None:
     """Hand-edited compose with no follow-up restart leaves the
     container running an older tag than what's pinned. Surface as
-    ``warn`` with the exact ``agents restart <name>`` hint — without
-    this the user only sees the new pin in ``agents list`` and assumes
+    ``warn`` with the exact ``agx restart <name>`` hint — without
+    this the user only sees the new pin in ``agx list`` and assumes
     the upgrade took.
     """
     _stub_minimal_doctor(mocker)
     mocker.patch(
-        "agents_cli.compose_runner.ps",
+        "agx_cli.compose_runner.ps",
         return_value=_ok(json.dumps([{"Service": "hermes-coder", "State": "running"}])),
     )
 
@@ -1279,14 +1279,14 @@ def test_doctor_version_check_warns_on_pin_vs_runtime_drift(
             return _ok("nousresearch/hermes-agent:v0.9.0\n")
         return _ok("ok\n")
 
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=runner)
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=runner)
 
     report = ops.doctor(config_path=with_coder)
     [check] = [c for c in report.checks if c.name == "coder.version"]
     assert check.status == "warn"
     assert "v0.9.0" in check.detail
     assert "v1.0.0" in check.detail
-    assert "agents restart coder" in check.detail
+    assert "agx restart coder" in check.detail
 
 
 def test_doctor_version_check_falls_back_when_container_down(
@@ -1300,7 +1300,7 @@ def test_doctor_version_check_falls_back_when_container_down(
     """
     _stub_minimal_doctor(mocker)
     mocker.patch(
-        "agents_cli.compose_runner.ps",
+        "agx_cli.compose_runner.ps",
         return_value=_ok(json.dumps([{"Service": "hermes-coder", "State": "exited"}])),
     )
 
@@ -1311,13 +1311,13 @@ def test_doctor_version_check_falls_back_when_container_down(
             return MpResult(stdout="", stderr="No such container", returncode=1)
         return base(vm_name, *cmd, check=check)
 
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=runner)
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=runner)
 
     # The container-state failure makes doctor raise HealthCheckFailure
     # after emitting the full report. We exercise the version-check
     # helper directly so we don't have to also placate every other
     # check just to read one row.
-    from agents_cli.ops import DoctorReport, _check_agent_version
+    from agx_cli.ops import DoctorReport, _check_agent_version
 
     report = DoctorReport()
     _check_agent_version(cfg, "hermes-coder", "coder", "hermes", report)
@@ -1335,7 +1335,7 @@ def _seed_agent_config(cfg: AgentsConfig, agent: str, model: str) -> None:
     pick it up. Seeds the bare-string form of ``model:`` (Hermes also
     accepts a dict — covered by ``_seed_agent_config_dict_model``).
     """
-    from agents_cli import hermes_config
+    from agx_cli import hermes_config
 
     p = hermes_config.config_path(cfg, agent)
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -1347,7 +1347,7 @@ def _seed_agent_config_dict_model(cfg: AgentsConfig, agent: str, default: str) -
     the ``hermes model`` wizard produces:
     ``model: {default: <name>, provider: ..., base_url: ...}``.
     """
-    from agents_cli import hermes_config
+    from agx_cli import hermes_config
 
     p = hermes_config.config_path(cfg, agent)
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -1424,17 +1424,17 @@ def test_doctor_model_set_warns_when_provider_set_but_model_empty(
     _seed_agent_config(cfg, "coder", "")
 
     mocker.patch(
-        "agents_cli.mp.info_vm",
+        "agx_cli.mp.info_vm",
         return_value=_ok(json.dumps({"info": {"agents": {"state": "Running"}}})),
     )
     mocker.patch(
-        "agents_cli.mp.exec_in_vm",
+        "agx_cli.mp.exec_in_vm",
         side_effect=_doctor_runner_with_auth(
             '{"active_provider": "openai-codex"}', host_data_dir=cfg.paths.host_data_dir
         ),
     )
     mocker.patch(
-        "agents_cli.compose_runner.ps",
+        "agx_cli.compose_runner.ps",
         return_value=_ok(json.dumps([{"Service": "hermes-coder", "State": "running"}])),
     )
 
@@ -1451,17 +1451,17 @@ def test_doctor_model_set_ok_when_model_and_provider_both_set(
     _seed_agent_config(cfg, "coder", "gpt-5.5")
 
     mocker.patch(
-        "agents_cli.mp.info_vm",
+        "agx_cli.mp.info_vm",
         return_value=_ok(json.dumps({"info": {"agents": {"state": "Running"}}})),
     )
     mocker.patch(
-        "agents_cli.mp.exec_in_vm",
+        "agx_cli.mp.exec_in_vm",
         side_effect=_doctor_runner_with_auth(
             '{"active_provider": "openai-codex"}', host_data_dir=cfg.paths.host_data_dir
         ),
     )
     mocker.patch(
-        "agents_cli.compose_runner.ps",
+        "agx_cli.compose_runner.ps",
         return_value=_ok(json.dumps([{"Service": "hermes-coder", "State": "running"}])),
     )
 
@@ -1483,17 +1483,17 @@ def test_doctor_model_set_ok_when_model_is_dict_form(
     _seed_agent_config_dict_model(cfg, "coder", "gpt-5.5")
 
     mocker.patch(
-        "agents_cli.mp.info_vm",
+        "agx_cli.mp.info_vm",
         return_value=_ok(json.dumps({"info": {"agents": {"state": "Running"}}})),
     )
     mocker.patch(
-        "agents_cli.mp.exec_in_vm",
+        "agx_cli.mp.exec_in_vm",
         side_effect=_doctor_runner_with_auth(
             '{"active_provider": "openai-codex"}', host_data_dir=cfg.paths.host_data_dir
         ),
     )
     mocker.patch(
-        "agents_cli.compose_runner.ps",
+        "agx_cli.compose_runner.ps",
         return_value=_ok(json.dumps([{"Service": "hermes-coder", "State": "running"}])),
     )
 
@@ -1513,16 +1513,16 @@ def test_doctor_model_set_skipped_when_no_active_provider(
     _seed_agent_config(cfg, "coder", "")
 
     mocker.patch(
-        "agents_cli.mp.info_vm",
+        "agx_cli.mp.info_vm",
         return_value=_ok(json.dumps({"info": {"agents": {"state": "Running"}}})),
     )
     mocker.patch(
-        "agents_cli.mp.exec_in_vm",
+        "agx_cli.mp.exec_in_vm",
         # auth.json present but empty (no active_provider)
         side_effect=_doctor_runner_with_auth("{}", host_data_dir=cfg.paths.host_data_dir),
     )
     mocker.patch(
-        "agents_cli.compose_runner.ps",
+        "agx_cli.compose_runner.ps",
         return_value=_ok(json.dumps([{"Service": "hermes-coder", "State": "running"}])),
     )
 
@@ -1603,15 +1603,15 @@ def test_in_vm_compose_exec_argv_threads_env_vars(cfg: AgentsConfig) -> None:
 def _run_credential_pool_check(cfg: AgentsConfig, with_coder: Path, mocker, auth_json: str):
     _seed_agent_config_dict_model(cfg, "coder", "gpt-6-astra")
     mocker.patch(
-        "agents_cli.mp.info_vm",
+        "agx_cli.mp.info_vm",
         return_value=_ok(json.dumps({"info": {"agents": {"state": "Running"}}})),
     )
     mocker.patch(
-        "agents_cli.mp.exec_in_vm",
+        "agx_cli.mp.exec_in_vm",
         side_effect=_doctor_runner_with_auth(auth_json, host_data_dir=cfg.paths.host_data_dir),
     )
     mocker.patch(
-        "agents_cli.compose_runner.ps",
+        "agx_cli.compose_runner.ps",
         return_value=_ok(json.dumps([{"Service": "hermes-coder", "State": "running"}])),
     )
     report = ops.doctor(config_path=with_coder, emit=False, raise_on_fail=False)

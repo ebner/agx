@@ -30,7 +30,7 @@ def _force_linux_host(mocker: Any) -> None:
 
 @pytest.fixture
 def bare_metal(mocker: Any) -> Any:
-    from agents_cli.backends import bare_metal as mod
+    from agx_cli.backends import bare_metal as mod
 
     return mod
 
@@ -209,21 +209,21 @@ def test_find_raises(bare_metal: Any) -> None:
 
 
 def test_snapshot_refuses_with_helpful_hint(bare_metal: Any) -> None:
-    from agents_cli.errors import UserError
+    from agx_cli.errors import UserError
 
-    with pytest.raises(UserError, match="agents export"):
+    with pytest.raises(UserError, match="agx export"):
         bare_metal.snapshot("agents", "pre-upgrade")
 
 
 def test_restore_refuses_with_helpful_hint(bare_metal: Any) -> None:
-    from agents_cli.errors import UserError
+    from agx_cli.errors import UserError
 
-    with pytest.raises(UserError, match="agents import"):
+    with pytest.raises(UserError, match="agx import"):
         bare_metal.restore("agents.pre-upgrade")
 
 
 def test_delete_snapshot_degrades_with_nonzero_rc(bare_metal: Any) -> None:
-    """Non-zero MpResult, NOT a raise: `agents prune` treats snapshot
+    """Non-zero MpResult, NOT a raise: `agx prune` treats snapshot
     deletion as best-effort and must keep going on bare-metal."""
     result = bare_metal.delete_snapshot("agents", "pre-upgrade-x")
     assert result.returncode != 0
@@ -235,7 +235,7 @@ def test_delete_snapshot_degrades_with_nonzero_rc(bare_metal: Any) -> None:
 
 def test_launch_refuses_on_non_linux(bare_metal: Any, mocker: Any) -> None:
     mocker.patch("platform.system", return_value="Darwin")
-    from agents_cli.errors import UserError
+    from agx_cli.errors import UserError
 
     with pytest.raises(UserError, match="Linux-only"):
         bare_metal.launch("ignored", image="x", cpus=1, memory_gb=1, disk_gb=1)
@@ -245,7 +245,7 @@ def test_verify_bootstrap_refuses_on_non_linux(
     bare_metal: Any, mocker: Any, tmp_path: Path
 ) -> None:
     mocker.patch("platform.system", return_value="Darwin")
-    from agents_cli.errors import UserError
+    from agx_cli.errors import UserError
 
     with pytest.raises(UserError, match="Linux-only"):
         bare_metal.verify_bootstrap(tmp_path)

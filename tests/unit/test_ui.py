@@ -8,8 +8,8 @@ import click
 import pytest
 from click.testing import CliRunner
 
-from agents_cli import ui
-from agents_cli.errors import HealthCheckFailure, RuntimeFailure, UserError
+from agx_cli import ui
+from agx_cli.errors import HealthCheckFailure, RuntimeFailure, UserError
 
 
 def _invoke(flags: dict[str, bool], body):

@@ -8,16 +8,16 @@ from typing import Any
 
 import pytest
 
-from agents_cli import sidecar
-from agents_cli.config import (
+from agx_cli import sidecar
+from agx_cli.config import (
     AgentsConfig,
     DefaultsConfig,
     HostConfig,
     PathsConfig,
     VmRuntimeConfig,
 )
-from agents_cli.errors import RuntimeFailure, UserError
-from agents_cli.mp import MpResult
+from agx_cli.errors import RuntimeFailure, UserError
+from agx_cli.mp import MpResult
 
 
 def _ok(stdout: str = "") -> MpResult:
@@ -72,7 +72,7 @@ def test_firecrawl_alias_delegates_to_sidecar(mocker: Any) -> None:
     """firecrawl_cmd._docker_arch is kept as an alias (ops.py + its tests
     reference it) — must stay in lock-step with the sidecar helper.
     """
-    from agents_cli import firecrawl_cmd
+    from agx_cli import firecrawl_cmd
 
     mocker.patch("platform.machine", return_value="aarch64")
     assert firecrawl_cmd._docker_arch() == sidecar.docker_arch() == "arm64"
@@ -91,7 +91,7 @@ def test_resolve_digest_returns_pinned_ref(cfg: AgentsConfig, mocker: Any) -> No
             return _ok(digest + "\n")
         return _ok()
 
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=runner)
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=runner)
     assert sidecar.resolve_digest(cfg, "redis:alpine") == digest
 
 
@@ -109,7 +109,7 @@ def test_resolve_digest_rejects_off_allowlist_ref(cfg: AgentsConfig, mocker: Any
             return _ok(evil + "\n")
         return _ok()
 
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=runner)
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=runner)
     with pytest.raises(UserError, match="not on the allowlist"):
         sidecar.resolve_digest(cfg, "redis:alpine")
 
@@ -120,7 +120,7 @@ def test_resolve_digest_pull_failure_raises(cfg: AgentsConfig, mocker: Any) -> N
             return _fail("no route to registry")
         return _ok()
 
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=runner)
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=runner)
     with pytest.raises(RuntimeFailure, match="docker pull failed"):
         sidecar.resolve_digest(cfg, "redis:alpine")
 
@@ -133,7 +133,7 @@ def test_resolve_digest_empty_inspect_raises(cfg: AgentsConfig, mocker: Any) -> 
             return _ok("")
         return _ok()
 
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=runner)
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=runner)
     with pytest.raises(RuntimeFailure, match="could not resolve digest"):
         sidecar.resolve_digest(cfg, "redis:alpine")
 
@@ -150,7 +150,7 @@ def test_resolve_digest_unparseable_ref_raises(cfg: AgentsConfig, mocker: Any) -
             return _ok("redis:alpine\n")
         return _ok()
 
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=runner)
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=runner)
     with pytest.raises(RuntimeFailure, match="unparseable repo-digest"):
         sidecar.resolve_digest(cfg, "redis:alpine")
 
@@ -175,19 +175,19 @@ def test_service_running_accepts_running_or_healthy(
     cfg: AgentsConfig, mocker: Any, state: str, expected: bool
 ) -> None:
     mocker.patch(
-        "agents_cli.compose_runner.ps",
+        "agx_cli.compose_runner.ps",
         return_value=_ok(json.dumps([{"Service": "ollama", "State": state}])),
     )
     assert sidecar.service_running(cfg, "ollama") is expected
 
 
 def test_service_running_false_when_absent(cfg: AgentsConfig, mocker: Any) -> None:
-    mocker.patch("agents_cli.compose_runner.ps", return_value=_ok("[]"))
+    mocker.patch("agx_cli.compose_runner.ps", return_value=_ok("[]"))
     assert sidecar.service_running(cfg, "ollama") is False
 
 
 def test_service_running_false_when_ps_fails(cfg: AgentsConfig, mocker: Any) -> None:
-    mocker.patch("agents_cli.compose_runner.ps", return_value=_fail("daemon down"))
+    mocker.patch("agx_cli.compose_runner.ps", return_value=_fail("daemon down"))
     assert sidecar.service_running(cfg, "ollama") is False
 
 

@@ -1,4 +1,4 @@
-"""edit_cmd.py: `agents edit` — container-routed edits of Hermes text files."""
+"""edit_cmd.py: `agx edit` — container-routed edits of Hermes text files."""
 
 from __future__ import annotations
 
@@ -7,12 +7,12 @@ from pathlib import Path
 
 import pytest
 
-from agents_cli import config as cfg_mod
-from agents_cli import edit_cmd, hermes_config
-from agents_cli.agents_cmd import create
-from agents_cli.config import AgentsConfig, DefaultsConfig, HostConfig, PathsConfig, VmRuntimeConfig
-from agents_cli.errors import UserError
-from agents_cli.mp import MpResult
+from agx_cli import config as cfg_mod
+from agx_cli import edit_cmd, hermes_config
+from agx_cli.agents_cmd import create
+from agx_cli.config import AgentsConfig, DefaultsConfig, HostConfig, PathsConfig, VmRuntimeConfig
+from agx_cli.errors import UserError
+from agx_cli.mp import MpResult
 
 WRITER = ("sh", "-c", 'umask 077; cat > "$1"')
 
@@ -111,7 +111,7 @@ def env(cfg: AgentsConfig, tmp_path: Path, mocker, monkeypatch):
     from tests.conftest import install_vm_fs_simulation
 
     mocks = install_vm_fs_simulation(mocker, cfg)
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     config_path = tmp_path / "config.toml"
     cfg_mod.save(cfg, config_path)
     create(name="coder", agent_type="hermes", config_path=config_path)
@@ -156,7 +156,7 @@ def _editor(mocker, *contents: bytes | None):
         if nxt is not None:
             path.write_bytes(nxt)
 
-    mocker.patch("agents_cli.edit_cmd._run_editor", side_effect=run)
+    mocker.patch("agx_cli.edit_cmd._run_editor", side_effect=run)
     return seen
 
 
@@ -240,7 +240,7 @@ def test_edit_container_not_running_is_a_user_error(env, mocker) -> None:
     box, config_path, _ = env
     box.running = False
     _editor(mocker)
-    with pytest.raises(UserError, match="agents start coder"):
+    with pytest.raises(UserError, match="agx start coder"):
         edit_cmd.edit(agent="coder", path="SOUL.md", config_path=config_path)
 
 
@@ -277,7 +277,7 @@ def test_edit_config_yaml_goes_through_write_atomically_with_derived_profile(env
     box.dirs |= {"/opt/data/profiles", "/opt/data/profiles/work"}
     box.files["/opt/data/profiles/work/config.yaml"] = b"model:\n  provider: x\n"
     _editor(mocker, b"model:\n  provider: y\n")
-    write = mocker.patch("agents_cli.hermes_config.write_atomically")
+    write = mocker.patch("agx_cli.hermes_config.write_atomically")
     edit_cmd.edit(agent="coder", path="profiles/work/config.yaml", config_path=config_path)
     assert write.call_args.kwargs == {"profile": "work"}
     assert write.call_args.args[1] == "coder"
@@ -290,8 +290,8 @@ def test_edit_config_yaml_via_symlink_is_still_routed_to_the_validated_writer(en
     box.files["/opt/data/config.yaml"] = b"dashboard:\n  address: 127.0.0.1\n"
     box.links["/opt/data/innocent.md"] = "/opt/data/config.yaml"
     _editor(mocker, b"dashboard:\n  address: 0.0.0.0\n")
-    mocker.patch("agents_cli.ui.confirm", return_value=False)
-    write = mocker.patch("agents_cli.hermes_config.write_atomically")
+    mocker.patch("agx_cli.ui.confirm", return_value=False)
+    write = mocker.patch("agx_cli.hermes_config.write_atomically")
     with pytest.raises(UserError, match="not changed"):
         edit_cmd.edit(agent="coder", path="innocent.md", config_path=config_path)
     write.assert_not_called()
@@ -302,8 +302,8 @@ def test_edit_config_yaml_reopens_editor_after_a_yaml_error(env, mocker) -> None
     box, config_path, _ = env
     box.files["/opt/data/config.yaml"] = b"a: 1\n"
     seen = _editor(mocker, b"a: [unclosed\n", b"a: 2\n")
-    mocker.patch("agents_cli.ui.confirm", return_value=True)
-    write = mocker.patch("agents_cli.hermes_config.write_atomically")
+    mocker.patch("agx_cli.ui.confirm", return_value=True)
+    write = mocker.patch("agx_cli.hermes_config.write_atomically")
     edit_cmd.edit(agent="coder", path="config.yaml", config_path=config_path)
     assert len(seen) == 2
     assert write.call_args.args[2]["a"] == 2
@@ -313,8 +313,8 @@ def test_edit_config_yaml_reopens_editor_after_a_yaml_error(env, mocker) -> None
 def test_write_atomically_passes_stage_path_as_positional_not_shell_text(
     cfg: AgentsConfig, mocker
 ) -> None:
-    write = mocker.patch("agents_cli.mp.exec_in_vm_with_stdin", return_value=_ok())
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok())
+    write = mocker.patch("agx_cli.mp.exec_in_vm_with_stdin", return_value=_ok())
+    mocker.patch("agx_cli.mp.exec_in_vm", return_value=_ok())
     hermes_config.write_atomically(cfg, "coder", hermes_config._yaml().load("a: 1\n"))
     argv = write.call_args.args
     i = argv.index("sh")
@@ -330,8 +330,8 @@ def test_edit_detects_config_behind_a_symlinked_config_yaml(env, mocker) -> None
     box.links["/opt/data/config.yaml"] = "/opt/data/settings.yaml"
     bad = b"dashboard:\n  address: 0.0.0.0\n"
     _editor(mocker, bad, bad)
-    mocker.patch("agents_cli.ui.confirm", return_value=False)
-    write = mocker.patch("agents_cli.hermes_config.write_atomically")
+    mocker.patch("agx_cli.ui.confirm", return_value=False)
+    write = mocker.patch("agx_cli.hermes_config.write_atomically")
     for requested in ("config.yaml", "settings.yaml"):
         with pytest.raises(UserError, match="not changed"):
             edit_cmd.edit(agent="coder", path=requested, config_path=config_path)
@@ -346,7 +346,7 @@ def test_edit_keeps_saved_buffer_when_the_editor_exits_nonzero(env, mocker) -> N
         path.write_bytes(b"precious\n")
         raise UserError("editor exited 1; nothing was written")
 
-    mocker.patch("agents_cli.edit_cmd._run_editor", side_effect=crashy)
+    mocker.patch("agx_cli.edit_cmd._run_editor", side_effect=crashy)
     with pytest.raises(UserError, match="editor exited"):
         edit_cmd.edit(agent="coder", path="SOUL.md", config_path=config_path)
     kept = list(run_dir.glob("*/SOUL.md"))
@@ -356,7 +356,7 @@ def test_edit_keeps_saved_buffer_when_the_editor_exits_nonzero(env, mocker) -> N
 
 def test_edit_drops_untouched_buffer_when_the_editor_fails(env, mocker) -> None:
     _, config_path, run_dir = env
-    mocker.patch("agents_cli.edit_cmd._run_editor", side_effect=UserError("no tty"))
+    mocker.patch("agx_cli.edit_cmd._run_editor", side_effect=UserError("no tty"))
     with pytest.raises(UserError):
         edit_cmd.edit(agent="coder", path="SOUL.md", config_path=config_path)
     assert list(run_dir.iterdir()) == []

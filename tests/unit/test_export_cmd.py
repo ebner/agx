@@ -6,12 +6,12 @@ from pathlib import Path
 
 import pytest
 
-from agents_cli import config as cfg_mod
-from agents_cli import export_cmd, mp
-from agents_cli.agents_cmd import create
-from agents_cli.config import AgentsConfig, DefaultsConfig, HostConfig, PathsConfig, VmRuntimeConfig
-from agents_cli.errors import RuntimeFailure, UserError
-from agents_cli.mp import MpResult
+from agx_cli import config as cfg_mod
+from agx_cli import export_cmd, mp
+from agx_cli.agents_cmd import create
+from agx_cli.config import AgentsConfig, DefaultsConfig, HostConfig, PathsConfig, VmRuntimeConfig
+from agx_cli.errors import RuntimeFailure, UserError
+from agx_cli.mp import MpResult
 
 
 def _ok(stdout: str = "") -> MpResult:
@@ -48,7 +48,7 @@ def with_coder(cfg: AgentsConfig, saved_config: Path, mocker) -> Path:
     from tests.conftest import install_vm_fs_simulation
 
     install_vm_fs_simulation(mocker, cfg)
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     create(name="coder", agent_type="hermes", config_path=saved_config)
     # Seed some agent data
     (cfg.paths.host_data_dir / "coder" / ".data" / "state.db").write_text(
@@ -61,7 +61,7 @@ def with_coder(cfg: AgentsConfig, saved_config: Path, mocker) -> Path:
 
 
 def test_export_writes_archive_into_backups_dir(with_coder: Path, cfg: AgentsConfig) -> None:
-    from agents_cli.archive import ARCHIVE_SUFFIX, extract_tar_zst
+    from agx_cli.archive import ARCHIVE_SUFFIX, extract_tar_zst
 
     archive = export_cmd.export("coder", config_path=with_coder)
     assert archive.parent == cfg.paths.host_data_dir / "backups"
@@ -80,7 +80,7 @@ def test_export_in_vm_mode_tars_as_root_and_captures_agent_state(
     """``--data-dir-in-vm``: the state subtree is subuid-owned under mode
     700 on the VM disk. The unprivileged tar + ``--ignore-failed-read``
     this branch used to run produced a "successful" archive without it."""
-    from agents_cli.archive import extract_tar_zst
+    from agx_cli.archive import extract_tar_zst
 
     cfg.paths.data_dir_in_vm = True
     cfg_mod.save(cfg, saved_config)
@@ -234,7 +234,7 @@ def test_export_all_iterates_every_agent(cfg: AgentsConfig, saved_config: Path, 
     from tests.conftest import install_vm_fs_simulation
 
     install_vm_fs_simulation(mocker, cfg)
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     create(name="coder", agent_type="hermes", config_path=saved_config)
     create(name="personal", agent_type="openclaw", config_path=saved_config)
     # Seed data
@@ -255,7 +255,7 @@ def test_export_emit_false_returns_path_without_emitting(
     """Composite commands (rebuild, remove --export-first, destroy's
     export offer) embed an export but own the command's single stdout
     object — the impl must do the work and return the path silently."""
-    emit = mocker.patch("agents_cli.ui.emit")
+    emit = mocker.patch("agx_cli.ui.emit")
 
     archive = export_cmd.export("coder", config_path=with_coder, emit=False)
 
@@ -264,7 +264,7 @@ def test_export_emit_false_returns_path_without_emitting(
 
 
 def test_export_emits_by_default(with_coder: Path, mocker) -> None:
-    emit = mocker.patch("agents_cli.ui.emit")
+    emit = mocker.patch("agx_cli.ui.emit")
     export_cmd.export("coder", config_path=with_coder)
     emit.assert_called_once()
 
@@ -273,7 +273,7 @@ def test_import_archive_emit_false_suppresses_object(
     with_coder: Path, cfg: AgentsConfig, mocker
 ) -> None:
     archive = export_cmd.export("coder", config_path=with_coder, emit=False)
-    emit = mocker.patch("agents_cli.ui.emit")
+    emit = mocker.patch("agx_cli.ui.emit")
 
     export_cmd.import_archive("coder", archive, yes=True, config_path=with_coder, emit=False)
 
@@ -288,11 +288,11 @@ def test_export_all_emits_single_summary_and_narrates_per_agent(
     from tests.conftest import install_vm_fs_simulation
 
     install_vm_fs_simulation(mocker, cfg)
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     create(name="coder", agent_type="hermes", config_path=saved_config)
     create(name="personal", agent_type="openclaw", config_path=saved_config)
-    emit = mocker.patch("agents_cli.ui.emit")
-    progress = mocker.patch("agents_cli.ui.progress")
+    emit = mocker.patch("agx_cli.ui.emit")
+    progress = mocker.patch("agx_cli.ui.progress")
 
     archives = export_cmd.export_all(config_path=saved_config)
 
@@ -310,9 +310,9 @@ def test_export_all_emit_false_is_fully_silent_on_stdout(
     from tests.conftest import install_vm_fs_simulation
 
     install_vm_fs_simulation(mocker, cfg)
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     create(name="coder", agent_type="hermes", config_path=saved_config)
-    emit = mocker.patch("agents_cli.ui.emit")
+    emit = mocker.patch("agx_cli.ui.emit")
 
     export_cmd.export_all(config_path=saved_config, emit=False)
 
@@ -349,7 +349,7 @@ def test_import_vm_temp_path_excludes_user_filename(with_coder: Path, cfg: Agent
     import re
     import shutil
 
-    from agents_cli import mp
+    from agx_cli import mp
 
     archive = export_cmd.export("coder", config_path=with_coder)
     hostile = archive.parent / HOSTILE_ARCHIVE_NAME
@@ -407,10 +407,10 @@ def test_remove_export_first_declined_leaves_no_archive(
     to leave a fresh tarball (and an extra JSON object) behind."""
     from click.testing import CliRunner
 
-    from agents_cli import cli as cli_mod
+    from agx_cli import cli as cli_mod
 
-    mocker.patch("agents_cli.config.load", return_value=cfg)
-    confirm = mocker.patch("agents_cli.ui.confirm", return_value=False)
+    mocker.patch("agx_cli.config.load", return_value=cfg)
+    confirm = mocker.patch("agx_cli.ui.confirm", return_value=False)
 
     result = CliRunner().invoke(cli_mod.main, ["remove", "coder", "--export-first"])
 
@@ -427,20 +427,20 @@ def test_remove_export_first_confirms_then_exports_then_removes(
 ) -> None:
     from click.testing import CliRunner
 
-    from agents_cli import cli as cli_mod
+    from agx_cli import cli as cli_mod
 
-    mocker.patch("agents_cli.config.load", return_value=cfg)
+    mocker.patch("agx_cli.config.load", return_value=cfg)
     order: list[str] = []
     mocker.patch(
-        "agents_cli.ui.confirm",
+        "agx_cli.ui.confirm",
         side_effect=lambda *a, **k: order.append("confirm") or True,
     )
     mocker.patch(
-        "agents_cli.export_cmd.export",
+        "agx_cli.export_cmd.export",
         side_effect=lambda *a, **k: order.append("export"),
     )
     remove_mock = mocker.patch(
-        "agents_cli.agents_cmd.remove",
+        "agx_cli.agents_cmd.remove",
         side_effect=lambda *a, **k: order.append("remove"),
     )
 
@@ -457,12 +457,12 @@ def test_remove_export_first_with_yes_skips_prompt_but_still_exports(
 ) -> None:
     from click.testing import CliRunner
 
-    from agents_cli import cli as cli_mod
+    from agx_cli import cli as cli_mod
 
-    mocker.patch("agents_cli.config.load", return_value=cfg)
-    confirm = mocker.patch("agents_cli.ui.confirm", return_value=True)
-    export_mock = mocker.patch("agents_cli.export_cmd.export")
-    remove_mock = mocker.patch("agents_cli.agents_cmd.remove")
+    mocker.patch("agx_cli.config.load", return_value=cfg)
+    confirm = mocker.patch("agx_cli.ui.confirm", return_value=True)
+    export_mock = mocker.patch("agx_cli.export_cmd.export")
+    remove_mock = mocker.patch("agx_cli.agents_cmd.remove")
 
     result = CliRunner().invoke(cli_mod.main, ["remove", "coder", "--export-first", "-y"])
 
@@ -477,11 +477,11 @@ def test_remove_export_first_unknown_agent_fails_before_prompt_and_export(
 ) -> None:
     from click.testing import CliRunner
 
-    from agents_cli import cli as cli_mod
+    from agx_cli import cli as cli_mod
 
-    mocker.patch("agents_cli.config.load", return_value=cfg)
-    confirm = mocker.patch("agents_cli.ui.confirm", return_value=True)
-    export_mock = mocker.patch("agents_cli.export_cmd.export")
+    mocker.patch("agx_cli.config.load", return_value=cfg)
+    confirm = mocker.patch("agx_cli.ui.confirm", return_value=True)
+    export_mock = mocker.patch("agx_cli.export_cmd.export")
 
     result = CliRunner().invoke(cli_mod.main, ["remove", "ghost", "--export-first"])
 
@@ -510,10 +510,8 @@ class FakeCrontab:
 @pytest.fixture
 def fake_crontab(mocker) -> FakeCrontab:
     ct = FakeCrontab()
-    mocker.patch("agents_cli.export_cmd._read_crontab", side_effect=lambda: ct.read())
-    mocker.patch(
-        "agents_cli.export_cmd._write_crontab", side_effect=lambda content: ct.write(content)
-    )
+    mocker.patch("agx_cli.export_cmd._read_crontab", side_effect=lambda: ct.read())
+    mocker.patch("agx_cli.export_cmd._write_crontab", side_effect=lambda content: ct.write(content))
     return ct
 
 

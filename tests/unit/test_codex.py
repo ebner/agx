@@ -9,12 +9,12 @@ from pathlib import Path
 
 import pytest
 
-from agents_cli import codex, hermes_config
-from agents_cli import config as cfg_mod
-from agents_cli.agents_cmd import create
-from agents_cli.config import AgentsConfig, DefaultsConfig, HostConfig, PathsConfig, VmRuntimeConfig
-from agents_cli.errors import RuntimeFailure, UserError
-from agents_cli.mp import MpResult
+from agx_cli import codex, hermes_config
+from agx_cli import config as cfg_mod
+from agx_cli.agents_cmd import create
+from agx_cli.config import AgentsConfig, DefaultsConfig, HostConfig, PathsConfig, VmRuntimeConfig
+from agx_cli.errors import RuntimeFailure, UserError
+from agx_cli.mp import MpResult
 
 
 def _ok(stdout: str = "") -> MpResult:
@@ -59,7 +59,7 @@ def vm_fs_mocks(cfg: AgentsConfig, mocker) -> dict:
 
 @pytest.fixture
 def with_coder(cfg: AgentsConfig, saved_config: Path, mocker, vm_fs_mocks: dict) -> Path:
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     create(name="coder", agent_type="hermes", config_path=saved_config)
     return saved_config
 
@@ -112,7 +112,7 @@ def test_sandbox_volume_mapping_uses_vm_host_path(cfg: AgentsConfig) -> None:
 def test_skill_enable_refuses_openclaw(
     cfg: AgentsConfig, saved_config: Path, mocker, vm_fs_mocks: dict
 ) -> None:
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     create(name="personal", agent_type="openclaw", config_path=saved_config)
     with pytest.raises(UserError, match="only applies to Hermes"):
         codex.skill_enable("personal", config_path=saved_config)
@@ -127,9 +127,9 @@ def test_skill_enable_builds_image_and_updates_config(
     with_coder: Path, mocker, cfg: AgentsConfig, vm_fs_mocks: dict
 ) -> None:
     parent = mocker.Mock()
-    parent.attach_mock(mocker.patch("agents_cli.compose_runner.up", return_value=_ok()), "up")
+    parent.attach_mock(mocker.patch("agx_cli.compose_runner.up", return_value=_ok()), "up")
     parent.attach_mock(
-        mocker.patch("agents_cli.compose_runner.restart", return_value=_ok()), "restart"
+        mocker.patch("agx_cli.compose_runner.restart", return_value=_ok()), "restart"
     )
     result = codex.skill_enable("coder", config_path=with_coder)
 
@@ -162,7 +162,7 @@ def test_skill_enable_builds_image_and_updates_config(
 def test_skill_enable_persists_original_for_restore(
     with_coder: Path, mocker, cfg: AgentsConfig
 ) -> None:
-    mocker.patch("agents_cli.compose_runner.restart", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.restart", return_value=_ok())
     codex.skill_enable("coder", config_path=with_coder)
     state_path = codex._skill_state_path(cfg, "coder")
     state = json.loads(state_path.read_text())
@@ -172,7 +172,7 @@ def test_skill_enable_persists_original_for_restore(
 
 
 def test_skill_enable_is_idempotent(with_coder: Path, mocker) -> None:
-    mocker.patch("agents_cli.compose_runner.restart", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.restart", return_value=_ok())
     first = codex.skill_enable("coder", config_path=with_coder)
     second = codex.skill_enable("coder", config_path=with_coder)
     assert first["derived_image"] == second["derived_image"]
@@ -188,7 +188,7 @@ def test_skill_enable_refuses_derived_image_without_state_file(
     enable/disable cycle on the derived image — refuse instead, naming
     the state file and the manual fix.
     """
-    mocker.patch("agents_cli.compose_runner.restart", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.restart", return_value=_ok())
     # Simulate the trap: config.yaml points at a derived image, no state.
     p = hermes_config.config_path(cfg, "coder")
     doc = hermes_config.load(p)
@@ -229,15 +229,15 @@ def test_skill_enable_propagates_docker_build_failure(
 
 
 def test_skill_disable_restores_original(with_coder: Path, mocker, cfg: AgentsConfig) -> None:
-    mocker.patch("agents_cli.compose_runner.restart", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.restart", return_value=_ok())
     codex.skill_enable("coder", config_path=with_coder)
     state = json.loads(codex._skill_state_path(cfg, "coder").read_text())
     original = state["original_docker_image"]
 
     parent = mocker.Mock()
-    parent.attach_mock(mocker.patch("agents_cli.compose_runner.up", return_value=_ok()), "up")
+    parent.attach_mock(mocker.patch("agx_cli.compose_runner.up", return_value=_ok()), "up")
     parent.attach_mock(
-        mocker.patch("agents_cli.compose_runner.restart", return_value=_ok()), "restart"
+        mocker.patch("agx_cli.compose_runner.restart", return_value=_ok()), "restart"
     )
     codex.skill_disable("coder", config_path=with_coder)
     # Disable is also a config.yaml-only edit on a possibly-absent
@@ -300,7 +300,7 @@ def test_parse_expiry_garbage_returns_none() -> None:
 def test_status_reports_missing_auth(cfg: AgentsConfig, saved_config: Path, mocker) -> None:
     # status() probes the VM-side mount via mp.exec_in_vm - stub it so
     # the test never invokes a real backend binary (CI has no multipass).
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_fail())
+    mocker.patch("agx_cli.mp.exec_in_vm", return_value=_fail())
     info = codex.status(config_path=saved_config)
     assert info["auth_present"] is False
     assert info["expiry_warning"] is False
@@ -311,7 +311,7 @@ def test_status_reports_expiry_warning_under_7_days(
 ) -> None:
     # status() probes the VM-side mount via mp.exec_in_vm - stub it so
     # the test never invokes a real backend binary (CI has no multipass).
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_fail())
+    mocker.patch("agx_cli.mp.exec_in_vm", return_value=_fail())
     codex_home = cfg.paths.host_data_dir / ".codex"
     codex_home.mkdir()
     near_expiry = datetime.datetime.now(datetime.UTC) + datetime.timedelta(days=2)
@@ -329,7 +329,7 @@ def test_status_no_warning_when_far_from_expiry(
 ) -> None:
     # status() probes the VM-side mount via mp.exec_in_vm - stub it so
     # the test never invokes a real backend binary (CI has no multipass).
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_fail())
+    mocker.patch("agx_cli.mp.exec_in_vm", return_value=_fail())
     codex_home = cfg.paths.host_data_dir / ".codex"
     codex_home.mkdir()
     far = datetime.datetime.now(datetime.UTC) + datetime.timedelta(days=30)
@@ -346,7 +346,7 @@ def test_status_includes_per_agent_skill_status(
     """Status reports only the SKILL dimension per agent. The retired
     import-bridge probe (`container_mount`) is gone: provider auth is
     Hermes-owned inside the container, not something the toolkit mounts."""
-    mocker.patch("agents_cli.compose_runner.restart", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.restart", return_value=_ok())
     exec_spy = mocker.spy(codex.mp, "exec_in_vm")
     info = codex.status(config_path=with_coder)
     names = {entry["name"] for entry in info["per_agent_skill"]}
@@ -414,12 +414,12 @@ def test_login_raises_when_codex_missing(mocker, saved_config: Path) -> None:
 
 
 def test_refresh_is_retired() -> None:
-    """`agents codex refresh` rotated a single-use OAuth refresh chain a
+    """`agx codex refresh` rotated a single-use OAuth refresh chain a
     running agent could share, invalidating the agent's token. Hidden
     stub: exit 1 with the in-container re-auth pointer, absent from help."""
     from click.testing import CliRunner
 
-    from agents_cli.cli import main
+    from agx_cli.cli import main
 
     assert not hasattr(codex, "refresh")
     runner = CliRunner()
@@ -436,7 +436,7 @@ def test_refresh_is_retired() -> None:
 def test_skill_enable_narrates_build(with_coder: Path, mocker) -> None:
     """The derived-sandbox docker build can run for minutes — narrate
     start (with duration hint) and completion via always-on ui.progress."""
-    mocker.patch("agents_cli.compose_runner.restart", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.restart", return_value=_ok())
     spy = mocker.spy(codex.ui, "progress")
 
     result = codex.skill_enable("coder", config_path=with_coder)
@@ -448,7 +448,7 @@ def test_skill_enable_narrates_build(with_coder: Path, mocker) -> None:
 
 def test_skill_enable_reenable_skips_build_narration(with_coder: Path, mocker) -> None:
     """Idempotent re-enable doesn't rebuild — no build narration."""
-    mocker.patch("agents_cli.compose_runner.restart", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.restart", return_value=_ok())
     codex.skill_enable("coder", config_path=with_coder)
 
     spy = mocker.spy(codex.ui, "progress")

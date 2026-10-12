@@ -6,14 +6,14 @@ from pathlib import Path
 
 import pytest
 
-from agents_cli import hermes_config
-from agents_cli.config import AgentsConfig, PathsConfig
-from agents_cli.errors import UserError
+from agx_cli import hermes_config
+from agx_cli.config import AgentsConfig, PathsConfig
+from agx_cli.errors import UserError
 
 
 @pytest.fixture
 def cfg(tmp_path: Path) -> AgentsConfig:
-    from agents_cli.config import VmRuntimeConfig
+    from agx_cli.config import VmRuntimeConfig
 
     return AgentsConfig(
         paths=PathsConfig(host_data_dir=str(tmp_path / "data")),

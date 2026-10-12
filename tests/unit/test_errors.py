@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from agents_cli.errors import CliError, HealthCheckFailure, RuntimeFailure, UserError
+from agx_cli.errors import CliError, HealthCheckFailure, RuntimeFailure, UserError
 
 
 def test_exit_codes_are_load_bearing() -> None:

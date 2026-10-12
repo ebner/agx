@@ -1,4 +1,4 @@
-"""``agents access``: idmapped host views — mount / unmount / list, the
+"""``agx access``: idmapped host views — mount / unmount / list, the
 state file, lifecycle guards and the doctor check.
 
 ``sudo`` and ``/proc/self/mountinfo`` are faked by a tiny in-memory
@@ -13,11 +13,11 @@ from typing import Any
 
 import pytest
 
-from agents_cli import access_cmd, agents_cmd, ops
-from agents_cli import config as cfg_mod
-from agents_cli import idmap_view as iv
-from agents_cli.config import AgentsConfig, DefaultsConfig, HostConfig, PathsConfig, VmRuntimeConfig
-from agents_cli.errors import RuntimeFailure, UserError
+from agx_cli import access_cmd, agents_cmd, ops
+from agx_cli import config as cfg_mod
+from agx_cli import idmap_view as iv
+from agx_cli.config import AgentsConfig, DefaultsConfig, HostConfig, PathsConfig, VmRuntimeConfig
+from agx_cli.errors import RuntimeFailure, UserError
 
 # ---------- fixtures ----------
 
@@ -63,11 +63,11 @@ class FakeMounts:
         self.sudo_calls: list[list[str]] = []
         self.fail_on: str | None = None  # substring of a view path whose mount fails
         self.lie = False  # mount "succeeds" but nothing shows up
-        mocker.patch("agents_cli.idmap_view.read_mountinfo", side_effect=lambda: list(self.entries))
-        mocker.patch("agents_cli.permissions.run_with_sudo", side_effect=self._sudo)
-        mocker.patch("agents_cli.access_cmd.subprocess.run", side_effect=self._raw_sudo)
+        mocker.patch("agx_cli.idmap_view.read_mountinfo", side_effect=lambda: list(self.entries))
+        mocker.patch("agx_cli.permissions.run_with_sudo", side_effect=self._sudo)
+        mocker.patch("agx_cli.access_cmd.subprocess.run", side_effect=self._raw_sudo)
         mocker.patch(
-            "agents_cli.access_cmd._owner_ids",
+            "agx_cli.access_cmd._owner_ids",
             side_effect=lambda src: (1000, 1000) if src.name == "workspace" else (100999, 100999),
         )
 
@@ -126,7 +126,7 @@ def test_mount_hermes_is_read_only_hardened_and_idmapped_from_disk_owner(
 def test_mount_emits_an_escaped_nofail_fstab_line(
     saved_config: Path, mounts: FakeMounts, mocker: Any
 ) -> None:
-    emit = mocker.patch("agents_cli.ui.emit")
+    emit = mocker.patch("agx_cli.ui.emit")
     access_cmd.mount(agent="coder", writable=True, yes=True, config_path=saved_config)
     payload = emit.call_args.args[0]
     (line,) = payload["fstab_lines"]
@@ -253,7 +253,7 @@ def test_unmount_never_deletes_through_a_view_that_failed_to_unmount(
     access_cmd.mount(agent="coder", writable=False, yes=True, config_path=saved_config)
     view = tmp_path / "views" / "coder"
     (view / "state.db").write_text("the real data, seen through the view")
-    mocker.patch("agents_cli.permissions.run_with_sudo")  # umount "runs" but does nothing
+    mocker.patch("agx_cli.permissions.run_with_sudo")  # umount "runs" but does nothing
     with pytest.raises(RuntimeFailure, match="still mounted"):
         access_cmd.unmount(agent="coder", yes=True, config_path=saved_config)
     assert (view / "state.db").exists()
@@ -316,10 +316,10 @@ def test_remove_and_rename_refuse_while_a_view_is_registered(
     cfg_with_coder: AgentsConfig, saved_config: Path, mounts: FakeMounts, mocker: Any
 ) -> None:
     access_cmd.mount(agent="coder", writable=False, yes=True, config_path=saved_config)
-    stop = mocker.patch("agents_cli.compose_runner.stop")
-    with pytest.raises(UserError, match="agents access unmount coder"):
+    stop = mocker.patch("agx_cli.compose_runner.stop")
+    with pytest.raises(UserError, match="agx access unmount coder"):
         agents_cmd.remove("coder", yes=True, config_path=saved_config)
-    with pytest.raises(UserError, match="agents access unmount coder"):
+    with pytest.raises(UserError, match="agx access unmount coder"):
         agents_cmd.rename("coder", "alfie", yes=True, config_path=saved_config)
     stop.assert_not_called()
     # --keep-data leaves the directory (and so the view) intact: allowed past the guard.
@@ -333,8 +333,8 @@ def test_create_sets_no_acl_on_the_agent_data_dir(tmp_path: Path, mocker: Any) -
     """ACLs can't hold on runtime-owned state (restrictive creates are
     born masked); create must not pretend otherwise."""
     assert not hasattr(access_cmd, "auto_grant_on_create")
-    run_owned = mocker.patch("agents_cli.permissions.run_owned")
-    sudo = mocker.patch("agents_cli.permissions.run_with_sudo")
+    run_owned = mocker.patch("agx_cli.permissions.run_owned")
+    sudo = mocker.patch("agx_cli.permissions.run_with_sudo")
     cfg = AgentsConfig(paths=PathsConfig(host_data_dir=str(tmp_path / "data")))
     (tmp_path / "data").mkdir()
     agents_cmd._create_data_dirs(cfg, "coder", "hermes")
@@ -347,10 +347,10 @@ def test_mount_hints_at_leftover_default_acls(
     saved_config: Path, mounts: FakeMounts, mocker: Any
 ) -> None:
     mocker.patch(
-        "agents_cli.access_cmd.os.listxattr",
+        "agx_cli.access_cmd.os.listxattr",
         return_value=["system.posix_acl_access", "system.posix_acl_default"],
     )
-    progress = mocker.patch("agents_cli.ui.progress")
+    progress = mocker.patch("agx_cli.ui.progress")
     access_cmd.mount(agent="coder", writable=False, yes=True, config_path=saved_config)
     (hint,) = [c.args[0] for c in progress.call_args_list if "setfacl" in c.args[0]]
     assert "sudo setfacl -R -b -k" in hint and "coder/.data" in hint
@@ -359,12 +359,12 @@ def test_mount_hints_at_leftover_default_acls(
 def test_retired_grant_and_revoke_point_at_the_replacement() -> None:
     from click.testing import CliRunner
 
-    from agents_cli import cli as cli_mod
+    from agx_cli import cli as cli_mod
 
     for name in ("grant", "revoke"):
         result = CliRunner().invoke(cli_mod.main, ["access", name, "coder", "--rw", "-y"])
         assert result.exit_code == 1
-        assert "agents access mount" in result.output
+        assert "agx access mount" in result.output
     listed = CliRunner().invoke(cli_mod.main, ["access", "--help"]).output.split("Commands:")[1]
     assert "grant" not in listed and "revoke" not in listed  # hidden stubs
 
@@ -389,7 +389,7 @@ def test_unmount_keeps_a_view_registered_when_umount_did_not_take(
     cfg_with_coder: AgentsConfig, saved_config: Path, mounts: FakeMounts, mocker: Any
 ) -> None:
     access_cmd.mount(agent="coder", writable=False, yes=True, config_path=saved_config)
-    mocker.patch("agents_cli.permissions.run_with_sudo")  # "target is busy"
+    mocker.patch("agx_cli.permissions.run_with_sudo")  # "target is busy"
     with pytest.raises(RuntimeFailure, match="still mounted"):
         access_cmd.unmount(agent="coder", yes=True, config_path=saved_config)
     assert list(_state(cfg_with_coder)["views"]) == ["coder"]  # guards + doctor still see it
@@ -405,9 +405,9 @@ def test_remove_rechecks_the_view_guard_under_the_lock(
         access_cmd.mount(agent="coder", writable=False, yes=True, config_path=saved_config)
         return True
 
-    mocker.patch("agents_cli.ui.confirm", side_effect=confirm_and_race)
-    stop = mocker.patch("agents_cli.compose_runner.stop")
-    with pytest.raises(UserError, match="agents access unmount coder"):
+    mocker.patch("agx_cli.ui.confirm", side_effect=confirm_and_race)
+    stop = mocker.patch("agx_cli.compose_runner.stop")
+    with pytest.raises(UserError, match="agx access unmount coder"):
         agents_cmd.remove("coder", yes=False, config_path=saved_config)
     stop.assert_not_called()
     assert (cfg_with_coder.paths.host_data_dir / "coder" / ".data").exists()
@@ -435,7 +435,7 @@ def test_view_groups_files_as_the_users_primary_group_not_the_recorded_gid(
     view showed every file as group `libvirt`."""
     cfg_with_coder.host = HostConfig(uid=1000, gid=127)
     cfg_mod.save(cfg_with_coder, saved_config)
-    mocker.patch("agents_cli.access_cmd.pwd.getpwuid", return_value=mocker.Mock(pw_gid=1000))
+    mocker.patch("agx_cli.access_cmd.pwd.getpwuid", return_value=mocker.Mock(pw_gid=1000))
     access_cmd.mount(agent="coder", writable=False, yes=True, config_path=saved_config)
     (argv,) = mounts.sudo_calls
     assert "g:1000:100999:1 g:100999:1000:1" in argv[3]

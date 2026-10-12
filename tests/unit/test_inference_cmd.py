@@ -8,18 +8,18 @@ from typing import Any
 
 import pytest
 
-from agents_cli import compose, inference_cmd
-from agents_cli import config as cfg_mod
-from agents_cli.compose import OLLAMA_IMAGE_BASE, OLLAMA_SERVICE_NAME
-from agents_cli.config import (
+from agx_cli import compose, inference_cmd
+from agx_cli import config as cfg_mod
+from agx_cli.compose import OLLAMA_IMAGE_BASE, OLLAMA_SERVICE_NAME
+from agx_cli.config import (
     AgentsConfig,
     DefaultsConfig,
     HostConfig,
     PathsConfig,
     VmRuntimeConfig,
 )
-from agents_cli.errors import UserError
-from agents_cli.mp import MpResult
+from agx_cli.errors import UserError
+from agx_cli.mp import MpResult
 
 
 def _ok(stdout: str = "") -> MpResult:
@@ -93,7 +93,7 @@ def test_up_ollama_resolves_digest_and_pins(
     """
     digest = f"{OLLAMA_IMAGE_BASE}@sha256:" + "f" * 64
     mocker.patch(
-        "agents_cli.mp.exec_in_vm",
+        "agx_cli.mp.exec_in_vm",
         side_effect=_layer_runner(
             vm_fs,
             {
@@ -102,7 +102,7 @@ def test_up_ollama_resolves_digest_and_pins(
             },
         ),
     )
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
 
     payload = inference_cmd.up("ollama", config_path=saved_config)
 
@@ -135,8 +135,8 @@ def test_up_ollama_reuses_existing_digest(
             return _ok()
         return sim_runner(vm_name, *cmd, check=check)
 
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=runner)
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=runner)
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
 
     inference_cmd.up("ollama", config_path=saved_config)
     assert pull_calls == []
@@ -154,7 +154,7 @@ def test_up_ollama_upgrade_flag_re_resolves(
     new_digest = f"{OLLAMA_IMAGE_BASE}@sha256:" + "b" * 64
 
     mocker.patch(
-        "agents_cli.mp.exec_in_vm",
+        "agx_cli.mp.exec_in_vm",
         side_effect=_layer_runner(
             vm_fs,
             {
@@ -163,7 +163,7 @@ def test_up_ollama_upgrade_flag_re_resolves(
             },
         ),
     )
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
 
     inference_cmd.up("ollama", upgrade=True, config_path=saved_config)
     reloaded = cfg_mod.load(saved_config)
@@ -208,8 +208,8 @@ def test_down_ollama_removes_service_and_clears_enabled_flag(
     doc.setdefault("services", {})[OLLAMA_SERVICE_NAME] = {"image": cfg.inference.ollama_image}
     compose.write_compose_atomically(cfg, doc)
 
-    mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())
-    mocker.patch("agents_cli.compose_runner.rm", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.stop", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.rm", return_value=_ok())
 
     inference_cmd.down("ollama", config_path=saved_config)
 
@@ -238,7 +238,7 @@ def test_up_llamacpp_pins_image_without_starting_service(
     digest = "ghcr.io/ggml-org/llama.cpp@sha256:" + "d" * 64
 
     mocker.patch(
-        "agents_cli.mp.exec_in_vm",
+        "agx_cli.mp.exec_in_vm",
         side_effect=_layer_runner(
             vm_fs,
             {
@@ -315,7 +315,7 @@ def test_up_ollama_ensures_llamacpp_models_dir_too(
     """
     cfg.inference.ollama_image = f"{OLLAMA_IMAGE_BASE}@sha256:" + "a" * 64
     cfg_mod.save(cfg, saved_config)
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
 
     inference_cmd.up("ollama", config_path=saved_config)
 
@@ -335,8 +335,8 @@ def test_up_ollama_emit_false_suppresses_stdout_object(
     """
     cfg.inference.ollama_image = f"{OLLAMA_IMAGE_BASE}@sha256:" + "a" * 64
     cfg_mod.save(cfg, saved_config)
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
-    emit_spy = mocker.patch("agents_cli.ui.emit")
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
+    emit_spy = mocker.patch("agx_cli.ui.emit")
 
     payload = inference_cmd.up("ollama", config_path=saved_config, emit=False)
 
@@ -350,7 +350,7 @@ def test_up_llamacpp_emit_false_suppresses_stdout_object(
 ) -> None:
     cfg.inference.llamacpp_image = "ghcr.io/ggml-org/llama.cpp@sha256:" + "d" * 64
     cfg_mod.save(cfg, saved_config)
-    emit_spy = mocker.patch("agents_cli.ui.emit")
+    emit_spy = mocker.patch("agx_cli.ui.emit")
 
     payload = inference_cmd.up("llama-cpp", config_path=saved_config, emit=False)
 
@@ -385,8 +385,8 @@ def test_reup_llamacpp_services_ups_each_defined_service(
     block the rest); non-llama-cpp services untouched.
     """
     _seed_llamacpp_services(cfg, "tiny", "big")
-    up_spy = mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
-    mocker.patch("agents_cli.inference_cmd._wait_service_running", return_value=True)
+    up_spy = mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.inference_cmd._wait_service_running", return_value=True)
 
     result = inference_cmd.reup_llamacpp_services(cfg)
 
@@ -399,10 +399,10 @@ def test_reup_llamacpp_services_warns_and_continues_on_failure(
     cfg: AgentsConfig, saved_config: Path, mocker: Any, vm_fs: dict[str, Any]
 ) -> None:
     """A model service that fails to start is warned about — with the
-    exact `agents inference load` recovery command including the GGUF
+    exact `agx inference load` recovery command including the GGUF
     from the fragment — and the remaining services still come up.
     """
-    from agents_cli.errors import RuntimeFailure
+    from agx_cli.errors import RuntimeFailure
 
     _seed_llamacpp_services(cfg, "bad", "good")
 
@@ -411,8 +411,8 @@ def test_reup_llamacpp_services_warns_and_continues_on_failure(
             raise RuntimeFailure("compose up failed (exit 1)")
         return _ok()
 
-    mocker.patch("agents_cli.compose_runner.up", side_effect=failing_up)
-    mocker.patch("agents_cli.inference_cmd._wait_service_running", return_value=True)
+    mocker.patch("agx_cli.compose_runner.up", side_effect=failing_up)
+    mocker.patch("agx_cli.inference_cmd._wait_service_running", return_value=True)
     warn_spy = mocker.spy(inference_cmd.ui, "warn")
 
     result = inference_cmd.reup_llamacpp_services(cfg)
@@ -420,7 +420,7 @@ def test_reup_llamacpp_services_warns_and_continues_on_failure(
     assert result == {"started": ["llama-cpp-good"], "failed": ["llama-cpp-bad"]}
     warnings = [c.args[0] for c in warn_spy.call_args_list]
     assert any(
-        "llama-cpp-bad" in w and "agents inference load llama-cpp bad --gguf bad.gguf" in w
+        "llama-cpp-bad" in w and "agx inference load llama-cpp bad --gguf bad.gguf" in w
         for w in warnings
     )
 
@@ -435,9 +435,9 @@ def test_reup_llamacpp_services_counts_only_actually_running(
     gets the recovery warning.
     """
     _seed_llamacpp_services(cfg, "crashy", "good")
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     mocker.patch(
-        "agents_cli.inference_cmd._wait_service_running",
+        "agx_cli.inference_cmd._wait_service_running",
         side_effect=lambda cfg_arg, svc, **kw: svc != "llama-cpp-crashy",
     )
     warn_spy = mocker.spy(inference_cmd.ui, "warn")
@@ -449,14 +449,14 @@ def test_reup_llamacpp_services_counts_only_actually_running(
     assert any(
         "llama-cpp-crashy" in w
         and "not running" in w
-        and "agents inference load llama-cpp crashy --gguf crashy.gguf" in w
+        and "agx inference load llama-cpp crashy --gguf crashy.gguf" in w
         for w in warnings
     )
 
 
 def test_wait_service_running_polls_until_running(cfg: AgentsConfig, mocker: Any) -> None:
     probe = mocker.patch(
-        "agents_cli.inference_cmd._service_running",
+        "agx_cli.inference_cmd._service_running",
         side_effect=[False, False, True],
     )
     assert inference_cmd._wait_service_running(cfg, "llama-cpp-x", timeout_s=5.0, interval_s=0.0)
@@ -464,7 +464,7 @@ def test_wait_service_running_polls_until_running(cfg: AgentsConfig, mocker: Any
 
 
 def test_wait_service_running_gives_up_after_window(cfg: AgentsConfig, mocker: Any) -> None:
-    mocker.patch("agents_cli.inference_cmd._service_running", return_value=False)
+    mocker.patch("agx_cli.inference_cmd._service_running", return_value=False)
     assert not inference_cmd._wait_service_running(
         cfg, "llama-cpp-x", timeout_s=0.05, interval_s=0.01
     )
@@ -473,7 +473,7 @@ def test_wait_service_running_gives_up_after_window(cfg: AgentsConfig, mocker: A
 def test_reup_llamacpp_services_noop_when_none_defined(
     cfg: AgentsConfig, saved_config: Path, mocker: Any, vm_fs: dict[str, Any]
 ) -> None:
-    up_spy = mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    up_spy = mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     result = inference_cmd.reup_llamacpp_services(cfg)
     assert result == {"started": [], "failed": []}
     up_spy.assert_not_called()
@@ -489,7 +489,7 @@ def test_status_reports_ollama_not_installed_when_compose_clean(
     `not installed`. Doesn't probe the daemon — that would be noisy
     in tight loops.
     """
-    mocker.patch("agents_cli.compose_runner.ps", return_value=_ok("[]"))
+    mocker.patch("agx_cli.compose_runner.ps", return_value=_ok("[]"))
     payload = inference_cmd.status(config_path=saved_config)
     assert payload["ollama"]["installed"] is False
     assert payload["ollama"]["running"] is False
@@ -517,9 +517,9 @@ def test_status_lists_loaded_models_when_running(
             return _ok(ollama_list_output)
         return _ok()
 
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=runner)
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=runner)
     mocker.patch(
-        "agents_cli.compose_runner.ps",
+        "agx_cli.compose_runner.ps",
         return_value=_ok(json.dumps([{"Service": OLLAMA_SERVICE_NAME, "State": "running"}])),
     )
 
@@ -541,7 +541,7 @@ def test_up_ollama_rejects_off_allowlist_digest_from_daemon(
     """
     evil = "evil.example/notollama@sha256:" + "f" * 64
     mocker.patch(
-        "agents_cli.mp.exec_in_vm",
+        "agx_cli.mp.exec_in_vm",
         side_effect=_layer_runner(
             vm_fs,
             {
@@ -550,7 +550,7 @@ def test_up_ollama_rejects_off_allowlist_digest_from_daemon(
             },
         ),
     )
-    up_spy = mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    up_spy = mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
 
     with pytest.raises(UserError, match="not on the allowlist"):
         inference_cmd.up("ollama", config_path=saved_config)
@@ -571,7 +571,7 @@ def test_up_ollama_reuse_path_rejects_doctored_config_image(
     """
     cfg.inference.ollama_image = "evil.example/miner@sha256:" + "a" * 64
     cfg_mod.save(cfg, saved_config)
-    up_spy = mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    up_spy = mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
 
     with pytest.raises(UserError, match="not on the allowlist"):
         inference_cmd.up("ollama", config_path=saved_config)
@@ -626,11 +626,11 @@ def test_up_ollama_failed_up_does_not_persist_enabled_flag(
     state in config.toml (doctor would then probe a service that never
     existed).
     """
-    from agents_cli.errors import RuntimeFailure
+    from agx_cli.errors import RuntimeFailure
 
     digest = f"{OLLAMA_IMAGE_BASE}@sha256:" + "f" * 64
     mocker.patch(
-        "agents_cli.mp.exec_in_vm",
+        "agx_cli.mp.exec_in_vm",
         side_effect=_layer_runner(
             vm_fs,
             {
@@ -640,7 +640,7 @@ def test_up_ollama_failed_up_does_not_persist_enabled_flag(
         ),
     )
     mocker.patch(
-        "agents_cli.compose_runner.up",
+        "agx_cli.compose_runner.up",
         side_effect=RuntimeFailure("compose up failed (exit 1)"),
     )
 
@@ -664,7 +664,7 @@ def test_up_ollama_narrates_pull(
     always-on ui.progress with a duration hint."""
     digest = f"{OLLAMA_IMAGE_BASE}@sha256:" + "f" * 64
     mocker.patch(
-        "agents_cli.mp.exec_in_vm",
+        "agx_cli.mp.exec_in_vm",
         side_effect=_layer_runner(
             vm_fs,
             {
@@ -673,7 +673,7 @@ def test_up_ollama_narrates_pull(
             },
         ),
     )
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     spy = mocker.spy(inference_cmd.ui, "progress")
 
     inference_cmd.up("ollama", config_path=saved_config)
@@ -688,7 +688,7 @@ def test_up_ollama_reuse_does_not_narrate_pull(
     """Reuse path pulls nothing — the narration must not promise a pull."""
     cfg.inference.ollama_image = f"{OLLAMA_IMAGE_BASE}@sha256:" + "a" * 64
     cfg_mod.save(cfg, saved_config)
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     spy = mocker.spy(inference_cmd.ui, "progress")
 
     inference_cmd.up("ollama", config_path=saved_config)
@@ -699,11 +699,11 @@ def test_up_ollama_reuse_does_not_narrate_pull(
 def test_up_llamacpp_narrates_pull(
     cfg: AgentsConfig, saved_config: Path, mocker: Any, vm_fs: dict[str, Any]
 ) -> None:
-    from agents_cli.compose import LLAMACPP_IMAGE_BASE
+    from agx_cli.compose import LLAMACPP_IMAGE_BASE
 
     digest = f"{LLAMACPP_IMAGE_BASE}@sha256:" + "e" * 64
     mocker.patch(
-        "agents_cli.mp.exec_in_vm",
+        "agx_cli.mp.exec_in_vm",
         side_effect=_layer_runner(
             vm_fs,
             {

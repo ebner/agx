@@ -7,8 +7,8 @@ agent's state isn't actually portable. This document is the runbook for
 the realistic path: **side-by-side cutover with archival**.
 
 > If you're looking for in-place version upgrades (Hermes → newer
-> Hermes, OpenClaw → newer OpenClaw), use `agents upgrade <name>
-> --latest` and `agents outdated` instead — those are seamless.
+> Hermes, OpenClaw → newer OpenClaw), use `agx upgrade <name>
+> --latest` and `agx outdated` instead — those are seamless.
 
 ## What carries over and what doesn't
 
@@ -17,7 +17,7 @@ the realistic path: **side-by-side cutover with archival**.
 | Personality / `SOUL.md` | Yes (plain text) | Hand-port into the new agent's system-prompt slot |
 | LLM provider (Codex auth) | Yes | `openclaw models auth login --provider openai` (or `hermes auth add openai-codex` going the other way) |
 | Other LLM API keys (OpenRouter, etc.) | Yes (bare strings) | Re-enter in the destination agent's wizard |
-| Conversation history | **Lossy** — text only | `agents conversations export <name> --to <dir>` produces Markdown transcripts |
+| Conversation history | **Lossy** — text only | `agx conversations export <name> --to <dir>` produces Markdown transcripts |
 | Bot tokens (Slack, Mattermost, email) | Yes if same bot | The tokens themselves are bare strings; bot apps don't care which client connects |
 | Channel routing | Partial | Channel IDs are stable; map structures differ between runtimes |
 | WhatsApp pairing | **No** | Bridge state is runtime-specific; re-pair on the destination side |
@@ -25,7 +25,7 @@ the realistic path: **side-by-side cutover with archival**.
 | Skills / plugins | **No** | Conceptually different abstractions; reinstall the closest equivalents |
 | Memory (holographic / mem0 / openviking) | **No** | Backend-specific binary state; OpenClaw has its own memory architecture |
 | Kanban data | **No** | Hermes-specific feature |
-| Sessions, plans, sandboxes, workspace | Archival only | Tarball via `agents export <name>`; not re-importable |
+| Sessions, plans, sandboxes, workspace | Archival only | Tarball via `agx export <name>`; not re-importable |
 
 ## The runbook (Hermes → OpenClaw)
 
@@ -36,11 +36,11 @@ respective CLI invocations.
 
 ```bash
 # Confirm both runtimes are reachable + current
-agents outdated
-agents doctor
+agx outdated
+agx doctor
 
 # Capture the current Hermes data dir for posterity
-agents export coder              # → <data-dir>/backups/coder-<utc>.tar.zst
+agx export coder              # → <data-dir>/backups/coder-<utc>.tar.zst
 ```
 
 Retention caveat: the default `backups/` dir is a rolling window —
@@ -54,7 +54,7 @@ pruned) or copy the archive somewhere durable.
 
 ```bash
 # One Markdown file per session, suitable for grep/diff/hand-seeding
-agents conversations export coder --to ~/migrations/coder-transcripts/
+agx conversations export coder --to ~/migrations/coder-transcripts/
 ```
 
 The transcripts give you a searchable history of what the agent was
@@ -66,8 +66,8 @@ this directory checked into version control if you care about audit.
 Pick a new name so the two run in parallel during cutover:
 
 ```bash
-agents create coder2 --type openclaw
-agents setup coder2                  # runs `openclaw onboard`
+agx create coder2 --type openclaw
+agx setup coder2                  # runs `openclaw onboard`
 ```
 
 During `openclaw onboard`:
@@ -86,13 +86,13 @@ During `openclaw onboard`:
 ```bash
 # Personality
 docker compose exec hermes-coder cat /opt/data/SOUL.md \
-  | agents exec --root coder2 tee /home/node/.openclaw/PERSONA.md
+  | agx exec --root coder2 tee /home/node/.openclaw/PERSONA.md
 
 # (Or copy via the export archive; the path inside OpenClaw will
 # depend on its current config schema.)
 ```
 
-Then open `agents setup coder2` again and paste the personality into
+Then open `agx setup coder2` again and paste the personality into
 OpenClaw's system-prompt UI. OpenClaw doesn't have a one-file `SOUL.md`
 analogue; it ships its own personality store via `openclaw configure`.
 
@@ -104,12 +104,12 @@ the tokens are reusable across runtimes.
 
 ```bash
 # Hermes side: read the tokens you need to carry
-agents exec --root coder sh -c 'ls /opt/data/platforms/'
-agents exec --root coder sh -c 'cat /opt/data/platforms/slack.yaml'   # example
+agx exec --root coder sh -c 'ls /opt/data/platforms/'
+agx exec --root coder sh -c 'cat /opt/data/platforms/slack.yaml'   # example
 
 # OpenClaw side: enter them in `openclaw configure` under the
 # matching platform plugin.
-agents exec coder2 -- openclaw configure
+agx exec coder2 -- openclaw configure
 ```
 
 **WhatsApp is the exception**: the bridge state (session keys, paired
@@ -121,7 +121,7 @@ You'll briefly see the QR code prompt again.
 Skills are not portable. List what Hermes has installed:
 
 ```bash
-agents exec coder -- hermes skills list
+agx exec coder -- hermes skills list
 ```
 
 For each one, look for an OpenClaw plugin with similar capabilities
@@ -133,7 +133,7 @@ plugin.
 ### 6. Cron jobs
 
 ```bash
-agents exec coder -- hermes cron list
+agx exec coder -- hermes cron list
 ```
 
 Re-create each job through OpenClaw's job system. The cron expressions
@@ -148,7 +148,7 @@ OpenClaw equivalents in the toolkit. If you depended on long-term
 memory:
 
 - Export memory dumps from Hermes if the backend supports it (e.g.
-  `agents memory disable coder` cleanly tears the sidecar down and
+  `agx memory disable coder` cleanly tears the sidecar down and
   the data dir at `<data-dir>/coder/.openviking/` is preserved).
 - Manually seed the OpenClaw agent with a brief summary as a
   system-prompt addition or first message.
@@ -165,14 +165,14 @@ When you're confident:
 
 ```bash
 # Stop the old agent first so it can't catch new messages
-agents stop coder
+agx stop coder
 
 # Re-point platform integrations (bot user → coder2's webhook /
 # socket-mode endpoint). For Slack Socket Mode this is automatic
 # once coder2's app token is the only active subscriber.
 
 # After a week of soak, remove the old agent's container + data dir
-agents remove coder --export-first   # bags a final archive, confirms, removes
+agx remove coder --export-first   # bags a final archive, confirms, removes
 ```
 
 The export archive from step 0 and the transcripts from step 1 are
@@ -196,22 +196,22 @@ that's the time to invest in the manifest format.
 
 ---
 
-# Migrating the data dir into the VM (`agents vm migrate-data`)
+# Migrating the data dir into the VM (`agx vm migrate-data`)
 
 A different kind of migration: same agents, same runtime, but the agent
 state moves from the host-mounted data dir onto the VM's own disk —
-converting an existing deployment to what `agents vm init
+converting an existing deployment to what `agx vm init
 --data-dir-in-vm` would have set up from scratch.
 
 ## When to use it
 
-The host-mount layout has two structural problems that `agents fix-perms`
+The host-mount layout has two structural problems that `agx fix-perms`
 can't permanently fix:
 
 - **Subuid-owned state on the host.** The agent's files land on the host
   as a rootless-Docker subuid under mode 700. The toolkit itself no
   longer needs to read them from the host (it works through the VM), and
-  `agents access mount` / `agents edit` cover human access — but it stays
+  `agx access mount` / `agx edit` cover human access — but it stays
   a second moving part that `--data-dir-in-vm` simply doesn't have.
 - **The 9p/virtiofs root asymmetry.** Container-root cannot write to
   the mounted share (container uid 0 maps to an unprivileged VM user,
@@ -224,7 +224,7 @@ SQLite-heavy stores (kanban/sessions/insights). If you're hitting any of
 these on an existing deployment, run:
 
 ```bash
-agents vm migrate-data          # add --yes for non-interactive
+agx vm migrate-data          # add --yes for non-interactive
 ```
 
 ## What it does
@@ -235,9 +235,9 @@ resumes from the last completed phase by re-running the command:
 1. Preflight: refuses on bare_metal (no VM), when `data_dir_in_vm` is
    already enabled, when the VM isn't running, and when the VM disk
    lacks headroom for the copy (data size + 20% margin, with the
-   numbers printed — grow via `agents vm resize --disk N` first).
+   numbers printed — grow via `agx vm resize --disk N` first).
 2. Safety exports: one archive per agent into `<data-dir>/backups/` —
-   your restore path (`agents import <name> <archive>`), and the last
+   your restore path (`agx import <name> <archive>`), and the last
    host-visible state your backup tool picks up before the move.
 3. Confirms the plan (downtime: every agent and sidecar stops).
 4. Stops all services, then copies the entire data dir VM-side onto the
@@ -256,7 +256,7 @@ resumes from the last completed phase by re-running the command:
    so absolute paths recorded elsewhere (e.g. the Codex-skill sandbox
    volume `<vm_agents_root>/.codex`) stay valid.
 6. Flips `[paths] data_dir_in_vm = true` in `config.toml`, restarts all
-   services, and requires a green `agents doctor` (run render-suppressed
+   services, and requires a green `agx doctor` (run render-suppressed
    — its per-check summary is folded into the command's single JSON
    payload). A red doctor exits 3, keeps the journal, and prints the
    exact flip-back steps.
@@ -280,7 +280,7 @@ migrated deployment has run cleanly for a few days. Until then they are
 your instant rollback:
 
 ```toml
-# ~/.config/agents/config.toml
+# ~/.config/agx/config.toml
 [paths]
 data_dir_in_vm = false
 ```
@@ -289,15 +289,15 @@ Rollback order matters — the container lifecycle must sandwich the
 remount:
 
 ```bash
-agents stop <name>                  # 1. each agent — nothing may keep
+agx stop <name>                  # 1. each agent — nothing may keep
                                     #    writing the VM-local copy
 # 2. edit config.toml as above
-agents vm start                     # 3. re-adds + verifies the host mount
-agents upgrade <name> --recreate    # 4. each agent — force-recreate so the
+agx vm start                     # 3. re-adds + verifies the host mount
+agx upgrade <name> --recreate    # 4. each agent — force-recreate so the
                                     #    bind mounts point at host data again
 ```
 
-A plain `agents start` is **not** enough for step 4: on libvirt the
+A plain `agx start` is **not** enough for step 4: on libvirt the
 remount is live (no VM reboot), and an existing container's bind mounts
 were materialized against the pre-rollback filesystem — it can keep
 writing the VM-local copy hidden beneath the reattached share.
@@ -305,11 +305,11 @@ writing the VM-local copy hidden beneath the reattached share.
 Keep (still live on the host after migration, never listed as
 deletable): `docker-compose.override.yml` — compose only merges the
 override while the **host** copy exists, so deleting it silently drops
-every `agents mount` volume from future compose calls;
-`<agent>/.mounts.json` — `agents mount` reads its manifest host-side in
+every `agx mount` volume from future compose calls;
+`<agent>/.mounts.json` — `agx mount` reads its manifest host-side in
 both modes (which is why agent dirs are listed via their bulk-state
 subdirs, never wholesale); `.codex/` (the toolkit-scoped Codex auth
-home — `agents codex login` writes there and syncs into the VM),
+home — `agx codex login` writes there and syncs into the VM),
 `.env`, `.firecrawl-state.json`, `.memory-state/`, `backups/`,
 `.upgrades/`, `.journal/`, `.agents.lock`.
 
@@ -321,12 +321,12 @@ home — `agents codex login` writes there and syncs into the VM),
   picks up:
 
   ```bash
-  agents export-cron install --time 02:30,08:30,14:30,20:30
+  agx export-cron install --time 02:30,08:30,14:30,20:30
   ```
 
-- `agents vm snapshot` now covers agent state too (the VM disk holds
+- `agx vm snapshot` now covers agent state too (the VM disk holds
   it), and on libvirt snapshots no longer force a VM stop (the
   virtiofs limitation only applied to host-mount mode).
 - If doctor flags `/opt/data` access for an agent after the migration,
-  `agents fix-perms <name>` realigns ownership — one-time, not the
+  `agx fix-perms <name>` realigns ownership — one-time, not the
   host-mount treadmill.

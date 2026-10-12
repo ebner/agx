@@ -8,8 +8,8 @@ from typing import Any
 
 import pytest
 
-from agents_cli import prune_cmd
-from agents_cli.config import (
+from agx_cli import prune_cmd
+from agx_cli.config import (
     AgentsConfig,
     DefaultsConfig,
     HostConfig,
@@ -17,8 +17,8 @@ from agents_cli.config import (
     UpgradesConfig,
     VmRuntimeConfig,
 )
-from agents_cli.errors import UserError
-from agents_cli.mp import MpResult
+from agx_cli.errors import UserError
+from agx_cli.mp import MpResult
 
 
 def _ok(stdout: str = "") -> MpResult:
@@ -87,7 +87,7 @@ def test_plan_archives_keep_zero_selects_all(cfg: AgentsConfig) -> None:
 
 def _stub_info_vm(mocker: Any, cfg: AgentsConfig, snapshot_names: list[str]) -> None:
     payload = {"info": {cfg.vm.name: {"snapshots": {n: {} for n in snapshot_names}}}}
-    mocker.patch("agents_cli.mp.info_vm", return_value=_ok(json.dumps(payload)))
+    mocker.patch("agx_cli.mp.info_vm", return_value=_ok(json.dumps(payload)))
 
 
 def test_plan_snapshots_filters_to_agents_upgrade_snaps(cfg: AgentsConfig, mocker: Any) -> None:
@@ -107,7 +107,7 @@ def test_plan_snapshots_filters_to_agents_upgrade_snaps(cfg: AgentsConfig, mocke
 
 
 def test_plan_snapshots_empty_on_info_failure(cfg: AgentsConfig, mocker: Any) -> None:
-    mocker.patch("agents_cli.mp.info_vm", return_value=_fail("VM unreachable"))
+    mocker.patch("agx_cli.mp.info_vm", return_value=_fail("VM unreachable"))
     assert prune_cmd._plan_snapshots(cfg, "coder", keep=2) == []
 
 
@@ -124,7 +124,7 @@ def test_plan_images_protects_referenced_baseline_and_newest(
     """v1.0.0 is compose-referenced AND the defaults baseline; v0.9.0
     survives inside the newest-2 window; v0.8.0/v0.7.0 go."""
     mocker.patch(
-        "agents_cli.mp.exec_in_vm",
+        "agx_cli.mp.exec_in_vm",
         return_value=_ok(
             _docker_images_stdout(
                 [
@@ -158,7 +158,7 @@ def test_plan_images_keeps_exactly_keep_when_defaults_tag_is_stale(
     )
     assert cfg.defaults.hermes_image_tag == "v1.0.0"  # stale baseline
     mocker.patch(
-        "agents_cli.mp.exec_in_vm",
+        "agx_cli.mp.exec_in_vm",
         return_value=_ok(
             _docker_images_stdout(
                 [
@@ -181,7 +181,7 @@ def test_plan_images_referenced_tag_survives_even_when_old(cfg: AgentsConfig, mo
     """A rolled-back agent pinned to an old tag: the referenced tag is
     outside the newest-N window but must never be deleted."""
     mocker.patch(
-        "agents_cli.mp.exec_in_vm",
+        "agx_cli.mp.exec_in_vm",
         return_value=_ok(
             _docker_images_stdout(
                 [
@@ -198,7 +198,7 @@ def test_plan_images_referenced_tag_survives_even_when_old(cfg: AgentsConfig, mo
 
 
 def test_plan_images_skips_repo_when_docker_unreachable(cfg: AgentsConfig, mocker: Any) -> None:
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_fail("VM down"))
+    mocker.patch("agx_cli.mp.exec_in_vm", return_value=_fail("VM down"))
     assert prune_cmd._plan_images(cfg, {"nousresearch/hermes-agent"}, keep=2) == []
 
 
@@ -213,7 +213,7 @@ def test_build_plan_unknown_agent_raises(cfg: AgentsConfig, mocker: Any) -> None
 def test_build_plan_scopes_to_named_agent(cfg: AgentsConfig, mocker: Any) -> None:
     _write_archives(cfg, [f"coder-2026010{i}T000000Z.tar.zst" for i in range(1, 5)])
     _stub_info_vm(mocker, cfg, [])
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok(""))
+    mocker.patch("agx_cli.mp.exec_in_vm", return_value=_ok(""))
     plan = prune_cmd.build_plan(cfg, "coder", keep=2)
     assert len(plan.archives) == 2
     assert plan.snapshots == []
@@ -230,10 +230,10 @@ def test_execute_plan_deletes_and_collects_per_item_failures(
     archive = cfg.paths.host_data_dir / ".upgrades" / "coder-20260101T000000Z.tar.zst"
     missing = cfg.paths.host_data_dir / ".upgrades" / "coder-20250101T000000Z.tar.zst"
     mocker.patch(
-        "agents_cli.mp.delete_snapshot",
+        "agx_cli.mp.delete_snapshot",
         side_effect=[_ok(), _fail("snapshot busy")],
     )
-    rmi = mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok())
+    rmi = mocker.patch("agx_cli.mp.exec_in_vm", return_value=_ok())
 
     plan = prune_cmd.PrunePlan(
         keep=2,
@@ -258,12 +258,12 @@ def test_execute_plan_deletes_and_collects_per_item_failures(
 
 
 def test_prune_dry_run_deletes_nothing(cfg: AgentsConfig, mocker: Any, tmp_path: Path) -> None:
-    from agents_cli import config as cfg_mod
+    from agx_cli import config as cfg_mod
 
     _write_archives(cfg, [f"coder-2026010{i}T000000Z.tar.zst" for i in range(1, 5)])
     _stub_info_vm(mocker, cfg, [])
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok(""))
-    delete_snap = mocker.patch("agents_cli.mp.delete_snapshot")
+    mocker.patch("agx_cli.mp.exec_in_vm", return_value=_ok(""))
+    delete_snap = mocker.patch("agx_cli.mp.delete_snapshot")
     config_path = tmp_path / "config.toml"
     cfg_mod.save(cfg, config_path)
 
@@ -275,11 +275,11 @@ def test_prune_dry_run_deletes_nothing(cfg: AgentsConfig, mocker: Any, tmp_path:
 
 
 def test_prune_executes_with_yes(cfg: AgentsConfig, mocker: Any, tmp_path: Path) -> None:
-    from agents_cli import config as cfg_mod
+    from agx_cli import config as cfg_mod
 
     _write_archives(cfg, [f"coder-2026010{i}T000000Z.tar.zst" for i in range(1, 5)])
     _stub_info_vm(mocker, cfg, [])
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok(""))
+    mocker.patch("agx_cli.mp.exec_in_vm", return_value=_ok(""))
     config_path = tmp_path / "config.toml"
     cfg_mod.save(cfg, config_path)
 
@@ -290,12 +290,12 @@ def test_prune_executes_with_yes(cfg: AgentsConfig, mocker: Any, tmp_path: Path)
 
 
 def test_prune_refuses_without_confirmation(cfg: AgentsConfig, mocker: Any, tmp_path: Path) -> None:
-    from agents_cli import config as cfg_mod
+    from agx_cli import config as cfg_mod
 
     _write_archives(cfg, [f"coder-2026010{i}T000000Z.tar.zst" for i in range(1, 5)])
     _stub_info_vm(mocker, cfg, [])
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok(""))
-    mocker.patch("agents_cli.ui.confirm", return_value=False)
+    mocker.patch("agx_cli.mp.exec_in_vm", return_value=_ok(""))
+    mocker.patch("agx_cli.ui.confirm", return_value=False)
     config_path = tmp_path / "config.toml"
     cfg_mod.save(cfg, config_path)
 
@@ -314,7 +314,7 @@ def test_auto_prune_disabled_returns_none(cfg: AgentsConfig) -> None:
 
 def test_auto_prune_no_op_on_clean_state(cfg: AgentsConfig, mocker: Any) -> None:
     _stub_info_vm(mocker, cfg, [])
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok(""))
+    mocker.patch("agx_cli.mp.exec_in_vm", return_value=_ok(""))
     result = prune_cmd.auto_prune_after_upgrade(cfg, "coder")
     assert result is not None
     assert result.archives == [] and result.snapshots == [] and result.images == []

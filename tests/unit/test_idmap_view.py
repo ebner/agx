@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from agents_cli import idmap_view as iv
+from agx_cli import idmap_view as iv
 
 
 def test_spec_swaps_owner_and_maps_everything_else_to_itself() -> None:

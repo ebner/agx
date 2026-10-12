@@ -5,8 +5,8 @@ Run explicitly with::
     pytest -m multipass tests/integration/
 
 Deselected by default (``addopts = -m 'not multipass'``); the session
-gate in ``conftest.py`` skips everything unless ``agents doctor`` is
-green. Every command goes through the ``agents`` console script as a
+gate in ``conftest.py`` skips everything unless ``agx doctor`` is
+green. Every command goes through the ``agx`` console script as a
 subprocess — full CLI wiring, ``--json`` stdout contract, exit codes —
 and everything created here carries the reserved ``itest-`` prefix and
 is torn down in finalizers. See ``conftest.py`` for the safety posture.
@@ -35,7 +35,7 @@ pytestmark = pytest.mark.multipass
 
 
 def test_doctor_green(deployment: Deployment) -> None:
-    """`agents --json doctor` exits 0 and emits one JSON array of checks,
+    """`agx --json doctor` exits 0 and emits one JSON array of checks,
     none of them failing. (The run itself happens once, in the session
     gate — a red doctor skips the whole suite, so reaching this test at
     all means the deployment was healthy; the assertions here pin the
@@ -51,8 +51,8 @@ def test_doctor_green(deployment: Deployment) -> None:
 @pytest.mark.slow
 def test_create_exec_remove_roundtrip(cli: Cli, disposable_agent: DisposableAgent) -> None:
     """The disposable Hermes agent (created by the session fixture, removed
-    with `remove --yes` at session end) shows up in `agents list`, and
-    `agents exec` runs commands inside its container with the in-container
+    with `remove --yes` at session end) shows up in `agx list`, and
+    `agx exec` runs commands inside its container with the in-container
     exit code propagated to the CLI's exit code."""
     info = disposable_agent.info
     assert info["name"] == disposable_agent.name
@@ -63,7 +63,7 @@ def test_create_exec_remove_roundtrip(cli: Cli, disposable_agent: DisposableAgen
     assert listed.returncode == 0, listed.stderr
     rows = parse_single_json(listed.stdout)
     match = [r for r in rows if r["name"] == disposable_agent.name]
-    assert match, f"{disposable_agent.name!r} missing from `agents list`: {rows!r}"
+    assert match, f"{disposable_agent.name!r} missing from `agx list`: {rows!r}"
     assert match[0]["type"] == "hermes"
 
     ok = cli.exec_in_agent(disposable_agent.name, "true")
@@ -74,7 +74,7 @@ def test_create_exec_remove_roundtrip(cli: Cli, disposable_agent: DisposableAgen
 
 @pytest.mark.slow
 def test_secret_reaches_container_env(cli: Cli, disposable_agent: DisposableAgent) -> None:
-    """`agents secret set` recreates the container with the key visible as
+    """`agx secret set` recreates the container with the key visible as
     process env (proves the per-agent .env + compose `env_file:` chain
     end-to-end); `unset` removes it from the env, the .env, and the Hermes
     `terminal.env_passthrough` list."""
@@ -113,10 +113,10 @@ def test_secret_reaches_container_env(cli: Cli, disposable_agent: DisposableAgen
 def test_mount_delivers_volume(
     cli: Cli, disposable_agent: DisposableAgent, itest_scratch_dir: Path
 ) -> None:
-    """THE override-regression test. `agents mount add --target runtime`
+    """THE override-regression test. `agx mount add --target runtime`
     writes the volume ONLY to docker-compose.override.yml — a file that a
     past bug silently dropped from every compose invocation. Reading a
-    host file back through `agents exec cat` after the `--restart`
+    host file back through `agx exec cat` after the `--restart`
     recreate proves Docker actually consumed the override, not merely
     that the file has the right content (which is all the unit suite can
     assert)."""
@@ -183,7 +183,7 @@ def test_export_import_roundtrip(
     stub-tarball failure mode export once had) and that import restores
     it with ownership the running container can read.
 
-    Same-name roundtrip by design: `agents import` extracts the archive's
+    Same-name roundtrip by design: `agx import` extracts the archive's
     embedded top-level dir (always the source agent's name) — importing
     under a second name is not supported by the CLI, so a second-name
     test would assert on behavior that doesn't exist. `--to` points at a
@@ -224,7 +224,7 @@ def test_export_import_roundtrip(
 def test_remove_deletes_subuid_owned_state(
     cli: Cli, deployment: Deployment, request: pytest.FixtureRequest
 ) -> None:
-    """`agents remove` must leave nothing behind on the host, although the
+    """`agx remove` must leave nothing behind on the host, although the
     started container has filled `<name>/.data` with files owned by a
     rootless-Docker subuid under mode 700 that the host user cannot even
     list. Unit tests can only assert the argv; this proves the delete
@@ -263,7 +263,7 @@ def test_remove_deletes_subuid_owned_state(
 
 
 def test_logs_returns_content(cli: Cli, disposable_agent: DisposableAgent) -> None:
-    """Non-follow `agents logs` exits 0 with non-empty output (the agent's
+    """Non-follow `agx logs` exits 0 with non-empty output (the agent's
     container has booted at least once by now, so s6/entrypoint output
     must be present)."""
     res = cli.run("--json", "logs", disposable_agent.name, timeout=EXEC_TIMEOUT)
@@ -282,5 +282,5 @@ def test_json_contract_single_object(cli: Cli, deployment: Deployment) -> None:
 
     for argv in (["list"], ["firecrawl", "status"], ["config"]):
         res = cli.run("--json", *argv, timeout=EXEC_TIMEOUT)
-        assert res.returncode == 0, f"agents --json {' '.join(argv)}: {res.stderr}"
+        assert res.returncode == 0, f"agx --json {' '.join(argv)}: {res.stderr}"
         parse_single_json(res.stdout)

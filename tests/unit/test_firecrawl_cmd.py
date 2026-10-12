@@ -8,19 +8,19 @@ from typing import Any
 
 import pytest
 
-from agents_cli import compose, firecrawl_cmd, hermes_config
-from agents_cli import config as cfg_mod
-from agents_cli.agents_cmd import create
-from agents_cli.compose import FIRECRAWL_SERVICE_PREFIX
-from agents_cli.config import (
+from agx_cli import compose, firecrawl_cmd, hermes_config
+from agx_cli import config as cfg_mod
+from agx_cli.agents_cmd import create
+from agx_cli.compose import FIRECRAWL_SERVICE_PREFIX
+from agx_cli.config import (
     AgentsConfig,
     DefaultsConfig,
     HostConfig,
     PathsConfig,
     VmRuntimeConfig,
 )
-from agents_cli.errors import UserError
-from agents_cli.mp import MpResult
+from agx_cli.errors import UserError
+from agx_cli.mp import MpResult
 
 
 def _ok(stdout: str = "") -> MpResult:
@@ -96,7 +96,7 @@ def _firecrawl_runner(vm_fs_mocks: dict[str, Any]) -> Any:
 def with_coder(
     cfg: AgentsConfig, saved_config: Path, mocker: Any, vm_fs_mocks: dict[str, Any]
 ) -> Path:
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     create(name="coder", agent_type="hermes", config_path=saved_config)
     return saved_config
 
@@ -152,8 +152,8 @@ def test_floating_refs_use_host_arch_for_api_image() -> None:
 def test_up_resolves_digests_and_writes_state(
     with_coder: Path, cfg: AgentsConfig, mocker: Any, vm_fs_mocks: dict[str, Any]
 ) -> None:
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
 
     payload = firecrawl_cmd.up(config_path=with_coder)
 
@@ -168,8 +168,8 @@ def test_up_resolves_digests_and_writes_state(
 def test_up_writes_five_compose_services(
     with_coder: Path, cfg: AgentsConfig, mocker: Any, vm_fs_mocks: dict[str, Any]
 ) -> None:
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
 
     firecrawl_cmd.up(config_path=with_coder)
 
@@ -188,8 +188,8 @@ def test_up_writes_five_compose_services(
 def test_up_populates_project_env_with_secrets(
     with_coder: Path, cfg: AgentsConfig, mocker: Any, vm_fs_mocks: dict[str, Any]
 ) -> None:
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
 
     firecrawl_cmd.up(config_path=with_coder)
     env = (cfg.paths.host_data_dir / ".env").read_text(encoding="utf-8")
@@ -211,8 +211,8 @@ def test_up_writes_project_env_to_vm_in_data_dir_in_vm_mode(
     """
     cfg.paths.data_dir_in_vm = True
     cfg_mod.save(cfg, saved_config)
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
 
     firecrawl_cmd.up(config_path=saved_config)
 
@@ -231,8 +231,8 @@ def test_up_wires_existing_hermes_agents_passthrough(
     gets the FIRECRAWL pair so the LLM's shell-based diagnostic doesn't
     falsely report "not configured".
     """
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
 
     firecrawl_cmd.up(config_path=with_coder)
 
@@ -253,9 +253,9 @@ def test_up_reports_openclaw_agents_as_wired_via_fragment_env(
     agents pick up firecrawl automatically once the project .env
     has the values.
     """
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     create(name="personal", agent_type="openclaw", config_path=saved_config)
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
 
     payload = firecrawl_cmd.up(config_path=saved_config)
 
@@ -272,9 +272,9 @@ def test_up_flags_stale_openclaw_fragments(
     """An OpenClaw agent created before this auto-wire change has an
     environment block missing the firecrawl entries. ``firecrawl up``
     must surface it as stale (alongside any Hermes stale agents) and
-    point the user at ``agents reseat`` — which covers OpenClaw too.
+    point the user at ``agx reseat`` — which covers OpenClaw too.
     """
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     create(name="personal", agent_type="openclaw", config_path=saved_config)
 
     # Simulate a pre-auto-wire fragment: strip the firecrawl entries.
@@ -284,7 +284,7 @@ def test_up_flags_stale_openclaw_fragments(
     del env["FIRECRAWL_BASE_URL"]
     compose.write_compose_atomically(cfg, doc)
 
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
     warn_spy = mocker.spy(firecrawl_cmd.ui, "warn")
     payload = firecrawl_cmd.up(config_path=saved_config)
 
@@ -292,7 +292,7 @@ def test_up_flags_stale_openclaw_fragments(
     assert "personal" not in payload["wired_agents"]
     stale_warnings = [c.args[0] for c in warn_spy.call_args_list if "personal" in c.args[0]]
     assert stale_warnings, "expected a stale-fragment warning naming the agent"
-    assert any("agents reseat" in w for w in stale_warnings)
+    assert any("agx reseat" in w for w in stale_warnings)
     assert not any("no reseat path" in w for w in stale_warnings)
 
 
@@ -303,8 +303,8 @@ def test_up_is_idempotent_does_not_regenerate_digests(
     upstream tags' digests would resolve differently — so the toolkit
     never silently pulls a new image version.
     """
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
-    in_vm_spy = mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
+    in_vm_spy = mocker.patch("agx_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
 
     firecrawl_cmd.up(config_path=with_coder)
     first_state = json.loads(json.dumps(firecrawl_cmd.read_state(cfg)))
@@ -328,8 +328,8 @@ def test_up_upgrade_re_resolves_digests(
     with_coder: Path, cfg: AgentsConfig, mocker: Any, vm_fs_mocks: dict[str, Any]
 ) -> None:
     """`--upgrade` re-pulls the floating tags and refreshes digests."""
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
-    in_vm_spy = mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
+    in_vm_spy = mocker.patch("agx_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
 
     firecrawl_cmd.up(config_path=with_coder)
     pull_count_before = sum(
@@ -354,13 +354,13 @@ def test_up_reconstructs_pins_from_compose_when_state_lost(
     exact digests round-trip — and NEVER touch the upstream resolver
     (which would be an unintended upgrade).
     """
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
     firecrawl_cmd.up(config_path=with_coder)
     original_images = firecrawl_cmd.read_state(cfg)["images"]
 
     firecrawl_cmd.clear_state(cfg)  # what the migration leaves behind
-    resolve_spy = mocker.patch("agents_cli.firecrawl_cmd._resolve_digests")
+    resolve_spy = mocker.patch("agx_cli.firecrawl_cmd._resolve_digests")
     progress_spy = mocker.spy(firecrawl_cmd.ui, "progress")
 
     payload = firecrawl_cmd.up(config_path=with_coder)
@@ -383,17 +383,17 @@ def test_up_reconstruction_still_gates_on_health_probe(
     an unhealthy probe still raises RuntimeFailure, wires nothing, and
     leaves the reconstructed pins on disk flagged degraded for retry.
     """
-    from agents_cli.errors import RuntimeFailure
+    from agx_cli.errors import RuntimeFailure
 
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
     firecrawl_cmd.up(config_path=with_coder)
     original_images = firecrawl_cmd.read_state(cfg)["images"]
     firecrawl_cmd.clear_state(cfg)
 
-    resolve_spy = mocker.patch("agents_cli.firecrawl_cmd._resolve_digests")
-    mocker.patch("agents_cli.firecrawl_cmd._wait_api_healthy", return_value=False)
-    wire_spy = mocker.patch("agents_cli.firecrawl_cmd._wire_agent")
+    resolve_spy = mocker.patch("agx_cli.firecrawl_cmd._resolve_digests")
+    mocker.patch("agx_cli.firecrawl_cmd._wait_api_healthy", return_value=False)
+    wire_spy = mocker.patch("agx_cli.firecrawl_cmd._wire_agent")
 
     with pytest.raises(RuntimeFailure, match="did not become healthy") as excinfo:
         firecrawl_cmd.up(config_path=with_coder)
@@ -413,8 +413,8 @@ def test_up_partial_compose_falls_back_to_full_resolve_with_warn(
     be incoherent, so ALL roles re-resolve upstream, with a warning
     explaining why.
     """
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
-    in_vm_spy = mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
+    in_vm_spy = mocker.patch("agx_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
     firecrawl_cmd.up(config_path=with_coder)
     firecrawl_cmd.clear_state(cfg)
 
@@ -461,8 +461,8 @@ def test_up_reconstruction_falls_back_on_unusable_api_pin(
     mixed/misassigned pins would be incoherent, so ALL roles re-resolve
     upstream with a warning (consistent with the partial-compose path).
     """
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
-    in_vm_spy = mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
+    in_vm_spy = mocker.patch("agx_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
     firecrawl_cmd.up(config_path=with_coder)
     firecrawl_cmd.clear_state(cfg)
 
@@ -496,16 +496,16 @@ def test_up_reconstruction_propagates_compose_read_failure(
     floating tags, the exact unintended-upgrade trap reconstruction
     exists to prevent.
     """
-    from agents_cli.errors import RuntimeFailure
+    from agx_cli.errors import RuntimeFailure
 
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
     firecrawl_cmd.up(config_path=with_coder)
     firecrawl_cmd.clear_state(cfg)
 
-    resolve_spy = mocker.patch("agents_cli.firecrawl_cmd._resolve_digests")
+    resolve_spy = mocker.patch("agx_cli.firecrawl_cmd._resolve_digests")
     mocker.patch(
-        "agents_cli.compose.read_compose_doc",
+        "agx_cli.compose.read_compose_doc",
         side_effect=RuntimeFailure("multipass transfer failed: ssh timeout"),
     )
 
@@ -523,9 +523,9 @@ def test_up_emit_false_suppresses_stdout_object(
     stdout object — the final emit must be suppressible while the
     payload is still returned.
     """
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
-    emit_spy = mocker.patch("agents_cli.ui.emit")
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+    emit_spy = mocker.patch("agx_cli.ui.emit")
 
     payload = firecrawl_cmd.up(config_path=with_coder, emit=False)
 
@@ -550,12 +550,12 @@ def test_up_starts_stack_before_wiring_agents(
         order.append("up")
         return _ok()
 
-    mocker.patch("agents_cli.compose_runner.up", side_effect=tracked_up)
+    mocker.patch("agx_cli.compose_runner.up", side_effect=tracked_up)
     mocker.patch(
-        "agents_cli.firecrawl_cmd._wire_agent",
+        "agx_cli.firecrawl_cmd._wire_agent",
         side_effect=lambda *a, **k: order.append("wire"),
     )
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
 
     firecrawl_cmd.up(config_path=with_coder)
 
@@ -572,14 +572,14 @@ def test_up_failed_compose_up_raises_exit2_and_wires_nothing(
     resolved digests in state (flagged degraded) so a retry doesn't
     re-resolve floating tags — the unintended-upgrade trap.
     """
-    from agents_cli.errors import RuntimeFailure
+    from agx_cli.errors import RuntimeFailure
 
     mocker.patch(
-        "agents_cli.compose_runner.up",
+        "agx_cli.compose_runner.up",
         side_effect=RuntimeFailure("compose up failed (exit 1)"),
     )
-    wire_spy = mocker.patch("agents_cli.firecrawl_cmd._wire_agent")
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+    wire_spy = mocker.patch("agx_cli.firecrawl_cmd._wire_agent")
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
     emit_spy = mocker.spy(firecrawl_cmd.ui, "emit")
 
     with pytest.raises(RuntimeFailure, match="firecrawl did not start") as excinfo:
@@ -588,7 +588,7 @@ def test_up_failed_compose_up_raises_exit2_and_wires_nothing(
     assert excinfo.value.exit_code == 2
     # Full recovery guidance travels in the exception message.
     assert "compose up failed" in str(excinfo.value)
-    assert "re-run `agents firecrawl up`" in str(excinfo.value)
+    assert "re-run `agx firecrawl up`" in str(excinfo.value)
     assert "No new agents were wired" in str(excinfo.value)
     # One-JSON-object stdout contract: no payload emitted alongside the
     # raise — ui.handle_cli_errors emits the single error object.
@@ -610,12 +610,12 @@ def test_up_unhealthy_probe_raises_and_wires_nothing(
     healthcheck and `up -d` doesn't wait on health anyway. Only a
     passing probe earns running:True + wiring; a timed-out probe raises.
     """
-    from agents_cli.errors import RuntimeFailure
+    from agx_cli.errors import RuntimeFailure
 
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
-    mocker.patch("agents_cli.firecrawl_cmd._wait_api_healthy", return_value=False)
-    wire_spy = mocker.patch("agents_cli.firecrawl_cmd._wire_agent")
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.firecrawl_cmd._wait_api_healthy", return_value=False)
+    wire_spy = mocker.patch("agx_cli.firecrawl_cmd._wire_agent")
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
 
     with pytest.raises(RuntimeFailure, match="did not become healthy") as excinfo:
         firecrawl_cmd.up(config_path=with_coder)
@@ -632,11 +632,11 @@ def test_up_retry_after_failure_reuses_digests_and_clears_degraded(
     the pinned digests), the retry succeeds WITHOUT re-pulling floating
     tags and clears the degraded flag.
     """
-    from agents_cli.errors import RuntimeFailure
+    from agx_cli.errors import RuntimeFailure
 
-    in_vm_spy = mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+    in_vm_spy = mocker.patch("agx_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
     mocker.patch(
-        "agents_cli.compose_runner.up",
+        "agx_cli.compose_runner.up",
         side_effect=RuntimeFailure("compose up failed"),
     )
     with pytest.raises(RuntimeFailure, match="firecrawl did not start"):
@@ -645,7 +645,7 @@ def test_up_retry_after_failure_reuses_digests_and_clears_degraded(
         1 for c in in_vm_spy.call_args_list if c.args[1:3] == ("docker", "pull")
     )
 
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     second = firecrawl_cmd.up(config_path=with_coder)
     assert second["running"] is True
 
@@ -661,16 +661,16 @@ def test_up_retry_after_failure_reuses_digests_and_clears_degraded(
 def test_ensure_agent_wired_skips_degraded_stack(
     with_coder: Path, cfg: AgentsConfig, mocker: Any, vm_fs_mocks: dict[str, Any]
 ) -> None:
-    """`agents create`'s auto-wire hook must not advertise a stack whose
+    """`agx create`'s auto-wire hook must not advertise a stack whose
     last up never came healthy.
     """
-    from agents_cli.errors import RuntimeFailure
+    from agx_cli.errors import RuntimeFailure
 
     mocker.patch(
-        "agents_cli.compose_runner.up",
+        "agx_cli.compose_runner.up",
         side_effect=RuntimeFailure("compose up failed"),
     )
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
     with pytest.raises(RuntimeFailure):
         firecrawl_cmd.up(config_path=with_coder)  # leaves degraded state
 
@@ -690,7 +690,7 @@ def test_up_success_commit_aborts_when_destroy_interleaves(
     file and wire agents to a nonexistent stack; the success commit must
     revalidate under the lock and abort instead.
     """
-    from agents_cli.errors import RuntimeFailure
+    from agx_cli.errors import RuntimeFailure
 
     def destroy_during_up(*a: Any, **k: Any) -> MpResult:
         # What `firecrawl destroy` leaves behind: no state file, no
@@ -703,9 +703,9 @@ def test_up_success_commit_aborts_when_destroy_interleaves(
         compose.write_compose_atomically(cfg, doc)
         return _ok()
 
-    mocker.patch("agents_cli.compose_runner.up", side_effect=destroy_during_up)
-    wire_spy = mocker.patch("agents_cli.firecrawl_cmd._wire_agent")
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+    mocker.patch("agx_cli.compose_runner.up", side_effect=destroy_during_up)
+    wire_spy = mocker.patch("agx_cli.firecrawl_cmd._wire_agent")
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
 
     with pytest.raises(RuntimeFailure, match="concurrent command tore") as excinfo:
         firecrawl_cmd.up(config_path=with_coder)
@@ -742,8 +742,8 @@ def test_up_success_commit_keeps_concurrent_repin(
         )
         return _ok()
 
-    mocker.patch("agents_cli.compose_runner.up", side_effect=repin_during_up)
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+    mocker.patch("agx_cli.compose_runner.up", side_effect=repin_during_up)
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
 
     payload = firecrawl_cmd.up(config_path=with_coder)
 
@@ -757,7 +757,7 @@ def test_up_success_commit_keeps_concurrent_repin(
 
 def test_wait_api_healthy_polls_until_healthy(cfg: AgentsConfig, mocker: Any) -> None:
     probe = mocker.patch(
-        "agents_cli.firecrawl_cmd._api_health",
+        "agx_cli.firecrawl_cmd._api_health",
         side_effect=["unknown", "unhealthy", "healthy"],
     )
     assert firecrawl_cmd._wait_api_healthy(cfg, timeout_s=5.0, interval_s=0.0) is True
@@ -765,7 +765,7 @@ def test_wait_api_healthy_polls_until_healthy(cfg: AgentsConfig, mocker: Any) ->
 
 
 def test_wait_api_healthy_gives_up_after_window(cfg: AgentsConfig, mocker: Any) -> None:
-    mocker.patch("agents_cli.firecrawl_cmd._api_health", return_value="unhealthy")
+    mocker.patch("agx_cli.firecrawl_cmd._api_health", return_value="unhealthy")
     assert firecrawl_cmd._wait_api_healthy(cfg, timeout_s=0.05, interval_s=0.01) is False
 
 
@@ -775,10 +775,10 @@ def test_wait_api_healthy_gives_up_after_window(cfg: AgentsConfig, mocker: Any) 
 def test_down_removes_agent_passthrough_wiring(
     with_coder: Path, cfg: AgentsConfig, mocker: Any, vm_fs_mocks: dict[str, Any]
 ) -> None:
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
-    mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())
-    mocker.patch("agents_cli.compose_runner.rm", return_value=_ok())
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.stop", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.rm", return_value=_ok())
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
 
     firecrawl_cmd.up(config_path=with_coder)
     firecrawl_cmd.down(config_path=with_coder)
@@ -795,10 +795,10 @@ def test_down_keeps_compose_entries(
     """`down` is reversible — compose entries stay so a subsequent
     `up` can bring the same digests back without re-resolving.
     """
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
-    mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())
-    mocker.patch("agents_cli.compose_runner.rm", return_value=_ok())
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.stop", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.rm", return_value=_ok())
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
 
     firecrawl_cmd.up(config_path=with_coder)
     firecrawl_cmd.down(config_path=with_coder)
@@ -821,10 +821,10 @@ def test_down_refuses_when_not_installed(saved_config: Path) -> None:
 def test_destroy_strips_everything(
     with_coder: Path, cfg: AgentsConfig, mocker: Any, vm_fs_mocks: dict[str, Any]
 ) -> None:
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
-    mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())
-    mocker.patch("agents_cli.compose_runner.rm", return_value=_ok())
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.stop", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.rm", return_value=_ok())
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
 
     firecrawl_cmd.up(config_path=with_coder)
     firecrawl_cmd.destroy(yes=True, config_path=with_coder)
@@ -843,16 +843,16 @@ def test_destroy_strips_everything(
 def test_destroy_aborts_without_yes(
     with_coder: Path, cfg: AgentsConfig, mocker: Any, vm_fs_mocks: dict[str, Any]
 ) -> None:
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
-    mocker.patch("agents_cli.ui.confirm", return_value=False)
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+    mocker.patch("agx_cli.ui.confirm", return_value=False)
     firecrawl_cmd.up(config_path=with_coder)
 
     with pytest.raises(UserError, match="aborted by user"):
         firecrawl_cmd.destroy(yes=False, config_path=with_coder)
 
 
-# ---------- agents create auto-wiring ----------
+# ---------- agx create auto-wiring ----------
 
 
 def test_agents_create_auto_wires_when_firecrawl_is_up(
@@ -861,8 +861,8 @@ def test_agents_create_auto_wires_when_firecrawl_is_up(
     """A Hermes agent created AFTER `firecrawl up` should pick up the
     passthrough automatically — no second user step needed.
     """
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
 
     # Bring firecrawl up first, with no agents yet.
     firecrawl_cmd.up(config_path=saved_config)
@@ -879,7 +879,7 @@ def test_agents_create_skips_wiring_when_firecrawl_is_down(
     saved_config: Path, cfg: AgentsConfig, mocker: Any, vm_fs_mocks: dict[str, Any]
 ) -> None:
     """No firecrawl installed → no passthrough wired (clean baseline)."""
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     create(name="solo", agent_type="hermes", config_path=saved_config)
 
     config_path_file = hermes_config.config_path(cfg, "solo")
@@ -955,9 +955,9 @@ def test_status_when_not_installed(saved_config: Path) -> None:
 def test_status_reports_wired_agents(
     with_coder: Path, cfg: AgentsConfig, mocker: Any, vm_fs_mocks: dict[str, Any]
 ) -> None:
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
-    mocker.patch("agents_cli.compose_runner.ps", return_value=_ok(""))
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.ps", return_value=_ok(""))
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
 
     firecrawl_cmd.up(config_path=with_coder)
     info = firecrawl_cmd.status(config_path=with_coder)
@@ -972,9 +972,9 @@ def test_status_includes_containers_and_api_health(
     api health, even when the simulator returns generic ok for
     docker stats / nc probes.
     """
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
-    mocker.patch("agents_cli.compose_runner.ps", return_value=_ok(""))
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.ps", return_value=_ok(""))
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
 
     firecrawl_cmd.up(config_path=with_coder)
     info = firecrawl_cmd.status(config_path=with_coder)
@@ -1024,7 +1024,7 @@ def test_queue_stats_parses_rabbitmqctl_and_redis(cfg: AgentsConfig, mocker: Any
             return _ok("0\n")
         return _ok("")
 
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=runner)
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=runner)
 
     stats = firecrawl_cmd._queue_stats(cfg)
 
@@ -1104,7 +1104,7 @@ def test_queue_stats_handles_rabbitmq_unavailable(cfg: AgentsConfig, mocker: Any
             return _ok("0\n")
         return _ok("")
 
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=runner)
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=runner)
     stats = firecrawl_cmd._queue_stats(cfg)
     assert stats["rabbitmq"] == []
     # Bull still gets a slot per queue even when redis returns 0.
@@ -1120,8 +1120,8 @@ def test_up_narrates_pulls_compose_up_and_health_wait(
     """First `firecrawl up` runs five multi-GB pulls plus a bounded
     health probe — each stage gets an always-on progress line so the
     terminal never reads as hung."""
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
     spy = mocker.spy(firecrawl_cmd.ui, "progress")
 
     firecrawl_cmd.up(config_path=with_coder)
@@ -1139,8 +1139,8 @@ def test_up_reuses_pins_without_pull_narration(
 ) -> None:
     """Re-running `up` with pins on file resolves nothing — no pull
     narration should promise work that won't happen."""
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=_firecrawl_runner(vm_fs_mocks))
     firecrawl_cmd.up(config_path=with_coder)
 
     spy = mocker.spy(firecrawl_cmd.ui, "progress")
@@ -1149,12 +1149,12 @@ def test_up_reuses_pins_without_pull_narration(
 
 
 def test_ensure_agent_wired_narrates_when_installed(cfg: AgentsConfig, mocker: Any) -> None:
-    """The `agents create` hook silently edits the new agent's
+    """The `agx create` hook silently edits the new agent's
     config.yaml when firecrawl is up — narrate so the user learns the
     wiring happened."""
-    mocker.patch("agents_cli.firecrawl_cmd.is_installed", return_value=True)
-    mocker.patch("agents_cli.firecrawl_cmd.read_state", return_value={})
-    wire = mocker.patch("agents_cli.firecrawl_cmd._wire_agent")
+    mocker.patch("agx_cli.firecrawl_cmd.is_installed", return_value=True)
+    mocker.patch("agx_cli.firecrawl_cmd.read_state", return_value={})
+    wire = mocker.patch("agx_cli.firecrawl_cmd._wire_agent")
     spy = mocker.spy(firecrawl_cmd.ui, "progress")
 
     firecrawl_cmd.ensure_agent_wired(cfg, "coder")
@@ -1166,7 +1166,7 @@ def test_ensure_agent_wired_narrates_when_installed(cfg: AgentsConfig, mocker: A
 def test_ensure_agent_wired_silent_when_not_installed(cfg: AgentsConfig, mocker: Any) -> None:
     """No-op paths (not installed / degraded) must stay silent — a
     "wiring firecrawl" line for work that never happens is misleading."""
-    mocker.patch("agents_cli.firecrawl_cmd.is_installed", return_value=False)
+    mocker.patch("agx_cli.firecrawl_cmd.is_installed", return_value=False)
     spy = mocker.spy(firecrawl_cmd.ui, "progress")
     firecrawl_cmd.ensure_agent_wired(cfg, "coder")
     spy.assert_not_called()

@@ -7,18 +7,18 @@ from typing import Any
 
 import pytest
 
-from agents_cli import config as cfg_mod
-from agents_cli import fixperms_cmd
-from agents_cli.agents_cmd import create
-from agents_cli.config import (
+from agx_cli import config as cfg_mod
+from agx_cli import fixperms_cmd
+from agx_cli.agents_cmd import create
+from agx_cli.config import (
     AgentsConfig,
     DefaultsConfig,
     HostConfig,
     PathsConfig,
     VmRuntimeConfig,
 )
-from agents_cli.errors import RuntimeFailure, UserError
-from agents_cli.mp import MpResult
+from agx_cli.errors import RuntimeFailure, UserError
+from agx_cli.mp import MpResult
 
 
 def _ok(stdout: str = "") -> MpResult:
@@ -65,7 +65,7 @@ def vm_fs_mocks(cfg: AgentsConfig, mocker: Any) -> dict[str, Any]:
 def with_coder(
     cfg: AgentsConfig, saved_config: Path, mocker: Any, vm_fs_mocks: dict[str, Any]
 ) -> Path:
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     create(name="coder", agent_type="hermes", config_path=saved_config)
     return saved_config
 
@@ -74,7 +74,7 @@ def with_coder(
 def with_openclaw(
     cfg: AgentsConfig, saved_config: Path, mocker: Any, vm_fs_mocks: dict[str, Any]
 ) -> Path:
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     create(name="personal", agent_type="openclaw", config_path=saved_config)
     return saved_config
 
@@ -116,9 +116,9 @@ def test_happy_path_when_entrypoint_aligned(
     """hermes inside container = uid 1000 = toolkit RUNTIME_UID. fix-perms
     reports `aligned=True` and proceeds without warnings.
     """
-    mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_stub_in_vm("1000"))
+    mocker.patch("agx_cli.compose_runner.stop", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=_stub_in_vm("1000"))
 
     result = fixperms_cmd.fix_perms("coder", yes=True, config_path=with_coder)
     assert result["aligned"] is True
@@ -133,9 +133,9 @@ def test_happy_path_when_entrypoint_did_not_usermod(
     fix-perms still runs to completion but reports `aligned=False` so
     the user knows the underlying image issue persists.
     """
-    mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_stub_in_vm("10000"))
+    mocker.patch("agx_cli.compose_runner.stop", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=_stub_in_vm("10000"))
 
     result = fixperms_cmd.fix_perms("coder", yes=True, config_path=with_coder)
     assert result["aligned"] is False
@@ -148,9 +148,9 @@ def test_happy_path_when_entrypoint_did_not_usermod(
 
 def test_force_recreate_sequence(with_coder: Path, cfg: AgentsConfig, mocker: Any) -> None:
     """Stop → docker rm -f → compose up — in that order."""
-    stop_spy = mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())
-    up_spy = mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
-    in_vm_spy = mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_stub_in_vm("1000"))
+    stop_spy = mocker.patch("agx_cli.compose_runner.stop", return_value=_ok())
+    up_spy = mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
+    in_vm_spy = mocker.patch("agx_cli.mp.exec_in_vm", side_effect=_stub_in_vm("1000"))
 
     fixperms_cmd.fix_perms("coder", yes=True, config_path=with_coder)
 
@@ -172,9 +172,9 @@ def test_chown_uses_numeric_uid(with_coder: Path, cfg: AgentsConfig, mocker: Any
     or the username 'hermes' (which would resolve to whatever uid is in
     /etc/passwd, defeating the purpose).
     """
-    mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
-    in_vm_spy = mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_stub_in_vm("10000"))
+    mocker.patch("agx_cli.compose_runner.stop", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
+    in_vm_spy = mocker.patch("agx_cli.mp.exec_in_vm", side_effect=_stub_in_vm("10000"))
 
     fixperms_cmd.fix_perms("coder", yes=True, config_path=with_coder)
     chown_calls = [c for c in in_vm_spy.call_args_list if "chown" in c.args]
@@ -197,7 +197,7 @@ def test_chown_data_dir_tolerates_paths_deleted_mid_walk(cfg: AgentsConfig, mock
         "chown: cannot access '/opt/data/installs/x/environments/old/.leases': "
         "No such file or directory\n"
     )
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_fail(vanished))
+    mocker.patch("agx_cli.mp.exec_in_vm", return_value=_fail(vanished))
     fixperms_cmd.chown_data_dir(cfg, "hermes-coder", 1000)
 
 
@@ -206,10 +206,10 @@ def test_chown_data_dir_still_fails_on_real_errors(cfg: AgentsConfig, mocker: An
         "chown: cannot access '/opt/data/gone': No such file or directory\n"
         "chown: changing ownership of '/opt/data/auth.json': Operation not permitted\n"
     )
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_fail(mixed))
+    mocker.patch("agx_cli.mp.exec_in_vm", return_value=_fail(mixed))
     with pytest.raises(RuntimeFailure, match="Operation not permitted"):
         fixperms_cmd.chown_data_dir(cfg, "hermes-coder", 1000)
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_fail(""))
+    mocker.patch("agx_cli.mp.exec_in_vm", return_value=_fail(""))
     with pytest.raises(RuntimeFailure):
         fixperms_cmd.chown_data_dir(cfg, "hermes-coder", 1000)
 
@@ -221,8 +221,8 @@ def test_chown_hermes_install_paths_chowns_both_targets(
     so `hermes setup`'s install branches don't hit EACCES. Verifies
     `test -e <path>` is probed first (skip-on-missing semantics).
     """
-    mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.stop", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
 
     seen_chowns: list[tuple[str, ...]] = []
 
@@ -236,7 +236,7 @@ def test_chown_hermes_install_paths_chowns_both_targets(
             return _ok()
         return _ok()
 
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=runner)
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=runner)
 
     fixperms_cmd.fix_perms("coder", yes=True, config_path=with_coder)
 
@@ -260,8 +260,8 @@ def test_chown_hermes_install_paths_creates_runtime_home(
     WhatsApp bridge's dependency install fails half-way (2026-09-21).
     The helper must `mkdir -p` it (as root) BEFORE the existence-gated
     chown so the chown then applies."""
-    mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.stop", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     calls: list[tuple[str, ...]] = []
 
     def runner(vm_name: str, *cmd: str, check: bool = True) -> MpResult:
@@ -270,7 +270,7 @@ def test_chown_hermes_install_paths_creates_runtime_home(
             return _ok(stdout="1000\n")
         return _ok()
 
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=runner)
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=runner)
     fixperms_cmd.fix_perms("coder", yes=True, config_path=with_coder)
 
     mkdir_idx = next(
@@ -288,8 +288,8 @@ def test_chown_hermes_install_paths_skips_missing(
     image without that dir), the helper must skip rather than warn or
     fail. /home/hermes is always present so it still gets chowned.
     """
-    mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.stop", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
 
     seen_chowns: list[tuple[str, ...]] = []
 
@@ -306,7 +306,7 @@ def test_chown_hermes_install_paths_skips_missing(
             return _ok()
         return _ok()
 
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=runner)
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=runner)
 
     fixperms_cmd.fix_perms("coder", yes=True, config_path=with_coder)
 
@@ -323,8 +323,8 @@ def test_chown_hermes_install_paths_prunes_codex_mount(
     recursive chown would emit a noisy "Read-only file system" warning
     on every entry under .codex (regression seen 2026-05-13 on coder).
     """
-    mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.stop", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
 
     find_invocations: list[tuple[str, ...]] = []
 
@@ -337,7 +337,7 @@ def test_chown_hermes_install_paths_prunes_codex_mount(
             find_invocations.append(cmd)
         return _ok()
 
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=runner)
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=runner)
 
     fixperms_cmd.fix_perms("coder", yes=True, config_path=with_coder)
 
@@ -357,9 +357,9 @@ def test_chmod_opens_data_dir_traversal(with_coder: Path, cfg: AgentsConfig, moc
     toolkit's RUNTIME_UID exec can traverse /opt/data even when the
     image entrypoint didn't usermod.
     """
-    mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
-    in_vm_spy = mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_stub_in_vm("10000"))
+    mocker.patch("agx_cli.compose_runner.stop", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
+    in_vm_spy = mocker.patch("agx_cli.mp.exec_in_vm", side_effect=_stub_in_vm("10000"))
 
     fixperms_cmd.fix_perms("coder", yes=True, config_path=with_coder)
     chmod_calls = [c for c in in_vm_spy.call_args_list if "chmod" in c.args]
@@ -370,31 +370,31 @@ def test_chmod_opens_data_dir_traversal(with_coder: Path, cfg: AgentsConfig, moc
 
 
 def test_compose_up_failure_raises(with_coder: Path, cfg: AgentsConfig, mocker: Any) -> None:
-    mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())
-    mocker.patch("agents_cli.compose_runner.up", return_value=_fail("up exploded"))
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_stub_in_vm("1000"))
+    mocker.patch("agx_cli.compose_runner.stop", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_fail("up exploded"))
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=_stub_in_vm("1000"))
 
     with pytest.raises(RuntimeFailure, match="compose up failed"):
         fixperms_cmd.fix_perms("coder", yes=True, config_path=with_coder)
 
 
 def test_unparseable_hermes_uid_raises(with_coder: Path, cfg: AgentsConfig, mocker: Any) -> None:
-    mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.stop", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
 
     def runner(vm_name: str, *cmd: str, check: bool = True) -> MpResult:
         if "id" in cmd and "-u" in cmd and "hermes" in cmd:
             return _ok(stdout="not-a-uid\n")
         return _ok()
 
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=runner)
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=runner)
     with pytest.raises(RuntimeFailure, match="unparseable hermes uid"):
         fixperms_cmd.fix_perms("coder", yes=True, config_path=with_coder)
 
 
 def test_chown_failure_propagates(with_coder: Path, cfg: AgentsConfig, mocker: Any) -> None:
-    mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.stop", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
 
     def runner(vm_name: str, *cmd: str, check: bool = True) -> MpResult:
         if "id" in cmd and "-u" in cmd and "hermes" in cmd:
@@ -403,7 +403,7 @@ def test_chown_failure_propagates(with_coder: Path, cfg: AgentsConfig, mocker: A
             return _fail("chown denied")
         return _ok()
 
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=runner)
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=runner)
     with pytest.raises(RuntimeFailure, match="chown"):
         fixperms_cmd.fix_perms("coder", yes=True, config_path=with_coder)
 
@@ -415,9 +415,9 @@ def test_refuses_without_yes_and_no_confirm(with_coder: Path, mocker: Any) -> No
     """In non-interactive mode (no TTY, no --yes), the confirm prompt
     is what blocks. Simulate by patching `ui.confirm` to return False.
     """
-    mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
-    mocker.patch("agents_cli.ui.confirm", return_value=False)
+    mocker.patch("agx_cli.compose_runner.stop", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.ui.confirm", return_value=False)
 
     with pytest.raises(UserError, match="aborted by user"):
         fixperms_cmd.fix_perms("coder", yes=False, config_path=with_coder)
@@ -432,9 +432,9 @@ def test_fix_perms_narrates_recreate_and_chown(
     """fix-perms force-recreates the container and chown -R's /opt/data
     (minutes on big data dirs) — each stage gets an always-on progress
     line so the terminal never reads as hung."""
-    mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=_stub_in_vm("1000"))
+    mocker.patch("agx_cli.compose_runner.stop", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=_stub_in_vm("1000"))
     spy = mocker.spy(fixperms_cmd.ui, "progress")
 
     fixperms_cmd.fix_perms("coder", yes=True, config_path=with_coder)

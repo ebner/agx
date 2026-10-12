@@ -8,13 +8,13 @@ from pathlib import Path
 
 import pytest
 
-from agents_cli import compose, upgrades
-from agents_cli import config as cfg_mod
-from agents_cli.agents_cmd import create
-from agents_cli.config import AgentsConfig, DefaultsConfig, HostConfig, PathsConfig, VmRuntimeConfig
-from agents_cli.errors import RuntimeFailure, UserError
-from agents_cli.journal import Journal
-from agents_cli.mp import MpResult
+from agx_cli import compose, upgrades
+from agx_cli import config as cfg_mod
+from agx_cli.agents_cmd import create
+from agx_cli.config import AgentsConfig, DefaultsConfig, HostConfig, PathsConfig, VmRuntimeConfig
+from agx_cli.errors import RuntimeFailure, UserError
+from agx_cli.journal import Journal
+from agx_cli.mp import MpResult
 
 
 def _ok(stdout: str = "") -> MpResult:
@@ -59,7 +59,7 @@ def with_coder(cfg: AgentsConfig, saved_config: Path, mocker) -> Path:
     from tests.conftest import install_vm_fs_simulation
 
     install_vm_fs_simulation(mocker, cfg)
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     create(name="coder", agent_type="hermes", config_path=saved_config)
     return saved_config
 
@@ -91,31 +91,27 @@ def _stub_happy_upgrade(mocker, cfg: AgentsConfig | None = None) -> dict:
         return out
 
     return {
-        "stop": mocker.patch("agents_cli.mp.stop_vm", return_value=_ok()),
-        "start": mocker.patch("agents_cli.mp.start_vm", return_value=_ok()),
-        "snapshot": mocker.patch("agents_cli.mp.snapshot", return_value=_ok()),
+        "stop": mocker.patch("agx_cli.mp.stop_vm", return_value=_ok()),
+        "start": mocker.patch("agx_cli.mp.start_vm", return_value=_ok()),
+        "snapshot": mocker.patch("agx_cli.mp.snapshot", return_value=_ok()),
         "info_vm": mocker.patch(
-            "agents_cli.mp.info_vm",
+            "agx_cli.mp.info_vm",
             return_value=_ok(json.dumps({"info": {"agents": {"snapshots": {}}}})),
         ),
-        "pull": mocker.patch("agents_cli.compose_runner.pull", return_value=_ok()),
-        "inspect": mocker.patch(
-            "agents_cli.compose_runner.docker_image_inspect", return_value=_ok()
-        ),
-        "compose_up": mocker.patch("agents_cli.compose_runner.up", return_value=_ok()),
+        "pull": mocker.patch("agx_cli.compose_runner.pull", return_value=_ok()),
+        "inspect": mocker.patch("agx_cli.compose_runner.docker_image_inspect", return_value=_ok()),
+        "compose_up": mocker.patch("agx_cli.compose_runner.up", return_value=_ok()),
         "doctor": mocker.patch(
-            "agents_cli.ops.doctor", return_value=type("R", (), {"failed": False})()
+            "agx_cli.ops.doctor", return_value=type("R", (), {"failed": False})()
         ),
-        "host_snap": mocker.patch(
-            "agents_cli.upgrades._host_data_snapshot", side_effect=_fake_snap
-        ),
-        # Bare ``agents upgrade`` now implicitly fetches the latest
+        "host_snap": mocker.patch("agx_cli.upgrades._host_data_snapshot", side_effect=_fake_snap),
+        # Bare ``agx upgrade`` now implicitly fetches the latest
         # upstream tag. Default to returning the current pin (v1.0.0
         # in the cfg fixture) so tests that exercise the bare form
         # without specifying their own intent get a clean no-op rather
         # than hitting the real GitHub API.
         "fetch_latest_tag": mocker.patch(
-            "agents_cli.outdated_cmd.fetch_latest_tag", return_value="v1.0.0"
+            "agx_cli.outdated_cmd.fetch_latest_tag", return_value="v1.0.0"
         ),
     }
 
@@ -149,7 +145,7 @@ def test_upgrade_writes_new_tag_to_compose(with_coder: Path, mocker, cfg: Agents
 
 def test_upgrade_runs_auto_prune_after_success(with_coder: Path, mocker, cfg: AgentsConfig) -> None:
     _stub_happy_upgrade(mocker, cfg)
-    spy = mocker.patch("agents_cli.prune_cmd.auto_prune_after_upgrade", return_value=None)
+    spy = mocker.patch("agx_cli.prune_cmd.auto_prune_after_upgrade", return_value=None)
     upgrades.upgrade("coder", tag="v1.0.1", config_path=with_coder)
     spy.assert_called_once()
     assert spy.call_args.args[1] == "coder"
@@ -162,7 +158,7 @@ def test_upgrade_auto_prune_failure_is_non_fatal(
     upgrade nor route it into the compose-tag revert handler."""
     _stub_happy_upgrade(mocker, cfg)
     mocker.patch(
-        "agents_cli.prune_cmd.auto_prune_after_upgrade",
+        "agx_cli.prune_cmd.auto_prune_after_upgrade",
         side_effect=RuntimeError("virsh went away"),
     )
     outcome = upgrades.upgrade("coder", tag="v1.0.1", config_path=with_coder)
@@ -178,7 +174,7 @@ def test_upgrade_skips_auto_prune_when_disabled(
     cfg.upgrades.keep_generations = 0
     cfg_mod.save(cfg, with_coder)
     _stub_happy_upgrade(mocker, cfg)
-    spy = mocker.patch("agents_cli.prune_cmd.auto_prune_after_upgrade")
+    spy = mocker.patch("agx_cli.prune_cmd.auto_prune_after_upgrade")
     upgrades.upgrade("coder", tag="v1.0.1", config_path=with_coder)
     spy.assert_not_called()
 
@@ -203,13 +199,13 @@ def test_upgrade_to_latest_resolves_upstream_and_writes_default(
     with_coder: Path, mocker, cfg: AgentsConfig
 ) -> None:
     """--latest pulls the upstream tag, pins it on the agent, AND
-    refreshes the toolkit-wide default so future `agents create`
+    refreshes the toolkit-wide default so future `agx create`
     starts on the latest baseline. Without the default refresh, new
     agents would silently re-anchor to the (now-stale) `vm init`-time
     tag.
     """
     _stub_happy_upgrade(mocker, cfg)
-    mocker.patch("agents_cli.outdated_cmd.fetch_latest_tag", return_value="v9.9.9")
+    mocker.patch("agx_cli.outdated_cmd.fetch_latest_tag", return_value="v9.9.9")
 
     upgrades.upgrade("coder", to_latest=True, config_path=with_coder)
 
@@ -228,10 +224,29 @@ def test_upgrade_to_latest_refuses_when_github_unreachable(
     determine what that is.
     """
     _stub_happy_upgrade(mocker, cfg)
-    mocker.patch("agents_cli.outdated_cmd.fetch_latest_tag", return_value=None)
+    mocker.patch("agx_cli.outdated_cmd.fetch_latest_tag", return_value=None)
 
     with pytest.raises(UserError, match="could not resolve latest"):
         upgrades.upgrade("coder", to_latest=True, config_path=with_coder)
+
+
+def test_upgrade_to_latest_refuses_unpublished_image_before_any_mutation(
+    with_coder: Path, mocker, cfg: AgentsConfig
+) -> None:
+    """A release without an image under its tag (Hermes v0.21.7) must be
+    refused before snapshots/stop/pin — not discovered at the pull."""
+    mocks = _stub_happy_upgrade(mocker, cfg)
+    mocker.patch("agx_cli.outdated_cmd.fetch_latest_tag", return_value="v9.9.9")
+    mocker.patch("agx_cli.outdated_cmd.image_tag_published", return_value=False)
+
+    with pytest.raises(UserError, match="has no image tag"):
+        upgrades.upgrade("coder", to_latest=True, config_path=with_coder)
+
+    doc = compose.load_compose(cfg.paths.host_data_dir / "docker-compose.yml")
+    assert doc["services"]["hermes-coder"]["image"].endswith(":v1.0.0")
+    assert cfg_mod.load(with_coder).defaults.hermes_image_tag != "v9.9.9"
+    for key in ("host_snap", "snapshot", "pull", "compose_up"):
+        mocks[key].assert_not_called()
 
 
 # ---------- failure paths ----------
@@ -239,9 +254,9 @@ def test_upgrade_to_latest_refuses_when_github_unreachable(
 
 def test_upgrade_reverts_tag_when_pull_fails(with_coder: Path, mocker, cfg: AgentsConfig) -> None:
     _stub_happy_upgrade(mocker, cfg)
-    mocker.patch("agents_cli.compose_runner.pull", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.pull", return_value=_ok())
     mocker.patch(
-        "agents_cli.compose_runner.docker_image_inspect",
+        "agx_cli.compose_runner.docker_image_inspect",
         return_value=_fail("manifest unknown"),
     )
     with pytest.raises(RuntimeFailure, match="docker image inspect"):
@@ -253,9 +268,9 @@ def test_upgrade_reverts_tag_when_pull_fails(with_coder: Path, mocker, cfg: Agen
 
 def test_upgrade_reverts_when_doctor_fails(with_coder: Path, mocker, cfg: AgentsConfig) -> None:
     _stub_happy_upgrade(mocker, cfg)
-    from agents_cli.errors import HealthCheckFailure
+    from agx_cli.errors import HealthCheckFailure
 
-    mocker.patch("agents_cli.ops.doctor", side_effect=HealthCheckFailure("bad"))
+    mocker.patch("agx_cli.ops.doctor", side_effect=HealthCheckFailure("bad"))
     with pytest.raises(HealthCheckFailure):
         upgrades.upgrade("coder", tag="v1.0.1", config_path=with_coder)
     doc = compose.load_compose(cfg.paths.host_data_dir / "docker-compose.yml")
@@ -530,13 +545,13 @@ def test_rollback_restores_from_latest_archive(with_coder: Path, mocker, cfg: Ag
     with tarfile.open(archive, "w:gz") as tf:
         tf.add(snapshot_data / "marker.txt", arcname="coder/marker.txt")
     # Stub VM ops + skip confirm
-    mocker.patch("agents_cli.ui.confirm", return_value=True)
+    mocker.patch("agx_cli.ui.confirm", return_value=True)
     mocker.patch(
-        "agents_cli.mp.info_vm",
+        "agx_cli.mp.info_vm",
         return_value=_ok(json.dumps({"info": {"agents": {"snapshots": {}}}})),
     )
-    mocker.patch("agents_cli.mp.stop_vm", return_value=_ok())
-    mocker.patch("agents_cli.mp.start_vm", return_value=_ok())
+    mocker.patch("agx_cli.mp.stop_vm", return_value=_ok())
+    mocker.patch("agx_cli.mp.start_vm", return_value=_ok())
 
     upgrades.rollback("coder", config_path=with_coder)
     # Marker file from the archive landed at <data-dir>/coder/marker.txt
@@ -555,9 +570,9 @@ def test_restore_host_snapshot_extracts_as_root_inside_vm(
     archive = cfg.paths.host_data_dir / ".upgrades" / "coder-20260512T120000Z.tar.zst"
     archive.parent.mkdir(exist_ok=True)
     archive.write_bytes(b"")
-    transfer = mocker.patch("agents_cli.mp.transfer_to_vm", return_value=_ok())
-    exec_bash = mocker.patch("agents_cli.mp.exec_bash", side_effect=RuntimeFailure("tar: exploded"))
-    exec_in_vm = mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok())
+    transfer = mocker.patch("agx_cli.mp.transfer_to_vm", return_value=_ok())
+    exec_bash = mocker.patch("agx_cli.mp.exec_bash", side_effect=RuntimeFailure("tar: exploded"))
+    exec_in_vm = mocker.patch("agx_cli.mp.exec_in_vm", return_value=_ok())
 
     with pytest.raises(RuntimeFailure):
         upgrades._restore_host_snapshot(cfg, archive)
@@ -574,7 +589,7 @@ def test_rollback_aborts_without_confirmation(with_coder: Path, mocker, cfg: Age
     upgrades_dir = cfg.paths.host_data_dir / ".upgrades"
     upgrades_dir.mkdir(exist_ok=True)
     (upgrades_dir / "coder-20260512T120000Z.tar.gz").write_bytes(b"")
-    mocker.patch("agents_cli.ui.confirm", return_value=False)
+    mocker.patch("agx_cli.ui.confirm", return_value=False)
     with pytest.raises(UserError, match="aborted"):
         upgrades.rollback("coder", config_path=with_coder)
 
@@ -605,9 +620,9 @@ def test_rollback_locks_stops_restores_and_recreates_in_order(
     start_vm calls it replaces never checked mp.restore's result), and
     recreate the container from the restored compose at the end."""
     _write_rollback_archive(cfg, "coder")
-    mocker.patch("agents_cli.ui.confirm", return_value=True)
+    mocker.patch("agx_cli.ui.confirm", return_value=True)
     mocker.patch(
-        "agents_cli.mp.info_vm",
+        "agx_cli.mp.info_vm",
         return_value=_ok(
             json.dumps(
                 {"info": {"agents": {"snapshots": {"pre-upgrade-coder-20260512T120000Z": {}}}}}
@@ -616,24 +631,24 @@ def test_rollback_locks_stops_restores_and_recreates_in_order(
     )
     order: list[str] = []
     mocker.patch(
-        "agents_cli.compose_runner.stop",
+        "agx_cli.compose_runner.stop",
         side_effect=lambda *a, **k: order.append("stop") or _ok(),
     )
     mocker.patch(
-        "agents_cli.upgrades._restore_host_snapshot",
+        "agx_cli.upgrades._restore_host_snapshot",
         side_effect=lambda *a, **k: order.append("restore_host"),
     )
     vm_restore = mocker.patch(
-        "agents_cli.vm.restore_snapshot",
+        "agx_cli.vm.restore_snapshot",
         side_effect=lambda *a, **k: order.append("restore_vm"),
     )
     mocker.patch(
-        "agents_cli.compose_runner.up",
+        "agx_cli.compose_runner.up",
         side_effect=lambda *a, **k: order.append("up") or _ok(),
     )
-    raw_stop = mocker.patch("agents_cli.mp.stop_vm", return_value=_ok())
-    raw_restore = mocker.patch("agents_cli.mp.restore", return_value=_ok())
-    raw_start = mocker.patch("agents_cli.mp.start_vm", return_value=_ok())
+    raw_stop = mocker.patch("agx_cli.mp.stop_vm", return_value=_ok())
+    raw_restore = mocker.patch("agx_cli.mp.restore", return_value=_ok())
+    raw_start = mocker.patch("agx_cli.mp.start_vm", return_value=_ok())
     lock_spy = mocker.spy(upgrades.compose, "acquire_lock")
 
     upgrades.rollback("coder", config_path=with_coder)
@@ -662,25 +677,25 @@ def test_rollback_saves_current_state_before_overwriting(
     rollback somewhere: exported to backups/pre-rollback/ AFTER the stop
     (consistent archive) and BEFORE the extraction."""
     _write_rollback_archive(cfg, "coder")
-    mocker.patch("agents_cli.ui.confirm", return_value=True)
-    mocker.patch("agents_cli.upgrades._latest_vm_snapshot", return_value=None)
+    mocker.patch("agx_cli.ui.confirm", return_value=True)
+    mocker.patch("agx_cli.upgrades._latest_vm_snapshot", return_value=None)
     order: list[str] = []
     mocker.patch(
-        "agents_cli.compose_runner.stop", side_effect=lambda *a, **k: order.append("stop") or _ok()
+        "agx_cli.compose_runner.stop", side_effect=lambda *a, **k: order.append("stop") or _ok()
     )
     safety = cfg.paths.host_data_dir / "backups" / "pre-rollback" / "coder-x.tar.zst"
     export = mocker.patch(
-        "agents_cli.export_cmd.export",
+        "agx_cli.export_cmd.export",
         side_effect=lambda *a, **k: order.append("safety") or safety,
     )
     mocker.patch(
-        "agents_cli.upgrades._restore_host_snapshot",
+        "agx_cli.upgrades._restore_host_snapshot",
         side_effect=lambda *a, **k: order.append("restore_host"),
     )
     mocker.patch(
-        "agents_cli.compose_runner.up", side_effect=lambda *a, **k: order.append("up") or _ok()
+        "agx_cli.compose_runner.up", side_effect=lambda *a, **k: order.append("up") or _ok()
     )
-    emit = mocker.patch("agents_cli.ui.emit")
+    emit = mocker.patch("agx_cli.ui.emit")
 
     upgrades.rollback("coder", config_path=with_coder)
 
@@ -693,12 +708,12 @@ def test_rollback_aborts_without_overwriting_when_safety_export_fails(
     with_coder: Path, mocker, cfg: AgentsConfig
 ) -> None:
     _write_rollback_archive(cfg, "coder")
-    mocker.patch("agents_cli.ui.confirm", return_value=True)
-    mocker.patch("agents_cli.upgrades._latest_vm_snapshot", return_value=None)
-    mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())
-    mocker.patch("agents_cli.export_cmd.export", side_effect=RuntimeFailure("tar failed"))
-    restore = mocker.patch("agents_cli.upgrades._restore_host_snapshot")
-    up = mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.ui.confirm", return_value=True)
+    mocker.patch("agx_cli.upgrades._latest_vm_snapshot", return_value=None)
+    mocker.patch("agx_cli.compose_runner.stop", return_value=_ok())
+    mocker.patch("agx_cli.export_cmd.export", side_effect=RuntimeFailure("tar failed"))
+    restore = mocker.patch("agx_cli.upgrades._restore_host_snapshot")
+    up = mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
 
     with pytest.raises(RuntimeFailure, match="tar failed"):
         upgrades.rollback("coder", config_path=with_coder)
@@ -714,17 +729,17 @@ def test_rollback_exports_every_agent_when_vm_restore_reverts_in_vm_data(
     cfg.paths.data_dir_in_vm = True
     cfg_mod.save(cfg, with_coder)
     _write_rollback_archive(cfg, "coder")
-    confirm = mocker.patch("agents_cli.ui.confirm", return_value=True)
+    confirm = mocker.patch("agx_cli.ui.confirm", return_value=True)
     mocker.patch(
-        "agents_cli.upgrades._latest_vm_snapshot",
+        "agx_cli.upgrades._latest_vm_snapshot",
         return_value="pre-upgrade-coder-20260512T120000Z",
     )
-    mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())
-    export_all = mocker.patch("agents_cli.export_cmd.export_all", return_value=[])
-    export_one = mocker.patch("agents_cli.export_cmd.export")
-    mocker.patch("agents_cli.upgrades._restore_host_snapshot")
-    mocker.patch("agents_cli.vm.restore_snapshot")
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.stop", return_value=_ok())
+    export_all = mocker.patch("agx_cli.export_cmd.export_all", return_value=[])
+    export_one = mocker.patch("agx_cli.export_cmd.export")
+    mocker.patch("agx_cli.upgrades._restore_host_snapshot")
+    mocker.patch("agx_cli.vm.restore_snapshot")
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
 
     upgrades.rollback("coder", config_path=with_coder)
 
@@ -752,22 +767,22 @@ def test_rollback_restarts_service_when_host_restore_fails(
     ATTEMPT into an outage. The service must be brought back up
     best-effort and the ORIGINAL error must propagate."""
     _write_rollback_archive(cfg, "coder")
-    mocker.patch("agents_cli.ui.confirm", return_value=True)
+    mocker.patch("agx_cli.ui.confirm", return_value=True)
     mocker.patch(
-        "agents_cli.mp.info_vm",
+        "agx_cli.mp.info_vm",
         return_value=_ok(json.dumps({"info": {"agents": {"snapshots": {}}}})),
     )
     order: list[str] = []
     mocker.patch(
-        "agents_cli.compose_runner.stop",
+        "agx_cli.compose_runner.stop",
         side_effect=lambda *a, **k: order.append("stop") or _ok(),
     )
     mocker.patch(
-        "agents_cli.upgrades._restore_host_snapshot",
+        "agx_cli.upgrades._restore_host_snapshot",
         side_effect=RuntimeFailure("archive is corrupt"),
     )
     up = mocker.patch(
-        "agents_cli.compose_runner.up",
+        "agx_cli.compose_runner.up",
         side_effect=lambda *a, **k: order.append("up") or _ok(),
     )
     warn_spy = mocker.spy(upgrades.ui, "warn")
@@ -790,22 +805,22 @@ def test_rollback_restarts_service_when_vm_restore_fails(
     final up. The service was stopped for the extraction — bring it
     back up and re-raise the VM error."""
     _write_rollback_archive(cfg, "coder")
-    mocker.patch("agents_cli.ui.confirm", return_value=True)
+    mocker.patch("agx_cli.ui.confirm", return_value=True)
     mocker.patch(
-        "agents_cli.mp.info_vm",
+        "agx_cli.mp.info_vm",
         return_value=_ok(
             json.dumps(
                 {"info": {"agents": {"snapshots": {"pre-upgrade-coder-20260512T120000Z": {}}}}}
             )
         ),
     )
-    mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())
-    mocker.patch("agents_cli.upgrades._restore_host_snapshot")
+    mocker.patch("agx_cli.compose_runner.stop", return_value=_ok())
+    mocker.patch("agx_cli.upgrades._restore_host_snapshot")
     mocker.patch(
-        "agents_cli.vm.restore_snapshot",
+        "agx_cli.vm.restore_snapshot",
         side_effect=RuntimeFailure("snapshot restore blew up"),
     )
-    up = mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    up = mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
 
     with pytest.raises(RuntimeFailure, match="snapshot restore blew up"):
         upgrades.rollback("coder", config_path=with_coder)
@@ -821,17 +836,17 @@ def test_rollback_secondary_up_failure_only_warns(
     problem), that failure must only warn — the original restore error
     is the one the user needs to see."""
     _write_rollback_archive(cfg, "coder")
-    mocker.patch("agents_cli.ui.confirm", return_value=True)
+    mocker.patch("agx_cli.ui.confirm", return_value=True)
     mocker.patch(
-        "agents_cli.mp.info_vm",
+        "agx_cli.mp.info_vm",
         return_value=_ok(json.dumps({"info": {"agents": {"snapshots": {}}}})),
     )
-    mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.stop", return_value=_ok())
     mocker.patch(
-        "agents_cli.upgrades._restore_host_snapshot",
+        "agx_cli.upgrades._restore_host_snapshot",
         side_effect=RuntimeFailure("archive is corrupt"),
     )
-    mocker.patch("agents_cli.compose_runner.up", side_effect=RuntimeError("VM unreachable"))
+    mocker.patch("agx_cli.compose_runner.up", side_effect=RuntimeError("VM unreachable"))
     warn_spy = mocker.spy(upgrades.ui, "warn")
 
     with pytest.raises(RuntimeFailure, match="archive is corrupt"):
@@ -847,14 +862,14 @@ def test_rollback_of_removed_agent_skips_stop_and_up_with_warning(
     is legitimate (restore-after-remove). There is no service to stop
     or recreate — warn and restore the data anyway, don't fail."""
     _write_rollback_archive(cfg, "ghost")
-    mocker.patch("agents_cli.ui.confirm", return_value=True)
+    mocker.patch("agx_cli.ui.confirm", return_value=True)
     mocker.patch(
-        "agents_cli.mp.info_vm",
+        "agx_cli.mp.info_vm",
         return_value=_ok(json.dumps({"info": {"agents": {"snapshots": {}}}})),
     )
-    restore_host = mocker.patch("agents_cli.upgrades._restore_host_snapshot")
-    stop = mocker.patch("agents_cli.compose_runner.stop", return_value=_ok())
-    up = mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    restore_host = mocker.patch("agx_cli.upgrades._restore_host_snapshot")
+    stop = mocker.patch("agx_cli.compose_runner.stop", return_value=_ok())
+    up = mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     warn_spy = mocker.spy(upgrades.ui, "warn")
 
     upgrades.rollback("ghost", config_path=saved_config)
@@ -873,12 +888,12 @@ def test_rollback_explicit_snapshot_id_ignores_prefix_colliding_agent(
     the id "ambiguous" (or worse, matched the wrong agent's archive)."""
     foo_archive = _write_rollback_archive(cfg, "foo", "20260512T120000Z")
     _write_rollback_archive(cfg, "foo-bar", "20260512T120000Z")
-    mocker.patch("agents_cli.ui.confirm", return_value=True)
+    mocker.patch("agx_cli.ui.confirm", return_value=True)
     mocker.patch(
-        "agents_cli.mp.info_vm",
+        "agx_cli.mp.info_vm",
         return_value=_ok(json.dumps({"info": {"agents": {"snapshots": {}}}})),
     )
-    restore_host = mocker.patch("agents_cli.upgrades._restore_host_snapshot")
+    restore_host = mocker.patch("agx_cli.upgrades._restore_host_snapshot")
 
     upgrades.rollback("foo", snapshot_id="20260512T120000Z", config_path=saved_config)
 
@@ -926,7 +941,7 @@ def test_latest_vm_snapshot_ignores_prefix_colliding_agent(mocker) -> None:
         "pre-upgrade-foo-bar-20260201T000000Z": {},
     }
     mocker.patch(
-        "agents_cli.mp.info_vm",
+        "agx_cli.mp.info_vm",
         return_value=_ok(json.dumps({"info": {"agents": {"snapshots": snapshots}}})),
     )
     assert upgrades._latest_vm_snapshot("agents", "foo") == "pre-upgrade-foo-20260101T000000Z"
@@ -943,7 +958,7 @@ def test_latest_vm_snapshot_accepts_collision_counter_suffix(mocker) -> None:
         "pre-upgrade-foo-20260101T000000Z-2": {},
     }
     mocker.patch(
-        "agents_cli.mp.info_vm",
+        "agx_cli.mp.info_vm",
         return_value=_ok(json.dumps({"info": {"agents": {"snapshots": snapshots}}})),
     )
     assert upgrades._latest_vm_snapshot("agents", "foo") == "pre-upgrade-foo-20260101T000000Z-2"
@@ -960,14 +975,14 @@ def test_vm_snapshot_uses_monotonic_suffix_on_collision(
     # _vm_snapshot uses it.
     base_existing = "pre-upgrade-coder-20260512T120000Z"
     mocker.patch(
-        "agents_cli.mp.info_vm",
+        "agx_cli.mp.info_vm",
         return_value=_ok(json.dumps({"info": {"agents": {"snapshots": {base_existing: {}}}}})),
     )
-    mocker.patch("agents_cli.mp.stop_vm", return_value=_ok())
-    mocker.patch("agents_cli.mp.start_vm", return_value=_ok())
-    snap_spy = mocker.patch("agents_cli.mp.snapshot", return_value=_ok())
+    mocker.patch("agx_cli.mp.stop_vm", return_value=_ok())
+    mocker.patch("agx_cli.mp.start_vm", return_value=_ok())
+    snap_spy = mocker.patch("agx_cli.mp.snapshot", return_value=_ok())
     # Force the timestamp portion so we hit the collision deterministically.
-    mocker.patch("agents_cli.upgrades._utc_stamp", return_value="20260512T120000Z")
+    mocker.patch("agx_cli.upgrades._utc_stamp", return_value="20260512T120000Z")
     name = upgrades._vm_snapshot(cfg, "coder", config_path=with_coder)
     assert name == f"{base_existing}-2"
     snap_spy.assert_called_once()
@@ -985,7 +1000,7 @@ def test_upgrade_runs_hermes_config_migrate_after_recreate(
     _stub_happy_upgrade(mocker, cfg)
     # Capture the exec_in_vm calls — config migrate runs through
     # docker compose exec, which goes through mp.exec_in_vm.
-    exec_spy = mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok())
+    exec_spy = mocker.patch("agx_cli.mp.exec_in_vm", return_value=_ok())
 
     upgrades.upgrade("coder", tag="v1.0.1", config_path=with_coder)
 
@@ -1024,7 +1039,7 @@ def test_upgrade_config_check_drift_warns_with_interactive_hint(
             return MpResult(stdout="missing: gateway.new_option", stderr="", returncode=1)
         return _ok()
 
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=runner)
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=runner)
     warn_spy = mocker.spy(upgrades.ui, "warn")
 
     outcome = upgrades.upgrade("coder", tag="v1.0.1", config_path=with_coder)
@@ -1033,7 +1048,7 @@ def test_upgrade_config_check_drift_warns_with_interactive_hint(
     drift_warns = [c.args[0] for c in warn_spy.call_args_list if "config check" in c.args[0]]
     assert drift_warns, "expected a drift warning from config check"
     assert "gateway.new_option" in drift_warns[0]
-    assert "agents exec coder -- hermes config migrate" in drift_warns[0]
+    assert "agx exec coder -- hermes config migrate" in drift_warns[0]
 
 
 def test_upgrade_config_check_skipped_when_migrate_failed(
@@ -1049,7 +1064,7 @@ def test_upgrade_config_check_skipped_when_migrate_failed(
             return MpResult(stdout="", stderr="unknown subcommand: migrate", returncode=2)
         return _ok()
 
-    exec_spy = mocker.patch("agents_cli.mp.exec_in_vm", side_effect=runner)
+    exec_spy = mocker.patch("agx_cli.mp.exec_in_vm", side_effect=runner)
 
     upgrades.upgrade("coder", tag="v1.0.1", config_path=with_coder)
 
@@ -1072,10 +1087,10 @@ def test_upgrade_skips_config_migrate_for_openclaw(
     from tests.conftest import install_vm_fs_simulation
 
     install_vm_fs_simulation(mocker, cfg)
-    mocker.patch("agents_cli.compose_runner.up", return_value=_ok())
+    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     create(name="bob", agent_type="openclaw", config_path=saved_config)
     _stub_happy_upgrade(mocker, cfg)
-    exec_spy = mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok())
+    exec_spy = mocker.patch("agx_cli.mp.exec_in_vm", return_value=_ok())
 
     upgrades.upgrade("bob", tag="0.1.1", config_path=saved_config)
 
@@ -1102,7 +1117,7 @@ def test_upgrade_config_migrate_failure_warns_but_continues(
             return MpResult(stdout="", stderr="unknown subcommand: migrate", returncode=2)
         return _ok()
 
-    mocker.patch("agents_cli.mp.exec_in_vm", side_effect=runner)
+    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=runner)
 
     # No exception expected.
     outcome = upgrades.upgrade("coder", tag="v1.0.1", config_path=with_coder)
@@ -1112,13 +1127,13 @@ def test_upgrade_config_migrate_failure_warns_but_continues(
 def test_upgrade_to_latest_is_noop_when_already_at_latest(
     with_coder: Path, mocker, cfg: AgentsConfig
 ) -> None:
-    """``agents upgrade --latest`` while already at the latest tag must
+    """``agx upgrade --latest`` while already at the latest tag must
     short-circuit BEFORE touching the VM. ``vm.take_snapshot`` on
     libvirt+virtiofs stops the VM for ~30-60s; doing that for a no-op
     is pure penalty and would make periodic ``upgrade --latest`` calls
     (e.g. from cron) unusable.
     """
-    mocker.patch("agents_cli.outdated_cmd.fetch_latest_tag", return_value="v1.0.0")
+    mocker.patch("agx_cli.outdated_cmd.fetch_latest_tag", return_value="v1.0.0")
     mocks = _stub_happy_upgrade(mocker, cfg)
     outcome = upgrades.upgrade("coder", to_latest=True, config_path=with_coder)
 
@@ -1137,7 +1152,7 @@ def test_upgrade_explicit_tag_matching_current_is_noop(
 ) -> None:
     """``--tag X`` when the agent is already at X is also a no-op —
     the user named the target and we're there. Differs from bare
-    ``agents upgrade <name>`` (no flags) which IS a force-refresh.
+    ``agx upgrade <name>`` (no flags) which IS a force-refresh.
     """
     mocks = _stub_happy_upgrade(mocker, cfg)
     outcome = upgrades.upgrade("coder", tag="v1.0.0", config_path=with_coder)
@@ -1149,7 +1164,7 @@ def test_upgrade_explicit_tag_matching_current_is_noop(
 def test_upgrade_bare_call_implicitly_fetches_latest(
     with_coder: Path, mocker, cfg: AgentsConfig
 ) -> None:
-    """Bare ``agents upgrade <name>`` MUST hit the upstream API to
+    """Bare ``agx upgrade <name>`` MUST hit the upstream API to
     discover newer versions — matches ``apt upgrade`` / ``brew upgrade``
     convention. Without this, a user typing the bare form would see
     "nothing to do" forever even when newer versions exist upstream,
@@ -1169,7 +1184,7 @@ def test_upgrade_bare_call_noops_when_at_latest(
     """Bare ``upgrade`` fetches latest, finds it matches current pin,
     no-ops cleanly — no snapshot dance, no misleading ``vX -> vX``
     output. Caught a user-facing regression today where a user typed
-    ``agents upgrade coder`` expecting either a real upgrade or a
+    ``agx upgrade coder`` expecting either a real upgrade or a
     quick "you're current" message, got ~30-60s of avoidable downtime
     instead.
     """
@@ -1248,7 +1263,7 @@ def test_upgrade_rollback_clears_journal_to_force_clean_retry(
     _stub_happy_upgrade(mocker, cfg)
     # Force doctor to fail so the except handler runs.
     mocker.patch(
-        "agents_cli.ops.doctor",
+        "agx_cli.ops.doctor",
         side_effect=RuntimeFailure("doctor probe blew up"),
     )
 
@@ -1273,15 +1288,15 @@ def test_upgrade_doctor_failure_names_the_failing_checks(
     "1 doctor check(s) failed" left the user nothing to investigate
     (2026-10-10, v0.21.6 rolled back with no hint). Warnings must not
     trip the gate and must not be listed as failures."""
-    from agents_cli.errors import HealthCheckFailure
-    from agents_cli.ops import DoctorReport
+    from agx_cli.errors import HealthCheckFailure
+    from agx_cli.ops import DoctorReport
 
     _stub_happy_upgrade(mocker, cfg)
     report = DoctorReport()
     report.add("coder.container", "ok")
     report.add("coder.hermes_doctor", "fail", "hermes: command not found")
     report.add("coder.version", "warn", "drift")
-    doctor = mocker.patch("agents_cli.ops.doctor", return_value=report)
+    doctor = mocker.patch("agx_cli.ops.doctor", return_value=report)
 
     with pytest.raises(HealthCheckFailure) as exc:
         upgrades.upgrade("coder", tag="v1.0.1", config_path=with_coder)
@@ -1298,11 +1313,11 @@ def test_upgrade_failed_run_does_not_bump_default_tag(
 ) -> None:
     """defaults.<type>_image_tag must only move once the upgrade has
     demonstrably landed. Persisting at resolve time meant a failed-and-
-    rolled-back upgrade still re-baselined every future `agents create`
+    rolled-back upgrade still re-baselined every future `agx create`
     onto the bad tag."""
     _stub_happy_upgrade(mocker, cfg)
-    mocker.patch("agents_cli.outdated_cmd.fetch_latest_tag", return_value="v9.9.9")
-    mocker.patch("agents_cli.ops.doctor", side_effect=RuntimeFailure("doctor probe blew up"))
+    mocker.patch("agx_cli.outdated_cmd.fetch_latest_tag", return_value="v9.9.9")
+    mocker.patch("agx_cli.ops.doctor", side_effect=RuntimeFailure("doctor probe blew up"))
 
     with pytest.raises(RuntimeFailure, match="doctor probe"):
         upgrades.upgrade("coder", to_latest=True, config_path=with_coder)
@@ -1320,7 +1335,7 @@ def test_upgrade_noop_at_latest_still_refreshes_default_tag(
     cfg.defaults.hermes_image_tag = "v0.9.0"  # stale default, agent pinned at v1.0.0
     cfg_mod.save(cfg, with_coder)
     _stub_happy_upgrade(mocker, cfg)
-    mocker.patch("agents_cli.outdated_cmd.fetch_latest_tag", return_value="v1.0.0")
+    mocker.patch("agx_cli.outdated_cmd.fetch_latest_tag", return_value="v1.0.0")
 
     outcome = upgrades.upgrade("coder", to_latest=True, config_path=with_coder)
 
@@ -1337,13 +1352,13 @@ def test_upgrade_revert_failure_preserves_original_error_and_cleanup(
     revert must NOT replace the original exception, and the journal clear
     plus the snapshots-preserved hint must still run."""
     _stub_happy_upgrade(mocker, cfg)
-    from agents_cli.errors import HealthCheckFailure
+    from agx_cli.errors import HealthCheckFailure
 
-    mocker.patch("agents_cli.ops.doctor", side_effect=HealthCheckFailure("doctor says no"))
+    mocker.patch("agx_cli.ops.doctor", side_effect=HealthCheckFailure("doctor says no"))
     # First call = the tag_pinned phase; second = the revert in the
     # except handler, which blows up like an unreachable VM would.
     mocker.patch(
-        "agents_cli.upgrades._set_image_tag",
+        "agx_cli.upgrades._set_image_tag",
         side_effect=[None, RuntimeError("VM unreachable")],
     )
     warn_spy = mocker.spy(upgrades.ui, "warn")
@@ -1369,9 +1384,9 @@ def test_host_data_snapshot_runs_sudo_tar_inside_vm_in_host_mount_mode(
     branch must run ``sudo tar`` inside the VM (where root reads
     everything via virtiofs passthrough) and transfer the archive out.
     """
-    exec_bash = mocker.patch("agents_cli.mp.exec_bash", return_value=_ok())
-    transfer = mocker.patch("agents_cli.mp.transfer_from_vm", return_value=_ok())
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok())
+    exec_bash = mocker.patch("agx_cli.mp.exec_bash", return_value=_ok())
+    transfer = mocker.patch("agx_cli.mp.transfer_from_vm", return_value=_ok())
+    mocker.patch("agx_cli.mp.exec_in_vm", return_value=_ok())
 
     upgrades._host_data_snapshot(cfg, "coder")
 
@@ -1397,9 +1412,9 @@ def test_host_data_snapshot_data_dir_in_vm_also_tars_as_root(
     cfg.paths = cfg.paths.model_copy(update={"data_dir_in_vm": True})
     cfg_mod.save(cfg, with_coder)
     cfg = cfg_mod.load(with_coder)
-    exec_bash = mocker.patch("agents_cli.mp.exec_bash", return_value=_ok())
-    mocker.patch("agents_cli.mp.transfer_from_vm", return_value=_ok())
-    mocker.patch("agents_cli.mp.exec_in_vm", return_value=_ok())
+    exec_bash = mocker.patch("agx_cli.mp.exec_bash", return_value=_ok())
+    mocker.patch("agx_cli.mp.transfer_from_vm", return_value=_ok())
+    mocker.patch("agx_cli.mp.exec_in_vm", return_value=_ok())
 
     upgrades._host_data_snapshot(cfg, "coder")
 
@@ -1428,16 +1443,16 @@ def test_vm_snapshot_waits_for_ssh_on_libvirt_after_start(
     cfg.vm.backend = "libvirt"
     cfg_mod.save(cfg, with_coder)
     mocker.patch(
-        "agents_cli.mp.info_vm",
+        "agx_cli.mp.info_vm",
         return_value=_ok(json.dumps({"info": {"agents": {"state": "Running", "snapshots": {}}}})),
     )
-    mocker.patch("agents_cli.mp.stop_vm", return_value=_ok())
-    mocker.patch("agents_cli.mp.start_vm", return_value=_ok())
-    mocker.patch("agents_cli.mp.snapshot", return_value=_ok())
-    wait_ssh = mocker.patch("agents_cli.backends.libvirt.wait_for_ssh")
+    mocker.patch("agx_cli.mp.stop_vm", return_value=_ok())
+    mocker.patch("agx_cli.mp.start_vm", return_value=_ok())
+    mocker.patch("agx_cli.mp.snapshot", return_value=_ok())
+    wait_ssh = mocker.patch("agx_cli.backends.libvirt.wait_for_ssh")
     # `_vm_running` polling inside take_snapshot's wait_for_stopped
     # would loop forever on a non-mocked info_vm — short-circuit it.
-    mocker.patch("agents_cli.vm._wait_for_vm_stopped")
+    mocker.patch("agx_cli.vm._wait_for_vm_stopped")
 
     upgrades._vm_snapshot(cfg, "coder", config_path=with_coder)
 
@@ -1449,7 +1464,7 @@ def test_vm_snapshot_waits_for_ssh_on_libvirt_after_start(
 
 
 def test_pull_without_name_pulls_all(with_coder: Path, mocker) -> None:
-    spy = mocker.patch("agents_cli.compose_runner.pull", return_value=_ok())
+    spy = mocker.patch("agx_cli.compose_runner.pull", return_value=_ok())
     upgrades.pull(config_path=with_coder)
     spy.assert_called_once()
     # No service name -> pull all
@@ -1458,7 +1473,7 @@ def test_pull_without_name_pulls_all(with_coder: Path, mocker) -> None:
 
 
 def test_pull_with_name_pulls_one(with_coder: Path, mocker) -> None:
-    spy = mocker.patch("agents_cli.compose_runner.pull", return_value=_ok())
+    spy = mocker.patch("agx_cli.compose_runner.pull", return_value=_ok())
     upgrades.pull("coder", config_path=with_coder)
     args, _ = spy.call_args
     assert "hermes-coder" in args
@@ -1468,9 +1483,9 @@ def test_pull_all_narrates_start_and_end(with_coder: Path, mocker) -> None:
     """Image pulls run for minutes on a cold cache; a silent terminal
     reads as a hang. Both paths narrate start + completion via
     ui.progress (stderr) while stdout keeps its single result object."""
-    mocker.patch("agents_cli.compose_runner.pull", return_value=_ok())
-    progress = mocker.patch("agents_cli.ui.progress")
-    emit = mocker.patch("agents_cli.ui.emit")
+    mocker.patch("agx_cli.compose_runner.pull", return_value=_ok())
+    progress = mocker.patch("agx_cli.ui.progress")
+    emit = mocker.patch("agx_cli.ui.emit")
 
     upgrades.pull(config_path=with_coder)
 
@@ -1481,9 +1496,9 @@ def test_pull_all_narrates_start_and_end(with_coder: Path, mocker) -> None:
 
 
 def test_pull_single_agent_narrates_start_and_end(with_coder: Path, mocker) -> None:
-    mocker.patch("agents_cli.compose_runner.pull", return_value=_ok())
-    progress = mocker.patch("agents_cli.ui.progress")
-    emit = mocker.patch("agents_cli.ui.emit")
+    mocker.patch("agx_cli.compose_runner.pull", return_value=_ok())
+    progress = mocker.patch("agx_cli.ui.progress")
+    emit = mocker.patch("agx_cli.ui.emit")
 
     upgrades.pull("coder", config_path=with_coder)
 
@@ -1499,7 +1514,7 @@ def test_vm_snapshot_suppresses_take_snapshot_emit(
     """The upgrade state machine narrates the snapshot phase itself via
     ui.progress; take_snapshot's own emit would put a second JSON object
     on stdout mid-upgrade."""
-    take = mocker.patch("agents_cli.vm.take_snapshot", return_value="pre-upgrade-coder-x")
+    take = mocker.patch("agx_cli.vm.take_snapshot", return_value="pre-upgrade-coder-x")
 
     name = upgrades._vm_snapshot(cfg, "coder", config_path=with_coder)
 
