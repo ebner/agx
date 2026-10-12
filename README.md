@@ -1,6 +1,6 @@
 # `agx` — multi-agent VM toolkit
 
-[![CI](https://github.com/ebner/agents/actions/workflows/ci.yml/badge.svg)](https://github.com/ebner/agents/actions/workflows/ci.yml)
+[![CI](https://github.com/ebner/agx/actions/workflows/ci.yml/badge.svg)](https://github.com/ebner/agx/actions/workflows/ci.yml)
 
 Host-side CLI for managing AI agents (Hermes Agent from Nous Research, OpenClaw) as rootless-Docker containers behind a pluggable isolation backend:
 

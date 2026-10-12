@@ -5,8 +5,8 @@
 Python ≥ 3.11 and [uv](https://docs.astral.sh/uv/):
 
 ```bash
-git clone https://github.com/ebner/agents.git
-cd agents
+git clone https://github.com/ebner/agx.git
+cd agx
 uv sync --locked --extra dev
 ```
 

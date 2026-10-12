@@ -861,7 +861,7 @@ agx inference unload llama-cpp llama-3-2-3b
 
 ### vLLM
 
-Not supported inside the toolkit's Multipass VM. vLLM is GPU-only in practice, and Multipass doesn't support GPU passthrough on stable releases (see [GH issue #2](https://github.com/ebner/agents/issues/2) for the libvirt-backend investigation). If you have an externally-hosted vLLM, point Hermes at it via:
+Not supported inside the toolkit's Multipass VM. vLLM is GPU-only in practice, and Multipass doesn't support GPU passthrough on stable releases (see [GH issue #2](https://github.com/ebner/agx/issues/2) for the libvirt-backend investigation). If you have an externally-hosted vLLM, point Hermes at it via:
 
 ```yaml
 model:
@@ -954,7 +954,7 @@ If your RPi5 has an NVMe HAT and you're booting from NVMe, microSD consideration
 
 ## Using the libvirt backend (experimental — Linux + GPU passthrough)
 
-The default `multipass` backend works everywhere and is the right choice for 95% of deployments. The `libvirt` backend exists for one reason: **GPU passthrough**, which Multipass doesn't support and which is required for vLLM (and helpful for accelerated Ollama/llama.cpp inference on workstations with discrete GPUs). See [GH #2](https://github.com/ebner/agents/issues/2) for the design rationale.
+The default `multipass` backend works everywhere and is the right choice for 95% of deployments. The `libvirt` backend exists for one reason: **GPU passthrough**, which Multipass doesn't support and which is required for vLLM (and helpful for accelerated Ollama/llama.cpp inference on workstations with discrete GPUs). See [GH #2](https://github.com/ebner/agx/issues/2) for the design rationale.
 
 ⚠️  **Experimental status**: lifecycle + mount + snapshot + restore validated on a real Linux + libvirt host (Ubuntu 24.04, kernel 6.17, AMD Strix Halo, 2026-05-16). GPU attach validated only via XML dry-run — actual hostdev attach has not been exercised yet because the test machine has no discrete GPU separable from the host display. Expect the GPU path may surface minor quirks on first use.
 
