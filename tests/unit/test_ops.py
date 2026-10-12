@@ -170,6 +170,9 @@ def _stub_minimal_doctor(mocker, vm_state: str = "Running") -> None:
         return _ok("ok\n")
 
     mocker.patch("agx_cli.mp.exec_in_vm", side_effect=vm_command)
+    # container_logs reads the daemon config via exec_bash; without this
+    # the check shells out to the real `multipass` (absent in CI).
+    mocker.patch("agx_cli.mp.exec_bash", return_value=_ok(""))
 
 
 def test_doctor_reports_vm_not_running_as_fail(with_coder: Path, mocker) -> None:

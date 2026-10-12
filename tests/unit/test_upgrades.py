@@ -589,6 +589,9 @@ def test_rollback_aborts_without_confirmation(with_coder: Path, mocker, cfg: Age
     upgrades_dir = cfg.paths.host_data_dir / ".upgrades"
     upgrades_dir.mkdir(exist_ok=True)
     (upgrades_dir / "coder-20260512T120000Z.tar.gz").write_bytes(b"")
+    # The prompt names the newest VM snapshot (and its age), which lists
+    # snapshots via the real backend binary unless stubbed (absent in CI).
+    mocker.patch("agx_cli.upgrades._latest_vm_snapshot", return_value=None)
     mocker.patch("agx_cli.ui.confirm", return_value=False)
     with pytest.raises(UserError, match="aborted"):
         upgrades.rollback("coder", config_path=with_coder)
