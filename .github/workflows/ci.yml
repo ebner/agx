@@ -47,4 +47,4 @@ jobs:
         run: uv run --no-sync pytest -q
 
       - name: Verify CLI entry point
-        run: uv run --no-sync agx --version && uv run --no-sync agx --help && uv run --no-sync agents --version
+        run: uv run --no-sync agx --version && uv run --no-sync agx --help

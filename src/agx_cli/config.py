@@ -10,7 +10,6 @@ pinned image tags managed by `vm init`.
 
 from __future__ import annotations
 
-import contextlib
 import os
 from pathlib import Path
 from typing import Any
@@ -31,8 +30,7 @@ def migrate_legacy_config_dir(new: Path | None = None, legacy: Path | None = Non
     """Move the pre-rename config dir to the new location, once.
 
     Only when the legacy config exists and no new one does — never
-    merges or overwrites. A symlink is left at the old directory so
-    scripts that still read it keep working. Returns True if it moved.
+    merges or overwrites. Returns True if it moved.
     """
     # Resolved at call time (not as default args) so the unit-test
     # fixture that repoints both constants keeps tests off the real ~.
@@ -40,6 +38,7 @@ def migrate_legacy_config_dir(new: Path | None = None, legacy: Path | None = Non
     legacy = legacy or LEGACY_CONFIG_PATH
     old_dir, new_dir = legacy.parent, new.parent
     if new.exists() or old_dir.is_symlink() or not legacy.is_file():
+        # (a symlinked old dir is the compat link earlier versions left)
         return False
     new_dir.parent.mkdir(parents=True, exist_ok=True)
     if new_dir.exists():
@@ -47,9 +46,6 @@ def migrate_legacy_config_dir(new: Path | None = None, legacy: Path | None = Non
         legacy.rename(new)
         return True
     old_dir.rename(new_dir)
-    # The compat link is a convenience; the move itself succeeded.
-    with contextlib.suppress(OSError):
-        old_dir.symlink_to(new_dir.name)
     return True
 
 

@@ -180,8 +180,7 @@ def main(ctx: click.Context, json_output: bool, assume_yes: bool, verbose: bool)
     if cfg_mod.migrate_legacy_config_dir():
         ui.warn(
             f"moved config {cfg_mod.LEGACY_CONFIG_PATH.parent} -> "
-            f"{cfg_mod.DEFAULT_CONFIG_PATH.parent} (CLI renamed `agents` -> `agx`; "
-            "a compatibility symlink stays at the old path)"
+            f"{cfg_mod.DEFAULT_CONFIG_PATH.parent} (CLI renamed `agents` -> `agx`)"
         )
 
     # Wire up the VM-backend dispatcher from config (if a config exists).
@@ -1869,16 +1868,6 @@ def show_config() -> None:
         ui.emit(cfg.model_dump(mode="json"))
 
     _run(body)
-
-
-def legacy_main() -> None:
-    """Entry point for the deprecated `agents` command name."""
-    if sys.stderr.isatty():
-        click.echo(
-            "note: `agents` is now `agx`; the old name is a deprecated alias.",
-            err=True,
-        )
-    main()
 
 
 if __name__ == "__main__":

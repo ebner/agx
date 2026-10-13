@@ -28,9 +28,6 @@ dev = [
 
 [project.scripts]
 agx = "agx_cli.cli:main"
-# Deprecated pre-rename name (2026-10); kept so existing crontabs and
-# muscle memory keep working.
-agents = "agx_cli.cli:legacy_main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/agx_cli"]

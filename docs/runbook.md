@@ -32,8 +32,8 @@ agx export-cron install --time 02:30,08:30,14:30,20:30   # your times; rewrites 
 agx doctor-cron install                           # likewise (keeps [doctor_cron] settings)
 ```
 
-- `agents` stays installed as a deprecated alias of `agx`, so crontab lines you haven't reinstalled keep working.
-- The first run moves the config dir and leaves a symlink `~/.config/agents -> agx`. It never overwrites an existing `~/.config/agx/config.toml`.
+- There is no `agents` command anymore, so reinstall the cron entries as above: lines still calling `agents` fail until then.
+- The first run moves the config dir. It never overwrites an existing `~/.config/agx/config.toml`.
 - Nothing about the running deployment changes: the VM name, data dir, `.agents.lock`, journals, cron markers and container names keep their old names on purpose (they identify live state).
 
 ## Day-to-day

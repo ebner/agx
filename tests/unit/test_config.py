@@ -224,15 +224,14 @@ def test_default_config_path_is_user_config_dir() -> None:
     assert expected == cfg_mod.DEFAULT_CONFIG_PATH
 
 
-def test_migrate_legacy_config_dir_moves_once_and_links(tmp_path: Path) -> None:
+def test_migrate_legacy_config_dir_moves_once(tmp_path: Path) -> None:
     legacy = tmp_path / "agents" / "config.toml"
     new = tmp_path / "agx" / "config.toml"
     legacy.parent.mkdir()
     legacy.write_text("x = 1\n")
     assert cfg_mod.migrate_legacy_config_dir(new, legacy) is True
     assert new.read_text() == "x = 1\n"
-    assert (tmp_path / "agents").is_symlink()
-    assert legacy.read_text() == "x = 1\n"  # via the compat link
+    assert not (tmp_path / "agents").exists()
     # second run: nothing to do
     assert cfg_mod.migrate_legacy_config_dir(new, legacy) is False
 
