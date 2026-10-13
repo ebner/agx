@@ -7,7 +7,7 @@
 pipx install -e .                 # macOS: brew install pipx first if missing
 # or use a venv: python3 -m venv .venv && source .venv/bin/activate && pip install -e .
 
-# (Optional) Codex CLI on host so Hermes can use Codex as LLM provider
+# (Optional) Codex CLI on host — only needed for `agx codex login` (the Codex sandbox skill)
 npm install -g @openai/codex
 
 # Bring up the VM. Pick any path your duplicity (or other host backup) covers.
@@ -21,21 +21,6 @@ agx codex login
 agx create coder --type hermes --setup
 ```
 
-## Upgrading from the `agents` command name
-
-The CLI was renamed `agents` → `agx` in 2026-10. On an existing install:
-
-```bash
-pipx uninstall agents-cli && pipx install -e .   # package is now agx-cli
-agx config                                        # first run moves ~/.config/agents -> ~/.config/agx
-agx export-cron install --time 02:30,08:30,14:30,20:30   # your times; rewrites the lines to call agx
-agx doctor-cron install                           # likewise (keeps [doctor_cron] settings)
-```
-
-- There is no `agents` command anymore, so reinstall the cron entries as above: lines still calling `agents` fail until then.
-- The first run moves the config dir. It never overwrites an existing `~/.config/agx/config.toml`.
-- Nothing about the running deployment changes: the VM name, data dir, `.agents.lock`, journals, cron markers and container names keep their old names on purpose (they identify live state).
-
 ## Day-to-day
 
 ```bash
@@ -43,7 +28,7 @@ agx list                      # what's running
 agx doctor                    # health
 agx logs coder -f             # follow logs
 agx exec coder                # TTY shell in the container
-agx exec coder hermes shell   # straight into Hermes
+agx exec coder hermes chat    # straight into Hermes
 agx export coder              # archive into <data-dir>/backups/
 ```
 
@@ -89,6 +74,8 @@ Semantics worth knowing:
 - **Successful upgrades re-baseline `defaults.<type>_image_tag`** in `~/.config/agx/config.toml`. A failed-and-rolled-back upgrade never re-baselines.
 - **`agx create` also starts on the newest upstream release** (GitHub's "latest", never a pre-release) and re-baselines the default once the agent is up. Offline, it falls back to the configured default with a warning; `--pinned` uses the default without asking GitHub, `--image-tag <T>` names one. Tags are always pinned concretely in compose — never `:latest`.
 - **Release tag ≠ image tag.** Hermes images carry the release tag verbatim (`v0.21.6`); OpenClaw images drop the `v` (release `v2026.10.1` → `openclaw/openclaw:2026.10.1`). The toolkit converts automatically, including tags you pass with `--image-tag` / `--tag`, and ignores non-version release tags such as OpenClaw's `linux-stable` desktop channel.
+- **A release without an image is skipped.** Upstream sometimes publishes a GitHub release before (or without) an image under that version tag — Hermes v0.21.7 shipped only as `:stable` / `:latest`. `create` then stays on the configured default with a warning, and `upgrade` refuses before taking any snapshot; pin an existing tag with `--tag` if you need it.
+- **Old upgrade artifacts are pruned automatically.** After every successful upgrade, `agx prune` keeps the newest `[upgrades].keep_generations` (default 2) generations of host archives, `pre-upgrade-*` VM snapshots and superseded image tags per agent. Run `agx prune [name] --dry-run` to see what it would delete; `keep_generations = 0` turns the automatic pass off.
 - **Rollback never silently discards the present.** It overwrites the agent's data dir with the pre-upgrade snapshot, so everything the agent learned or changed since (skills, memories, sessions, config) would be lost. Before overwriting, the current state is exported to `<data-dir>/backups/pre-rollback/` (never auto-pruned; restore with `agx import`); the rollback aborts if that export fails. Under `--data-dir-in-vm` a VM-snapshot restore rewinds *every* agent's data, so every agent is exported first. The prompt shows the snapshot's age. Restored credentials may be stale — OAuth refresh tokens are single-use, so expect to re-authenticate providers that rotated since the snapshot.
 - **Interrupted upgrades resume faithfully.** The journal records the original old→new tags at begin time; re-running `agx upgrade <name>` completes *that* upgrade (skipping done phases) instead of re-resolving latest — a release that appeared upstream mid-crash can't silently retarget the resume.
 
@@ -180,9 +167,8 @@ default, and allowlisted senders keep working. Groups do **not** —
 hard `return False` under `pairing` (no group pairing flow exists).
 A deployment with env-only WhatsApp config (no explicit
 `group_policy`) silently loses all group ingress at the first upgrade
-past v2026.7.1. We hit this 2026-07: groups last answered June 8
-(pre-upgrade quiet period), upgrade to v2026.7.7.2 on July 10, noticed
-July 29.
+past v2026.7.1 — and because group traffic can be quiet for weeks,
+the loss may go unnoticed for a long time.
 
 Diagnosis, in dependency order (each step rules out a layer):
 
@@ -283,7 +269,7 @@ entrypoint of your pinned Hermes image tag.
 Hermes also writes into image-baked paths *inside* the container's
 overlay filesystem — and those get wiped on every recreate.
 
-The two known targets:
+The known target:
 
 - `/opt/hermes/scripts/` — where `hermes setup` installs per-bridge
   helpers (e.g. the WhatsApp bridge's `npm install` lands at
@@ -291,24 +277,28 @@ The two known targets:
   default. Without a chown to uid 1000, `hermes setup` (or a
   re-run of one of its install branches) hits `EACCES: permission
   denied, mkdir '/opt/hermes/scripts/whatsapp-bridge/node_modules'`.
-- `/home/hermes/` — the runtime user's HOME in fragments written
-  before 2026-10 (current ones pin HOME to the persisted `/opt/data`;
-  `agx reseat` migrates). npm cache, pip cache, browser cache,
-  dotfiles. The image's `usermod -u 1000 hermes` doesn't migrate the
-  existing home dir, so it stays at the image-baked ownership.
+The toolkit chowns it after every container recreate (in
+`fixperms_cmd.chown_hermes_install_paths`, called by `agx create`,
+`agx fix-perms` and `agx reseat`) and again on every container boot
+via the cont-init hook. The runtime user's HOME is `/opt/data`, which
+is persisted, so caches and dotfiles survive recreates.
 
-The toolkit auto-chowns both after every container recreate (in
-`fixperms_cmd.chown_hermes_install_paths`) from three code paths:
-`agx create` (service_up phase), `agx fix-perms`, and
-`agx reseat`. The recursive chown still prunes `/home/hermes/.codex`:
-that is the RETIRED Codex import bridge, which agents not yet `reseat`ed
-carry mounted `:ro` (it would emit "Read-only file system" on every
-entry); once the mount is gone the prune matches nothing.
+If you ever see an `EACCES` on a path inside `/opt/hermes/` that
+*isn't* covered, add it to `fixperms_cmd.HERMES_WRITABLE_PATHS`
+rather than chowning manually.
 
-If you ever see an `EACCES` on a path inside `/opt/hermes/` or
-`/home/hermes/` that *isn't* in this list, add it to
-`fixperms_cmd.HERMES_WRITABLE_PATHS` (with prune entries for any
-ro bind-mounts under it) rather than chowning manually.
+## Remote access with Tailscale
+
+Dashboards and agent ports bind to `127.0.0.1` inside the VM. To reach them from your other devices without SSH tunnels, put the VM on your tailnet (VM backends only — on bare metal, install Tailscale on the host yourself):
+
+```bash
+agx tailscale up                        # prints a login URL; or --auth-key <key> for a non-interactive join
+agx tailscale status                    # tailnet IPs + ports published in docker-compose.override.yml
+agx tailscale down                      # leave the tailnet (tailscaled stays installed)
+agx tailscale upgrade                   # upgrade the tailscale package in the VM
+```
+
+Tailscale runs as a system service in the VM, not as a container. Ports the toolkit publishes are bound to `127.0.0.1` and stay private; to expose one on the tailnet, publish it without that prefix in `docker-compose.override.yml` (for example `9119:9119` for the Hermes dashboard).
 
 ## Observability
 
@@ -471,7 +461,7 @@ agx access list                  # registered views + mounted / not-mounted / st
 agx access unmount coder
 ```
 
-For a quick edit you don't need a view at all — see [`agx edit`](#editing-an-agents-files-agents-edit).
+For a quick edit you don't need a view at all — see [`agx edit`](#editing-an-agents-files-agx-edit).
 
 ### What it does
 
@@ -508,10 +498,6 @@ Doctor is silent if you never registered a view. Drop the fstab line again when 
 
 Requirements: Linux ≥ 5.12 with a filesystem that supports idmapped mounts (ext4, xfs, btrfs, …) and util-linux ≥ 2.39. On hosts without it (macOS, old kernels) the `mount` error is shown as-is; `agx edit` works everywhere.
 
-### Coming from `agx access grant`
-
-The ACL-based `grant`/`revoke` were retired: a directory or file created with a restrictive mode (`mkdir 0700`, `open 0600`) under a default ACL is *born* with an all-zero ACL mask, so the grant never held for the files that matter, and every entrypoint `chmod` re-masked the rest. `agx create` no longer sets ACLs either. Existing ACL entries on older agents are harmless but keep propagating to new files; `access mount` / `access list` print the one-liner to drop them (`sudo setfacl -R -b -k <dir>`).
-
 ## Sharing host folders with an agent (`agx mount`)
 
 Give an agent access to a specific folder on the host. The toolkit handles the two hops the folder needs to traverse before the agent container sees it: host → VM mount → docker bind volume. On `bare_metal` there is only one hop: the Docker daemon runs on the host and binds the folder directly.
@@ -539,7 +525,7 @@ agx mount add coder --host ~/projects/x --container /workspace/x --restart
 
 ### Defaults
 
-- **Read-only** unless `--rw`. The CLAUDE.md threat model is explicit: a prompt-injected agent can be persuaded into destructive ops on any writable mount.
+- **Read-only** unless `--rw`. The AGENTS.md threat model is explicit: a prompt-injected agent can be persuaded into destructive ops on any writable mount.
 - **`--target`** defaults per agent type: **Hermes → `both`** (runtime container + Hermes sandbox via `terminal.docker_volumes`), **OpenClaw → `runtime`** (sandbox is Hermes-only).
 - **Per-agent isolation.** On the VM backends each agent gets its own VM-side mount target at `/home/ubuntu/host-extras/<agent>/<hash>-<basename>` — no cross-agent sharing. Two agents wanting the same host folder both run `agx mount add`. On `bare_metal` the bind source is the host folder itself.
 
@@ -561,7 +547,7 @@ agx mount add coder --host ~/projects/x --container /workspace/x --restart
 
 ### Reserved container paths
 
-The toolkit refuses container paths that would shadow its own bind mounts: `/opt/data`, `/home/hermes`, `/home/hermes/.codex`, `/home/node`, `/home/node/.openclaw`, `/run`, `/proc`, `/sys`, `/dev`, `/etc`, `/usr`, `/var`, `/`. Pick something under `/workspace/`.
+The toolkit refuses container paths that would shadow its own bind mounts or the agent's install: `/`, `/opt`, `/opt/data`, `/opt/hermes`, `/home/hermes`, `/home/node`, `/home/node/.openclaw`, `/run`, `/proc`, `/sys`, `/dev`, `/etc`, `/usr`, `/var` — and anything beneath them (other than `/` itself). Pick something under `/workspace/`.
 
 ### Restart required
 
@@ -684,7 +670,7 @@ Symptom of a dead credential: the agent answers *"Provider authentication failed
 - **Keep answering:** `fallback_providers` in the agent's `config.yaml` (a cheap OpenRouter model; Hermes fails over immediately on 401/403).
 - **Hear about it within 15 min:** `agx doctor-cron install --mail you@example.org` (below).
 - **Re-auth from anywhere:** the device-code URL works from a phone browser; with `agx tailscale up` + an SSH app you can run the `hermes auth add` line from the phone too.
-- **Never** `agx codex refresh` / `agx codex login` "for the agent" — the retired import bridge is why that used to invalidate agents' tokens; `agx reseat <name>` removes the bridge mount from agents created before 2026-09.
+- **Never** use `agx codex login` "for the agent": that login only feeds the Codex sandbox skill. The agent's provider credential is a separate login owned by Hermes (see [codex-integration](codex-integration.md)).
 
 ## doctor-cron
 
@@ -748,8 +734,9 @@ For strict crash consistency on a specific agent, stop it first: `agx stop coder
 default `<data-dir>/backups/` directory, the toolkit deletes that
 agent's oldest archives, keeping only the newest `keep_last`
 (default **14**). Only files matching the toolkit's own naming pattern
-(`<agent>-<utc>.tar.zst`, plus the legacy `.tar.gz` form) are pruning
-candidates — user files, other agents' archives, and the
+(`<agent>-<utc>.tar.zst`, matched exactly) are pruning
+candidates — user files, other agents' archives (including agents whose
+name starts with the same prefix), and the
 `.export-cron.log` are left alone. Archives written to a custom
 `--to <path>` destination are **never** pruned; custom destinations
 are user-managed.
@@ -1054,7 +1041,7 @@ If the card isn't there: the device isn't bound to vfio-pci. `lspci -k -d <vendo
 
 | Behavior | Multipass | libvirt |
 |---|---|---|
-| Cross-platform | Linux/macOS/Windows | Linux only |
+| Cross-platform | Linux/macOS | Linux only |
 | GPU passthrough | Not supported | Auto-detect NVIDIA/AMD/Intel |
 | VM provisioning | `multipass launch` (one shot) | virt-install + cloud-init seed ISO + ssh wait |
 | Exec into VM | `multipass exec` | `ssh ubuntu@<ip>` (key auth) |
@@ -1141,7 +1128,7 @@ Bare-metal runs agent containers directly on the host with rootless Docker — n
 
 ### What you trade away
 
-- **The VM trust boundary.** A compromised agent that escapes a container is on your host, period. CLAUDE.md's defense-in-depth rationale leans on the VM to absorb skill-marketplace malware; bare-metal forfeits that. Only use bare-metal where the host is *already* trusted.
+- **The VM trust boundary.** A compromised agent that escapes a container is on your host, period. AGENTS.md's defense-in-depth rationale leans on the VM to absorb skill-marketplace malware; bare-metal forfeits that. Only use bare-metal where the host is *already* trusted.
 - **Full-state rollback during upgrades.** `agx upgrade` still snapshots the host data-dir via tarball (so agent state can be reverted), but there's no VM snapshot of the rootless-Docker engine or OS state.
 - **Snapshots in general.** `agx vm snapshot` / `restore` refuse on bare-metal — use `agx export` for data archives, and host-level tools (duplicity, restic, btrfs/zfs) for full-host snapshots.
 
@@ -1174,7 +1161,7 @@ systemctl --user enable --now docker.service
 docker version
 ```
 
-If you already have a `daemon.json`, merge the `log-driver` / `log-opts` keys into it by hand. `agx vm init` warns when rotation is missing, and `agx doctor`'s `container_logs` check keeps warning — it also names containers created before rotation was set up (recreate them with `agx reseat <name>`). Without it, one chatty container fills your **host** root fs (the 2026-08 outage class, see CLAUDE.md).
+If you already have a `daemon.json`, merge the `log-driver` / `log-opts` keys into it by hand. `agx vm init` warns when rotation is missing, and `agx doctor`'s `container_logs` check keeps warning — it also names containers created before rotation was set up (recreate them with `agx reseat <name>`). Without it, one chatty container fills your **host** root fs (the 2026-08 outage class, see AGENTS.md).
 
 If `/var/run/docker.sock` already exists (rootful Docker), the toolkit will refuse to run on top of it — uninstall rootful first or migrate via `dockerd-rootless-setuptool.sh install`. The toolkit's security model assumes the rootless user namespace; running on rootful would put compromised containers' processes as effective root on the host.
 

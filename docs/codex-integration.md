@@ -16,7 +16,7 @@ agx exec coder -- hermes auth add openai-codex --type oauth --no-browser
 
 Device-code flow: it prints a URL + code; open the URL on **any** browser that is logged into the ChatGPT account (phone included — combined with `agx tailscale up` + an SSH app this is the "re-auth from anywhere" path). The credential lands in the agent's pooled auth store at `/opt/data/auth.json` (persistent: `/opt/data` is `$HERMES_HOME` on the bind-mounted data dir), and `agx exec coder -- hermes auth list openai-codex` shows it.
 
-**Why not the old "import bridge"?** The toolkit used to bind-mount `<data-dir>/.codex` read-only at `/home/hermes/.codex` so `hermes setup` could seed a credential from it. ChatGPT-subscription OAuth uses a **single-use refresh-token chain**: the seeded credential and the host file were two copies of one chain, so any refresh of the host copy (`agx codex refresh`, or the Codex CLI itself) rotated the token under the running agent — *"Your authentication token has been invalidated"* — and the two could never both stay valid. The bridge is gone from the compose fragment; `agx reseat <name>` removes it from agents created before. Hermes also suppresses re-seeding once you `hermes auth remove` a bridge-seeded credential ("Suppressed openai-codex device_code source").
+**Why the agent gets its own login, not a copy of the host's.** ChatGPT-subscription OAuth uses a **single-use refresh-token chain**. Earlier versions of this toolkit mounted `<data-dir>/.codex` into the agent so `hermes setup` could seed a credential from it — but then the host file and the agent's credential were two copies of one chain, and any refresh of either rotated the token under the other (*"Your authentication token has been invalidated"*). So the agent's provider login is created inside the container and owned by Hermes alone.
 
 **Expiry is not solved by any of this.** Upstream Hermes has an unresolved class of "Codex OAuth dies every 1–3 weeks although the token is not expired; the internal refresh stalls" ([NousResearch/hermes-agent#65346](https://github.com/NousResearch/hermes-agent/issues/65346)). Mitigations that work:
 
@@ -76,7 +76,7 @@ The Codex CLI honors a `CODEX_HOME` env var to relocate its auth directory. The 
 - A `⚠ less than 7 days` warning when re-login is needed soon
 - Per-Hermes-agent skill-enable state and current sandbox image
 
-Re-login with `agx codex login` when it expires. **`agx codex refresh` is retired** (hidden stub, exit 1): a silent refresh rotates the single-use refresh chain, which is exactly what invalidated agents' provider credentials under the old import bridge. The sandbox mounts the file `:ro`, so the Codex CLI inside the sandbox cannot persist its own refreshes either — for heavy skill use, expect to `agx codex login` periodically.
+Re-login with `agx codex login` when it expires. The toolkit never refreshes this login on your behalf: a silent refresh would rotate the single-use refresh chain. The sandbox mounts the file `:ro`, so the Codex CLI inside the sandbox cannot persist its own refreshes either — for heavy skill use, expect to `agx codex login` periodically.
 
 ## Cheat sheet
 

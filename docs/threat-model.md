@@ -4,7 +4,7 @@
 
 2026 has been rough for this class of software:
 
-- Multiple skill-marketplace malware incidents (~12% malicious-skill rate documented across two large agent ecosystems).
+- Multiple reported waves of malicious skills in agent skill marketplaces.
 - A wave of CVEs in agent runtimes that execute LLM-generated shell commands.
 - Supply-chain attacks via typosquatted image registries.
 
@@ -24,7 +24,7 @@ only the outer boundary changes:
 
 | Backend | Outer trust boundary | Notes |
 |---|---|---|
-| `multipass` (default) | **The VM.** A whole Ubuntu instance isolated by the platform hypervisor (KVM/qemu on Linux; Multipass's native driver on macOS/Windows). | Cross-platform default. Container break-out ends inside the VM. |
+| `multipass` (default) | **The VM.** A whole Ubuntu instance isolated by the platform hypervisor (KVM/qemu on Linux; Multipass's native driver on macOS). | Cross-platform default. Container break-out ends inside the VM. |
 | `libvirt` | **The VM.** Same guarantee as multipass — Ubuntu guest under KVM/qemu. | Linux-only, experimental. Exists for GPU passthrough (vfio-pci hostdev attach). |
 | `bare_metal` | **The host itself — there is no VM.** A compromised agent that escapes its container reaches the host directly. | Linux-only, opt-in. `vm init` warns explicitly: *"the VM trust boundary is forfeited … Only use this on single-user dev workstations where the host is already trusted."* Rootless Docker (never rootful — the toolkit refuses a rootful socket) is the only remaining isolation layer. |
 
@@ -81,11 +81,11 @@ The CLI refuses any image whose `(registry, repo)` isn't on the explicit allowli
 
 ### 5. Dashboard binding
 
-Hermes' web dashboard always binds `127.0.0.1` only. The CLI refuses any `dashboard.address` change to `0.0.0.0` (or anything else than `127.0.0.1` / `localhost` / `::1`). Remote access goes through SSH port-forwarding.
+Hermes' web dashboard always binds `127.0.0.1` only. The CLI refuses any `dashboard.address` change to `0.0.0.0` (or anything else than `127.0.0.1` / `localhost` / `::1`). Remote access goes through SSH port-forwarding or the VM's Tailscale node (`agx tailscale up`).
 
 ### 6. Compose-file mutation
 
-The compose file is the CLI's, not the user's. Any external write would be overwritten on the next `agx create`/`remove`/`upgrade`. Users with legitimate customizations use `docker-compose.override.yml`, which the CLI leaves untouched and which `docker compose` merges automatically.
+The compose file is the CLI's, not the user's. Any external write would be overwritten on the next `agx create`/`remove`/`upgrade`. Users with legitimate customizations use `docker-compose.override.yml`, which the CLI only ever appends to (via `agx mount`), never rewrites, and which `docker compose` merges automatically.
 
 The atomic-write contract (flock + stage in project dir + `docker compose config -q` validate + same-filesystem `os.replace`) ensures partial writes never appear in the live file even on a host crash mid-mutation. `cleanup_stale_temps` sweeps temp files left by prior crashes on startup.
 
@@ -98,4 +98,4 @@ Every multi-phase op (`create`, `remove`, `rename`, `upgrade`) writes a journal 
 - Sophisticated lateral movement once a container is compromised. The VM is the boundary; a VM compromise is a VM compromise.
 - Network-level egress filtering. The user's host firewall is the right layer.
 - Skill-marketplace curation or static scanning. Skills land in `<data-dir>/<name>/.data/skills/` and are subject to the trust model above.
-- Off-site backup encryption. The user's host backup (duplicity, restic, borg, …) owns that.
+- Off-site backup encryption. The host backup (e.g. duplicity or restic) owns that.

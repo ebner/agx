@@ -26,7 +26,7 @@ Also: `/personality <name>` inside an interactive Hermes session is a **temporar
 
 ## 3. How many agents do you actually need?
 
-**Rule of thumb: one container = one agent = one Hermes installation = one bot identity.** Upstream Hermes positions profiles as full production agents, and its own default Docker topology is one container hosting many profile gateways. This toolkit deliberately doesn't follow that default: the container is the isolation boundary profiles don't provide (upstream is explicit that profiles do not sandbox the agent), and the toolkit's management surface targets one Hermes home per container. Here, profiles are a within-container tool for *interactive* second `$HERMES_HOME`s (scratch personas, A/B tests, state-contained experiments — see §6) — in this toolkit they don't (yet) unlock managed extra bots or dashboards (GH #6), auto-routing doesn't exist natively, and any of those wants another container for now.
+**Rule of thumb: one container = one agent = one Hermes installation = one bot identity.** Upstream Hermes positions profiles as full production agents, and its own default Docker topology is one container hosting many profile gateways. This toolkit deliberately doesn't follow that default: the container is the isolation boundary profiles don't provide (upstream is explicit that profiles do not sandbox the agent), and the toolkit's management surface targets one Hermes home per container. Here, profiles are for personas that share a trust level: several `$HERMES_HOME`s in one container, each optionally with its own messaging gateway (see §6). The toolkit manages them through `--profile` flags; anything with a different risk level gets its own container.
 
 Your instinct will be "one agent per topic" — *finance*, *family*, *health*, etc. Resist it. Start small and earn the splits.
 
@@ -68,16 +68,19 @@ If none of those apply, you probably don't need a second container.
 
 **Profiles are not a security boundary.** The Hermes docs are explicit: "Profiles do not sandbox the agent." Every profile in a container has the same filesystem access, and tool subprocesses share the real `HOME` across profiles by default (opt into stricter separation per profile with `terminal.home_mode: profile` in that profile's `config.yaml`). If a persona handles data that must survive another persona's compromised skill, that's a second container (criterion 5 above), full stop.
 
-**Profiles are not (yet) this toolkit's way to run more bots.** Upstream supports it — in the official image each profile's gateway is a first-class s6-supervised service, and upstream's default topology is one container running all profile gateways side by side. The mechanics work in this toolkit's containers (spike-verified, with tier-1 guardrails landed: boot-time log-dir pre-create + a doctor watch — see §6), but secondary profiles' *configuration* stays outside the toolkit, and each gateway needs its own bot token anyway — at which point a second toolkit agent buys real isolation for the same token cost. Profile-aware management (tier 2) is tracked in GH #6.
+**Profiles are not a substitute for a second container when trust differs.** Upstream runs each profile's gateway as a first-class s6-supervised service, and this toolkit supports that (see §6): the cont-init hook and `agx doctor` cover profile gateways, and `agx secret`, `agx model use`, `agx memory` and `agx conversations` accept `--profile`. But every profile in a container can read every other profile's files, so personas with different sensitivity still belong in separate toolkit agents.
 
-**Profiles are not a way to multiplex one Mattermost (or Slack/Discord) bot across personas.** Each profile that runs a gateway binds its own bot token; two profiles cannot share a bot. The Hermes docs are explicit:
+**Independent profile gateways cannot share a bot token.** The Hermes docs are explicit:
 
 > Each profile runs its own gateway as a separate process with its own bot token. If two profiles accidentally share a token, the second gateway will be blocked with a clear error naming the conflicting profile.
 
-So "one container, three profiles, one Mattermost bot routing per channel" — that pattern does not exist natively. If you want channel-aware persona switching, you have three options:
+Since v2026.8, Hermes' *multiplexed* gateway mode is the exception: one bot token can serve several profiles, routed by guild, chat or thread id (`profile_routes`). One unsafe security setting in any routed profile stops the whole multiplexer.
+
+If you want channel-aware persona switching, you have four options:
 
 - **One bot, one voice, topical skills** (the default above; the bot adapts to context via skills).
 - **One bot, one voice, `/personality <name>` runtime overlay** (manual: the bot still defaults to the agent's `SOUL.md`, but interactive users can switch the voice mid-session).
+- **One bot, several profiles, multiplexed routing** (`profile_routes`): one container, one bot token, a profile per channel or chat. Each persona gets its own state and secrets, but they share a trust level (see above).
 - **Separate bot users + separate toolkit agents** — one container per persona, each with its own Mattermost bot user. Use this when the personas really are different agents with different skills, different LLM, or different data-blast-radius needs.
 
 ### Worked examples for the finance/family/health scenario
@@ -228,7 +231,7 @@ agx ollama configure --url https://api.groq.example/v1 --api-key gsk_…
 Switch backends with `agx memory disable coder` followed by another
 `enable`. `agx memory status` shows what's wired and (for
 holographic) flags the SQLite-on-9p / missing-NumPy risks described in
-`CLAUDE.md`.
+`AGENTS.md`.
 
 ### 4.4 Connect to a messaging platform
 
@@ -254,16 +257,7 @@ agx exec coder hermes gateway          # status / live runtime
 agx exec coder hermes whatsapp         # pairing code flow
 ```
 
-**Mattermost / Matrix / Discord / IRC / Rocket.Chat / Teams** — *not first-class as of Hermes v1.x*. Two viable paths:
-
-1. Check the skill registry — community skills may exist:
-   ```bash
-   agx exec coder hermes skills search mattermost
-   agx exec coder hermes skills search matrix
-   ```
-2. Or write/find a custom gateway adapter and drop it under `$HERMES_HOME/gateway/adapters/`. See the Hermes Developer Guide section *Extending the gateway*.
-
-If you discover a working community skill or adapter, please open a PR adding it to this section.
+**Mattermost, Matrix, Discord, Teams, IRC, email, SMS and more** ship with Hermes as bundled platform plugins (v0.21.6 includes discord, email, google_chat, irc, matrix, mattermost, slack, sms, teams, telegram and whatsapp, among others). Configure them with `agx setup coder` or by following the [Hermes messaging docs](https://hermes-agent.nousresearch.com/docs). For a platform that isn't bundled, search the skill registry (`agx exec coder hermes skills search <platform>`) or write a gateway adapter — see *Adding a platform* in the Hermes developer guide.
 
 #### Networking considerations
 
@@ -379,7 +373,7 @@ Worth knowing before you lean on them:
 
 - **Backups cover profiles automatically.** Profile data lives at `<data-dir>/coder/.data/profiles/<profile-name>/` on the host, so `agx export coder` and your host backup cover all profiles inside that container.
 - **Two clone flavors.** `--clone` copies config, `.env`, `SOUL.md`, and skills. `--clone-all` additionally copies memories, cron jobs, and plugins — but never per-profile history (`state.db`, `backups/`, `checkpoints/`), which can reach tens of GB. Because `--clone` copies `.env`, a cloned profile inherits the default's bot token — harmless, since Hermes refuses to start a second gateway on a token already in use.
-- **The toolkit manages the default profile only.** `agx secret set` (the `terminal.env_passthrough` half), `agx model use`, `agx ollama configure`, `agx conversations`, `agx memory`, the dashboard `0.0.0.0` refusal, and doctor's per-agent Hermes probes all read/write the *default* profile's `config.yaml` and `state.db`. Secondary profiles are yours to manage by hand via `agx exec <agent> hermes -p <profile> …` — the toolkit neither sees nor validates them.
+- **Toolkit commands target the default profile unless you pass `--profile`.** `agx secret set/unset/clear` (the `terminal.env_passthrough` half — the `.env` half is container-wide), `agx model use`, `agx memory enable/disable` (holographic and mem0; openviking is per agent) and `agx conversations` all take `--profile <name>`; `agx profile list <agent>` shows what exists. The dashboard `0.0.0.0` refusal applies to every profile, and doctor sweeps all profile configs. Creating and deleting profiles stays with Hermes: `agx exec <agent> hermes profile create <name>`.
 - **No privilege isolation between profiles.** Same container, same uid, same filesystem access; tool subprocesses share the real `HOME` across profiles by default (`terminal.home_mode: profile` opts a profile's tools into `$HERMES_HOME/home` instead). The container is the security boundary, not the profile.
 - **`hermes update` upgrades all profiles at once.** Profiles share the installation, so there's no per-profile version pinning or canarying — that's a per-container property (§3 criterion 3).
 
@@ -394,11 +388,10 @@ The toolkit backs this with two guardrails (GH #6 tier 1):
 - The cont-init hook pre-creates **every existing profile's** gateway log dir on each container boot, not just the default's. This covers restored or imported data dirs, which arrive without the log tree and would otherwise hot-loop the log service. Restart the agent after restoring an archive (or after creating a profile you plan to gateway-expose) so the hook runs.
 - `agx doctor` warns when a profile whose `gateway_state.json` wants `running` has its s6 service down or its log service flapping, with the remediation in the message.
 
-Still, a gateway-exposed secondary profile remains **mostly unmanaged** (GH #6 tier 2):
+Management goes through the same commands as for the default profile, with `--profile <name>` (see the list above). Two things to keep in mind:
 
-1. **One bot token per gateway, enforced.** Each profile needs its own Slack/Mattermost/Discord bot account. If you're provisioning a second bot anyway, a profile saves you almost nothing over a second toolkit agent.
-2. **Config stays outside the toolkit.** No `agx conversations`, no secrets/`env_passthrough` wiring, no config validation (including the `0.0.0.0` dashboard refusal) for secondary profiles — you manage them by hand via `agx exec <agent> hermes -p <profile> …`.
-3. **The dashboard isn't reachable.** The compose fragment publishes only the default profile's dashboard port to the host loopback; a secondary profile's dashboard binds a port nothing forwards.
+1. **Bot tokens.** Independent profile gateways need one bot account each; Hermes' multiplexed mode (`profile_routes`) lets one token serve several profiles instead.
+2. **Dashboard.** One dashboard instance (`HERMES_DASHBOARD=1`, port 9119) serves all profiles in the container, switching per request — no extra ports needed.
 
 If a second gateway-exposed persona is worth a bot token, it's usually worth a container: `agx create <name> --type hermes` buys full doctor coverage, independent upgrade/rollback, resource caps, and a real isolation boundary. The sweet spot for profile gateways is a **pod**: several same-trust-domain personas sharing one container, with containers still separating trust domains.
 

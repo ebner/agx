@@ -3,7 +3,7 @@
 ```
 ┌──────────────────────────────── host ─────────────────────────────────┐
 │                                                                       │
-│   $ agents …                                                          │
+│   $ agx …                                                             │
 │        │                                                              │
 │        ▼                                                              │
 │   ┌────────────┐    ┌───────────────────────────────┐                 │
@@ -74,7 +74,7 @@ plus the dispatcher, never to `mp.py` alone.
 ## Data flow
 
 1. **`agx vm init`** provisions the runtime for the selected `--backend`: `multipass launch` on the default backend, cloud-image download + seed ISO + `virt-install` + SSH-wait on libvirt, and *no VM at all* on bare-metal (a verify-only probe of the host's rootless-Docker prerequisites). VM backends mount the host `<data-dir>` at `/home/ubuntu/agents` with explicit UID/GID mapping (host-mount mode) or skip the mount (`--data-dir-in-vm`), then run the bootstrap script (`templates.VM_BOOTSTRAP_SCRIPT`). The script emits a final `BOOTSTRAP_OK ...` line; `mp.parse_bootstrap_ok` reads it. Captured fields (rootless docker socket path, ubuntu UID/GID, etc.) land in `~/.config/agx/config.toml` under `[vm_runtime]`. Seed files (`docker-compose.yml`, `.env`, `.codex/`, `backups/`, `.upgrades/`) are written host-side in host-mount mode; in `--data-dir-in-vm` mode they're written VM-side via `exec_bash` and only `.journal/` lives on the host. On bare-metal, `vm_agents_root` is set to the host data-dir so compose paths need no translation.
-2. **`agx create`** allocates a free port (inside the flock), ensures the pinned image is pulled (the compose fragment pins the runtime `user:` and `HOME` explicitly, so image USER/HOME drift between releases doesn't matter), writes a service fragment into `docker-compose.yml` via the staged-transfer mutation pattern, then `docker compose up -d <service>` inside the VM. Per-agent paths are bind-mounted from the host so backups round-trip cleanly. `--reuse-data` is allowed only if no live container currently maps the dir.
+2. **`agx create`** allocates a free port (inside the flock), ensures the pinned image is pulled (the Hermes fragment pins `HOME` and `PATH` to the image's own values and deliberately sets no `user:` override under rootless Docker), writes a service fragment into `docker-compose.yml` via the staged-transfer mutation pattern, then `docker compose up -d <service>` inside the VM. Per-agent paths are bind-mounted from the host so backups round-trip cleanly. `--reuse-data` is allowed only if no live container currently maps the dir.
 3. **`agx upgrade`** resolves the target tag first — bare `upgrade <name>` implicitly fetches the latest upstream tag from GitHub Releases (`--tag` pins explicitly, `--recreate` force-refreshes at the current pin) and no-ops without downtime when the agent is already at the target. Otherwise it takes two snapshots (host-data `.tar.zst` + VM snapshot), pins the new tag via compose mutation, pulls, verifies via `docker image inspect`, recreates, runs `hermes config migrate` (Hermes only), then runs `doctor`. Auto-reverts the compose tag on any failure; both snapshot ids are reported so the user can `agx rollback <name>` (or `--snapshot <id>` to pick a specific one). Interrupted upgrades resume from a journal that recorded the original old→new tags.
 4. **`agx doctor`** runs a layered health probe (VM reachable, mount round-trip, rootless docker service active, disk/memory/load, port conflicts, dangling journals, Codex auth + token expiry; per-agent: container state, docker socket, `hermes doctor`, `/opt/data` access, Codex mount, version pin-vs-running drift; project-level: firecrawl and inference stack health when installed, registered host views mounted).
 
@@ -109,9 +109,13 @@ The cost is 9p/virtiofs mount overhead for SQLite-heavy workloads. The opt-out i
 | `agents_cmd.py` | create / list / remove / rename / reseat. |
 | `ops.py` | start / stop / restart / logs / exec / setup / doctor. |
 | `upgrades.py` | Implicit-latest resolution + two-snapshot state machine with rollback and journal resume. |
+| `prune_cmd.py` | `agx prune` — generation-counted retention of upgrade artifacts (host archives, `pre-upgrade-*` VM snapshots, superseded image tags); also run automatically after each successful upgrade. |
+| `migrate_cmd.py` | `agx vm migrate-data` — moves agent state from the host-mounted data dir onto the VM disk (switching an existing deployment to `--data-dir-in-vm`), with export archives as the safety net. |
+| `profile_cmd.py` | `agx profile list` — read-only listing of a Hermes agent's profiles (config/state presence, gateway desired vs. actual state). |
+| `tailscale_cmd.py` | `agx tailscale {up,down,status,upgrade}` — tailscaled as a systemd service in the VM (not a container: rootless Docker can't own `/dev/net/tun`). Refused on bare metal. |
 | `outdated_cmd.py` | `agx outdated`: classify each agent against the latest GitHub Releases tag (current / outdated / unknown). |
 | `export_cmd.py` | export / import / host-cron integration. Auto-prunes the default backups dir to `[export_cron].keep_last`. |
-| `archive.py` | tar.zst helpers shared by export and upgrade snapshots. |
+| `archive.py` | Archive naming shared by exports and upgrade snapshots (suffix + exact `<name>-<utc>` match); the archives themselves are written by `tar --zstd` in the VM. |
 | `codex.py` | Codex login / status / skill-enable / skill-disable — the sandbox *skill* only; provider auth is in-container `hermes auth add`. `refresh` retired (hidden stub). |
 | `doctor_cron.py` | `agx doctor-cron {install,uninstall,status,run}` — host cron running doctor, mails on state change via host `sendmail`. |
 | `ollama_cmd.py` | configure / status / clear for an **external** Ollama / OpenAI-compatible endpoint. Stores URL + model names in `[ollama]`; stores bearer token (if any) in `<data-dir>/.env`, never in TOML. Refuses `localhost` URLs. |

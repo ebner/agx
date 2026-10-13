@@ -2,7 +2,9 @@
 
 [![CI](https://github.com/ebner/agx/actions/workflows/ci.yml/badge.svg)](https://github.com/ebner/agx/actions/workflows/ci.yml)
 
-Host-side CLI for managing AI agents (Hermes Agent from Nous Research, OpenClaw) as rootless-Docker containers behind a pluggable isolation backend:
+`agx` runs a few long-lived AI agents — [Hermes Agent](https://github.com/NousResearch/hermes-agent) by Nous Research and [OpenClaw](https://github.com/openclaw/openclaw) — on hardware you own. Each agent gets its own rootless Docker container, all inside one VM, with pinned images, upgrades that can roll back, health checks with mail alerts, and scheduled exports of each agent's state to a directory your regular backup covers.
+
+The host-side CLI drives one of three isolation backends:
 
 - **`multipass`** (default, cross-platform) — a single Multipass VM; the host shells out only to `multipass`.
 - **`libvirt`** (Linux-only, experimental) — a KVM/qemu VM driven via `virt-install`/`virsh` + ssh/scp; enables GPU passthrough.
@@ -10,16 +12,19 @@ Host-side CLI for managing AI agents (Hermes Agent from Nous Research, OpenClaw)
 
 Defense in depth (VM backends): outer isolation = VM, inner isolation = one rootless container per agent. Pick the backend at `agx vm init --backend …`; see [docs/threat-model.md](docs/threat-model.md) for what each trades away and [docs/runbook.md](docs/runbook.md) for the libvirt / bare-metal setup guides.
 
+## Requirements
+
+- A Linux or macOS host with Python 3.11+.
+- For the default backend: [Multipass](https://canonical.com/multipass) (`sudo snap install multipass` / `brew install --cask multipass`). The VM defaults to 4 vCPUs, 8 GB RAM and a 25 GB disk (`agx vm init --cpus/--memory/--disk`).
+- For `libvirt` or `bare_metal`: see the setup guides linked under [Choosing a backend](#choosing-a-backend).
+
 ## Quickstart
 
 ```bash
-# 1. Install the host-side CLI (requires Python 3.11+).
-#    Recommended: pipx — installs into an isolated env, gets `agx` on $PATH,
-#    works on Homebrew / Debian / Ubuntu 24+ where pip refuses (PEP 668).
-pipx install -e .                 # macOS: brew install pipx first if missing
-# or, if you prefer a manual venv:
-#   python3 -m venv .venv && source .venv/bin/activate && pip install -e .
-#    Upgrading from the old `agents` command name? See docs/runbook.md#upgrading-from-the-agents-command-name
+# 1. Install the host-side CLI. pipx puts `agx` on your PATH in an isolated
+#    environment (macOS: `brew install pipx` first if missing).
+pipx install git+https://github.com/ebner/agx.git
+# For development: git clone https://github.com/ebner/agx.git && cd agx && pipx install -e .
 
 # 2. (Optional) Install Codex CLI on the host if you want a toolkit-scoped Codex account
 npm install -g @openai/codex
@@ -59,7 +64,7 @@ agx export-cron status
 agx list
 agx doctor
 agx logs coder -f
-agx exec coder -- hermes shell
+agx exec coder -- hermes chat
 ```
 
 For the full lifecycle — Hermes profiles vs. personalities vs. skills, connecting to Slack / WhatsApp / Mattermost / Matrix, and the OpenClaw flow — see [docs/tutorial.md](docs/tutorial.md). The [runbook](docs/runbook.md) is the cheat-sheet.
@@ -70,7 +75,7 @@ All three backends run the same compose project through the same commands — `c
 
 | | `multipass` (default) | `libvirt` | `bare_metal` |
 |---|---|---|---|
-| Host OS | macOS / Linux / Windows | Linux, experimental | Linux |
+| Host OS | Linux / macOS | Linux, experimental | Linux |
 | Outer trust boundary | VM | VM | **none — the host** |
 | Bootstrap | installs rootless Docker in the VM | same | **verify-only**: you install the prerequisites, the toolkit checks them |
 | Container-log rotation | written by the bootstrap | same | **you** write `~/.config/docker/daemon.json` (`vm init` and `doctor` warn until you do) |
@@ -88,16 +93,32 @@ Pick `bare_metal` only where the host is already trusted (single-user workstatio
 
 **One backend per host user.** `~/.config/agx/config.toml` selects exactly one backend, and the cron entries (`export-cron`, `doctor-cron`) are per-user singletons, so one user cannot run a VM deployment and a bare-metal deployment side by side. Two separate Linux users (each with its own config, data dir, crontab and rootless Docker) can — see [the runbook](docs/runbook.md#running-a-vm-deployment-and-bare-metal-side-by-side).
 
+## How agx compares
+
+agx is for running a few **long-lived personal agents around the clock on hardware you own**, with their state on your own disk. Other ways to run Hermes or OpenClaw solve different problems:
+
+| | Isolation | Where agent state lives | Built for |
+|---|---|---|---|
+| **agx** | One VM (or none, on bare metal) shared by all agents + one rootless container per agent | Host directory you back up yourself | 24/7 messaging agents; pinned versions, upgrade with rollback, health alerts, scheduled exports |
+| **Upstream Docker images** ([Hermes](https://hermes-agent.nousresearch.com/docs/user-guide/docker), [OpenClaw](https://docs.openclaw.ai/install/docker)) | One container on your regular Docker daemon | Host bind mount | The quickest start; upgrades, backups and monitoring are up to you |
+| **Agent-side tool sandboxing** (Hermes [terminal backends](https://hermes-agent.nousresearch.com/docs/user-guide/configuration), OpenClaw [sandboxing](https://docs.openclaw.ai/gateway/sandboxing)) | Only the commands the agent's tools run; the agent process itself, with its credentials and memory, is not isolated | Unchanged | Complementary — usable inside an agx agent too |
+| **[Docker Sandboxes](https://docs.docker.com/ai/sandboxes/)** (`sbx`, with community [Hermes](https://hub.docker.com/r/sbx/hermes-agent-kit) and [OpenClaw](https://hub.docker.com/r/sbx/openclaw) kits) | One microVM per agent, outbound traffic limited to an allow-list, API keys injected by a host proxy | Inside each sandbox (removed with it) | Interactive coding-agent sessions on a developer machine |
+| **[NanoClaw](https://nanoclaw.dev/)** | Agents in containers (Docker / Apple Container) | Per-group mounted directories | A different assistant (Claude Agent SDK) designed around container isolation |
+| **Hosted templates** (e.g. [Railway](https://railway.com/deploy/hermes-agent-official)) | The provider's | The provider's servers | Not running hardware yourself |
+
+Where agx is weaker today: all agents share one VM (sbx gives each its own), agents can reach any host on the internet (sbx enforces an allow-list), and API keys live in the agent's container environment (sbx and NanoClaw keep them in a host-side proxy or vault).
+
 ## Command overview
 
 | Command | What it does | Docs |
 |---|---|---|
-| `agx vm init/start/stop/status/shell/resize/rebuild/snapshot/restore/destroy` | Runtime lifecycle for the selected backend (`--backend multipass\|libvirt\|bare_metal`) | [runbook](docs/runbook.md) |
+| `agx vm init/start/stop/status/shell/resize/rebuild/snapshot/snapshots/restore/migrate-data/destroy` | Runtime lifecycle for the selected backend (`--backend multipass\|libvirt\|bare_metal`) | [runbook](docs/runbook.md) |
 | `agx create/list/remove/rename` | Agent CRUD (`remove --export-first` bags a final archive) | [tutorial](docs/tutorial.md) |
 | `agx start/stop/restart/logs/exec/setup` | Day-2 container ops | [runbook](docs/runbook.md) |
 | `agx doctor [name]` | Layered health checks: VM, mount, docker, per-agent probes, version pin-drift | [runbook](docs/runbook.md) |
 | `agx outdated [name]` | Which agents are behind upstream (GitHub Releases) | [runbook](docs/runbook.md) |
 | `agx upgrade [name]` / `rollback` / `pull` | Bare `upgrade` implicitly targets the latest upstream tag; `--tag` pins, `--recreate` force-refreshes; two-snapshot rollback safety | [runbook](docs/runbook.md) |
+| `agx prune [name]` | Delete old upgrade artifacts (archives, VM snapshots, superseded images); also runs after every successful upgrade | [runbook](docs/runbook.md#upgrades) |
 | `agx reseat <name>` | Rewrite an agent's compose block from the current template after toolkit upgrades | [runbook](docs/runbook.md) |
 | `agx fix-perms <name>` | Remediate the recurring `/opt/data` permission-drift bug (Hermes) | [runbook](docs/runbook.md) |
 | `agx export/import` / `export-cron` | Archives into `<data-dir>/backups/` + host-cron scheduling; auto-prunes to `keep_last` | [runbook](docs/runbook.md) |
@@ -112,6 +133,8 @@ Pick `bare_metal` only where the host is already trusted (single-user workstatio
 | `agx inference up/down/status/load/unload` | **In-VM** local inference (Ollama, llama.cpp) as sibling services | [runbook](docs/runbook.md) |
 | `agx model pull/list/rm/use` | Local model lifecycle + wiring an agent to an engine | [runbook](docs/runbook.md) |
 | `agx firecrawl up/down/status/logs/destroy` | Project-scoped self-hosted Firecrawl stack, digest-pinned | [runbook](docs/runbook.md) |
+| `agx profile list <name>` | List a Hermes agent's profiles; most Hermes commands take `--profile` | [tutorial](docs/tutorial.md) |
+| `agx tailscale up/down/status/upgrade` | Put the VM on your tailnet, e.g. to reach a dashboard from your phone (VM backends only) | [runbook](docs/runbook.md#remote-access-with-tailscale) |
 | `agx conversations status/export` | Session stats + Markdown transcript export (Hermes) | [migration](docs/migration.md) |
 | `agx config` | Print the resolved toolkit config | — |
 
@@ -122,7 +145,7 @@ Every command supports `--json` (machine-readable output) and `--yes` (skip conf
 | Path | Role |
 |---|---|
 | `<data-dir>/docker-compose.yml` | Managed by the CLI — do not hand-edit. Use `docker-compose.override.yml` for overrides. |
-| `<data-dir>/.env` | `HERMES_UID` / `HERMES_GID` so files written by containers round-trip cleanly to the host user. |
+| `<data-dir>/.env` | Project-level values for compose `${VAR}` interpolation (`HERMES_UID` / `HERMES_GID`, `OLLAMA_API_KEY`, Firecrawl). Per-agent secrets go in `<name>/.env`. |
 | `<data-dir>/<name>/.data/` | Each Hermes agent's `$HERMES_HOME` (auth, sessions, skills, memories, state.db). |
 | `<data-dir>/<name>/.openclaw/` | Each OpenClaw agent's persistent dir. |
 | `<data-dir>/<name>/.env` | Per-agent secrets (API keys for skills). Managed via `agx secret …`. Wired into the container via compose `env_file:`. |
@@ -156,9 +179,9 @@ Hermes agents start with built-in memory. The toolkit ships three managed altern
 
 ```bash
 agx memory list                            # plugins + tier + summary
-agx memory enable holographic coder       # zero-dep, in-process
-agx ollama configure --url http://10.20.30.1:11434  # point at an existing Ollama
-agx memory enable openviking coder        # sibling service
+agx memory enable holographic coder        # zero-dep, in-process
+agx ollama configure --url http://192.168.1.50:11434  # point at an existing Ollama (not localhost)
+agx memory enable openviking coder         # sibling service
 agx memory status coder
 ```
 
@@ -179,4 +202,14 @@ See [docs/threat-model.md](docs/threat-model.md). Short version:
 
 ## Status
 
-v0.1.0 — initial implementation. The locked architecture rules and their rationale live in [`CLAUDE.md`](CLAUDE.md) and [`docs/architecture.md`](docs/architecture.md).
+A personal, single-maintainer project that the author runs daily. The `libvirt` backend (Linux) is the most exercised path; `multipass` is the cross-platform default, `bare_metal` is opt-in, and macOS has seen less testing. Before 1.0, expect breaking changes — run `agx reseat <name>` after upgrading the toolkit. Issues and pull requests are welcome and handled on a best-effort basis.
+
+The architecture rules and their rationale live in [`docs/architecture.md`](docs/architecture.md) and [`AGENTS.md`](AGENTS.md) (the engineering guide, also used by AI coding assistants).
+
+## Contributing, security, license
+
+- Contributing: bug reports and feature requests are welcome as [issues](https://github.com/ebner/agx/issues); pull requests are limited to collaborators. See [CONTRIBUTING.md](CONTRIBUTING.md) and the [Code of Conduct](CODE_OF_CONDUCT.md).
+- Security issues: please report privately, see [SECURITY.md](SECURITY.md).
+- License: [MIT](LICENSE).
+
+agx is an independent project. It is not affiliated with or endorsed by Nous Research, the OpenClaw project, OpenAI, Anthropic, Docker Inc. or Canonical; product names are trademarks of their respective owners.

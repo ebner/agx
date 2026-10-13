@@ -24,9 +24,8 @@ land before public disclosure.
 
 ## Supported versions
 
-Rolling: the latest state of `master` (and the most recent tagged release,
-once releases exist). Older pins receive no backported fixes — upgrade via
-`agents upgrade`, which snapshots before touching anything.
+Rolling: the latest state of `master` and the most recent tagged release. Older pins receive no backported fixes — upgrade via
+`agx upgrade`, which snapshots before touching anything.
 
 ## Out of scope
 
