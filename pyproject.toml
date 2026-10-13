@@ -38,8 +38,8 @@ classifiers = [
 Homepage = "https://github.com/ebner/agx"
 Repository = "https://github.com/ebner/agx"
 Issues = "https://github.com/ebner/agx/issues"
-Documentation = "https://github.com/ebner/agx/tree/master/docs"
-Changelog = "https://github.com/ebner/agx/blob/master/CHANGELOG.md"
+Documentation = "https://github.com/ebner/agx/tree/main/docs"
+Changelog = "https://github.com/ebner/agx/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 dev = [
