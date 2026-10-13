@@ -5,13 +5,23 @@ on:
     branches: [master]
   pull_request:
     branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
+      fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12"]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
 
     # UV_PYTHON pins every uv invocation to the matrix interpreter;
     # --no-sync on each `uv run` stops it from re-syncing the venv to
@@ -22,6 +32,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Set up uv
         uses: astral-sh/setup-uv@v7
@@ -42,7 +54,7 @@ jobs:
 
       # Integration tests (tests/integration/, marker `multipass`) are
       # deselected via addopts and must NEVER run in CI — they require a
-      # live VM deployment. See CLAUDE.md's Testing section.
+      # live VM deployment. See AGENTS.md's Testing section.
       - name: Test (pytest, unit only)
         run: uv run --no-sync pytest -q
 

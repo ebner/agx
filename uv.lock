@@ -8,14 +8,13 @@ resolution-markers = [
 
 [[package]]
 name = "agx-cli"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "click" },
     { name = "pydantic" },
     { name = "ruamel-yaml" },
     { name = "tomlkit" },
-    { name = "zstandard" },
 ]
 
 [package.optional-dependencies]
@@ -24,6 +23,7 @@ dev = [
     { name = "pytest" },
     { name = "pytest-mock" },
     { name = "ruff" },
+    { name = "zstandard" },
 ]
 
 [package.metadata]
@@ -36,7 +36,7 @@ requires-dist = [
     { name = "ruamel-yaml", specifier = ">=0.18" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.6" },
     { name = "tomlkit", specifier = ">=0.13" },
-    { name = "zstandard", specifier = ">=0.22" },
+    { name = "zstandard", marker = "extra == 'dev'", specifier = ">=0.22" },
 ]
 provides-extras = ["dev"]
 

@@ -1,0 +1,58 @@
+name: Bug report
+description: Something in agx doesn't work as documented.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Security issues: please don't file them here — use the private report form (see SECURITY.md).
+        Please redact hostnames, paths and anything personal from logs before pasting them.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. agx create test --type hermes
+        2. ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: agx version or commit
+      placeholder: output of `agx --version`, or a commit SHA
+    validations:
+      required: true
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Backend
+      options: [multipass, libvirt, bare_metal]
+    validations:
+      required: true
+  - type: input
+    id: host
+    attributes:
+      label: Host OS
+      placeholder: e.g. Ubuntu 24.04, macOS 15
+  - type: dropdown
+    id: data_dir_in_vm
+    attributes:
+      label: Created with --data-dir-in-vm?
+      options: ["no", "yes", "n/a (bare_metal)"]
+  - type: input
+    id: agent
+    attributes:
+      label: Agent type and image tag
+      placeholder: e.g. hermes v0.21.6, openclaw 2026.10.1
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of `agx --json doctor` (redacted)
+      render: json

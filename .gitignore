@@ -14,7 +14,11 @@ venv/
 .ruff_cache/
 .mypy_cache/
 .coverage
+coverage.xml
 htmlcov/
+.tox/
+.nox/
+.dmypy.json
 
 # Editor / OS
 .idea/
@@ -25,3 +29,9 @@ htmlcov/
 # Local config (toolkit writes here at runtime, but never commit)
 /.config/
 .claude/
+CLAUDE.local.md
+
+# Never commit agent data or secrets
+.env
+*.tar.zst
+.staging/
