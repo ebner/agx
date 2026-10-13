@@ -181,13 +181,6 @@ def test_find_dangling_ignores_corrupt(tmp_path: Path) -> None:
     assert Journal.find_dangling(tmp_path) == []
 
 
-def test_remaining_phases_filters_completed(tmp_path: Path) -> None:
-    j = Journal.begin(tmp_path, "create", "coder", ["a", "b", "c"])
-    j.advance("a")
-    j.advance("b")
-    assert j.remaining_phases() == ["c"]
-
-
 def test_is_phase_done(tmp_path: Path) -> None:
     j = Journal.begin(tmp_path, "create", "coder", ["a", "b"])
     j.advance("a")

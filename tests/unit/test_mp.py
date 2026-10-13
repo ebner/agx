@@ -9,6 +9,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from agx_cli import mp
+from agx_cli.backends import multipass as multipass_backend
 from agx_cli.errors import RuntimeFailure
 from agx_cli.mp import BootstrapStatus, parse_bootstrap_ok
 
@@ -155,7 +156,7 @@ def test_delete_snapshot_argv_uses_dotted_form(mocker) -> None:
 def test_delete_snapshot_failure_returns_result_instead_of_raising(mocker) -> None:
     """Prune treats snapshot deletion as best-effort and inspects the
     MpResult — a check=True raise on the first undeletable snapshot
-    would abort the rest of the cleanup pass (codex review 2026-08-24)."""
+    would abort the rest of the cleanup pass."""
     mocker.patch("subprocess.run", return_value=_stub_run(returncode=1, stderr=b"not found"))
     result = mp.delete_snapshot("agents", "ghost-snap")
     assert result.returncode == 1
@@ -183,12 +184,12 @@ def test_find_with_show_unsupported(mocker) -> None:
 def test_nonzero_exit_raises_runtime_failure(mocker) -> None:
     mocker.patch("subprocess.run", return_value=_stub_run(returncode=1, stderr=b"boom"))
     with pytest.raises(RuntimeFailure, match="boom"):
-        mp.mp("nope")
+        multipass_backend.mp("nope")
 
 
 def test_nonzero_exit_with_check_false_returns_result(mocker) -> None:
     mocker.patch("subprocess.run", return_value=_stub_run(returncode=2, stderr=b"x"))
-    result = mp.mp("nope", check=False)
+    result = multipass_backend.mp("nope", check=False)
     assert result.returncode == 2
     assert result.stderr == "x"
 
@@ -196,7 +197,7 @@ def test_nonzero_exit_with_check_false_returns_result(mocker) -> None:
 def test_command_not_found_raises_runtime_failure(mocker) -> None:
     mocker.patch("subprocess.run", side_effect=FileNotFoundError("no such file: multipass"))
     with pytest.raises(RuntimeFailure, match="command not found"):
-        mp.mp("info", "agents")
+        multipass_backend.mp("info", "agents")
 
 
 def test_timeout_raises_runtime_failure(mocker) -> None:
@@ -205,13 +206,13 @@ def test_timeout_raises_runtime_failure(mocker) -> None:
         side_effect=subprocess.TimeoutExpired(cmd=["multipass"], timeout=1.0),
     )
     with pytest.raises(RuntimeFailure, match="timed out"):
-        mp.mp("info", "agents", timeout=1.0)
+        multipass_backend.mp("info", "agents", timeout=1.0)
 
 
 def test_non_utf8_stdout_decoded_with_replacement(mocker) -> None:
     bad = b"\xff\xfe ok bytes"
     mocker.patch("subprocess.run", return_value=_stub_run(stdout=bad))
-    result = mp.mp("anything")
+    result = multipass_backend.mp("anything")
     assert "�" in result.stdout
 
 

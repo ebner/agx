@@ -702,7 +702,7 @@ def rebuild(
     if cfg.vm.backend == "bare_metal":
         raise UserError(
             "vm rebuild doesn't apply on the bare_metal backend (there's no VM to "
-            "rebuild). For data restore: `agx import`; for full reset: `agents "
+            "rebuild). For data restore: `agx import`; for full reset: `agx "
             "vm destroy --yes` then `agx vm init --backend bare_metal`."
         )
 
@@ -851,9 +851,9 @@ def rebuild(
     # Sidecar stacks (firecrawl, in-VM inference) also lived only in the
     # old VM's Docker engine: their compose blocks, digest pins, and env
     # wiring all survive on the host data-dir, but no container crosses
-    # to the fresh VM — the exact failure mode of the 2026-07 multipass →
-    # libvirt migration, where everything LOOKED restored while the
-    # firecrawl stack sat silently stranded. Runs OUTSIDE the rebuild
+    # to the fresh VM. Without this step everything LOOKS restored (e.g.
+    # after a multipass → libvirt migration) while the firecrawl stack
+    # sits silently stranded. Runs OUTSIDE the rebuild
     # lock: firecrawl_cmd.up / inference_cmd.up acquire `.agents.lock`
     # themselves, and a second flock on the same file blocks even within
     # one process (flock is per open-file-description).
@@ -1188,8 +1188,8 @@ def _ensure_mount(cfg: AgentsConfig) -> None:
     backend's virtiofs mount works ``--live --config`` (no stop
     needed). To avoid an unnecessary stop/start cycle (which loses
     DHCP lease + briefly wedges the host's ARP cache, then breaks
-    bootstrap with "no route to host" — observed during the
-    2026-05-16 smoke test), only stop+start on multipass.
+    bootstrap with "no route to host" — observed in testing), only
+    stop+start on multipass.
 
     Mounts persist across reboots, so this only triggers when the
     mount is genuinely absent (fresh ``vm init`` or after an external
@@ -1334,6 +1334,10 @@ def _seed_vm_data_dir(cfg: AgentsConfig) -> None:
     env_content = templates.initial_env_content(
         cfg.vm_runtime.ubuntu_uid, cfg.vm_runtime.ubuntu_gid
     )
+    # The one allowed heredoc through the backend exec: first-time
+    # seeding of static template content, guarded by `[ -f ] ||` so it
+    # never overwrites a live file. Every later compose/.env write goes
+    # through the staged-transfer + validate + atomic-rename path.
     script = (
         f"set -eu\n"
         f"mkdir -p {root}/.codex {root}/backups {root}/.upgrades\n"

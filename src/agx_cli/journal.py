@@ -183,9 +183,6 @@ class Journal:
 
     # ---------- helpers ----------
 
-    def remaining_phases(self) -> list[str]:
-        return [p for p in self.phases if p not in self.completed_phases]
-
     def is_phase_done(self, phase: str) -> bool:
         return phase in self.completed_phases
 

@@ -343,9 +343,9 @@ def test_status_no_warning_when_far_from_expiry(
 def test_status_includes_per_agent_skill_status(
     with_coder: Path, mocker, cfg: AgentsConfig
 ) -> None:
-    """Status reports only the SKILL dimension per agent. The retired
-    import-bridge probe (`container_mount`) is gone: provider auth is
-    Hermes-owned inside the container, not something the toolkit mounts."""
+    """Status reports only the SKILL dimension per agent — no in-container
+    Codex mount probe (`container_mount`): provider auth is Hermes-owned
+    inside the container, not something the toolkit mounts."""
     mocker.patch("agx_cli.compose_runner.restart", return_value=_ok())
     exec_spy = mocker.spy(codex.mp, "exec_in_vm")
     info = codex.status(config_path=with_coder)
@@ -390,10 +390,9 @@ def test_login_device_auth_appends_flag(mocker, saved_config: Path, cfg: AgentsC
 def test_login_does_not_relax_auth_permissions(
     mocker, saved_config: Path, cfg: AgentsConfig
 ) -> None:
-    """The retired import bridge needed auth.json other-readable so the
-    container's runtime user could read it through the :ro mount. With
-    the bridge gone the toolkit leaves the Codex CLI's mode-600 file
-    alone — nothing in a Hermes container reads it any more."""
+    """The toolkit leaves the Codex CLI's mode-600 auth.json alone —
+    nothing in a Hermes container reads it, so there is no reason to
+    make it other-readable."""
     home = cfg.paths.host_data_dir / ".codex"
     home.mkdir(mode=0o700)
     auth = home / "auth.json"
@@ -411,26 +410,6 @@ def test_login_raises_when_codex_missing(mocker, saved_config: Path) -> None:
     mocker.patch("shutil.which", return_value=None)
     with pytest.raises(UserError, match="codex CLI not found"):
         codex.login(config_path=saved_config)
-
-
-def test_refresh_is_retired() -> None:
-    """`agx codex refresh` rotated a single-use OAuth refresh chain a
-    running agent could share, invalidating the agent's token. Hidden
-    stub: exit 1 with the in-container re-auth pointer, absent from help."""
-    from click.testing import CliRunner
-
-    from agx_cli.cli import main
-
-    assert not hasattr(codex, "refresh")
-    runner = CliRunner()
-    result = runner.invoke(main, ["codex", "refresh"])
-    assert result.exit_code == 1
-    assert "hermes auth add openai-codex" in result.output
-    helptext = runner.invoke(main, ["codex", "--help"]).output
-    assert "refresh" not in helptext.split("Commands:")[-1]
-
-
-# ---------- progress narration ----------
 
 
 def test_skill_enable_narrates_build(with_coder: Path, mocker) -> None:

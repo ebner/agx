@@ -211,19 +211,6 @@ def test_remove_docker_volume_no_op_when_missing() -> None:
     assert list(doc["terminal"]["docker_volumes"]) == []
 
 
-# ---------- model.provider getter ----------
-
-
-def test_get_model_provider() -> None:
-    doc = hermes_config._yaml().load("model:\n  provider: openai-codex\n")
-    assert hermes_config.get_model_provider(doc) == "openai-codex"
-
-
-def test_get_model_provider_returns_none_when_missing() -> None:
-    doc = hermes_config._yaml().load("{}\n")
-    assert hermes_config.get_model_provider(doc) is None
-
-
 # ---------- config_path helper ----------
 
 

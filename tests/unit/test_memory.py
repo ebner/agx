@@ -143,9 +143,7 @@ def test_holographic_disable_restores_config(
     assert memory.read_state(cfg, "coder") is None
 
 
-def test_holographic_enable_is_idempotent(
-    with_coder: Path, cfg: AgentsConfig, mocker: Any
-) -> None:
+def test_holographic_enable_is_idempotent(with_coder: Path, cfg: AgentsConfig, mocker: Any) -> None:
     mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
     memory.enable("holographic", "coder", config_path=with_coder)
     # Second call should not duplicate state or change defaults.
@@ -337,8 +335,8 @@ def test_openviking_disable_removes_sidecar(
 
 
 def test_openviking_image_on_allowlist() -> None:
-    """The toolkit MUST validate the sidecar image against the plan's
-    parsed (registry, repo) tuple check, not a substring match.
+    """The toolkit MUST validate the sidecar image against the image
+    allowlist's parsed (registry, repo) tuple check, not a substring match.
     """
     from agx_cli.compose import validate_image_ref
 

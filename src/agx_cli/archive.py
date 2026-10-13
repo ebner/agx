@@ -1,52 +1,25 @@
-"""Tar+zstd archive helpers.
+"""Archive naming shared by upgrade snapshots and exports.
 
-The plan specifies ``.tar.zst`` for upgrade snapshots and exports. We
-use the ``zstandard`` library for host-side I/O (streaming compress and
-decompress) and external ``tar --zstd`` inside the VM (Ubuntu 26.04
-ships tar 1.34+ which supports it).
-
-The suffix is exposed as :data:`ARCHIVE_SUFFIX` so callers don't hardcode
-it.
+Both are tar+zstd archives written by ``tar --zstd`` inside the VM (or
+on the host under bare_metal) — the host never compresses or extracts
+them itself. The suffix lives here so callers don't hardcode it.
 """
 
 from __future__ import annotations
 
-import tarfile
-from collections.abc import Iterable
-from pathlib import Path
+import re
 from typing import Final
-
-import zstandard
 
 ARCHIVE_SUFFIX: Final = ".tar.zst"
 
+# ``YYYYMMDDTHHMMSSZ`` — sorts lexicographically in time order.
+UTC_STAMP_RE: Final = r"\d{8}T\d{6}Z"
 
-def write_tar_zst(target: Path, members: Iterable[tuple[Path, str]]) -> None:
-    """Stream-compress a tar archive to ``target``.
 
-    Each ``(src, arcname)`` tuple is added; non-existent ``src`` paths
-    are skipped silently to match the prior tar.gz behavior under
-    upgrades.
+def archive_name_re(name: str) -> re.Pattern[str]:
+    """Match ``<name>-<UTC stamp>`` + the archive suffix, exactly.
+
+    A plain ``<name>-*`` glob would also match agent ``<name>-other``'s
+    archives, so retention for ``foo`` could delete ``foo-bar``'s.
     """
-    cctx = zstandard.ZstdCompressor(level=3)
-    with (
-        target.open("wb") as fh,
-        cctx.stream_writer(fh, closefd=False) as zw,
-        tarfile.open(fileobj=zw, mode="w|") as tf,
-    ):
-        for src, arcname in members:
-            if src.exists():
-                tf.add(src, arcname=arcname)
-
-
-def extract_tar_zst(archive: Path, dest: Path) -> None:
-    """Stream-decompress and extract ``archive`` into ``dest`` with the
-    ``data`` filter to refuse absolute paths and dangerous link entries.
-    """
-    dctx = zstandard.ZstdDecompressor()
-    with (
-        archive.open("rb") as fh,
-        dctx.stream_reader(fh, closefd=False) as zr,
-        tarfile.open(fileobj=zr, mode="r|") as tf,
-    ):
-        tf.extractall(dest, filter="data")
+    return re.compile(re.escape(name) + "-" + UTC_STAMP_RE + re.escape(ARCHIVE_SUFFIX))

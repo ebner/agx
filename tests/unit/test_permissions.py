@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -82,8 +83,8 @@ def test_apply_acl_argv_emits_recurse_and_default_when_both_set(tmp_path: Path) 
     )
     assert len(cmds) == 2
     # Mask MUST be in the spec — see the long comment in
-    # apply_acl_argv. Without it, coder-style stuck-mask state
-    # leaves the new entry masked to ---.
+    # apply_acl_argv. Without it, a stuck ``mask::---`` leaves the
+    # new entry masked to ---.
     assert cmds[0] == ["setfacl", "-R", "-m", "u:1000:rX,m::rwx", str(tmp_path)]
     # Critical: the default-ACL form must NOT carry the `d:` prefix —
     # `setfacl -d -m` rejects `d:u:…:rX` as "Invalid argument".
@@ -101,8 +102,8 @@ def test_apply_acl_argv_skips_recurse_when_false(tmp_path: Path) -> None:
 
 
 def test_apply_acl_argv_emits_only_default_when_recurse_off(tmp_path: Path) -> None:
-    """Used by ``access_cmd.auto_grant_on_create``: dir is empty so
-    recurse is pointless, but the default ACL is the whole point.
+    """For a freshly created (empty) dir recurse is pointless, but the
+    default ACL is the whole point.
     """
     cmds = permissions.apply_acl_argv(
         tmp_path,
@@ -188,6 +189,7 @@ def test_probe_acl_support_returns_false_when_setfacl_fails(tmp_path: Path, mock
     assert err is not None and "not supported" in err
 
 
+@pytest.mark.skipif(shutil.which("setfacl") is None, reason="setfacl (acl package) not installed")
 def test_probe_acl_support_returns_true_on_real_ext4(tmp_path: Path) -> None:
     """Live probe on the test runner's filesystem. tmp_path is usually
     on the same ext4 partition that runs the toolkit's CI; if this
@@ -276,8 +278,8 @@ def test_getfacl_passes_numeric_flag(mocker: Any, tmp_path: Path) -> None:
 def test_has_user_acl_handles_real_getfacl_numeric_output(mocker: Any, tmp_path: Path) -> None:
     """End-to-end style: feed an actual ``getfacl --numeric`` payload
     (uids, not names) and verify the substring matcher recognises it.
-    Mirrors what ``access grant`` produces in the field — caught the
-    bug where coder kept showing ``missing`` after a successful grant.
+    Mirrors real ``setfacl`` output — guards against a grant that
+    succeeded still being reported as ``missing``.
     """
     mocker.patch("shutil.which", return_value="/usr/bin/getfacl")
     mocker.patch(
@@ -316,7 +318,7 @@ def test_container_recipient_uses_subuid_mapping(mocker: Any) -> None:
 
 
 def test_run_with_sudo_prints_each_argv_via_progress_before_confirm(mocker: Any) -> None:
-    """SECURITY-UX: the docstring, CLI help, and CLAUDE.md promise the
+    """SECURITY-UX: the docstring, CLI help, and AGENTS.md promise the
     exact argvs are printed before sudo runs. That display must be
     always-on (ui.progress), NOT --verbose-gated ui.info — a user can't
     audit a sudo grant they never saw — and must land before the

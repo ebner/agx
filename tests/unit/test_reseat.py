@@ -329,7 +329,7 @@ def test_reseat_openclaw_preserves_customizations_and_gains_new_keys(
     # Stock volumes stay, exactly once each.
     assert "./personal/.openclaw:/home/node/.openclaw" in volumes
     assert "./personal/workspace:/home/node/.openclaw/workspace" in volumes
-    # Gained from the 2026-10 template: OpenClaw's auth-profile key dir
+    # Gained from the current template: OpenClaw's auth-profile key dir
     # (.config/openclaw) and agent-installed tools (.local) now persist.
     assert "./personal/.config:/home/node/.config" in volumes
     assert "./personal/.local:/home/node/.local" in volumes
@@ -500,45 +500,6 @@ def test_reseat_preserves_extra_user_volume_hermes(
         name="coder", cfg=cfg, port=port, image_tag="v1.0.0"
     )["volumes"]
     assert volumes == [*stock_volumes, "/home/ubuntu/notes:/home/hermes/notes:ro"]
-
-
-def test_reseat_drops_retired_codex_import_bridge_but_keeps_user_volumes(
-    with_coder_stale_fragment: Path,
-    cfg: AgentsConfig,
-    mocker: Any,
-    vm_fs_mocks: dict[str, Any],
-) -> None:
-    """Agents created before 2026-09 carry the toolkit's own
-    ``./.codex:/home/hermes/.codex:ro`` import bridge. The fresh template
-    no longer emits it, so the carry-over diff would classify it as a
-    user addition and preserve it on every reseat — reseat must drop it
-    explicitly (it is what tied the agent's Codex credential to the
-    host copy's single-use refresh chain) while still keeping genuine
-    user volumes.
-    """
-    mocker.patch("agx_cli.compose_runner.stop", return_value=_ok())
-    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
-    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=_stub_in_vm(vm_fs_mocks, "1000"))
-
-    doc = compose.read_compose_doc(cfg)
-    svc = doc["services"]["hermes-coder"]
-    port = agents_cmd._extract_host_port(svc)
-    svc["volumes"] = [
-        *svc["volumes"],
-        "./.codex:/home/hermes/.codex:ro",
-        "/home/ubuntu/notes:/home/hermes/notes:ro",
-    ]
-    compose.write_compose_atomically(cfg, doc)
-
-    agents_cmd.reseat("coder", yes=True, config_path=with_coder_stale_fragment)
-
-    doc = compose.read_compose_doc(cfg)
-    volumes = list(doc["services"]["hermes-coder"]["volumes"])
-    stock_volumes = compose.hermes_service_fragment(
-        name="coder", cfg=cfg, port=port, image_tag="v1.0.0"
-    )["volumes"]
-    assert volumes == [*stock_volumes, "/home/ubuntu/notes:/home/hermes/notes:ro"]
-    assert not any(compose.LEGACY_CODEX_BRIDGE_TARGET in v for v in volumes)
 
 
 def test_carry_user_additions_supersedes_reshaped_stock_volume() -> None:

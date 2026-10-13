@@ -30,7 +30,6 @@ from agx_cli.compose import (
     dump_compose,
     ensure_cont_init_script,
     hermes_service_fragment,
-    list_services,
     llamacpp_service_fragment,
     load_compose,
     next_free_port,
@@ -92,10 +91,10 @@ def test_hermes_fragment_has_required_mounts(cfg: AgentsConfig) -> None:
     # cannot write to that mount.
     assert "user" not in s
 
-    # Two required mounts: data dir, socket. NO Codex import bridge at
-    # the container user's home — retired 2026-09 (the bridge-seeded
-    # credential shared a single-use OAuth refresh chain with the host
-    # copy); provider auth is done inside the container.
+    # Two required mounts: data dir, socket. NO mount of the toolkit
+    # Codex auth (a seeded copy would share a single-use OAuth refresh
+    # chain with the host copy); provider auth is done inside the
+    # container.
     assert "./coder/.data:/opt/data" in s["volumes"]
     assert "/run/user/1000/docker.sock:/run/user/1000/docker.sock" in s["volumes"]
     assert not any("/home/hermes/.codex" in v for v in s["volumes"])
@@ -424,13 +423,6 @@ def test_rename_service_refuses_existing_target(cfg: AgentsConfig) -> None:
     add_service(doc, "b", {"image": "i"})
     with pytest.raises(UserError, match="already exists"):
         rename_service(doc, "a", "b")
-
-
-def test_list_services(cfg: AgentsConfig) -> None:
-    doc = load_compose(cfg.paths.host_data_dir / "docker-compose.yml")
-    add_service(doc, "a", {"image": "i"})
-    add_service(doc, "b", {"image": "i"})
-    assert set(list_services(doc)) == {"a", "b"}
 
 
 # ---------- round-trip preserves comments ----------

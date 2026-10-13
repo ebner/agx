@@ -231,16 +231,6 @@ def test_cont_init_npm_resolved_defensively() -> None:
     assert "npm not found" in s
 
 
-def test_cont_init_creates_runtime_home_before_chown() -> None:
-    """The hook must create /home/hermes (the image doesn't; it used to
-    exist only as the parent of the retired .codex bridge mount) before
-    the existence-gated chown, or npm's cache/log dir is missing and the
-    bridge's `npm ci` fails half-way on every boot."""
-    s = templates.HERMES_CONT_INIT_FIXPERMS
-    assert "mkdir -p /home/hermes" in s
-    assert s.index("mkdir -p /home/hermes") < s.index("find /home/hermes")
-
-
 def test_cont_init_hook_is_valid_posix_sh(tmp_path: Path) -> None:
     """The hook is `#!/command/with-contenv sh` — POSIX sh, not bash. sh -n
     catches bashisms and quoting errors before the template ships into a

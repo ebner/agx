@@ -16,8 +16,6 @@ import click
 
 from agx_cli.errors import CliError, UserError
 
-JsonValue = None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
-
 
 def _flag(name: str) -> bool:
     ctx = click.get_current_context(silent=True)

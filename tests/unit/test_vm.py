@@ -977,7 +977,7 @@ def _stub_sidecar_reups(mocker) -> dict[str, MagicMock]:
 
 
 def test_rebuild_reups_sidecars_when_installed(mocker, tmp_path: Path) -> None:
-    """The 2026-07 migration incident: agent containers get restored but
+    """After a VM migration/rebuild, agent containers get restored but
     sidecar stacks (firecrawl, ollama, llama-cpp models) lived only in
     the old VM's Docker engine and stayed silently absent. rebuild must
     re-up each installed sidecar via the Python API with emit=False

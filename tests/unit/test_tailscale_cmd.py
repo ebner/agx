@@ -112,8 +112,7 @@ def test_up_auth_key_rides_stdin_never_argv(
     cfg: AgentsConfig, saved_config: Path, mocker: Any
 ) -> None:
     """The auth key is a reusable credential and both backends echo the
-    exec argv under --verbose — it must travel via stdin, not argv
-    (codex review 2026-08-27)."""
+    exec argv under --verbose — it must travel via stdin, not argv."""
     mocker.patch("agx_cli.mp.exec_bash", return_value=_ok("1.86.2\n"))
     stdin_exec = mocker.patch("agx_cli.mp.exec_in_vm_with_stdin", return_value=_ok())
     mocker.patch("agx_cli.mp.exec_in_vm", return_value=_ok(_status_json("Running")))

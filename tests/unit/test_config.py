@@ -222,34 +222,3 @@ def test_save_creates_parent_dir(tmp_path: Path) -> None:
 def test_default_config_path_is_user_config_dir() -> None:
     expected = Path.home() / ".config" / "agx" / "config.toml"
     assert expected == cfg_mod.DEFAULT_CONFIG_PATH
-
-
-def test_migrate_legacy_config_dir_moves_once(tmp_path: Path) -> None:
-    legacy = tmp_path / "agents" / "config.toml"
-    new = tmp_path / "agx" / "config.toml"
-    legacy.parent.mkdir()
-    legacy.write_text("x = 1\n")
-    assert cfg_mod.migrate_legacy_config_dir(new, legacy) is True
-    assert new.read_text() == "x = 1\n"
-    assert not (tmp_path / "agents").exists()
-    # second run: nothing to do
-    assert cfg_mod.migrate_legacy_config_dir(new, legacy) is False
-
-
-def test_migrate_legacy_config_dir_never_overwrites(tmp_path: Path) -> None:
-    legacy = tmp_path / "agents" / "config.toml"
-    new = tmp_path / "agx" / "config.toml"
-    legacy.parent.mkdir()
-    new.parent.mkdir()
-    legacy.write_text("old\n")
-    new.write_text("new\n")
-    assert cfg_mod.migrate_legacy_config_dir(new, legacy) is False
-    assert new.read_text() == "new\n"
-    assert legacy.read_text() == "old\n"
-
-
-def test_migrate_legacy_config_dir_noop_without_legacy(tmp_path: Path) -> None:
-    assert not cfg_mod.migrate_legacy_config_dir(
-        tmp_path / "agx" / "c.toml", tmp_path / "agents" / "c.toml"
-    )
-    assert not (tmp_path / "agx").exists()

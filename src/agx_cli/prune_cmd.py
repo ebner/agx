@@ -1,15 +1,15 @@
 """Retention for upgrade artifacts: tarballs, VM snapshots, image tags.
 
-Every ``agx upgrade`` leaves three artifacts behind, and none of
-them expired before this module existed:
+Every ``agx upgrade`` leaves three artifacts behind, none of which
+expires on its own:
 
 - a host tarball at ``<data-dir>/.upgrades/<name>-<utc>.tar.zst``
 - a ``pre-upgrade-<name>-<utc>`` VM snapshot (bloats the qcow2 /
   multipass image on disk)
 - the superseded image tag in the VM's Docker cache (~4-9 GB per
-  Hermes release — eight of these filled a 58 GB VM disk to 100% in
-  ~3 months of routine upgrades; the 2026-08 outage class doctor's
-  ``vm_disk`` check now watches for)
+  Hermes release — eight of these fill a 58 GB VM disk within ~3
+  months of routine upgrades, which doctor's ``vm_disk`` check
+  watches for)
 
 Retention is counted in upgrade *generations*, not age: ``agx
 rollback`` only ever uses the newest generation, and age-based expiry
@@ -138,7 +138,7 @@ def _plan_images(cfg: AgentsConfig, repos: set[str], keep: int) -> list[str]:
     ``agx create`` baseline, so during a ``--latest`` upgrade the
     outgoing tag is still the defaults tag. Counting it as a protected
     extra on top of the spares retained one image more than configured
-    on every upgrade (codex review 2026-08-24); counting newest-N over
+    on every upgrade; counting newest-N over
     all tags keeps exactly ``keep`` generations in the steady state
     while referenced/baseline tags still always survive.
     """

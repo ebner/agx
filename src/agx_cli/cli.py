@@ -176,13 +176,6 @@ def main(ctx: click.Context, json_output: bool, assume_yes: bool, verbose: bool)
     ctx.obj["yes"] = assume_yes
     ctx.obj["verbose"] = verbose
 
-    # One-time move of the pre-rename config dir (~/.config/agents).
-    if cfg_mod.migrate_legacy_config_dir():
-        ui.warn(
-            f"moved config {cfg_mod.LEGACY_CONFIG_PATH.parent} -> "
-            f"{cfg_mod.DEFAULT_CONFIG_PATH.parent} (CLI renamed `agents` -> `agx`)"
-        )
-
     # Wire up the VM-backend dispatcher from config (if a config exists).
     # `vm init` runs before any config exists — it sets the backend via
     # its own --backend flag before invoking any backend primitive.
@@ -214,7 +207,7 @@ def main(ctx: click.Context, json_output: bool, assume_yes: bool, verbose: bool)
 
 @main.group()
 def vm() -> None:
-    """Multipass VM lifecycle."""
+    """VM lifecycle (selected backend)."""
 
 
 @vm.command("init")
@@ -412,7 +405,7 @@ def vm_migrate_data(ctx: click.Context, yes_local: bool) -> None:
 
 @vm.command("shell")
 def vm_shell() -> None:
-    """Drop into the VM via `multipass shell`."""
+    """Open a shell in the VM (bare_metal: a subshell in the data dir)."""
     _run(vm_mod.shell)
 
 
@@ -456,7 +449,7 @@ def vm_restore(ctx: click.Context, name: str, destructive: bool, yes_local: bool
 
 @vm.group("snapshots")
 def vm_snapshots_group() -> None:
-    """Multipass snapshot management."""
+    """VM snapshot management (multipass / libvirt)."""
 
 
 @vm_snapshots_group.command("list")
@@ -897,8 +890,8 @@ def agents_rollback(
     """Restore an agent from a pre-upgrade snapshot.
 
     Without ``--snapshot``, the latest archive under ``<data-dir>/.upgrades/``
-    is used. Pass ``--snapshot <name>`` (with or without the ``.tar.gz``
-    suffix) to pick a specific one.
+    is used. Pass ``--snapshot <name>`` (the full archive name or a unique
+    part of it, e.g. the timestamp) to pick a specific one.
     """
     _run(
         upgrades.rollback,
@@ -1096,24 +1089,6 @@ def codex_group() -> None:
 def codex_login(device_auth: bool) -> None:
     """Authenticate the toolkit-scoped Codex account (sandbox skill only)."""
     _run(codex_mod.login, device_auth=device_auth)
-
-
-def _retired_codex_refresh() -> None:
-    raise UserError(
-        "`agx codex refresh` was retired: refreshing the toolkit-scoped Codex "
-        "auth rotates a single-use OAuth refresh chain that a running Hermes agent "
-        "may share, invalidating the agent's token (\"Your authentication token has "
-        'been invalidated"). Re-authenticate the agent inside its container '
-        "instead: `agx exec <name> -- hermes auth add openai-codex --type oauth "
-        "--no-browser`. For the sandbox skill, `agx codex login`."
-    )
-
-
-@codex_group.command("refresh", hidden=True, context_settings={"ignore_unknown_options": True})
-@click.argument("args", nargs=-1, type=click.UNPROCESSED)
-def codex_refresh(args: tuple[str, ...]) -> None:
-    """Retired — see `hermes auth add openai-codex` inside the container."""
-    _run(_retired_codex_refresh)
 
 
 @codex_group.command("status")
@@ -1795,8 +1770,8 @@ def access_group() -> None:
     under mode 700, which the host user can't open. ``access mount``
     bind-mounts that directory at ``~/agents-view/<agent>`` with the owner
     ids swapped (an idmapped mount), so through the view you are the
-    owner — immune to the chmod/ACL-mask drift the old ``access grant``
-    suffered from. For a quick edit without any mount: ``agx edit``.
+    owner — immune to the chmod/ACL-mask drift that defeats host ACLs on
+    agent state. For a quick edit without any mount: ``agx edit``.
     """
 
 
@@ -1825,28 +1800,6 @@ def access_unmount(ctx: click.Context, agent: str, yes_local: bool) -> None:
     """Unmount AGENT's host view(s) and remove the empty mountpoint."""
     yes = yes_local or ctx.obj.get("yes", False)
     _run(access_cmd.unmount, agent=agent, yes=yes)
-
-
-def _retired_access_command(name: str) -> None:
-    raise UserError(
-        f"`agx access {name}` was retired: host ACLs can't hold on an agent's data dir "
-        "(files created with a restrictive mode are born with a masked ACL). Use "
-        "`agx access mount <agent>` for a host view, or `agx edit <agent> <path>`."
-    )
-
-
-@access_group.command("grant", hidden=True, context_settings={"ignore_unknown_options": True})
-@click.argument("args", nargs=-1, type=click.UNPROCESSED)
-def access_grant(args: tuple[str, ...]) -> None:
-    """Retired — see `agx access mount`."""
-    _run(_retired_access_command, "grant")
-
-
-@access_group.command("revoke", hidden=True, context_settings={"ignore_unknown_options": True})
-@click.argument("args", nargs=-1, type=click.UNPROCESSED)
-def access_revoke(args: tuple[str, ...]) -> None:
-    """Retired — see `agx access mount`."""
-    _run(_retired_access_command, "revoke")
 
 
 @access_group.command("list")

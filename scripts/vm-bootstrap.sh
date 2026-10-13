@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# Idempotent rootless-Docker bootstrap for the `agx` Multipass VM.
+# Idempotent rootless-Docker bootstrap for the `agx` VM (Multipass or libvirt).
 # Emits a final `BOOTSTRAP_OK ...` line that mp.parse_bootstrap_ok reads.
 #
 # Re-runnable: every step checks before doing. Failures land as
 # `<field>=fail` in the handshake so the host CLI can refuse to proceed
 # without burying the cause in subprocess noise. Stdout/stderr of each
-# step is tee'd to /tmp/agents-bootstrap.log so the host CLI can pull
-# it back on failure.
+# step is also tee'd to /tmp/agx-bootstrap.log for debugging inside the
+# VM.
 
 set -uo pipefail
 
-LOG=/tmp/agents-bootstrap.log
+LOG=/tmp/agx-bootstrap.log
 : > "$LOG"
 # Save the real stdout on fd 3 BEFORE the tee redirect. bash does not
 # wait for process-substitution children at exit, so a final line written
@@ -123,8 +123,8 @@ fi
 
 # Rootless Docker ships with NO container-log rotation: the json-file
 # driver grows unbounded, and one chatty container can fill the VM disk
-# (firecrawl-postgres wrote 2.8 GB in 5 days; disk-full wedged rabbitmq
-# and killed web search — 2026-08 outage class). Write the rotation
+# (firecrawl-postgres was observed writing 2.8 GB in 5 days; the full
+# disk then wedged rabbitmq and with it web search). Write the rotation
 # defaults BEFORE the daemon's first start so every container created on
 # this VM inherits them. Never clobber an existing daemon.json (user
 # customization); on re-runs against an existing VM the file is left

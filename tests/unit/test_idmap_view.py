@@ -139,9 +139,7 @@ def test_view_status_distinguishes_missing_stale_and_foreign() -> None:
     )
     # right mountpoint, wrong source
     assert (
-        iv.view_status(
-            entries, Path("/home/u/agents/bob/.data"), Path("/home/u/agents-view/coder")
-        )
+        iv.view_status(entries, Path("/home/u/agents/bob/.data"), Path("/home/u/agents-view/coder"))
         == "foreign"
     )
     # a plain (non-idmapped) bind mount is not a view

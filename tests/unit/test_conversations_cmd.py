@@ -206,9 +206,7 @@ def test_conversations_rejects_unknown_agent(saved_config: Path) -> None:
 # ---------- failure modes ----------
 
 
-def test_conversations_surfaces_container_down_as_user_error(
-    with_coder: Path, mocker: Any
-) -> None:
+def test_conversations_surfaces_container_down_as_user_error(with_coder: Path, mocker: Any) -> None:
     """When the container isn't running, the SQLite probe returns
     'service is not running'. Translate to UserError so the CLI exits
     with code 1 (user-fixable) instead of 2 (runtime crash).

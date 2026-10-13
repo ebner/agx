@@ -88,8 +88,8 @@ def mounts_mocked(mocker, cfg_with_agent: AgentsConfig):
     plumbing. There are dedicated tests for the ACL wiring below.
 
     ``install_vm_fs_simulation`` is installed so ``read_doc`` (which
-    routes through ``docker compose exec cat`` in both modes since
-    the 2026-05-22 subuid-readability fix) finds the host-side
+    routes through ``docker compose exec cat`` in both modes, since the
+    host user can't read the subuid-owned file) finds the host-side
     config.yaml. The simulator translates ``cat /opt/data/X`` to a
     host read at ``<data-dir>/<agent>/.data/X``.
     """
@@ -208,7 +208,7 @@ def test_add_rejects_relative_container_path(
 
 @pytest.mark.parametrize(
     "reserved",
-    ["/opt/data", "/home/hermes/.codex", "/proc", "/etc", "/run", "/"],
+    ["/opt/data", "/home/hermes", "/proc", "/etc", "/run", "/"],
 )
 def test_add_rejects_reserved_container_paths(
     host_folder: Path, saved_config: Path, mounts_mocked, reserved: str
@@ -1110,9 +1110,7 @@ def test_add_on_bare_metal_binds_the_host_folder_directly(
     data_dir = cfg_with_agent.paths.host_data_dir
     override = YAML().load((data_dir / "docker-compose.override.yml").read_text(encoding="utf-8"))
     assert override["services"]["hermes-coder"]["volumes"] == [f"{host_folder}:/workspace/x:ro"]
-    config = YAML().load(
-        (data_dir / "coder" / ".data" / "config.yaml").read_text(encoding="utf-8")
-    )
+    config = YAML().load((data_dir / "coder" / ".data" / "config.yaml").read_text(encoding="utf-8"))
     assert config["terminal"]["docker_volumes"] == [f"{host_folder}:/workspace/x:ro"]
 
     rows = mounts_cmd.list_mounts(agent="coder", config_path=saved_config)
@@ -1120,11 +1118,11 @@ def test_add_on_bare_metal_binds_the_host_folder_directly(
     assert rows[0]["vm"] is None
 
 
-def test_remove_on_bare_metal_also_strips_legacy_vm_path_entries(
+def test_remove_on_bare_metal_strips_the_host_folder_entry(
     host_folder: Path, cfg_with_agent: AgentsConfig, saved_config: Path, mounts_mocked
 ) -> None:
-    """Older toolkit versions wrote the (non-existent) VM-side path as the
-    bind source on bare-metal. ``remove`` must still clean those up."""
+    """On bare-metal the bind source is the host folder itself; ``remove``
+    strips that entry and never touches a VM share."""
     cfg_with_agent.vm.backend = "bare_metal"
     cfg_mod.save(cfg_with_agent, saved_config)
     entry = MountEntry(
@@ -1132,9 +1130,9 @@ def test_remove_on_bare_metal_also_strips_legacy_vm_path_entries(
     )
     mounts_cmd.save_manifest(cfg_with_agent, "coder", [entry])
     data_dir = cfg_with_agent.paths.host_data_dir
-    legacy = f"{entry.vm_path('coder')}:/workspace/x:ro"
+    volume = f"{host_folder}:/workspace/x:ro"
     (data_dir / "docker-compose.override.yml").write_text(
-        f"services:\n  hermes-coder:\n    volumes:\n      - {legacy}\n", encoding="utf-8"
+        f"services:\n  hermes-coder:\n    volumes:\n      - {volume}\n", encoding="utf-8"
     )
 
     mounts_cmd.remove(

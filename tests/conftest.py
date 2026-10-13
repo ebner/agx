@@ -52,20 +52,6 @@ def _no_vm_view_wait(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(compose, "await_vm_view", lambda cfg, host_path: None)
 
 
-@pytest.fixture(autouse=True)
-def _no_real_config_migration(
-    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """`cli.main` moves ~/.config/agents -> ~/.config/agx on first run
-    after the rename; CliRunner tests invoke main, so without this a
-    unit-test run would migrate the developer's REAL config dir."""
-    if request.node.get_closest_marker("multipass"):
-        return
-    monkeypatch.setattr(
-        "agx_cli.config.LEGACY_CONFIG_PATH", tmp_path / ".legacy-config" / "agents" / "config.toml"
-    )
-
-
 def _ok(stdout: str = "") -> MpResult:
     return MpResult(stdout=stdout, stderr="", returncode=0)
 

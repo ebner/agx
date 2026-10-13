@@ -169,9 +169,6 @@ def expected_root(entries: Iterable[MountEntry], source: Path) -> str | None:
     return str(Path(best.root) / source.relative_to(best.mount_point))
 
 
-VIEW_STATUSES = ("mounted", "not-mounted", "stale", "foreign")
-
-
 def view_status(entries: list[MountEntry], source: Path, view: Path) -> str:
     """``mounted`` | ``not-mounted`` | ``stale`` (source dir was deleted
     or replaced underneath it) | ``foreign`` (something else is mounted
@@ -187,12 +184,13 @@ def view_status(entries: list[MountEntry], source: Path, view: Path) -> str:
         return "not-mounted"
     if entry.deleted:
         return "stale"
-    home = containing_mount([e for e in entries if e is not entry], source)
+    others = [e for e in entries if e is not entry]
+    home = containing_mount(others, source)
     if (
         home is None
         or not entry.idmapped
         or entry.device != home.device
-        or entry.root != str(Path(home.root) / source.relative_to(home.mount_point))
+        or entry.root != expected_root(others, source)
     ):
         return "foreign"
     return "mounted"

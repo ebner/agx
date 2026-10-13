@@ -242,9 +242,7 @@ def test_use_writes_structured_model_block(
     # through `docker compose exec cat > ...`) and lands them at the
     # host-side config_path, which read_doc then sees.
 
-    payload = models_cmd.use(
-        "coder", engine="ollama", model="llama3.2:3b", config_path=with_coder
-    )
+    payload = models_cmd.use("coder", engine="ollama", model="llama3.2:3b", config_path=with_coder)
 
     doc = hermes_config.read_doc(cfg, "coder")
     assert doc["model"]["default"] == "llama3.2:3b"

@@ -328,7 +328,7 @@ def test_profile_list_refuses_openclaw(cfg: AgentsConfig, saved_config: Path, mo
         profile_cmd.list_profiles("claw", config_path=saved_config)
 
 
-# ---------- codex-review regression tests (2026-08-27) ----------
+# ---------- review regression tests ----------
 
 
 def test_cli_model_use_reaches_backend_with_profile(mocker: Any) -> None:

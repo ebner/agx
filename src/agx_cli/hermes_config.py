@@ -21,8 +21,8 @@ this one goes THROUGH the container):
 5. RM the staged file on any error path.
 
 The CLI refuses any change that would bind the dashboard to anything
-other than ``127.0.0.1`` / ``localhost`` / ``::1`` — one of the locked
-security invariants from the plan.
+other than ``127.0.0.1`` / ``localhost`` / ``::1`` — one of the toolkit's
+locked security invariants (see AGENTS.md and docs/threat-model.md).
 """
 
 from __future__ import annotations
@@ -107,18 +107,6 @@ def config_path(cfg: AgentsConfig, agent_name: str, profile: str | None = None) 
     if p is not None:
         base = base / "profiles" / p
     return base / "config.yaml"
-
-
-def vm_config_path(cfg: AgentsConfig, agent_name: str, profile: str | None = None) -> str:
-    """VM-host-side path of an agent's config.yaml (the bind-mount source).
-
-    Used by ``read_doc`` in ``--data-dir-in-vm`` mode to pull the file
-    out via ``multipass transfer``. Writes don't go through this path
-    anymore — see :func:`write_atomically`.
-    """
-    p = normalize_profile(profile)
-    mid = "" if p is None else f"profiles/{p}/"
-    return f"{cfg.paths.vm_agents_root}/{agent_name}/.data/{mid}config.yaml"
 
 
 def container_config_path(profile: str | None = None) -> str:
@@ -447,12 +435,3 @@ def remove_env_passthrough(doc: Any, key: str) -> None:
     passthrough = terminal.get("env_passthrough") or []
     if key in passthrough:
         passthrough.remove(key)
-
-
-# ---------- general model.provider helper (informational) ----------
-
-
-def get_model_provider(doc: Any) -> str | None:
-    model = doc.get("model") or {}
-    provider = model.get("provider")
-    return str(provider) if provider else None

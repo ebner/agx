@@ -326,13 +326,12 @@ def test_remove_and_rename_refuse_while_a_view_is_registered(
     access_cmd.refuse_if_view_registered(cfg_with_coder, "bob", "remove 'bob'")
 
 
-# ---------- retired ACL mechanism ----------
+# ---------- no ACLs on agent data dirs ----------
 
 
 def test_create_sets_no_acl_on_the_agent_data_dir(tmp_path: Path, mocker: Any) -> None:
     """ACLs can't hold on runtime-owned state (restrictive creates are
     born masked); create must not pretend otherwise."""
-    assert not hasattr(access_cmd, "auto_grant_on_create")
     run_owned = mocker.patch("agx_cli.permissions.run_owned")
     sudo = mocker.patch("agx_cli.permissions.run_with_sudo")
     cfg = AgentsConfig(paths=PathsConfig(host_data_dir=str(tmp_path / "data")))
@@ -341,32 +340,6 @@ def test_create_sets_no_acl_on_the_agent_data_dir(tmp_path: Path, mocker: Any) -
     assert (tmp_path / "data" / "coder" / ".env").exists()
     run_owned.assert_not_called()
     sudo.assert_not_called()
-
-
-def test_mount_hints_at_leftover_default_acls(
-    saved_config: Path, mounts: FakeMounts, mocker: Any
-) -> None:
-    mocker.patch(
-        "agx_cli.access_cmd.os.listxattr",
-        return_value=["system.posix_acl_access", "system.posix_acl_default"],
-    )
-    progress = mocker.patch("agx_cli.ui.progress")
-    access_cmd.mount(agent="coder", writable=False, yes=True, config_path=saved_config)
-    (hint,) = [c.args[0] for c in progress.call_args_list if "setfacl" in c.args[0]]
-    assert "sudo setfacl -R -b -k" in hint and "coder/.data" in hint
-
-
-def test_retired_grant_and_revoke_point_at_the_replacement() -> None:
-    from click.testing import CliRunner
-
-    from agx_cli import cli as cli_mod
-
-    for name in ("grant", "revoke"):
-        result = CliRunner().invoke(cli_mod.main, ["access", name, "coder", "--rw", "-y"])
-        assert result.exit_code == 1
-        assert "agx access mount" in result.output
-    listed = CliRunner().invoke(cli_mod.main, ["access", "--help"]).output.split("Commands:")[1]
-    assert "grant" not in listed and "revoke" not in listed  # hidden stubs
 
 
 # ---------- review regressions ----------

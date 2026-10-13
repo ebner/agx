@@ -348,7 +348,7 @@ def test_up_upgrade_re_resolves_digests(
 def test_up_reconstructs_pins_from_compose_when_state_lost(
     with_coder: Path, cfg: AgentsConfig, mocker: Any, vm_fs_mocks: dict[str, Any]
 ) -> None:
-    """The 2026-07 incident: a VM migration preserved the host data-dir
+    """A VM migration can preserve the host data-dir
     (compose blocks included) but lost .firecrawl-state.json. `up` must
     reconstruct the images map from the compose service blocks — the
     exact digests round-trip — and NEVER touch the upstream resolver

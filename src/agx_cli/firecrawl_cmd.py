@@ -131,10 +131,6 @@ OPENCLAW_ENV_KEYS: tuple[str, ...] = (
     "FIRECRAWL_BASE_URL",
 )
 
-# `agx firecrawl status` returns these payload keys so JSON callers
-# can rely on them.
-STATUS_KEYS: tuple[str, ...] = ("running", "api_url", "wired_agents", "images")
-
 # The api's address on the project docker network — what lands in the
 # state file, the project .env, and every agent's container env.
 API_URL_IN_VM = "http://firecrawl-api:3002"
@@ -636,7 +632,7 @@ def _reconstruct_pins_from_compose(cfg: AgentsConfig) -> dict[str, str] | None:
     VM migration (multipass → libvirt) or rebuild — the host data-dir
     (compose included) survives wholesale while the state file sometimes
     doesn't, and the naive no-state ``up`` would re-resolve upstream
-    floating tags = an unintended upgrade (2026-07 incident).
+    floating tags = an unintended upgrade.
 
     Compose-read failures PROPAGATE instead of returning ``None`` —
     ``None`` is reserved for a *successfully read* compose doc with no

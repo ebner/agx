@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import tarfile
 from pathlib import Path
 
 import pytest
+import zstandard
 
 from agx_cli import config as cfg_mod
 from agx_cli import export_cmd, mp
@@ -16,6 +18,18 @@ from agx_cli.mp import MpResult
 
 def _ok(stdout: str = "") -> MpResult:
     return MpResult(stdout=stdout, stderr="", returncode=0)
+
+
+def extract_tar_zst(archive: Path, dest: Path) -> None:
+    """Extract a ``.tar.zst`` export into ``dest`` (``data`` filter:
+    refuses absolute paths and dangerous link entries)."""
+    dctx = zstandard.ZstdDecompressor()
+    with (
+        archive.open("rb") as fh,
+        dctx.stream_reader(fh, closefd=False) as zr,
+        tarfile.open(fileobj=zr, mode="r|") as tf,
+    ):
+        tf.extractall(dest, filter="data")
 
 
 @pytest.fixture
@@ -61,7 +75,7 @@ def with_coder(cfg: AgentsConfig, saved_config: Path, mocker) -> Path:
 
 
 def test_export_writes_archive_into_backups_dir(with_coder: Path, cfg: AgentsConfig) -> None:
-    from agx_cli.archive import ARCHIVE_SUFFIX, extract_tar_zst
+    from agx_cli.archive import ARCHIVE_SUFFIX
 
     archive = export_cmd.export("coder", config_path=with_coder)
     assert archive.parent == cfg.paths.host_data_dir / "backups"
@@ -80,8 +94,6 @@ def test_export_in_vm_mode_tars_as_root_and_captures_agent_state(
     """``--data-dir-in-vm``: the state subtree is subuid-owned under mode
     700 on the VM disk. The unprivileged tar + ``--ignore-failed-read``
     this branch used to run produced a "successful" archive without it."""
-    from agx_cli.archive import extract_tar_zst
-
     cfg.paths.data_dir_in_vm = True
     cfg_mod.save(cfg, saved_config)
     exec_bash = mocker.spy(mp, "exec_bash")
@@ -170,21 +182,6 @@ def test_prune_no_op_when_under_threshold(tmp_path: Path) -> None:
     deleted = export_cmd._prune_old_archives("coder", d, keep_last=14)
     assert deleted == []
     assert len(list(d.iterdir())) == 2
-
-
-def test_prune_handles_legacy_tar_gz_archives(tmp_path: Path) -> None:
-    """Pre-G6 archives are .tar.gz, not .tar.zst. Auto-prune must
-    treat both as toolkit-owned so users migrating from older
-    versions don't end up with an unbounded old-format pile."""
-    d = tmp_path / "backups"
-    d.mkdir()
-    (d / "coder-20260518T003001Z.tar.gz").write_bytes(b"x")  # legacy
-    (d / "coder-20260519T003001Z.tar.zst").write_bytes(b"x")
-    (d / "coder-20260520T003001Z.tar.zst").write_bytes(b"x")
-    deleted = export_cmd._prune_old_archives("coder", d, keep_last=2)
-    # The legacy .tar.gz is the oldest → gets deleted.
-    assert len(deleted) == 1
-    assert deleted[0].name == "coder-20260518T003001Z.tar.gz"
 
 
 def test_export_skips_prune_when_to_is_custom(
@@ -366,7 +363,7 @@ def test_import_vm_temp_path_excludes_user_filename(with_coder: Path, cfg: Agent
     for script in scripts:
         assert "rm -rf $HOME" not in script
         assert HOSTILE_ARCHIVE_NAME not in script
-        assert re.search(r"/tmp/agents-import-coder-\d+-[0-9a-f]{8}\.tar\b", script)
+        assert re.search(r"/tmp/agx-import-coder-\d+-[0-9a-f]{8}\.tar\b", script)
     # The transfer destination (also a shell-adjacent VM path) is clean too.
     vm_dst = mp.transfer_to_vm.call_args.args[2]
     assert "rm -rf" not in vm_dst and HOSTILE_ARCHIVE_NAME not in vm_dst
@@ -392,9 +389,9 @@ def test_import_in_vm_mode_temp_path_excludes_user_filename(
     script = mocks["exec_bash"].call_args.args[1]
     assert "rm -rf $HOME" not in script
     assert HOSTILE_ARCHIVE_NAME not in script
-    assert re.search(r"/tmp/agents-import-coder-\d+-[0-9a-f]{8}\.tar\b", script)
+    assert re.search(r"/tmp/agx-import-coder-\d+-[0-9a-f]{8}\.tar\b", script)
     # Root extract so the members' subuid ownership is restored.
-    assert re.search(r"sudo tar -xf /tmp/agents-import-coder-\S+ --numeric-owner", script)
+    assert re.search(r"sudo tar -xf /tmp/agx-import-coder-\S+ --numeric-owner", script)
 
 
 # ---------- remove --export-first (CLI ordering) ----------
@@ -638,3 +635,17 @@ def test_read_crontab_raises_on_unexpected_failure(mocker) -> None:
     mocker.patch("subprocess.run", return_value=StubProc())
     with pytest.raises(RuntimeFailure):
         export_cmd._read_crontab()
+
+
+def test_prune_never_touches_an_agent_whose_name_extends_this_one(tmp_path: Path) -> None:
+    """`foo-*` would also match agent `foo-bar`'s archives; pruning `foo`
+    must count and delete only `foo-<stamp>.tar.zst`."""
+    from agx_cli.export_cmd import _prune_old_archives
+
+    stamps = ["20260101T000000Z", "20260102T000000Z", "20260103T000000Z"]
+    for s in stamps:
+        (tmp_path / f"foo-{s}.tar.zst").write_bytes(b"")
+        (tmp_path / f"foo-bar-{s}.tar.zst").write_bytes(b"")
+    deleted = _prune_old_archives("foo", tmp_path, keep_last=1)
+    assert sorted(p.name for p in deleted) == [f"foo-{s}.tar.zst" for s in stamps[:2]]
+    assert all((tmp_path / f"foo-bar-{s}.tar.zst").exists() for s in stamps)

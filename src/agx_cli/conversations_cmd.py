@@ -52,19 +52,22 @@ _SAFE_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 # Run inside the agent's container. Emits one JSON object on stdout
 # describing all sessions + which are within the freshness window.
 # Reads ``/opt/data/config.yaml`` to pick up the agent's configured
-# freshness window (falls back to ``DEFAULT_FRESHNESS_S`` if unparseable).
+# freshness window (falls back to ``DEFAULT_FRESHNESS_S``, prepended as
+# ``DEFAULT_FRESH``, if unparseable).
 # Kept as a single string so we can pass it through ``python3 -c`` via
 # argv without staging a temp file — the script is read-only and tiny.
-_QUERY_SCRIPT = """\
+_QUERY_SCRIPT = (
+    f"DEFAULT_FRESH = {DEFAULT_FRESHNESS_S}\n"
+    + """\
 import json, os, sqlite3, time
 home = os.environ.get("H_HOME", "/opt/data")
 try:
     import yaml
     cfg = yaml.safe_load(open(home + "/config.yaml")) or {}
     fresh = int((cfg.get("agent") or {}).get(
-        "gateway_auto_continue_freshness", 3600))
+        "gateway_auto_continue_freshness", DEFAULT_FRESH))
 except Exception:
-    fresh = 3600
+    fresh = DEFAULT_FRESH
 now = time.time()
 c = sqlite3.connect("file:" + home + "/state.db?mode=ro", uri=True)
 c.row_factory = sqlite3.Row
@@ -105,6 +108,7 @@ out = {
 }
 print(json.dumps(out))
 """
+)
 
 
 _EXPORT_SCRIPT = """\

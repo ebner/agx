@@ -1,6 +1,7 @@
-"""Compose-file mutation with the strict atomicity contract from the plan.
+"""Compose-file mutation with a strict atomicity contract.
 
-Pattern, plan-locked:
+Pattern (a locked architecture rule — see AGENTS.md and
+docs/architecture.md):
 
 1. Hold ``flock`` on ``<data-dir>/.agents.lock`` for the duration.
 2. Read+mutate the compose doc with ``ruamel.yaml``. Reads come straight
@@ -84,11 +85,6 @@ OPENCLAW_STATE_MOUNTS: Final = (
 # bind-mounted read-only into each Hermes container.
 CONT_INIT_REL: Final = ".toolkit/cont-init/99-fixperms"
 CONT_INIT_CONTAINER_PATH: Final = "/etc/cont-init.d/99-toolkit-fixperms"
-# Container-side target of the retired Codex "import bridge" volume
-# (``./.codex:/home/hermes/.codex:ro``). Stock fragments no longer emit
-# it; ``agx reseat`` drops it from existing agents explicitly, because
-# its carry-user-additions diff would otherwise preserve it forever.
-LEGACY_CODEX_BRIDGE_TARGET: Final = "/home/hermes/.codex"
 # Sibling-service memory backends managed by the toolkit. Whitelisted by
 # the same parsed (registry, repo) tuple check as the agent images so an
 # attacker-controlled compose can't sneak in a typo-squatted variant.
@@ -380,8 +376,8 @@ def ensure_cont_init_script(cfg: AgentsConfig) -> None:
 
 
 # How long a host-side write may take to show up in the VM. virtiofs
-# (libvirt) caches attributes/dentries for ~1 s by default: measured
-# 2026-10-12, a host rename was invisible to the VM for 0.5-1 s, so an
+# (libvirt) caches attributes/dentries for ~1 s by default: a host
+# rename was measured invisible to the VM for 0.5-1 s, so an
 # `agx mount remove --restart` handed `docker compose up` the OLD
 # override, compose saw no change, and the container kept the removed
 # bind mount. 9p (multipass) has its own caching; the check is cheap.
@@ -536,11 +532,11 @@ def hermes_service_fragment(
     official image), the rootless Docker socket so Hermes can spawn its
     nested sandbox, and the toolkit's cont-init perms hook.
 
-    Deliberately NO ``./.codex:/home/hermes/.codex:ro`` "import bridge"
-    (retired 2026-09 — see :data:`LEGACY_CODEX_BRIDGE_TARGET`): a
+    Deliberately NO mount of the toolkit-scoped ``<data-dir>/.codex``: a
     Hermes agent authenticates its ``openai-codex`` provider inside the
     container (``hermes auth add openai-codex``) so the credential and
-    its single-use OAuth refresh chain are owned by the agent alone.
+    its single-use OAuth refresh chain are owned by the agent alone —
+    two copies of one chain invalidate each other on refresh.
 
     No ``user:`` override. Under rootless Docker, container UID 0 (the
     image's default entrypoint user) maps to the rootless host user
@@ -584,12 +580,11 @@ def hermes_service_fragment(
         "env_file": [f"./{name}/.env"],
         "environment": {
             "DOCKER_HOST": f"unix://{socket_path}",
-            # The runtime user's passwd home — ON the bind mount. The old
-            # pin to /home/hermes (container overlay) existed for the
-            # retired Codex bridge and silently dropped everything written
-            # under ~ by `docker exec` processes (`agx exec` sessions)
-            # on every recreate. The gateway is unaffected either way: s6
-            # resets HOME from passwd.
+            # The runtime user's passwd home — ON the bind mount, so what
+            # `docker exec` processes (`agx exec` sessions) write under ~
+            # survives recreates; a HOME on the container overlay would be
+            # wiped each time. The gateway itself always gets HOME from
+            # passwd (s6 resets it).
             "HOME": HERMES_HOME_DIR,
             # Mirrors the image's Config.Env PATH. Pinned because images
             # predating that env relied on the entrypoint to add the venv,
@@ -932,7 +927,7 @@ def firecrawl_service_fragments(
             "restart": "unless-stopped",
             # Disable both RDB snapshots and AOF — queue state is fine
             # to drop on restart for a single-user setup, and avoids the
-            # SQLite-WAL-on-9p class of issue documented in CLAUDE.md
+            # SQLite-WAL-on-9p class of issue documented in AGENTS.md
             # for redis' append-only-log under host-mount mode.
             "command": ["redis-server", "--save", "", "--appendonly", "no"],
             "expose": ["6379"],
@@ -1022,10 +1017,6 @@ def rename_service(doc: Any, old_name: str, new_name: str) -> None:
     if new_name in services:
         raise UserError(f"service {new_name!r} already exists")
     services[new_name] = services.pop(old_name)
-
-
-def list_services(doc: Any) -> list[str]:
-    return list((doc.get("services") or {}).keys())
 
 
 # ---------- port allocator ----------

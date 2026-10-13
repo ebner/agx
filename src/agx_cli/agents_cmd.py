@@ -215,7 +215,7 @@ def create(
                     f"or pick a different name."
                 )
             # Both --reuse-data and resume paths must refuse if a live
-            # container is currently mapping the dir. Plan rule #1.
+            # container is currently mapping the dir.
             if _has_live_container(cfg, svc):
                 raise UserError(
                     f"refusing to {'resume' if resumable else 'attach'}: "
@@ -247,9 +247,8 @@ def create(
                 compose_runner.up(cfg, svc)
                 if agent_type == "hermes":
                     # Auto-chown the image-baked paths Hermes' setup
-                    # wizard writes into (e.g. /opt/hermes/scripts/
-                    # for bridge npm-installs, /home/hermes/ for npm
-                    # cache) so first-run `hermes setup` doesn't hit
+                    # wizard writes into (/opt/hermes/scripts/ for
+                    # bridge npm-installs) so first-run `hermes setup` doesn't hit
                     # EACCES on its install branches. Lost on every
                     # container recreate — re-applied by fix-perms
                     # and reseat. See fixperms_cmd.HERMES_WRITABLE_PATHS.
@@ -358,7 +357,7 @@ def prepare_openclaw_state(cfg: AgentsConfig, name: str, svc: str) -> None:
     toolkit creates: those belong to the host user, i.e. container ROOT
     under rootless Docker, while ``node`` maps to a subuid — so OpenClaw
     could persist nothing ("Permission denied" on its own state dir,
-    reproduced 2026-10). Upstream's fix is ``chown -R 1000:1000`` on the
+    reproduced with ``openclaw/openclaw:2026.10.1``). Upstream's fix is ``chown -R 1000:1000`` on the
     bind sources; here the chown must happen inside the userns (the host
     user can't chown to a subuid), so it runs as root in a one-off
     container of the service, with the service's own mounts. Idempotent —
@@ -540,11 +539,10 @@ def _add_service_to_compose(
 
 def _ensure_hermes_image_pulled(cfg: AgentsConfig, tag: str) -> None:
     """Pull the Hermes image up front so `docker compose up` doesn't hit a
-    network failure mid-mutation. We used to also verify the image's
-    entrypoint USER/HOME for the (since retired) Codex import mount;
-    the fragment pins `HOME` in env and the entrypoint remaps the
-    runtime uid via HERMES_UID, so image drift there is no longer our
-    concern. We just need the image local before compose up.
+    network failure mid-mutation. The image's entrypoint USER/HOME need
+    no verification: the fragment pins `HOME` in env and the entrypoint
+    remaps the runtime uid via HERMES_UID. We just need the image local
+    before compose up.
     """
     image_ref = f"{HERMES_IMAGE_BASE}:{tag}"
     inspect = mp.exec_in_vm(cfg.vm.name, "docker", "image", "inspect", image_ref, check=False)
@@ -995,7 +993,7 @@ def reseat(
             compose.ensure_cont_init_script(cfg)
         else:
             # The template may mount state dirs the old block didn't
-            # (2026-10: .config / .local) — create + hand them to `node`.
+            # (e.g. .config / .local) — create + hand them to `node`.
             prepare_openclaw_state(cfg, name, svc)
         fixperms_cmd.force_recreate(cfg, svc)
         if agent_type == "hermes":
@@ -1074,22 +1072,6 @@ def _carry_user_additions(new_fragment: dict[str, object], existing: dict[str, o
     _merge_list_additions(new_fragment, existing, "depends_on")
     _merge_list_additions(new_fragment, existing, "ports", entry_identity=_port_identity)
     _merge_list_additions(new_fragment, existing, "volumes", entry_identity=_volume_identity)
-    _drop_retired_stock_volumes(new_fragment)
-
-
-def _drop_retired_stock_volumes(new_fragment: dict[str, object]) -> None:
-    """Remove volumes the toolkit itself used to emit and has since
-    retired. The carry-over diff can't tell "user addition" from "stale
-    stock entry" — both are absent from the fresh template — so a retired
-    toolkit volume would otherwise be preserved on every reseat forever.
-    Currently: the Codex import bridge (``compose.LEGACY_CODEX_BRIDGE_TARGET``).
-    """
-    volumes = new_fragment.get("volumes")
-    if not isinstance(volumes, list):
-        return
-    kept = [v for v in volumes if _volume_identity(v) != compose.LEGACY_CODEX_BRIDGE_TARGET]
-    if len(kept) != len(volumes):
-        new_fragment["volumes"] = kept
 
 
 def _merge_list_additions(

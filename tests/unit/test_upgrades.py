@@ -7,6 +7,7 @@ import tarfile
 from pathlib import Path
 
 import pytest
+import zstandard
 
 from agx_cli import compose, upgrades
 from agx_cli import config as cfg_mod
@@ -19,6 +20,17 @@ from agx_cli.mp import MpResult
 
 def _ok(stdout: str = "") -> MpResult:
     return MpResult(stdout=stdout, stderr="", returncode=0)
+
+
+def _write_tar_zst(archive: Path, src: Path, arcname: str) -> None:
+    """A one-member ``.tar.zst``, the format ``agx upgrade`` snapshots use."""
+    cctx = zstandard.ZstdCompressor()
+    with (
+        archive.open("wb") as fh,
+        cctx.stream_writer(fh, closefd=False) as zw,
+        tarfile.open(fileobj=zw, mode="w|") as tf,
+    ):
+        tf.add(src, arcname=arcname)
 
 
 def _fail(stderr: str = "boom") -> MpResult:
@@ -541,9 +553,8 @@ def test_rollback_restores_from_latest_archive(with_coder: Path, mocker, cfg: Ag
     snapshot_data = cfg.paths.host_data_dir / "snapshot-data"
     snapshot_data.mkdir()
     (snapshot_data / "marker.txt").write_text("from-snapshot", encoding="utf-8")
-    archive = upgrades_dir / "coder-20260512T120000Z.tar.gz"
-    with tarfile.open(archive, "w:gz") as tf:
-        tf.add(snapshot_data / "marker.txt", arcname="coder/marker.txt")
+    archive = upgrades_dir / "coder-20260512T120000Z.tar.zst"
+    _write_tar_zst(archive, snapshot_data / "marker.txt", "coder/marker.txt")
     # Stub VM ops + skip confirm
     mocker.patch("agx_cli.ui.confirm", return_value=True)
     mocker.patch(
@@ -578,7 +589,7 @@ def test_restore_host_snapshot_extracts_as_root_inside_vm(
         upgrades._restore_host_snapshot(cfg, archive)
 
     vm_tmp = transfer.call_args.args[2]
-    assert vm_tmp.startswith("/tmp/agents-restore-") and archive.name not in vm_tmp
+    assert vm_tmp.startswith("/tmp/agx-restore-") and archive.name not in vm_tmp
     script = exec_bash.call_args.args[1]
     assert f"cd {cfg.paths.vm_agents_root}\n" in script
     assert f"sudo tar -xf {vm_tmp} --numeric-owner" in script
@@ -588,7 +599,7 @@ def test_restore_host_snapshot_extracts_as_root_inside_vm(
 def test_rollback_aborts_without_confirmation(with_coder: Path, mocker, cfg: AgentsConfig) -> None:
     upgrades_dir = cfg.paths.host_data_dir / ".upgrades"
     upgrades_dir.mkdir(exist_ok=True)
-    (upgrades_dir / "coder-20260512T120000Z.tar.gz").write_bytes(b"")
+    (upgrades_dir / "coder-20260512T120000Z.tar.zst").write_bytes(b"")
     # The prompt names the newest VM snapshot (and its age), which lists
     # snapshots via the real backend binary unless stubbed (absent in CI).
     mocker.patch("agx_cli.upgrades._latest_vm_snapshot", return_value=None)
@@ -607,9 +618,8 @@ def _write_rollback_archive(cfg: AgentsConfig, name: str, stamp: str = "20260512
     upgrades_dir.mkdir(exist_ok=True)
     marker = cfg.paths.host_data_dir / f"{name}-marker.txt"
     marker.write_text("from-snapshot", encoding="utf-8")
-    archive = upgrades_dir / f"{name}-{stamp}.tar.gz"
-    with tarfile.open(archive, "w:gz") as tf:
-        tf.add(marker, arcname=f"{name}/marker.txt")
+    archive = upgrades_dir / f"{name}-{stamp}.tar.zst"
+    _write_tar_zst(archive, marker, f"{name}/marker.txt")
     return archive
 
 
@@ -766,8 +776,8 @@ def test_rollback_restarts_service_when_host_restore_fails(
 ) -> None:
     """Regression: once the live container is stopped, a failure in the
     restore steps (corrupt archive, extraction error) used to raise
-    before the final ``compose_runner.up`` — turning a failed rollback
-    ATTEMPT into an outage. The service must be brought back up
+    before the final ``compose_runner.up`` — leaving the agent stopped
+    after a merely failed rollback ATTEMPT. The service must be brought back up
     best-effort and the ORIGINAL error must propagate."""
     _write_rollback_archive(cfg, "coder")
     mocker.patch("agx_cli.ui.confirm", return_value=True)
@@ -925,12 +935,12 @@ def test_latest_host_snapshot_ignores_prefix_colliding_agent(cfg: AgentsConfig) 
     assert other.name == "foo-bar-20260201T000000Z.tar.zst"
 
 
-def test_latest_host_snapshot_still_accepts_legacy_tar_gz(cfg: AgentsConfig) -> None:
+def test_latest_host_snapshot_ignores_non_archives(cfg: AgentsConfig) -> None:
     upgrades_dir = cfg.paths.host_data_dir / ".upgrades"
     upgrades_dir.mkdir(exist_ok=True)
-    (upgrades_dir / "foo-20260101T000000Z.tar.gz").write_bytes(b"")
     (upgrades_dir / "foo-20260201T000000Z.tar.zst").write_bytes(b"")
-    # Stray non-snapshot files with a matching prefix are ignored.
+    # Stray files with a matching prefix (incl. other suffixes) are ignored.
+    (upgrades_dir / "foo-20260301T000000Z.tar.gz").write_bytes(b"")
     (upgrades_dir / "foo-notes.txt").write_bytes(b"")
 
     got = upgrades._latest_host_snapshot(cfg, "foo")
@@ -1082,7 +1092,7 @@ def test_upgrade_config_check_skipped_when_migrate_failed(
 def test_upgrade_skips_config_migrate_for_openclaw(
     cfg: AgentsConfig, saved_config: Path, mocker
 ) -> None:
-    """OpenClaw owns its own plugin/config lifecycle (CLAUDE.md
+    """OpenClaw owns its own plugin/config lifecycle (AGENTS.md
     Hermes-vs-OpenClaw matrix); the toolkit must not call
     ``hermes config migrate`` on an OpenClaw agent — that would be
     invoking the wrong binary entirely.
@@ -1186,10 +1196,9 @@ def test_upgrade_bare_call_noops_when_at_latest(
 ) -> None:
     """Bare ``upgrade`` fetches latest, finds it matches current pin,
     no-ops cleanly — no snapshot dance, no misleading ``vX -> vX``
-    output. Caught a user-facing regression today where a user typed
-    ``agx upgrade coder`` expecting either a real upgrade or a
-    quick "you're current" message, got ~30-60s of avoidable downtime
-    instead.
+    output. A user typing ``agx upgrade <name>`` expects either a
+    real upgrade or a quick "you're current" message, not ~30-60s of
+    avoidable downtime.
     """
     mocks = _stub_happy_upgrade(mocker, cfg)  # fetch returns "v1.0.0" = current
     outcome = upgrades.upgrade("coder", config_path=with_coder)
@@ -1255,8 +1264,7 @@ def test_upgrade_recreate_with_explicit_tag_match_still_runs_pipeline(
 def test_upgrade_rollback_clears_journal_to_force_clean_retry(
     with_coder: Path, mocker, cfg: AgentsConfig
 ) -> None:
-    """Regression for the 2026-05-22 silent-no-op-on-retry bug:
-    when the upgrade except handler reverts the compose tag, the
+    """Regression for a silent-no-op-on-retry bug: when the upgrade except handler reverts the compose tag, the
     journal must be cleared too. Without this, the next retry sees
     completed_phases = [host_data_snapshot, vm_snapshot, tag_pinned,
     pulled, recreated] and skips them — so the live container stays
@@ -1289,7 +1297,7 @@ def test_upgrade_doctor_failure_names_the_failing_checks(
     """A red doctor phase must say WHICH check failed (and why): the
     revert replaces the container the report was about, so a bare
     "1 doctor check(s) failed" left the user nothing to investigate
-    (2026-10-10, v0.21.6 rolled back with no hint). Warnings must not
+    (observed when Hermes v0.21.6 was rolled back). Warnings must not
     trip the gate and must not be listed as failures."""
     from agx_cli.errors import HealthCheckFailure
     from agx_cli.ops import DoctorReport
@@ -1380,8 +1388,7 @@ def test_upgrade_revert_failure_preserves_original_error_and_cleanup(
 def test_host_data_snapshot_runs_sudo_tar_inside_vm_in_host_mount_mode(
     with_coder: Path, mocker, cfg: AgentsConfig
 ) -> None:
-    """Regression for the 2026-05-22 EACCES on coder's .data: the
-    naïve "stream through zstandard on the host" path doesn't work
+    """Regression for an EACCES on an agent's ``.data``: the naïve "stream through zstandard on the host" path doesn't work
     when the agent's data is owned by a rootless-Docker subuid the
     host user can't read (mode 700 + foreign uid). The host-mount
     branch must run ``sudo tar`` inside the VM (where root reads
@@ -1429,8 +1436,7 @@ def test_host_data_snapshot_data_dir_in_vm_also_tars_as_root(
 def test_vm_snapshot_waits_for_ssh_on_libvirt_after_start(
     with_coder: Path, mocker, cfg: AgentsConfig
 ) -> None:
-    """Regression for the 2026-05-22 upgrade-on-libvirt failure:
-    ``_vm_snapshot`` must NOT return until the VM is back online
+    """Regression for an upgrade-on-libvirt failure: ``_vm_snapshot`` must NOT return until the VM is back online
     after the snapshot stop/start cycle. The next phase (``tag_pinned``)
     does compose-write-via-scp which races DHCP otherwise — error
     surfaces as "could not get IP for libvirt VM".

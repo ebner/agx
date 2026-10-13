@@ -541,7 +541,6 @@ def open_shell(data_dir: Path, socket_path: str) -> int:
     env = os.environ.copy()
     env["DOCKER_HOST"] = f"unix://{socket_path}"
     env["AGX_BARE_METAL"] = "1"
-    env["AGENTS_BARE_METAL"] = "1"  # pre-rename name, for existing prompts/rc files
     shell_bin = os.environ.get("SHELL") or shutil.which("bash") or "/bin/bash"
     ui.info(f"$ cd {shlex.quote(str(data_dir))} && DOCKER_HOST=unix://{socket_path} {shell_bin}")
     try:

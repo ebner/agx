@@ -175,43 +175,26 @@ def _only_vanished_paths(stderr: str) -> bool:
     venvs — tens of thousands of files). Each entry removed between
     readdir and chown is a "No such file or directory" and makes chown
     exit 1; there is nothing left to fix for it, so that alone must not
-    fail a reseat/fix-perms half-way (2026-10-12, coder).
+    fail a reseat/fix-perms half-way.
     """
     lines = [line for line in stderr.splitlines() if line.strip()]
     return bool(lines) and all(line.endswith("No such file or directory") for line in lines)
 
 
-# The runtime user's HOME in fragments written before 2026-10 (current
-# fragments pin HOME=/opt/data, the persisted passwd home). Still created
-# by chown_hermes_install_paths + the cont-init hook (the image doesn't)
-# so agents not yet `reseat`ed keep a writable npm cache/log dir.
-LEGACY_HERMES_HOME_DIR = "/home/hermes"
-
-HERMES_WRITABLE_PATHS: tuple[tuple[str, tuple[str, ...]], ...] = (
-    # (target, paths-to-prune). `find -path <prune> -prune` keeps the
-    # chown from touching read-only bind-mounts. /home/hermes/.codex is
-    # the RETIRED Codex import bridge (2026-09): agents not yet
-    # `reseat`ed still carry it mounted :ro, where every entry would
-    # emit "Read-only file system" without the prune. Harmless once the
-    # mount is gone — a non-existent prune path matches nothing.
-    #
+# Image-baked paths Hermes itself writes into at runtime. They live on
+# the container overlay fs, so every recreate resets their ownership.
+HERMES_WRITABLE_PATHS: tuple[str, ...] = (
     # Where Hermes' `setup` wizard installs per-bridge helpers (e.g.
     # whatsapp-bridge → npm install target). Image-baked at build,
     # root-owned by default. uid 1000 needs write here to install.
-    ("/opt/hermes/scripts", ()),
-    # Runtime user's home: npm log/cache (`.npm/`), pip cache,
-    # browser cache, etc. The image's `usermod -u 1000 hermes`
-    # doesn't migrate the home dir, so it stays at the image-baked
-    # ownership and uid 1000 can't drop dotfiles here.
-    ("/home/hermes", ("/home/hermes/.codex",)),
+    "/opt/hermes/scripts",
 )
 
 
 def chown_hermes_install_paths(cfg: AgentsConfig, svc: str, uid: int) -> None:
     """Chown the image-baked paths Hermes itself writes into, to the
     runtime user — so `hermes setup`'s install branches (WhatsApp
-    bridge npm install, future bridges, npm/pip log caches in
-    `/home/hermes/`) can write without EACCES.
+    bridge npm install, future bridges) can write without EACCES.
 
     Best-effort: skips any path that doesn't exist (e.g. older
     Hermes images may not ship ``/opt/hermes/scripts/``). Failures
@@ -225,21 +208,7 @@ def chown_hermes_install_paths(cfg: AgentsConfig, svc: str, uid: int) -> None:
     fix-perms``, ``agx reseat``) calls this helper after start.
     """
     ui.progress(f"chowning image-baked install paths in {svc} (hermes setup prerequisites)...")
-    # Fragments written before 2026-10 pin HOME=/home/hermes, but nothing
-    # in the image creates it (`usermod` doesn't, and newer images run as
-    # root with no home at all). It used to exist only as a side effect
-    # of Docker creating the parent of the retired /home/hermes/.codex
-    # bridge mount — without it npm has no cache/log dir and the WhatsApp
-    # bridge's dependency install fails half-way (ERR_MODULE_NOT_FOUND,
-    # 2026-09-21). Harmless for reseated agents (HOME=/opt/data).
-    mp.exec_in_vm(
-        cfg.vm.name,
-        *_compose_exec_in_vm_argv(
-            cfg, svc, "mkdir", "-p", LEGACY_HERMES_HOME_DIR, no_tty=True, as_root=True
-        ),
-        check=False,
-    )
-    for path, prunes in HERMES_WRITABLE_PATHS:
+    for path in HERMES_WRITABLE_PATHS:
         check = mp.exec_in_vm(
             cfg.vm.name,
             *_compose_exec_in_vm_argv(cfg, svc, "test", "-e", path, no_tty=True, as_root=True),
@@ -247,16 +216,6 @@ def chown_hermes_install_paths(cfg: AgentsConfig, svc: str, uid: int) -> None:
         )
         if check.returncode != 0:
             continue
-        # `find <path> [ -path <prune> -prune -o ]* -exec chown ... +`
-        # walks the tree, short-circuits each pruned subtree (no descent,
-        # no action on the mountpoint dir entry itself), and chowns
-        # everything else. We need the prune rather than just `-xdev`
-        # because `find -xdev` still emits the mountpoint directory's
-        # own entry — and the resulting chown lands on the mounted
-        # read-only fs, not the parent.
-        prune_clause: list[str] = []
-        for prune_path in prunes:
-            prune_clause.extend(["-path", prune_path, "-prune", "-o"])
         result = mp.exec_in_vm(
             cfg.vm.name,
             *_compose_exec_in_vm_argv(
@@ -264,7 +223,6 @@ def chown_hermes_install_paths(cfg: AgentsConfig, svc: str, uid: int) -> None:
                 svc,
                 "find",
                 path,
-                *prune_clause,
                 "-exec",
                 "chown",
                 f"{uid}:{uid}",

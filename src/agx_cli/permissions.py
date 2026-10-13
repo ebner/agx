@@ -155,8 +155,7 @@ def apply_acl_argv(
     # ``---`` so effective perms stay at zero. Including ``m::rwx``
     # in the spec forces the mask wide open; each individual entry's
     # own perms still cap effective access (u:1000:rX → r-x on dirs).
-    # Reproduced live on coder's .data (subuid-owned, mode 700) before
-    # this fix landed.
+    # Reproduced on an agent's ``.data`` dir (subuid-owned, mode 700).
     specs = [r.to_spec() for r in recipients] + ["m::rwx"]
     cmds: list[list[str]] = []
     base = ["setfacl"]

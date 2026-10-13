@@ -19,7 +19,7 @@ adds *additional* per-folder hops on demand. Per the design lock-in:
   from the manifest, never relying on text-matching to find the
   entry.
 - **Read-only by default.** ``--rw`` requires explicit opt-in with a
-  warning. The CLAUDE.md threat model is explicit that a prompt-
+  warning. The AGENTS.md threat model is explicit that a prompt-
   injected agent can modify writable mounts.
 - **Two compose targets:**
   * ``runtime``: the agent's runtime container — added via
@@ -63,7 +63,6 @@ RESERVED_CONTAINER_PATHS: frozenset[str] = frozenset(
         "/opt/data",
         "/opt/hermes",
         "/home/hermes",
-        "/home/hermes/.codex",
         "/home/node",
         "/home/node/.openclaw",
         "/run",
@@ -441,23 +440,17 @@ def remove(
     entry = matching[0]
     vm_path = entry.vm_path(agent)
     bare_metal = cfg.vm.backend == "bare_metal"
-    # Toolkit versions before 2026-10 wrote the VM-side path as the bind
-    # source on bare-metal too (a dead mount: nothing backs it on the
-    # host). Strip that legacy form as well so such entries still go.
-    sources = [entry.volume_source(agent, cfg.vm.backend)]
-    if bare_metal:
-        sources.append(vm_path)
+    source = entry.volume_source(agent, cfg.vm.backend)
 
     with compose.acquire_lock(cfg.paths.host_data_dir):
-        ui.info(f"removing mount: source={sources[0]}  container={container}")
+        ui.info(f"removing mount: source={source}  container={container}")
 
-        for source in sources:
-            if entry.target in {"runtime", "both"}:
-                with _suppress():
-                    _remove_runtime_volume(cfg, svc, source, container, entry.readonly)
-            if entry.target in {"sandbox", "both"}:
-                with _suppress():
-                    _remove_sandbox_volume(cfg, svc, agent, source, container, entry.readonly)
+        if entry.target in {"runtime", "both"}:
+            with _suppress():
+                _remove_runtime_volume(cfg, svc, source, container, entry.readonly)
+        if entry.target in {"sandbox", "both"}:
+            with _suppress():
+                _remove_sandbox_volume(cfg, svc, agent, source, container, entry.readonly)
 
         if not bare_metal:
             detached = mp.umount(cfg.vm.name, vm_path)

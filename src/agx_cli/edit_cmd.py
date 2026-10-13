@@ -251,7 +251,7 @@ def _run_editor(path: Path) -> None:
 def _make_buffer(name: str, content: bytes) -> Path:
     runtime = os.environ.get("XDG_RUNTIME_DIR", "")
     parent = runtime if runtime and os.path.isdir(runtime) else None
-    workdir = Path(tempfile.mkdtemp(prefix="agents-edit-", dir=parent))  # mode 0700
+    workdir = Path(tempfile.mkdtemp(prefix="agx-edit-", dir=parent))  # mode 0700
     buffer = workdir / name
     fd = os.open(buffer, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "wb") as fh:

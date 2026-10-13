@@ -103,7 +103,7 @@ def export(
         )
         if check.returncode != 0:
             raise UserError(f"agent data dir for {name!r} not found in VM")
-        vm_archive = f"/tmp/agents-export-{name}-{_utc_stamp()}{archive_mod.ARCHIVE_SUFFIX}"
+        vm_archive = f"/tmp/agx-export-{name}-{_utc_stamp()}{archive_mod.ARCHIVE_SUFFIX}"
         # As root, like the host-mount branch below: the agent's state
         # subtree is subuid-owned under mode 700 on the VM disk too, and
         # an unprivileged tar with ``--ignore-failed-read`` skips it
@@ -128,17 +128,15 @@ def export(
             raise UserError(f"agent data dir for {name!r} not found at {agent_dir}")
         # Host-mount mode: the agent's ``.data/`` subtree is owned by
         # a rootless-Docker subuid (host uid 100999) under mode 700.
-        # A host-side ``write_tar_zst([(agent_dir, name)])`` walks the
-        # tree as the toolkit user (uid 1000), which can't even ``opendir``
-        # ``.data``. Worse, Python's tarfile suppresses per-file errors
-        # and writes an archive containing JUST the readable directory
-        # stubs — silently produces ~200-byte "successful" tarballs
-        # missing every actual file. ``agx export-cron`` has been
-        # running 4x/day, faithfully producing useless archives that
-        # duplicity then backs up — silent data loss disguised as
-        # working backups.
+        # A host-side tar (e.g. Python's ``tarfile``) walks the tree as
+        # the toolkit user (uid 1000), which can't even ``opendir``
+        # ``.data``. Worse, ``tarfile`` suppresses per-file errors and
+        # writes an archive containing JUST the readable directory
+        # stubs — a ~200-byte "successful" tarball missing every actual
+        # file, which ``agx export-cron`` and duplicity would then keep
+        # as if it were a working backup.
         #
-        # Fix: same pattern as ``upgrades._host_data_snapshot`` —
+        # Instead, same pattern as ``upgrades._host_data_snapshot`` —
         # tar inside the VM as root (virtiofs passes file ownership
         # through; root can read any uid), chown the archive back to
         # ubuntu so SFTP can transfer it, then transfer out and clean
@@ -146,7 +144,7 @@ def export(
         from agx_cli import mp
 
         out = _archive_dir(cfg, to) / archive_name
-        vm_archive = f"/tmp/agents-export-{name}-{_utc_stamp()}{archive_mod.ARCHIVE_SUFFIX}"
+        vm_archive = f"/tmp/agx-export-{name}-{_utc_stamp()}{archive_mod.ARCHIVE_SUFFIX}"
         # ``--warning=no-file-changed`` demotes GNU tar's rc=1 exit on
         # "file changed as we read it" (the running agent rewriting
         # state.db / kanban.db / WAL files during the walk) to a
@@ -200,7 +198,7 @@ def _prune_old_archives(agent_name: str, archive_dir: Path, keep_last: int) -> l
     only the newest ``keep_last``. Returns the deleted paths.
 
     Only files matching the toolkit's own naming pattern
-    (``<agent>-<utc>.tar.zst``, plus the legacy ``.tar.gz`` form) are
+    (``<agent>-<utc>.tar.zst``) are
     candidates — anything else in the dir is left alone (user files,
     other agents' archives, the ``.export-cron.log``).
 
@@ -213,9 +211,9 @@ def _prune_old_archives(agent_name: str, archive_dir: Path, keep_last: int) -> l
     """
     if keep_last <= 0 or not archive_dir.is_dir():
         return []
+    pattern = archive_mod.archive_name_re(agent_name)
     candidates = sorted(
-        list(archive_dir.glob(f"{agent_name}-*.tar.zst"))
-        + list(archive_dir.glob(f"{agent_name}-*.tar.gz")),
+        (p for p in archive_dir.iterdir() if pattern.fullmatch(p.name)),
         key=lambda p: p.name,
     )
     if len(candidates) <= keep_last:
@@ -279,7 +277,7 @@ def _vm_import_temp_path(name: str) -> str:
     injection. ``tar -xf`` detects compression by content, so the fixed
     ``.tar`` extension is only cosmetic.
     """
-    return f"/tmp/agents-import-{name}-{os.getpid()}-{uuid.uuid4().hex[:8]}.tar"
+    return f"/tmp/agx-import-{name}-{os.getpid()}-{uuid.uuid4().hex[:8]}.tar"
 
 
 def import_archive(
@@ -480,12 +478,7 @@ def export_cron_status(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> di
     installed = any(CRON_MARKER in ln for ln in existing.splitlines())
     backups_dir = cfg.paths.host_data_dir / "backups"
     archives = (
-        sorted(
-            list(backups_dir.glob(f"*{archive_mod.ARCHIVE_SUFFIX}"))
-            + list(backups_dir.glob("*.tar.gz"))
-        )
-        if backups_dir.exists()
-        else []
+        sorted(backups_dir.glob(f"*{archive_mod.ARCHIVE_SUFFIX}")) if backups_dir.exists() else []
     )
     last_archive = archives[-1] if archives else None
     info: dict[str, object] = {

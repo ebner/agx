@@ -376,28 +376,3 @@ def _ensure_env_file_in_compose(cfg: AgentsConfig, agent_name: str, svc_name: st
         # Unknown shape; replace with what we want.
         svc["env_file"] = [ref]
     compose.write_compose_atomically(cfg, doc)
-
-
-# ---------- doctor helpers (optional surface) ----------
-
-
-def all_secret_keys(cfg: AgentsConfig) -> dict[str, list[str]]:
-    """For every agent in compose, return the list of secret-key names
-    (no values). Used by ``status``-style commands that want to surface
-    "coder has 3 secrets set" without leaking content.
-    """
-    out: dict[str, list[str]] = {}
-    doc = compose.read_compose_doc(cfg)
-    services = doc.get("services") or {}
-    for svc_name in services:
-        for prefix in ("hermes-", "openclaw-"):
-            if svc_name.startswith(prefix):
-                agent_name = svc_name[len(prefix) :]
-                out[agent_name] = sorted(_read_env(cfg, agent_name).keys())
-                break
-    return out
-
-
-# Public re-export — useful in tests and from `agx secret list --json`.
-read_env = _read_env
-write_env = _write_env

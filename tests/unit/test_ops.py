@@ -253,7 +253,7 @@ def test_doctor_disk_space_thresholds_classify(
     [
         (30_000_000, 60_000_000, "ok"),  # 50% — comfortable
         (6_000_000, 60_000_000, "warn"),  # 10% — under 15% threshold
-        (0, 60_000_000, "fail"),  # 0% — the full-VM-disk outage class
+        (0, 60_000_000, "fail"),  # 0% — full VM disk
     ],
 )
 def test_doctor_vm_disk_thresholds_classify(
@@ -348,7 +348,7 @@ def test_doctor_container_logs_ok_when_daemon_and_containers_rotate(
 
 def test_doctor_container_logs_warns_on_missing_daemon_config(cfg: AgentsConfig, mocker) -> None:
     """Bare-metal's verify-only bootstrap never writes daemon.json — doctor
-    is the standing guard (2026-08 disk-full outage class)."""
+    is the standing guard against unrotated logs filling the disk."""
     from agx_cli.ops import DoctorReport, _check_container_logs
 
     cfg.vm.backend = "bare_metal"
@@ -1369,8 +1369,8 @@ def _doctor_runner_with_auth(auth_json: str | None, *, host_data_dir: Path | Non
     If ``host_data_dir`` is given, ``cat /opt/data/config.yaml`` reads
     the host-side file at ``<host_data_dir>/<agent>/.data/config.yaml``
     so tests that seed config.yaml via the host filesystem continue to
-    work after read_doc started routing through ``docker compose
-    exec cat`` (2026-05-22 subuid-readability fix).
+    work although read_doc routes through ``docker compose exec cat``
+    (the host user can't read the subuid-owned file).
     """
 
     def runner(vm_name: str, *cmd: str, check: bool = True) -> MpResult:

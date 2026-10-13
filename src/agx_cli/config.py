@@ -3,9 +3,9 @@
 `~/.config/agx/config.toml` is owned by the CLI. The pydantic v2 schema
 validates every load; tomlkit preserves any user comments across saves.
 
-The schema mirrors the design in the plan: a single host data-dir as the
-source of truth, captured VM runtime fields populated by BOOTSTRAP_OK, and
-pinned image tags managed by `vm init`.
+The schema encodes the architecture (see docs/architecture.md): a single
+host data-dir as the source of truth, captured VM runtime fields populated
+by BOOTSTRAP_OK, and pinned image tags managed by `vm init`.
 """
 
 from __future__ import annotations
@@ -21,32 +21,6 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from agx_cli.errors import UserError
 
 DEFAULT_CONFIG_PATH = Path.home() / ".config" / "agx" / "config.toml"
-# Where the config lived before the CLI was renamed `agents` -> `agx`
-# (2026-10). migrate_legacy_config_dir moves it once.
-LEGACY_CONFIG_PATH = Path.home() / ".config" / "agents" / "config.toml"
-
-
-def migrate_legacy_config_dir(new: Path | None = None, legacy: Path | None = None) -> bool:
-    """Move the pre-rename config dir to the new location, once.
-
-    Only when the legacy config exists and no new one does — never
-    merges or overwrites. Returns True if it moved.
-    """
-    # Resolved at call time (not as default args) so the unit-test
-    # fixture that repoints both constants keeps tests off the real ~.
-    new = new or DEFAULT_CONFIG_PATH
-    legacy = legacy or LEGACY_CONFIG_PATH
-    old_dir, new_dir = legacy.parent, new.parent
-    if new.exists() or old_dir.is_symlink() or not legacy.is_file():
-        # (a symlinked old dir is the compat link earlier versions left)
-        return False
-    new_dir.parent.mkdir(parents=True, exist_ok=True)
-    if new_dir.exists():
-        # An empty/stray new dir (e.g. created by hand) — move the file only.
-        legacy.rename(new)
-        return True
-    old_dir.rename(new_dir)
-    return True
 
 
 def _refuse_forbidden_data_dir(path: Path) -> None:
@@ -361,8 +335,8 @@ class UpgradesConfig(BaseModel):
     # artifacts per agent — host tarball under ``.upgrades/``,
     # ``pre-upgrade-*`` VM snapshot, and superseded image tags — and
     # deletes the rest. Rationale: `agx rollback` only ever uses the
-    # latest generation, and unbounded accumulation filled a 58 GB VM
-    # disk to 100% in ~3 months of routine upgrades (2026-08 outage).
+    # latest generation, and unbounded accumulation can fill a 58 GB VM
+    # disk within ~3 months of routine upgrades.
     # 0 disables the automatic prune; `agx prune` remains available
     # for manual cleanup either way.
     keep_generations: int = Field(default=2, ge=0)

@@ -462,7 +462,7 @@ def daemon_log_rotation_gap(daemon_json: str | None) -> str | None:
 
 
 def _check_container_logs(cfg: AgentsConfig, report: DoctorReport) -> None:
-    """Container-log rotation — the 2026-08 disk-full outage class.
+    """Container-log rotation — unrotated logs can fill the disk.
 
     Rootless Docker ships no log rotation: one chatty container
     (firecrawl-postgres: 2.8 GB in 5 days) can fill the disk the engine
@@ -930,7 +930,7 @@ def _check_hermes_doctor(
       as "state.db is in WAL mode on a cross-VM filesystem" — whereas
       ≤ v2026.9.x exited 0 with the same findings. Mapping that to
       ``fail`` made ``agx upgrade`` roll back a perfectly healthy
-      v0.21.6 (2026-10-10). It is a ``warn`` carrying the issue lines.
+      v0.21.6. It is a ``warn`` carrying the issue lines.
     - ``hermes doctor`` could NOT run (binary missing, import crash,
       container down): ``fail`` — that is the "upgrade broke the agent"
       signal this check exists for.
@@ -1334,7 +1334,7 @@ def _check_inference_ollama(cfg: AgentsConfig, report: DoctorReport) -> None:
             "inference_ollama",
             "fail",
             f"`ollama list` failed inside container: {err or 'rc=' + str(result.returncode)}. "
-            f"Try `agents restart-service ollama` or `agx inference down ollama && agx inference up ollama`.",
+            "Try `agx inference down ollama && agx inference up ollama`.",
         )
 
 

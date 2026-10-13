@@ -33,18 +33,18 @@ HERMES_DEFAULT_SANDBOX_IMAGE: Final = "nikolaik/python-nodejs:python3.11-nodejs2
 
 
 VM_BOOTSTRAP_SCRIPT: Final = r"""#!/usr/bin/env bash
-# Idempotent rootless-Docker bootstrap for the `agx` Multipass VM.
+# Idempotent rootless-Docker bootstrap for the `agx` VM (Multipass or libvirt).
 # Emits a final `BOOTSTRAP_OK ...` line that mp.parse_bootstrap_ok reads.
 #
 # Re-runnable: every step checks before doing. Failures land as
 # `<field>=fail` in the handshake so the host CLI can refuse to proceed
 # without burying the cause in subprocess noise. Stdout/stderr of each
-# step is tee'd to /tmp/agents-bootstrap.log so the host CLI can pull
-# it back on failure.
+# step is also tee'd to /tmp/agx-bootstrap.log for debugging inside the
+# VM.
 
 set -uo pipefail
 
-LOG=/tmp/agents-bootstrap.log
+LOG=/tmp/agx-bootstrap.log
 : > "$LOG"
 # Save the real stdout on fd 3 BEFORE the tee redirect. bash does not
 # wait for process-substitution children at exit, so a final line written
@@ -157,8 +157,8 @@ fi
 
 # Rootless Docker ships with NO container-log rotation: the json-file
 # driver grows unbounded, and one chatty container can fill the VM disk
-# (firecrawl-postgres wrote 2.8 GB in 5 days; disk-full wedged rabbitmq
-# and killed web search — 2026-08 outage class). Write the rotation
+# (firecrawl-postgres was observed writing 2.8 GB in 5 days; the full
+# disk then wedged rabbitmq and with it web search). Write the rotation
 # defaults BEFORE the daemon's first start so every container created on
 # this VM inherits them. Never clobber an existing daemon.json (user
 # customization); on re-runs against an existing VM the file is left
@@ -242,7 +242,7 @@ echo "BOOTSTRAP_OK uidmap=${UIDMAP_OK} dbus=${DBUS_OK} lingering=${LINGERING_OK}
 # toolkit no longer has to chase rootless-Docker permission drift with
 # ``agx fix-perms`` after each upgrade/recreate. See
 # ``compose.ensure_cont_init_script`` and the "durable in-container perms
-# hook" pitfall in CLAUDE.md.
+# hook" pitfall in AGENTS.md.
 HERMES_CONT_INIT_FIXPERMS: Final = r"""#!/command/with-contenv sh
 # 99-toolkit-fixperms — MANAGED BY THE `agx` HOST CLI. DO NOT EDIT.
 #
@@ -251,16 +251,14 @@ HERMES_CONT_INIT_FIXPERMS: Final = r"""#!/command/with-contenv sh
 # rootless-Docker permission problems the toolkit otherwise has to chase with
 # `agx fix-perms` after every upgrade/recreate:
 #
-#   1. Image-baked install paths (/opt/hermes/scripts, /home/hermes) live on
-#      the container overlay fs owned by the image build-time uid; a recreate
+#   1. Image-baked install paths (/opt/hermes/scripts) live on the
+#      container overlay fs owned by the image build-time uid; a recreate
 #      resets them, so the runtime `hermes` user can't `npm install` bridge
 #      deps etc. Chown them AS ROOT — the overlay fs honors the container's
 #      CAP_CHOWN. We chown to the NUMERIC uid:gid of the live `hermes` user
 #      (resolved via `id`), not the name `hermes:hermes`: a name target would
 #      silently no-op (with the trailing `exit 0`) if the group were ever
 #      renamed, whereas the numeric form mirrors fixperms_cmd and can't drift.
-#      Prune the :ro Codex import bridge so chown never touches a read-only
-#      mount.
 #
 #   2. The gateway log dir. The image's gateway log run script does a root
 #      `mkdir -p` under /opt/data, but /opt/data is a 9p-backed bind mount
@@ -286,9 +284,10 @@ HERMES_CONT_INIT_FIXPERMS: Final = r"""#!/command/with-contenv sh
 #      encoded below:
 #        - npm runs AS the hermes uid via s6-setuidgid with the NUMERIC
 #          "$HUID:$HGID" — the exact ids the chown in (1) just applied to the
-#          overlay paths npm writes to (/opt/hermes/scripts/whatsapp-bridge,
-#          $HOME/.npm cache under /home/hermes); a name lookup could drift
-#          from those ids exactly the way the chown comment explains.
+#          overlay path npm writes to (/opt/hermes/scripts/whatsapp-bridge;
+#          its $HOME/.npm cache lands on the hermes-owned /opt/data mount);
+#          a name lookup could drift from those ids exactly the way the
+#          chown comment explains.
 #        - it is BACKGROUNDED: npm ci can take minutes, cont-init blocks
 #          every service start, and a slow heal must never stall boot. The
 #          orphaned job is reparented to the container's init and keeps
@@ -316,15 +315,6 @@ HGID="$(id -g hermes 2>/dev/null || true)"
 if [ -n "$HUID" ] && [ -n "$HGID" ]; then
     if [ -e /opt/hermes/scripts ]; then
         find /opt/hermes/scripts -exec chown "$HUID:$HGID" {} + 2>/dev/null
-    fi
-    # Fragments written before 2026-10 pin HOME=/home/hermes, but the
-    # image never creates it (it used to appear only as the parent of the
-    # retired .codex bridge mount). npm needs it for cache/logs, or the
-    # WhatsApp bridge's dependency install fails half-way. Current
-    # fragments pin HOME=/opt/data; this stays for un-reseated agents.
-    mkdir -p /home/hermes 2>/dev/null
-    if [ -e /home/hermes ]; then
-        find /home/hermes -path /home/hermes/.codex -prune -o -exec chown "$HUID:$HGID" {} + 2>/dev/null
     fi
 fi
 
@@ -382,7 +372,7 @@ if [ -n "$HUID" ] && [ -n "$HGID" ] && bridge_needs_heal; then
                     /command/s6-setuidgid "$HUID:$HGID" sh -c '
                         exec >>"$NPM_LOG" 2>&1
                         echo "[toolkit-npm-ci] $(date -u +%Y-%m-%dT%H:%M:%SZ) npm ci starting in $BRIDGE"
-                        export HOME="${HOME:-/home/hermes}"
+                        export HOME="${HOME:-/opt/data}"
                         export PATH="$NPM_DIR:$PATH"
                         cd "$BRIDGE" || exit 1
                         npm ci

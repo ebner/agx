@@ -66,7 +66,7 @@ def test_plan_archives_keeps_newest_and_matches_strictly(cfg: AgentsConfig) -> N
         cfg,
         [
             "coder-20260101T000000Z.tar.zst",
-            "coder-20260201T000000Z.tar.gz",  # legacy suffix still counted
+            "coder-20260201T000000Z.tar.zst",
             "coder-20260301T000000Z.tar.zst",
             "coder-two-20260401T000000Z.tar.zst",  # other agent — never touched
             "not-an-archive.txt",
@@ -150,8 +150,7 @@ def test_plan_images_keeps_exactly_keep_when_defaults_tag_is_stale(
     """The upgrade-hook race: auto-prune runs before _persist_default_tag,
     so during a --latest upgrade compose already references the new tag
     while defaults still holds the outgoing one. Newest-N counting must
-    yield exactly ``keep`` survivors, not keep + 1 (codex review
-    2026-08-24)."""
+    yield exactly ``keep`` survivors, not keep + 1."""
     (cfg.paths.host_data_dir / "docker-compose.yml").write_text(
         "services:\n  hermes-coder:\n    image: nousresearch/hermes-agent:v1.0.1\n",
         encoding="utf-8",

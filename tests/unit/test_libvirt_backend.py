@@ -155,8 +155,8 @@ def test_snapshot_creates_internal_revertible_snapshot(libvirt: Any, mocker: Any
     Earlier versions used --disk-only for external snapshots,
     but those CAN'T be reverted via snapshot-revert — they're
     backup points only. Worse, they mutate the disk backing chain
-    and break VM restart afterwards (real-world smoke test on
-    2026-05-16 found this). Revertible semantics match what
+    and break VM restart afterwards (found in a real-world smoke
+    test). Revertible semantics match what
     vm.upgrade's rollback flow assumes.
     """
     run_mock = _mock_subprocess(mocker)

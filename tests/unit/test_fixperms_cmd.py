@@ -214,12 +214,12 @@ def test_chown_data_dir_still_fails_on_real_errors(cfg: AgentsConfig, mocker: An
         fixperms_cmd.chown_data_dir(cfg, "hermes-coder", 1000)
 
 
-def test_chown_hermes_install_paths_chowns_both_targets(
+def test_chown_hermes_install_paths_chowns_install_target(
     with_coder: Path, cfg: AgentsConfig, mocker: Any
 ) -> None:
-    """The helper must chown both /opt/hermes/scripts and /home/hermes
-    so `hermes setup`'s install branches don't hit EACCES. Verifies
-    `test -e <path>` is probed first (skip-on-missing semantics).
+    """The helper must chown /opt/hermes/scripts so `hermes setup`'s
+    install branches don't hit EACCES. Verifies `test -e <path>` is
+    probed first (skip-on-missing semantics).
     """
     mocker.patch("agx_cli.compose_runner.stop", return_value=_ok())
     mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
@@ -240,45 +240,13 @@ def test_chown_hermes_install_paths_chowns_both_targets(
 
     fixperms_cmd.fix_perms("coder", yes=True, config_path=with_coder)
 
-    # The install-paths helper uses `find <path> -xdev -exec chown ...`
-    # (so it skips bind-mounts like /home/hermes/.codex); the data-dir
-    # helper still uses `chown -R /opt/data`. Both forms put the target
-    # path in argv as a literal element, so a set-membership check
-    # works uniformly.
+    # The install-paths helper uses `find <path> -exec chown ...`; the
+    # data-dir helper uses `chown -R /opt/data`. Both forms put the
+    # target path in argv as a literal element, so a set-membership
+    # check works uniformly.
     chowned = {arg for c in seen_chowns for arg in c}
     assert "/opt/data" in chowned
     assert "/opt/hermes/scripts" in chowned
-    assert "/home/hermes" in chowned
-
-
-def test_chown_hermes_install_paths_creates_runtime_home(
-    with_coder: Path, cfg: AgentsConfig, mocker: Any
-) -> None:
-    """HOME=/home/hermes is pinned by the fragment but the image never
-    creates the dir; it only existed as the parent of the retired
-    .codex bridge mount. Without it npm has no cache/log dir and the
-    WhatsApp bridge's dependency install fails half-way (2026-09-21).
-    The helper must `mkdir -p` it (as root) BEFORE the existence-gated
-    chown so the chown then applies."""
-    mocker.patch("agx_cli.compose_runner.stop", return_value=_ok())
-    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
-    calls: list[tuple[str, ...]] = []
-
-    def runner(vm_name: str, *cmd: str, check: bool = True) -> MpResult:
-        calls.append(cmd)
-        if "id" in cmd and "-u" in cmd and "hermes" in cmd:
-            return _ok(stdout="1000\n")
-        return _ok()
-
-    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=runner)
-    fixperms_cmd.fix_perms("coder", yes=True, config_path=with_coder)
-
-    mkdir_idx = next(
-        i for i, c in enumerate(calls) if "mkdir" in c and "-p" in c and "/home/hermes" in c
-    )
-    assert "--user" not in calls[mkdir_idx]  # as root
-    chown_idx = next(i for i, c in enumerate(calls) if "chown" in c and "/home/hermes" in c)
-    assert mkdir_idx < chown_idx
 
 
 def test_chown_hermes_install_paths_skips_missing(
@@ -286,7 +254,7 @@ def test_chown_hermes_install_paths_skips_missing(
 ) -> None:
     """If `test -e /opt/hermes/scripts` returns non-zero (older Hermes
     image without that dir), the helper must skip rather than warn or
-    fail. /home/hermes is always present so it still gets chowned.
+    fail. The /opt/data chown still runs.
     """
     mocker.patch("agx_cli.compose_runner.stop", return_value=_ok())
     mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
@@ -296,7 +264,7 @@ def test_chown_hermes_install_paths_skips_missing(
     def runner(vm_name: str, *cmd: str, check: bool = True) -> MpResult:
         if "id" in cmd and "-u" in cmd and "hermes" in cmd:
             return _ok(stdout="1000\n")
-        # /opt/hermes/scripts missing; /home/hermes present
+        # /opt/hermes/scripts missing
         if "test" in cmd and "-e" in cmd and "/opt/hermes/scripts" in cmd:
             return MpResult(stdout="", stderr="", returncode=1)
         if "test" in cmd and "-e" in cmd:
@@ -312,44 +280,7 @@ def test_chown_hermes_install_paths_skips_missing(
 
     chowned = {arg for c in seen_chowns for arg in c}
     assert "/opt/hermes/scripts" not in chowned
-    assert "/home/hermes" in chowned
-
-
-def test_chown_hermes_install_paths_prunes_codex_mount(
-    with_coder: Path, cfg: AgentsConfig, mocker: Any
-) -> None:
-    """The /home/hermes chown must `-prune` the .codex bind-mount, which
-    is mounted :ro for the Codex import bridge. Without pruning, the
-    recursive chown would emit a noisy "Read-only file system" warning
-    on every entry under .codex (regression seen 2026-05-13 on coder).
-    """
-    mocker.patch("agx_cli.compose_runner.stop", return_value=_ok())
-    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
-
-    find_invocations: list[tuple[str, ...]] = []
-
-    def runner(vm_name: str, *cmd: str, check: bool = True) -> MpResult:
-        if "id" in cmd and "-u" in cmd and "hermes" in cmd:
-            return _ok(stdout="1000\n")
-        if "test" in cmd and "-e" in cmd:
-            return _ok()
-        if "find" in cmd:
-            find_invocations.append(cmd)
-        return _ok()
-
-    mocker.patch("agx_cli.mp.exec_in_vm", side_effect=runner)
-
-    fixperms_cmd.fix_perms("coder", yes=True, config_path=with_coder)
-
-    home_find = next(c for c in find_invocations if "/home/hermes" in c and "/opt" not in c[-3:])
-    # Required argv order around the prune: `-path /home/hermes/.codex -prune -o`
-    idx = home_find.index("/home/hermes/.codex")
-    assert home_find[idx - 1] == "-path"
-    assert home_find[idx + 1] == "-prune"
-    assert home_find[idx + 2] == "-o"
-    # /opt/hermes/scripts has no prune list — must NOT include -prune at all.
-    scripts_find = next(c for c in find_invocations if "/opt/hermes/scripts" in c)
-    assert "-prune" not in scripts_find
+    assert "/opt/data" in chowned
 
 
 def test_chmod_opens_data_dir_traversal(with_coder: Path, cfg: AgentsConfig, mocker: Any) -> None:

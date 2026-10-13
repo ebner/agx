@@ -250,18 +250,6 @@ def test_render_empty_env_file_is_empty_string() -> None:
     assert secrets_cmd._render_env_file({}) == ""
 
 
-# ---------- all_secret_keys (toolkit-wide view) ----------
-
-
-def test_all_secret_keys_lists_every_agent(
-    with_coder: Path, cfg: AgentsConfig, mocker: Any
-) -> None:
-    mocker.patch("agx_cli.compose_runner.up", return_value=_ok())
-    secrets_cmd.set_secret("coder", "FIRECRAWL_API_KEY", "fc-x", config_path=with_coder)
-    summary = secrets_cmd.all_secret_keys(cfg)
-    assert summary["coder"] == ["FIRECRAWL_API_KEY"]
-
-
 # ---------- list refuses unknown agent ----------
 
 

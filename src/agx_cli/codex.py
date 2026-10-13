@@ -14,15 +14,14 @@ sandbox-volume entry (``<vm_agents_root>/.codex:/codex:ro``) using
 **VM-side** host paths.
 
 It is deliberately NOT the way a Hermes agent authenticates its
-``openai-codex`` **LLM provider** any more. That used to be an "import
-bridge" (``<data-dir>/.codex`` bind-mounted at ``/home/hermes/.codex``
-for ``hermes setup`` to seed a credential from), retired 2026-09: the
-seeded credential shared ONE single-use OAuth refresh-token chain with
-the host copy, so any refresh of the host file (``agx codex
-refresh``, the CLI itself) rotated the token under the running agent —
-"Your authentication token has been invalidated" — and the two copies
-could never both stay valid. Provider auth is now done inside the
-container, where Hermes owns the credential and its refresh cycle::
+``openai-codex`` **LLM provider**. Mounting ``<data-dir>/.codex`` into
+the agent for ``hermes setup`` to seed a credential from would leave
+two copies of ONE single-use OAuth refresh-token chain: any refresh of
+the host file (e.g. by the Codex CLI itself) rotates the token under
+the running agent — "Your authentication token has been invalidated" —
+and the two copies can never both stay valid. Provider auth is done
+inside the container, where Hermes owns the credential and its refresh
+cycle::
 
     agx exec <name> -- hermes auth add openai-codex --type oauth --no-browser
 
@@ -30,7 +29,7 @@ container, where Hermes owns the credential and its refresh cycle::
 logged into the ChatGPT account; the credential persists in the agent's
 ``/opt/data/auth.json``). Because of the same single-use-chain rule,
 nothing in the toolkit refreshes ``<data-dir>/.codex`` on the user's
-behalf: ``agx codex refresh`` is retired.
+behalf.
 
 OpenClaw bundles its own Codex plugin — the toolkit refuses
 ``skill-enable`` on OpenClaw agents.
@@ -134,7 +133,7 @@ def _sync_host_codex_to_vm(cfg: AgentsConfig) -> None:
     try:
         with _tarfile.open(host_tar, "w") as tar:
             tar.add(host_dir, arcname=".")
-        vm_tar = f"/tmp/agents-codex-sync-{os.getpid()}-{_uuid.uuid4().hex[:8]}.tar"
+        vm_tar = f"/tmp/agx-codex-sync-{os.getpid()}-{_uuid.uuid4().hex[:8]}.tar"
         mp.transfer_to_vm(host_tar, cfg.vm.name, vm_tar)
         target = f"{cfg.paths.vm_agents_root}/.codex"
         mp.exec_bash(

@@ -5,7 +5,7 @@ cache, OS state). It does NOT capture the host-mounted data-dir, which
 holds the compose file, the agent's config.yaml, and its persistent
 state. So every upgrade takes BOTH:
 
-- A host-data tarball at ``<data-dir>/.upgrades/<name>-<utc>.tar.gz``
+- A host-data tarball at ``<data-dir>/.upgrades/<name>-<utc>.tar.zst``
   (compose + .env + the agent's data dir).
 - A multipass snapshot named ``pre-upgrade-<name>-<utc>``.
 
@@ -342,10 +342,10 @@ def upgrade(
                     # agent's bind mount has its source. AND re-apply the
                     # install-path chown directly: agents whose fragment
                     # predates the hook (not yet reseated) get recreated here
-                    # with the overlay fs reset to the image-baked uid, and
-                    # upgrade was historically the one recreate path that never
-                    # called the fixer — the exact "re-breaks after every
-                    # upgrade" treadmill. Belt-and-suspenders for reseated ones.
+                    # with the overlay fs reset to the image-baked uid; without
+                    # this call upgrade would be the one recreate path that
+                    # never runs the fixer, and the perms would re-break after
+                    # every upgrade. Belt-and-suspenders for reseated ones.
                     compose.ensure_cont_init_script(cfg)
                 compose_runner.up(cfg, svc)
                 if agent_type == "hermes":
@@ -376,7 +376,7 @@ def upgrade(
                 # failing checks can be NAMED in the error: a bare "1
                 # doctor check(s) failed" left the user no way to know
                 # what rolled the upgrade back, since the revert replaces
-                # the container the report was about (2026-10-10).
+                # the container the report was about.
                 report = ops.doctor(
                     target=name, config_path=config_path, emit=False, raise_on_fail=False
                 )
@@ -540,11 +540,10 @@ def rollback(
     """Restore an agent from a pre-upgrade snapshot.
 
     Without ``snapshot_id``, the latest archive under
-    ``<data-dir>/.upgrades/<name>-*.tar.gz`` is used and the matching
+    ``<data-dir>/.upgrades/<name>-*.tar.zst`` is used and the matching
     multipass VM snapshot is restored. With an explicit ``snapshot_id``:
 
-    - If it ends in ``.tar.gz``: treated as a host-side archive filename
-      under ``.upgrades/``.
+    - If it is an archive filename under ``.upgrades/``: that archive.
     - If it starts with ``pre-upgrade-``: treated as a multipass snapshot
       name; ONLY the VM is restored (host data unchanged).
     - Otherwise: matched by suffix against archive names; if exactly one
@@ -635,8 +634,8 @@ def rollback(
         # Once the live container is stopped, ANY failure in the restore
         # steps below (invalid archive, extraction error, VM snapshot
         # restore failure) would otherwise raise before the final
-        # ``compose_runner.up`` — turning a failed rollback ATTEMPT into
-        # an outage. Track the stop and best-effort restart the service
+        # ``compose_runner.up`` — leaving the agent stopped after a
+        # merely failed rollback ATTEMPT. Track the stop and best-effort restart the service
         # before re-raising the original error.
         stopped_svc: str | None = None
         safety: list[Path] = []
@@ -770,19 +769,12 @@ def _utc_stamp() -> str:
 # prefix glob like ``foo-*`` also catches agent ``foo-bar``'s
 # artifacts, and since letters sort after digits, ``foo-bar``'s
 # newest would beat ``foo``'s own in a ``sorted(...)[-1]`` pick.
-_UTC_STAMP_RE = r"\d{8}T\d{6}Z"
+_UTC_STAMP_RE = archive_mod.UTC_STAMP_RE
 
 
 def _host_archive_re(name: str) -> re.Pattern[str]:
-    """Match ``<name>-<UTC stamp>`` + a known archive suffix, exactly."""
-    return re.compile(
-        re.escape(name)
-        + "-"
-        + _UTC_STAMP_RE
-        + "(?:"
-        + re.escape(archive_mod.ARCHIVE_SUFFIX)
-        + r"|\.tar\.gz)"
-    )
+    """Match ``<name>-<UTC stamp>`` + the archive suffix, exactly."""
+    return archive_mod.archive_name_re(name)
 
 
 def _vm_snapshot_re(agent_name: str) -> re.Pattern[str]:
@@ -852,7 +844,7 @@ def _host_data_snapshot(cfg: AgentsConfig, name: str) -> Path:
     # ``<host_data_dir>/.upgrades/`` owned by the toolkit user
     # (host-side default — ``shutil.copy`` semantics), which is what
     # the rollback path expects.
-    vm_archive = f"/tmp/agents-upgrade-snap-{name}-{_utc_stamp()}{archive_mod.ARCHIVE_SUFFIX}"
+    vm_archive = f"/tmp/agx-upgrade-snap-{name}-{_utc_stamp()}{archive_mod.ARCHIVE_SUFFIX}"
     # ``--warning=no-file-changed`` + ``--ignore-failed-read`` so a
     # live agent rewriting state.db / kanban.db / WAL files mid-walk
     # doesn't trip ``set -eu`` (GNU tar exits rc=1 on "file changed
@@ -884,10 +876,9 @@ def _restore_host_snapshot(cfg: AgentsConfig, archive_path: Path) -> None:
     subuid ownership under mode-700 parents: a host-side extraction
     can't even enter ``<name>/.data`` (and couldn't restore the owners
     if it did), and an unprivileged in-VM one has the same problem.
-    ``tar -xf`` auto-detects compression, so legacy ``.tar.gz``
-    snapshots restore through the same path.
+    ``tar -xf`` auto-detects the zstd compression.
     """
-    vm_archive = f"/tmp/agents-restore-{os.getpid()}-{uuid.uuid4().hex[:8]}.tar"
+    vm_archive = f"/tmp/agx-restore-{os.getpid()}-{uuid.uuid4().hex[:8]}.tar"
     mp.transfer_to_vm(archive_path, cfg.vm.name, vm_archive)
     try:
         mp.exec_bash(
@@ -906,10 +897,8 @@ def _latest_host_snapshot(cfg: AgentsConfig, name: str) -> Path | None:
     upgrades_dir = cfg.paths.host_data_dir / ".upgrades"
     if not upgrades_dir.exists():
         return None
-    # The pattern accepts both the canonical .tar.zst and legacy
-    # .tar.gz archives so rollbacks of older upgrades keep working —
-    # and matches strictly (no ``foo-*`` prefix glob that would pick
-    # up agent ``foo-bar``'s archives for agent ``foo``).
+    # Strict match (no ``foo-*`` prefix glob that would pick up agent
+    # ``foo-bar``'s archives for agent ``foo``).
     pattern = _host_archive_re(name)
     candidates = sorted(p for p in upgrades_dir.iterdir() if pattern.fullmatch(p.name))
     return candidates[-1] if candidates else None
@@ -928,7 +917,7 @@ def _run_config_migrate(cfg: AgentsConfig, svc: str, agent_type: str, *, name: s
 
     OpenClaw: skipped. OpenClaw owns its own plugin lifecycle and the
     toolkit deliberately stays out of its config surface (see
-    CLAUDE.md's Hermes-vs-OpenClaw matrix). Any config migration on
+    AGENTS.md's Hermes-vs-OpenClaw matrix). Any config migration on
     that side is the user's responsibility via ``openclaw configure``.
 
     After a successful migrate, ``hermes config check`` runs as a
@@ -950,8 +939,7 @@ def _run_config_migrate(cfg: AgentsConfig, svc: str, agent_type: str, *, name: s
     misconfiguration. Caveat: this command operates on
     ``config.yaml`` only — it does NOT migrate data-directory
     layouts (e.g. the v2026.5.7 → v2026.5.16 ``platforms/pairing/``
-    → ``pairing/`` move that ``agx upgrade coder`` famously hit
-    on 2026-05-22). Such migrations remain the user's responsibility
+    → ``pairing/`` move). Such migrations remain the user's responsibility
     until Hermes adds them upstream.
     """
     if agent_type != "hermes":

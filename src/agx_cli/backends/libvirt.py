@@ -539,8 +539,8 @@ def umount(vm: str, vm_path: str) -> MpResult:
         )
 
     # libvirt matches a virtiofs device on its SOURCE too ("missing
-    # source information for device <tag>" otherwise — every detach
-    # failed until 2026-10 and left the share attached), so detach the
+    # source information for device <tag>" otherwise — a detach by tag
+    # alone fails and leaves the share attached), so detach the
     # element exactly as the persistent domain config records it.
     dump = _virsh("dumpxml", "--inactive", vm, check=False)
     if dump.returncode != 0:

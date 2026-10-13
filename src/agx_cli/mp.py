@@ -1,9 +1,9 @@
-"""VM-backend dispatcher (historically the Multipass primitives module).
+"""VM-backend dispatcher.
 
 Every host↔VM call in the toolkit flows through here. The actual
-implementation lives in :mod:`agx_cli.backends.multipass` (default)
-or :mod:`agx_cli.backends.libvirt`; this module just delegates to
-whichever one is active.
+implementation lives in :mod:`agx_cli.backends.multipass` (default),
+:mod:`agx_cli.backends.libvirt` or :mod:`agx_cli.backends.bare_metal`;
+this module just delegates to whichever one is active.
 
 The dispatcher uses a module-level handle (:data:`_backend`) initialised
 lazily to multipass. ``cli.main`` calls :func:`set_backend` early after
@@ -14,9 +14,9 @@ function itself (so the patch wins regardless of which backend would
 otherwise have been active).
 
 Value types (:class:`MpResult`, :class:`BootstrapStatus`,
-:func:`parse_bootstrap_ok`) live in :mod:`agx_cli.backends` and
-are re-exported here for backward compatibility with the many call
-sites that do ``from agx_cli.mp import MpResult``.
+:func:`parse_bootstrap_ok`) live in :mod:`agx_cli.backends` and are
+re-exported here so call sites can import everything VM-related from
+one module (``from agx_cli.mp import MpResult``).
 """
 
 from __future__ import annotations
@@ -24,8 +24,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, cast
 
-# Re-export value types so the historical
-# ``from agx_cli.mp import MpResult`` style keeps working.
+# Value types re-exported for ``from agx_cli.mp import MpResult``.
 from agx_cli.backends import (
     BootstrapStatus,
     MpResult,
@@ -34,7 +33,6 @@ from agx_cli.backends import (
 )
 
 __all__ = [
-    "MULTIPASS_BIN",
     "BootstrapStatus",
     "MpResult",
     "delete_snapshot",
@@ -48,10 +46,8 @@ __all__ = [
     "launch",
     "list_vms",
     "mount",
-    "mp",
     "parse_bootstrap_ok",
     "restore",
-    "run",
     "set_autostart",
     "set_backend",
     "set_config",
@@ -62,19 +58,6 @@ __all__ = [
     "transfer_to_vm",
     "umount",
 ]
-
-# Re-export the low-level Multipass subprocess helpers so legacy
-# imports (``from agx_cli.mp import mp, run``) keep working. These
-# are Multipass-specific by design — they invoke the ``multipass``
-# binary directly — and don't go through the backend dispatcher.
-# Tests that exercise the Multipass implementation (``test_mp.py``)
-# call them directly; the libvirt backend doesn't have an equivalent
-# (its low-level helper is in ``backends/libvirt.py``).
-from agx_cli.backends.multipass import (
-    MULTIPASS_BIN,
-    mp,
-    run,
-)
 
 _backend: Any = None
 

@@ -11,7 +11,7 @@ warnings that matter on this stack:
 - **SQLite WAL on 9p**. Under default host-mount mode the data dir is
   shared via 9p, and SQLite WAL is fragile across that share. We warn
   loudly (matches the Hermes kanban/sessions trap documented in
-  ``CLAUDE.md``).
+  ``AGENTS.md``).
 - **NumPy missing in image**. Hermes upstream issue #17350: without
   NumPy the plugin silently degrades to FTS5-only and lies about it. We
   probe ``python -c "import numpy"`` in the running container.

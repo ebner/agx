@@ -1,6 +1,6 @@
 """flock-based mutation lock at <data-dir>/.agents.lock.
 
-Plan rule #10: every compose / .env / hermes-config mutation acquires
+Architecture rule: every compose / .env / hermes-config mutation acquires
 the lock; read-only commands don't. The first half is verified here
 (two concurrent locked workers serialize). The second half — that
 read-only paths don't lock — is exercised throughout the rest of the

@@ -4,8 +4,8 @@ The agent's runtime container writes its state as a rootless-Docker
 subuid (e.g. host uid 100999 for container uid 1000) under mode 700, so
 the host user can't open it. The userns map is bijective and the host
 uid is already taken by container root, so ownership can't be fixed at
-the source; and POSIX ACLs — what this command used to manage — don't
-hold: a ``mkdir(0700)`` under a default ACL is born with ``mask::---``.
+the source; and POSIX ACLs don't hold either: a ``mkdir(0700)`` under a
+default ACL is born with ``mask::---``.
 
 Instead this mounts an **idmapped bind-mount view** of the state dir at
 ``<view-root>/<agent>`` (default ``~/agents-view``) with the owner ids
@@ -172,38 +172,6 @@ def refuse_if_view_registered(cfg: AgentsConfig, agent: str | None, action: str)
         )
 
 
-# ---------- leftovers of the old ACL mechanism ----------
-
-
-def legacy_acl_dirs(dirs: list[Path]) -> list[Path]:
-    """Dirs still carrying a *default* ACL from the retired
-    ``access grant`` / create-time auto-grant. Harmless for the view,
-    but they keep propagating to every new file (overriding the agent's
-    umask), so tell the user how to drop them. The toolkit doesn't do it
-    itself: it needs sudo on a subuid-owned tree and changes nothing the
-    toolkit depends on."""
-    found = []
-    for d in dirs:
-        try:
-            if "system.posix_acl_default" in os.listxattr(d):
-                found.append(d)
-        except OSError:
-            continue
-    return found
-
-
-def _legacy_acl_hint(dirs: list[Path]) -> str | None:
-    legacy = legacy_acl_dirs(dirs)
-    if not legacy:
-        return None
-    return (
-        "note: leftover ACLs from the retired `agx access grant` are still set on "
-        + ", ".join(str(d) for d in legacy)
-        + ". They are unused now; to drop them: "
-        + " ; ".join(f"sudo setfacl -R -b -k {d}" for d in legacy)
-    )
-
-
 # ---------- mount ----------
 
 
@@ -343,8 +311,6 @@ def mount(
         _save_views(cfg, [*others, *active])
 
     lines = [line for v in active if (line := _fstab_line_for(cfg, v)) is not None]
-    if (hint := _legacy_acl_hint(dirs)) is not None:
-        ui.progress(hint)
     ui.emit(
         {
             "agent": agent,
@@ -492,8 +458,6 @@ def list_views(
                     f"`agx access mount {r['agent']}`"
                     + (" (or add the fstab line it prints)" if r["status"] == "not-mounted" else "")
                 )
-        if (hint := _legacy_acl_hint([Path(r["source"]) for r in rows])) is not None:
-            ui.echo_human(hint)
     else:
         ui.echo_human(
             "no host views registered — `agx access mount <agent>` creates one "
