@@ -200,6 +200,24 @@ The integration smoke suite lives at `tests/integration/` (marker `multipass`; a
 - Subprocess invocations use list-form argv (never `shell=True`).
 - New cross-layer mistakes get added to the "Critical cross-layer pitfalls" section above.
 
+## Publication hygiene (this is a public repository)
+
+Everything committed — file contents, commit messages, tag annotations, release notes, issue text — is public and, once pushed, effectively permanent. The maintainer runs agx on real deployments, so it is easy to leak their details into examples, tests and incident notes. The rules:
+
+- **Commit identity is `Hannes Ebner <hannes@ebner.se>`** — the same as `LICENSE` and `pyproject.toml` `authors`. It is set in the repo-local git config. In a fresh clone or worktree, run `git config user.email` before the first commit: the global identity on the maintainer's machines is a different, non-public address, and a commit made with it cannot be pulled back. Never commit or tag as anyone else, and never add trailers that contain personal or employer addresses (tool noreply addresses are fine).
+- **Examples are invented, never taken from a real deployment.** Use the agent names `coder`, `coder2` and `personal`, and never the name of an agent someone actually runs. For paths, use `<data-dir>`, `~/…`, `/home/user/…`, `/home/u/…` or `/home/alice/…`, never a real username or home directory. Use made-up hosts and addresses (`192.168.1.50`, `gpu-box.tail1234.ts.net`, `example.com`), never a real tailnet name, LAN/public IP, hostname, MAC, serial, account ID, chat/channel/guild ID or phone number. Container-side paths (`/home/ubuntu`, `/home/node`, `/home/hermes`) are product facts and fine.
+- **No credentials, even dead or truncated ones.** Use placeholders (`ghp_xxxx`, `sk-…`, `<token>`). Test fixtures are fabricated from scratch. A real `auth.json`, `.env`, `config.toml`, Codex `auth.json` or OAuth token must never be copied into a fixture, not even in redacted form.
+- **Agents' private content never enters the repo.** That means real `SOUL.md` text, memories, skills written for a person, session transcripts, `state.db` rows and messaging-platform payloads. When a log or command output goes into a doc, test, commit message or issue, first redact hostnames, paths, usernames, IDs and message text.
+- **Pitfall and incident notes describe the mechanism, not the deployment.** Write versions, dates, symptoms and the fix, and say "a live agent", not the agent's name or what it is used for. Don't name the maintainer's employer, colleagues, customers, other private projects, hardware inventory beyond what reproduces a bug, or which LLM accounts or subscriptions they use.
+- **Maintainer-private workflow stays out of tracked files.** That covers personal review tooling, local plan files, `~/.claude/…` paths, deployment state and account notes. It belongs in `CLAUDE.local.md` (gitignored) or the agent's own memory, never in `AGENTS.md`, `docs/` or code comments. Tracked docs reference only things a stranger who clones the repo has too.
+- **Stage explicitly and keep runtime state out.** `git add <paths>`, not `git add -A`/`.`, and read `git diff --cached` before committing. Never commit tool/runtime state: `.claude/` (a session lock file slipped in once), `.env`, `*.tar.zst`, `.staging/`, agent data dirs, `config.toml`, journals, `.codex/`. When a new tool writes into the working tree, extend `.gitignore` in the same change.
+- **Pre-commit check** (review every hit; the only legitimate one is the public author address above):
+  ```bash
+  git config user.email   # must print the public address above
+  git diff --cached -U0 | grep -nP '^\+.*(/home/(?!ubuntu|node|hermes|openviking|user\b|u\b|alice\b|my)[a-z]|[A-Za-z0-9._%+-]+@(?!example\.(com|org)|users\.noreply)[a-z0-9-]+\.[a-z]{2,}|BEGIN [A-Z ]*PRIVATE KEY|ghp_[A-Za-z0-9]{20}|sk-[A-Za-z0-9]{20}|xox[abp]-)'
+  ```
+- **If something private has already been pushed, stop and tell the maintainer. Do not fix it yourself.** A follow-up commit that deletes it does not help, because history keeps it. A history rewrite plus force-push does not remove it from GitHub either: GitHub keeps serving the old commits by SHA, and Actions run metadata keeps showing the old author emails. Real removal needs a rewrite AND a GitHub-side purge (GitHub Support, or deleting and recreating the repository). That decision belongs to the maintainer. Agents never rewrite history, force-push, delete refs or tags, or change repository visibility or settings on their own.
+
 ## Reference docs
 
 - Hermes Agent: https://hermes-agent.nousresearch.com/docs (configuration, Docker terminal backend, Codex provider, Codex skill)
