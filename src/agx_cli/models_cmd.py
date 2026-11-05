@@ -24,6 +24,8 @@ import re
 from pathlib import Path
 from typing import Any
 
+from ruamel.yaml.comments import CommentedMap
+
 from agx_cli import compose, hermes_config, mp, ui
 from agx_cli import config as cfg_mod
 from agx_cli.agents_cmd import _detect_type_from_compose
@@ -124,8 +126,8 @@ def use(
     produces, so the doctor's model_set check stays happy.
 
     ``context_length`` writes BOTH ``model.context_length`` (startup
-    resolution) and a per-model ``custom_providers`` entry keyed by the
-    endpoint's base_url — the latter is what Hermes' ``/model`` switch
+    resolution) and a per-model entry in the ``providers:`` map, matched
+    by the endpoint's URL — the latter is what Hermes' ``/model`` switch
     and display paths consult, so mid-session model swaps keep the
     correct window too. REQUIRED for external-ollama: the server's
     ``OLLAMA_CONTEXT_LENGTH`` cap cannot be probed remotely, and
@@ -246,34 +248,98 @@ def _upsert_provider_model_context(
     model: str,
     context_length: int,
 ) -> None:
-    """Record the per-model context window under ``custom_providers``.
+    """Record the per-model context window under ``providers.<key>``.
 
-    Hermes matches these entries by normalized base_url (provider name is
+    Hermes matches endpoint entries by normalized URL (key and name are
     cosmetic), and this is the lookup its ``/model`` switch + display
     paths use — ``model.context_length`` alone only covers the default
     model at startup. Upsert semantics: reuse an existing entry for the
     same endpoint (whatever the user named it), never drop its other
     models, only set/overwrite this model's context_length.
+
+    Writes the v12+ ``providers:`` map (endpoint under ``api``), never
+    the retired ``custom_providers`` list: Hermes' v11→v12 migration
+    moves that list ONCE, and every later list entry draws a
+    ``hermes doctor`` warning. A legacy list entry for the same endpoint
+    is moved into ``providers:`` (it would otherwise shadow the new one,
+    because Hermes reads the list first), and an emptied list is dropped.
     """
-    entries = doc.setdefault("custom_providers", [])
+    target = _endpoint_key(base_url)
+    providers = doc.get("providers")
+    if providers is None:
+        providers = doc["providers"] = CommentedMap()
+    elif not isinstance(providers, dict):
+        raise UserError(
+            f"config.yaml `providers:` is a {type(providers).__name__}, expected a mapping — "
+            "fix it by hand (`agx edit <agent> config.yaml`) and re-run"
+        )
     entry = next(
         (
             e
-            for e in entries
-            if isinstance(e, dict)
-            and str(e.get("base_url", "")).rstrip("/") == base_url.rstrip("/")
+            for e in providers.values()
+            if isinstance(e, dict) and _endpoint_key(_entry_url(e)) == target
         ),
         None,
     )
+
+    legacy = doc.get("custom_providers")
+    if isinstance(legacy, list):
+        for old in [e for e in legacy if isinstance(e, dict)]:
+            if _endpoint_key(_entry_url(old)) != target:
+                continue
+            legacy.remove(old)
+            if entry is None:
+                entry = _legacy_to_provider_entry(old)
+                providers[_free_provider_key(providers, str(old.get("name") or engine))] = entry
+            else:
+                for name, meta in (old.get("models") or {}).items():
+                    entry.setdefault("models", CommentedMap()).setdefault(name, meta)
+        if not legacy:
+            del doc["custom_providers"]
+
     if entry is None:
-        entry = {"name": engine, "base_url": base_url, "api_key": api_key}
-        entries.append(entry)
-    models_map = entry.setdefault("models", {})
+        entry = CommentedMap(api=base_url, name=engine, api_key=api_key)
+        providers[_free_provider_key(providers, engine)] = entry
+    models_map = entry.setdefault("models", CommentedMap())
     existing = models_map.get(model)
     if isinstance(existing, dict):
         existing["context_length"] = context_length
     else:
         models_map[model] = {"context_length": context_length}
+
+
+def _entry_url(entry: Any) -> str:
+    """Endpoint URL of a ``providers:`` entry (``api``) or a legacy list entry."""
+    return str(entry.get("api") or entry.get("base_url") or entry.get("url") or "")
+
+
+def _endpoint_key(url: str) -> str:
+    """Comparable form of an endpoint URL — same normalization as Hermes' doctor."""
+    return url.strip().rstrip("/").lower()
+
+
+def _free_provider_key(providers: Any, name: str) -> str:
+    """Kebab-case ``providers:`` key from ``name``, suffixed until unused."""
+    base = re.sub(r"[^a-z0-9]+", "-", name.strip().lower()).strip("-") or "endpoint"
+    key, n = base, 2
+    while key in providers:
+        key, n = f"{base}-{n}", n + 1
+    return key
+
+
+def _legacy_to_provider_entry(old: Any) -> CommentedMap:
+    """Translate a legacy ``custom_providers`` item to the ``providers:`` shape.
+
+    Mirrors Hermes' own ``_custom_provider_entry_to_provider_config``:
+    the URL moves to ``api``, ``model`` → ``default_model``,
+    ``api_mode`` → ``transport``; every other field is kept as-is.
+    """
+    renames = {"model": "default_model", "api_mode": "transport"}
+    new = CommentedMap(api=_entry_url(old))
+    for field, value in old.items():
+        if field not in ("base_url", "url", "api"):
+            new[renames.get(field, field)] = value
+    return new
 
 
 # ---------- ollama internals ----------

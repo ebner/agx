@@ -395,25 +395,28 @@ def test_use_external_ollama_writes_model_block_and_provider_entry(
         "api_key": "ollama",
         "context_length": 131072,
     }
-    [entry] = doc["custom_providers"]
-    assert entry["base_url"] == "http://192.168.122.1:11434/v1"
+    assert "custom_providers" not in doc  # retired store — draws a hermes doctor warning
+    assert list(doc["providers"]) == ["external-ollama"]
+    entry = doc["providers"]["external-ollama"]
+    assert entry["api"] == "http://192.168.122.1:11434/v1"
+    assert entry["api_key"] == "ollama"
     assert entry["models"]["qwen3.8:27b"]["context_length"] == 131072
 
 
 def test_use_external_ollama_upserts_into_existing_provider_entry(
     with_coder: Path, cfg: AgentsConfig, mocker: Any
 ) -> None:
-    """A pre-existing entry for the same endpoint (whatever its name) is
-    reused — other models' metadata survives, only this model's
-    context_length is set."""
+    """A pre-existing ``providers:`` entry for the same endpoint (whatever
+    its key, URL compared normalized) is reused — other models' metadata
+    survives, only this model's context_length is set."""
     _configure_external_ollama(with_coder)
     p = hermes_config.config_path(cfg, "coder")
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(
         "model: ''\n"
-        "custom_providers:\n"
-        "  - name: local-ollama\n"
-        "    base_url: http://192.168.122.1:11434/v1\n"
+        "providers:\n"
+        "  my-gpu:\n"
+        "    api: HTTP://192.168.122.1:11434/v1/\n"
         "    api_key: ollama\n"
         "    models:\n"
         '      "qwen3.8:27b": {context_length: 131072}\n',
@@ -429,10 +432,109 @@ def test_use_external_ollama_upserts_into_existing_provider_entry(
     )
 
     doc = hermes_config.read_doc(cfg, "coder")
-    [entry] = doc["custom_providers"]
-    assert entry["name"] == "local-ollama"  # reused, not duplicated
+    assert list(doc["providers"]) == ["my-gpu"]  # reused, not duplicated
+    entry = doc["providers"]["my-gpu"]
     assert entry["models"]["qwen3.8:27b"]["context_length"] == 131072  # untouched
     assert entry["models"]["gemma4:26b"]["context_length"] == 65536
+
+
+def test_use_migrates_legacy_custom_providers_entry_for_same_endpoint(
+    with_coder: Path, cfg: AgentsConfig, mocker: Any
+) -> None:
+    """A legacy list entry for the endpoint moves into ``providers:``
+    (keeping its name and other models) instead of shadowing a new one;
+    unrelated list entries stay where they are."""
+    _configure_external_ollama(with_coder)
+    p = hermes_config.config_path(cfg, "coder")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(
+        "model: ''\n"
+        "custom_providers:\n"
+        "  - name: local-ollama\n"
+        "    base_url: http://192.168.122.1:11434/v1\n"
+        "    api_key: ollama\n"
+        "    api_mode: chat_completions\n"
+        "    models:\n"
+        '      "qwen3.8:27b": {context_length: 131072}\n'
+        "  - name: other\n"
+        "    base_url: http://example.com/v1\n",
+        encoding="utf-8",
+    )
+
+    models_cmd.use(
+        "coder",
+        engine="external-ollama",
+        model="gemma4:26b",
+        context_length=65536,
+        config_path=with_coder,
+    )
+
+    doc = hermes_config.read_doc(cfg, "coder")
+    assert [e["name"] for e in doc["custom_providers"]] == ["other"]
+    assert list(doc["providers"]) == ["local-ollama"]
+    entry = doc["providers"]["local-ollama"]
+    assert entry["api"] == "http://192.168.122.1:11434/v1"
+    assert "base_url" not in entry
+    assert entry["transport"] == "chat_completions"  # Hermes' api_mode rename
+    assert entry["models"]["qwen3.8:27b"]["context_length"] == 131072
+    assert entry["models"]["gemma4:26b"]["context_length"] == 65536
+
+
+def test_use_merges_legacy_twin_into_existing_providers_entry(
+    with_coder: Path, cfg: AgentsConfig, mocker: Any
+) -> None:
+    """Both stores hold the endpoint: the ``providers:`` entry wins, the
+    legacy item's extra models are folded in, and the emptied list goes."""
+    _configure_external_ollama(with_coder)
+    p = hermes_config.config_path(cfg, "coder")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(
+        "model: ''\n"
+        "providers:\n"
+        "  gpu:\n"
+        "    api: http://192.168.122.1:11434/v1\n"
+        "    models:\n"
+        '      "qwen3.8:27b": {context_length: 131072}\n'
+        "custom_providers:\n"
+        "  - name: local-ollama\n"
+        "    base_url: http://192.168.122.1:11434/v1\n"
+        "    models:\n"
+        '      "qwen3.8:27b": {context_length: 4096}\n'
+        '      "llama3.2:3b": {context_length: 32768}\n',
+        encoding="utf-8",
+    )
+
+    models_cmd.use(
+        "coder",
+        engine="external-ollama",
+        model="gemma4:26b",
+        context_length=65536,
+        config_path=with_coder,
+    )
+
+    doc = hermes_config.read_doc(cfg, "coder")
+    assert "custom_providers" not in doc
+    models = doc["providers"]["gpu"]["models"]
+    assert models["qwen3.8:27b"]["context_length"] == 131072  # providers: wins
+    assert models["llama3.2:3b"]["context_length"] == 32768
+    assert models["gemma4:26b"]["context_length"] == 65536
+
+
+def test_use_refuses_non_mapping_providers(
+    with_coder: Path, cfg: AgentsConfig, mocker: Any
+) -> None:
+    _configure_external_ollama(with_coder)
+    p = hermes_config.config_path(cfg, "coder")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("model: ''\nproviders: [oops]\n", encoding="utf-8")
+    with pytest.raises(UserError, match="expected a mapping"):
+        models_cmd.use(
+            "coder",
+            engine="external-ollama",
+            model="gemma4:26b",
+            context_length=65536,
+            config_path=with_coder,
+        )
 
 
 def test_use_in_vm_engine_with_context_length_writes_provider_entry(
@@ -448,8 +550,8 @@ def test_use_in_vm_engine_with_context_length_writes_provider_entry(
     )
     doc = hermes_config.read_doc(cfg, "coder")
     assert doc["model"]["context_length"] == 32768
-    [entry] = doc["custom_providers"]
-    assert entry["base_url"] == f"http://{OLLAMA_SERVICE_NAME}:11434/v1"
+    entry = doc["providers"]["ollama"]
+    assert entry["api"] == f"http://{OLLAMA_SERVICE_NAME}:11434/v1"
     assert entry["models"]["llama3.2:3b"]["context_length"] == 32768
 
 
@@ -460,6 +562,7 @@ def test_use_without_context_length_writes_no_provider_entry(
     models_cmd.use("coder", engine="ollama", model="llama3.2:3b", config_path=with_coder)
     doc = hermes_config.read_doc(cfg, "coder")
     assert "context_length" not in doc["model"]
+    assert "providers" not in doc
     assert "custom_providers" not in doc
 
 

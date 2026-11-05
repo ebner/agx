@@ -1534,7 +1534,7 @@ def model_rm(ctx: click.Context, engine: str, model: str, yes_local: bool) -> No
     default=None,
     help=(
         "Effective context window to declare to Hermes (model.context_length + a "
-        "per-model custom_providers entry, so /model switches stay correct). "
+        "per-model providers: entry, so /model switches stay correct). "
         "REQUIRED for external-ollama: pass the server's OLLAMA_CONTEXT_LENGTH cap "
         "— it can't be probed remotely, and the model's native window is usually larger."
     ),
