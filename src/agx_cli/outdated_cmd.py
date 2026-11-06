@@ -49,6 +49,9 @@ GITHUB_API: dict[str, str] = {
 
 FETCH_TIMEOUT_S: float = 5.0
 
+# How many of the newest releases one ``fetch_releases`` call returns.
+RELEASES_PAGE = 30
+
 # A release tag that names a version: ``v0.21.6``, ``v2026.9.24``,
 # ``v2026.10.1``, ``v2026.10.5-beta.1``, ``v2026.7.1-2``. Non-version
 # release tags upstream also publishes (OpenClaw's ``linux-stable``
@@ -126,7 +129,19 @@ def check(
     as ``status: unknown`` for that row, not raised — partial visibility
     beats no visibility.
     """
-    cfg = cfg_mod.load(config_path)
+    payload = collect(cfg_mod.load(config_path), name=name, include_prerelease=include_prerelease)
+    _emit(payload)
+    return payload
+
+
+def collect(
+    cfg: cfg_mod.AgentsConfig,
+    *,
+    name: str | None = None,
+    include_prerelease: bool = False,
+) -> dict[str, Any]:
+    """:func:`check` without output — the payload only (doctor-cron's
+    update notification uses it)."""
     doc = compose.read_compose_doc(cfg)
     services = doc.get("services") or {}
 
@@ -181,7 +196,6 @@ def check(
         "outdated_count": sum(1 for r in rows if r["status"] == "outdated"),
         "unknown_count": sum(1 for r in rows if r["status"] == "unknown"),
     }
-    _emit(payload)
     return payload
 
 
@@ -254,6 +268,25 @@ def fetch_latest_tag(agent_type: str, *, include_prerelease: bool = False) -> st
         if rel.get("prerelease") or tag == stable:
             return image_tag_from_release(agent_type, tag)
     return None
+
+
+def fetch_releases(agent_type: str) -> list[dict[str, Any]] | None:
+    """The newest-created GitHub releases of the agent type's upstream
+    (raw API objects, incl. ``body`` = the Markdown release notes), or
+    ``None`` when unreachable."""
+    base = GITHUB_API.get(agent_type)
+    if base is None:
+        return None
+    data = _fetch_json(f"{base}/releases?per_page={RELEASES_PAGE}")
+    if not isinstance(data, list):
+        return None
+    return [r for r in data if isinstance(r, dict)]
+
+
+def html_repo_url(agent_type: str) -> str | None:
+    """``https://github.com/<owner>/<repo>`` for the agent type's upstream."""
+    base = GITHUB_API.get(agent_type)
+    return base.replace("://api.github.com/repos/", "://github.com/") if base else None
 
 
 def _fetch_json(url: str) -> Any:

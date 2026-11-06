@@ -21,6 +21,10 @@ Design:
   mail. A persistently red setup therefore produces exactly one mail,
   not one per interval. Warnings are reported in the body for context
   but never trigger a mail on their own.
+- Upstream releases: at most every ``update_check_hours`` (default 24,
+  0 = off) ``run`` also mails, once per new release per agent, which
+  agents can be upgraded, with condensed release notes
+  (``update_notify``). Separate mail, separate state keys.
 - Mail goes through the host's ``sendmail -t`` (postfix/msmtp/…) —
   the toolkit carries no SMTP configuration. ``install`` refuses when
   no ``sendmail`` binary is on PATH so a silent no-op can't be
@@ -60,10 +64,13 @@ def install(
     *,
     every_minutes: int = 15,
     mail_to: list[str] | None = None,
+    update_check_hours: int | None = None,
     binary: str | None = None,
     config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH,
 ) -> None:
-    """Install (or replace) the toolkit-managed doctor-cron entry."""
+    """Install (or replace) the toolkit-managed doctor-cron entry.
+
+    ``update_check_hours`` ``None`` keeps the configured value."""
     from agx_cli.export_cmd import _read_crontab, _write_crontab
 
     cfg = cfg_mod.load(config_path)
@@ -72,8 +79,13 @@ def install(
         raise UserError("at least one --mail recipient is required")
     # Validate through the config model so a bad address / interval is
     # rejected before anything lands in the crontab.
+    if update_check_hours is None:
+        update_check_hours = cfg.doctor_cron.update_check_hours
     cfg.doctor_cron = cfg_mod.DoctorCronConfig(
-        enabled=True, every_minutes=every_minutes, mail_to=recipients
+        enabled=True,
+        every_minutes=every_minutes,
+        mail_to=recipients,
+        update_check_hours=update_check_hours,
     )
     if _sendmail_path() is None:
         raise UserError(
@@ -97,11 +109,17 @@ def install(
             "installed": True,
             "every_minutes": every_minutes,
             "mail_to": recipients,
+            "update_check_hours": update_check_hours,
             "line": line,
         },
         human=(
             f"doctor-cron installed: every {every_minutes} min, "
-            f"mail on state change to {', '.join(recipients)}"
+            f"mail on state change to {', '.join(recipients)}; "
+            + (
+                f"upstream release check every {update_check_hours} h"
+                if update_check_hours
+                else "upstream release check off"
+            )
         ),
     )
 
@@ -132,6 +150,9 @@ def status(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> dict[str, Any]
         "last_run": state.get("checked_at"),
         "failing": state.get("failing", []),
         "last_notified": state.get("notified_at"),
+        "update_check_hours": cfg.doctor_cron.update_check_hours,
+        "updates_checked_at": state.get("updates_checked_at"),
+        "updates_notified": state.get("updates_notified") or {},
     }
     failing = info["failing"]
     ui.emit(
@@ -142,7 +163,18 @@ def status(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> dict[str, Any]
             f"mail to:   {', '.join(cfg.doctor_cron.mail_to) or '(none)'}\n"
             f"last run:  {info['last_run'] or '(never)'}\n"
             f"failing:   {', '.join(failing) if failing else '(none)'}\n"
-            f"notified:  {info['last_notified'] or '(never)'}"
+            f"notified:  {info['last_notified'] or '(never)'}\n"
+            f"updates:   "
+            + (
+                f"checked every {info['update_check_hours']} h, last "
+                f"{info['updates_checked_at'] or '(never)'}"
+                if info["update_check_hours"]
+                else "check off"
+            )
+            + "".join(
+                f"\n  {agent}: mailed about {tag}"
+                for agent, tag in sorted(info["updates_notified"].items())
+            )
         ),
     )
     return info
@@ -160,7 +192,8 @@ def run(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> dict[str, Any]:
 
     failing = {c.name: c.detail for c in report.checks if c.status == "fail"}
     warning = {c.name: c.detail for c in report.checks if c.status == "warn"}
-    now = datetime.datetime.now(datetime.UTC).replace(microsecond=0).isoformat()
+    now_dt = datetime.datetime.now(datetime.UTC).replace(microsecond=0)
+    now = now_dt.isoformat()
 
     previous = _read_state(cfg)
     prev_failing = set(previous.get("failing", []))
@@ -177,8 +210,12 @@ def run(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> dict[str, Any]:
         "checked_at": now,
         "failing": sorted(failing),
         "notified_at": now if notified else previous.get("notified_at"),
+        "updates_checked_at": previous.get("updates_checked_at"),
+        "updates_notified": previous.get("updates_notified") or {},
     }
+    # Doctor state is durable before the (network-bound) update check.
     _write_state(cfg, state)
+    update_mailed = _check_updates(cfg, state, now_dt)
 
     result = {
         "status": "fail" if failing else "ok",
@@ -186,6 +223,7 @@ def run(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> dict[str, Any]:
         "warning": sorted(warning),
         "changed": changed,
         "notified": notified,
+        "update_notified": update_mailed,
     }
     ui.emit(
         result,
@@ -193,9 +231,55 @@ def run(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> dict[str, Any]:
             f"doctor-cron: {result['status']} "
             f"(failing={len(failing)}, warn={len(warning)}, "
             f"{'mailed' if notified else 'no change'})"
+            + (f"; update mail for {', '.join(update_mailed)}" if update_mailed else "")
         ),
     )
     return result
+
+
+def _check_updates(
+    cfg: cfg_mod.AgentsConfig, state: dict[str, Any], now: datetime.datetime
+) -> list[str]:
+    """Mail newly available upstream releases (see ``update_notify``);
+    returns the agents mailed about. At most one check per
+    ``update_check_hours``; an incomplete check (GitHub unreachable for
+    some agent type) is retried on the next run, and the per-agent
+    ``updates_notified`` tag keeps any retry from mailing twice."""
+    from agx_cli import update_notify
+
+    hours = cfg.doctor_cron.update_check_hours
+    if hours == 0 or not cfg.doctor_cron.mail_to:
+        return []
+    last = _parse_time(state.get("updates_checked_at"))
+    if last is not None and now - last < datetime.timedelta(hours=hours):
+        return []
+
+    notified: dict[str, str] = dict(state.get("updates_notified") or {})
+    updates, reached = update_notify.check(cfg, notified)
+    mailed: list[str] = []
+    if updates:
+        _send_mail(
+            cfg.doctor_cron.mail_to,
+            update_notify.mail_subject(updates),
+            update_notify.mail_body(cfg, updates, now.isoformat()),
+        )
+        for update in updates:
+            for agent in update.agents:
+                notified[agent] = update.latest
+                mailed.append(agent)
+    if reached:
+        state["updates_checked_at"] = now.isoformat()
+    state["updates_notified"] = notified
+    _write_state(cfg, state)
+    return sorted(mailed)
+
+
+def _parse_time(value: Any) -> datetime.datetime | None:
+    try:
+        parsed = datetime.datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
 
 
 # ---------- helpers ----------

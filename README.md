@@ -127,7 +127,7 @@ Where agx is weaker today: all agents share one VM (sbx gives each its own), age
 | `agx edit <name> <path>` | Edit one of a Hermes agent's text files (`SOUL.md`, skills, `config.yaml`) in `$EDITOR` via the container — no sudo, no host access to the data dir | [runbook](docs/runbook.md) |
 | `agx access mount/unmount/list` | Host view of an agent's subuid-owned state dir (idmapped bind mount under `~/agents-view/`; read-only by default) | [runbook](docs/runbook.md) |
 | `agx codex login/status/skill-enable/skill-disable` | Toolkit-scoped Codex auth for the Codex coding *skill* (sandbox). Provider auth is `hermes auth add openai-codex` in-container | [codex-integration](docs/codex-integration.md) |
-| `agx doctor-cron install/uninstall/status/run` | Host cron: run doctor every N min, mail on state change via the host's `sendmail` (catches expired Codex credentials within one interval) | [runbook](docs/runbook.md#doctor-cron) |
+| `agx doctor-cron install/uninstall/status/run` | Host cron: run doctor every N min, mail on state change via the host's `sendmail` (catches expired Codex credentials within one interval); also mails once per new upstream release, with condensed release notes | [runbook](docs/runbook.md#doctor-cron) |
 | `agx memory list/enable/disable/status` | Managed memory backends for Hermes | [runbook](docs/runbook.md) |
 | `agx ollama configure/status/clear` | Point the toolkit at an **external** Ollama / OpenAI-compatible endpoint | [runbook](docs/runbook.md) |
 | `agx inference up/down/status/load/unload` | **In-VM** local inference (Ollama, llama.cpp) as sibling services | [runbook](docs/runbook.md) |

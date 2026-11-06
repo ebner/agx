@@ -310,6 +310,16 @@ class DoctorCronConfig(BaseModel):
     enabled: bool = False
     every_minutes: int = 15
     mail_to: list[str] = Field(default_factory=list)
+    # Hours between upstream release checks (one mail per new release
+    # per agent, with condensed release notes). 0 disables them.
+    update_check_hours: int = 24
+
+    @field_validator("update_check_hours")
+    @classmethod
+    def _validate_update_check_hours(cls, v: int) -> int:
+        if not (0 <= v <= 24 * 7):
+            raise ValueError(f"doctor_cron.update_check_hours must be 0..168, got {v}")
+        return v
 
     @field_validator("every_minutes")
     @classmethod

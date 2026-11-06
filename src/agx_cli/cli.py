@@ -1030,11 +1030,27 @@ def doctor_cron_group() -> None:
     multiple=True,
     help="Recipient address (repeatable). Required on first install.",
 )
-def doctor_cron_install(every_minutes: int, mail_to: tuple[str, ...]) -> None:
+@click.option(
+    "--update-check-hours",
+    type=click.IntRange(0, 168),
+    default=None,
+    help=(
+        "Hours between upstream release checks; a new release mails once per agent, "
+        "with condensed release notes. 0 = off. Default: keep the configured value (24)."
+    ),
+)
+def doctor_cron_install(
+    every_minutes: int, mail_to: tuple[str, ...], update_check_hours: int | None
+) -> None:
     """Install (or replace) the host cron entry."""
     from agx_cli import doctor_cron
 
-    _run(doctor_cron.install, every_minutes=every_minutes, mail_to=list(mail_to))
+    _run(
+        doctor_cron.install,
+        every_minutes=every_minutes,
+        mail_to=list(mail_to),
+        update_check_hours=update_check_hours,
+    )
 
 
 @doctor_cron_group.command("uninstall")

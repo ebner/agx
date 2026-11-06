@@ -677,13 +677,15 @@ Symptom of a dead credential: the agent answers *"Provider authentication failed
 Host cron that runs `agx doctor` every N minutes and mails **on state change only** — one mail when a check turns red (with every failing check's detail and the fix one-liner), one when everything is green again; warnings are listed for context but never trigger a mail. Delivery is through the host's `sendmail` (postfix, msmtp, …): the toolkit carries no SMTP config, and `install` refuses when no `sendmail` is on PATH.
 
 ```bash
-agx doctor-cron install --mail you@example.org [--every 15]
-agx doctor-cron status      # installed?, last run, currently failing checks, last mail
+agx doctor-cron install --mail you@example.org [--every 15] [--update-check-hours 24]
+agx doctor-cron status      # installed?, last run, currently failing checks, last mail, update checks
 agx doctor-cron run         # one poll by hand (what cron calls)
 agx doctor-cron uninstall
 ```
 
-State lives at `<data-dir>/.doctor-cron/state.json`; the cron log at `<data-dir>/.doctor-cron.log`. A red doctor never makes the cron line exit non-zero (that would trigger cron's own MAILTO spam) — only a failed run itself (config missing, sendmail rejected) does.
+**Update notices.** At most every `update_check_hours` (default 24; `0` turns it off) the poll also asks GitHub for each agent type's latest release — the same lookup as `agx outdated` — and sends a separate mail, **once per new release per agent**, naming the agents that can be upgraded (`agx upgrade <name>`), every release between the pinned tag and the latest one, and condensed notes per release: the lead paragraph, the full upgrade-notes / breaking-change bullets, the highlight titles, and a link to the full notes. A release whose Docker image isn't published yet is held back until it is (`agx upgrade` would refuse it anyway); when GitHub is unreachable the check is retried on the next poll. Nothing is upgraded automatically.
+
+State lives at `<data-dir>/.doctor-cron/state.json` (incl. the last tag mailed about per agent); the cron log at `<data-dir>/.doctor-cron.log`. A red doctor never makes the cron line exit non-zero (that would trigger cron's own MAILTO spam) — only a failed run itself (config missing, sendmail rejected) does.
 
 OpenClaw bundles its own Codex plugin — run `openclaw models auth login --provider openai --device-code` *inside* the OpenClaw container instead:
 

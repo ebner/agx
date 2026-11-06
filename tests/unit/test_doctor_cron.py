@@ -3,11 +3,13 @@ mails on state change."""
 
 from __future__ import annotations
 
+import datetime
 import email.policy
 import json
 from email.message import EmailMessage
 from email.parser import BytesParser
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -107,6 +109,22 @@ def test_install_is_idempotent_and_keeps_foreign_lines(
     assert cfg_mod.load(saved_config).doctor_cron.mail_to == ["a@b.c"]
 
 
+def test_install_sets_and_keeps_update_check_hours(
+    saved_config: Path, fake_crontab: FakeCrontab, sendmail, mocker
+) -> None:
+    mocker.patch("agx_cli.ui.emit")
+    assert cfg_mod.load(saved_config).doctor_cron.update_check_hours == 24
+    doctor_cron.install(
+        mail_to=["a@b.c"], update_check_hours=0, binary="/x/agx", config_path=saved_config
+    )
+    assert cfg_mod.load(saved_config).doctor_cron.update_check_hours == 0
+    # A reinstall without the option keeps the configured value.
+    doctor_cron.install(every_minutes=5, binary="/x/agx", config_path=saved_config)
+    assert cfg_mod.load(saved_config).doctor_cron.update_check_hours == 0
+    with pytest.raises(ValueError, match="update_check_hours"):
+        doctor_cron.install(update_check_hours=169, binary="/x/agx", config_path=saved_config)
+
+
 def test_install_requires_recipient_and_sendmail(
     saved_config: Path, fake_crontab: FakeCrontab, mocker
 ) -> None:
@@ -152,7 +170,14 @@ def test_run_mails_only_on_state_change(
     # 1. Green → no state before, nothing failing → no mail.
     doctor.return_value = _report(vm_reachable="ok")
     r = doctor_cron.run(config_path=saved_config)
-    assert r == {"status": "ok", "failing": [], "warning": [], "changed": False, "notified": False}
+    assert r == {
+        "status": "ok",
+        "failing": [],
+        "warning": [],
+        "changed": False,
+        "notified": False,
+        "update_notified": [],
+    }
     sendmail.assert_not_called()
     assert doctor.call_args.kwargs["raise_on_fail"] is False
 
@@ -255,3 +280,100 @@ def test_mail_wraps_multiline_detail_and_declares_mime(
     # The long item wraps; its continuation lines hang under the item text.
     assert any(line.startswith("      ") and line[6] != " " for line in section)
     assert max(len(line) for line in section) <= doctor_cron.MAIL_WIDTH
+
+
+# ---------- upstream-release notifications ----------
+
+
+def _update(agent: str = "coder", latest: str = "v1.3.0") -> Any:
+    from agx_cli.update_notify import Update
+
+    return Update(agent_type="hermes", current="v1.2.0", latest=latest, agents=[agent])
+
+
+def test_run_mails_each_release_once_and_respects_interval(
+    cfg: AgentsConfig, saved_config: Path, sendmail, mocker
+) -> None:
+    mocker.patch("agx_cli.ui.emit")
+    cfg.doctor_cron.mail_to = ["ops@example.org"]
+    cfg_mod.save(cfg, saved_config)
+    mocker.patch("agx_cli.ops.doctor", return_value=_report(vm_reachable="ok"))
+    check = mocker.patch("agx_cli.update_notify.check", return_value=([_update()], True))
+    clock = mocker.patch("agx_cli.doctor_cron.datetime")
+    clock.timedelta = datetime.timedelta
+    clock.datetime.fromisoformat = datetime.datetime.fromisoformat
+    clock.UTC = datetime.UTC
+    t0 = datetime.datetime(2026, 11, 6, 8, 0, tzinfo=datetime.UTC)
+
+    # 1. First run: checks, mails, records the notified tag.
+    clock.datetime.now.return_value = t0
+    r = doctor_cron.run(config_path=saved_config)
+    assert r["update_notified"] == ["coder"] and r["notified"] is False
+    msg = _sent(sendmail)
+    assert msg["Subject"] == "[agents] update available: coder v1.2.0 -> v1.3.0"
+    assert "agx upgrade coder" in msg.get_content()
+    state = json.loads((cfg.paths.host_data_dir / ".doctor-cron" / "state.json").read_text())
+    assert state["updates_notified"] == {"coder": "v1.3.0"}
+    assert state["updates_checked_at"] == t0.isoformat()
+
+    # 2. Within the interval: no upstream check at all.
+    clock.datetime.now.return_value = t0 + datetime.timedelta(hours=23)
+    doctor_cron.run(config_path=saved_config)
+    assert check.call_count == 1
+
+    # 3. Interval elapsed: checks again, passing what was already mailed.
+    clock.datetime.now.return_value = t0 + datetime.timedelta(hours=24)
+    check.return_value = ([], True)
+    r = doctor_cron.run(config_path=saved_config)
+    assert check.call_count == 2
+    assert check.call_args.args[1] == {"coder": "v1.3.0"}
+    assert r["update_notified"] == [] and sendmail.call_count == 1
+
+
+def test_run_retries_unreached_update_check_next_poll(
+    cfg: AgentsConfig, saved_config: Path, sendmail, mocker
+) -> None:
+    mocker.patch("agx_cli.ui.emit")
+    cfg.doctor_cron.mail_to = ["ops@example.org"]
+    cfg_mod.save(cfg, saved_config)
+    mocker.patch("agx_cli.ops.doctor", return_value=_report(vm_reachable="ok"))
+    check = mocker.patch("agx_cli.update_notify.check", return_value=([], False))
+    doctor_cron.run(config_path=saved_config)
+    state = json.loads((cfg.paths.host_data_dir / ".doctor-cron" / "state.json").read_text())
+    assert state["updates_checked_at"] is None
+    doctor_cron.run(config_path=saved_config)
+    assert check.call_count == 2
+    sendmail.assert_not_called()
+
+
+@pytest.mark.parametrize(("hours", "recipients"), [(0, ["ops@example.org"]), (24, [])])
+def test_run_skips_update_check_when_off_or_no_recipients(
+    cfg: AgentsConfig, saved_config: Path, sendmail, mocker, hours: int, recipients: list[str]
+) -> None:
+    mocker.patch("agx_cli.ui.emit")
+    cfg.doctor_cron.mail_to = recipients
+    cfg.doctor_cron.update_check_hours = hours
+    cfg_mod.save(cfg, saved_config)
+    mocker.patch("agx_cli.ops.doctor", return_value=_report(vm_reachable="ok"))
+    check = mocker.patch("agx_cli.update_notify.check")
+    doctor_cron.run(config_path=saved_config)
+    check.assert_not_called()
+
+
+def test_run_keeps_update_state_across_doctor_mails(
+    cfg: AgentsConfig, saved_config: Path, sendmail, mocker
+) -> None:
+    """The doctor half rewrites state.json every poll — it must carry the
+    update keys over, or every poll would re-mail the same release."""
+    mocker.patch("agx_cli.ui.emit")
+    cfg.doctor_cron.mail_to = ["ops@example.org"]
+    cfg.doctor_cron.update_check_hours = 1
+    cfg_mod.save(cfg, saved_config)
+    doctor = mocker.patch("agx_cli.ops.doctor", return_value=_report(vm_reachable="ok"))
+    mocker.patch("agx_cli.update_notify.check", return_value=([_update()], True))
+    doctor_cron.run(config_path=saved_config)
+    doctor.return_value = _report(vm_reachable="fail")
+    doctor_cron.run(config_path=saved_config)  # doctor mail; update check not due
+    state = json.loads((cfg.paths.host_data_dir / ".doctor-cron" / "state.json").read_text())
+    assert state["updates_notified"] == {"coder": "v1.3.0"}
+    assert state["failing"] == ["vm_reachable"]
