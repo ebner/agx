@@ -3,7 +3,10 @@ mails on state change."""
 
 from __future__ import annotations
 
+import email.policy
 import json
+from email.message import EmailMessage
+from email.parser import BytesParser
 from pathlib import Path
 
 import pytest
@@ -58,6 +61,11 @@ def sendmail(mocker):
     mocker.patch("agx_cli.doctor_cron._sendmail_path", return_value="/usr/sbin/sendmail")
     proc = mocker.MagicMock(returncode=0, stderr=b"")
     return mocker.patch("agx_cli.doctor_cron.subprocess.run", return_value=proc)
+
+
+def _sent(sendmail) -> EmailMessage:
+    raw = sendmail.call_args.kwargs["input"]
+    return BytesParser(policy=email.policy.default).parsebytes(raw)  # type: ignore[return-value]
 
 
 def _report(**checks: str) -> DoctorReport:
@@ -155,10 +163,12 @@ def test_run_mails_only_on_state_change(
     sendmail.assert_called_once()
     argv = sendmail.call_args.args[0]
     assert argv[:2] == ["/usr/sbin/sendmail", "-t"]
-    msg = sendmail.call_args.kwargs["input"].decode()
-    assert "To: ops@example.org" in msg
-    assert "Subject: [agents] doctor: 1 check(s) failing" in msg
-    assert "coder.credential_pool: detail of coder.credential_pool" in msg
+    msg = _sent(sendmail)
+    assert msg["To"] == "ops@example.org"
+    assert msg["Subject"] == "[agents] doctor: 1 check(s) failing (coder.credential_pool)"
+    body = msg.get_content()
+    assert "FAILING (1)\n===========\n\ncoder.credential_pool\n" in body
+    assert "\n    detail of coder.credential_pool\n" in body
 
     # 3. Still red, same set → no second mail.
     r = doctor_cron.run(config_path=saved_config)
@@ -176,10 +186,12 @@ def test_run_mails_only_on_state_change(
     doctor.return_value = _report(vm_reachable="ok", vm_disk="warn")
     r = doctor_cron.run(config_path=saved_config)
     assert r["status"] == "ok" and r["notified"] is True
-    msg = sendmail.call_args.kwargs["input"].decode()
-    assert "Subject: [agents] doctor: recovered" in msg
-    assert "Recovered since last notice:\n  - coder.credential_pool" in msg
-    assert "vm_disk: detail of vm_disk" in msg  # warning listed for context
+    msg = _sent(sendmail)
+    assert msg["Subject"] == "[agents] doctor: recovered - all checks green"
+    body = msg.get_content()
+    assert "RECOVERED since last notice (1)" in body
+    assert "\ncoder.credential_pool\n" in body
+    assert "\nvm_disk\n    detail of vm_disk\n" in body  # warning listed for context
 
     state = json.loads((cfg.paths.host_data_dir / ".doctor-cron" / "state.json").read_text())
     assert state["failing"] == []
@@ -208,3 +220,38 @@ def test_run_surfaces_sendmail_failure(cfg: AgentsConfig, saved_config: Path, mo
     )
     with pytest.raises(RuntimeFailure, match="sendmail failed"):
         doctor_cron.run(config_path=saved_config)
+
+
+def test_mail_wraps_multiline_detail_and_declares_mime(
+    cfg: AgentsConfig, saved_config: Path, sendmail, mocker
+) -> None:
+    """Multi-line details (hermes_doctor's ``- item`` list) keep one item
+    per line, wrapped with a hanging indent; no body line exceeds the
+    mail width; the message carries proper MIME headers."""
+    mocker.patch("agx_cli.ui.emit")
+    cfg.doctor_cron.mail_to = ["ops@example.org"]
+    cfg_mod.save(cfg, saved_config)
+    report = DoctorReport()
+    report.add("disk_space", "fail", "3.5% free on /home/user/agents")
+    report.add(
+        "coder.hermes_doctor",
+        "warn",
+        "`hermes doctor` reported 2 issue(s):\n"
+        "- Run 'hermes setup' to configure missing API keys for full tool access\n"
+        "- " + "web workspace has 5 npm vulnerabilities; wait for an upstream fix " * 3,
+    )
+    mocker.patch("agx_cli.ops.doctor", return_value=report)
+    doctor_cron.run(config_path=saved_config)
+
+    msg = _sent(sendmail)
+    assert msg["MIME-Version"] == "1.0"
+    assert msg.get_content_type() == "text/plain"
+    assert msg.get_content_charset() == "utf-8"
+    assert msg["Date"]
+    body = msg.get_content()
+    assert "Warnings (1, informational: never mailed on their own)" in body
+    assert "\n    - Run 'hermes setup' to configure missing API keys for full tool access\n" in body
+    section = body.split("never mailed on their own)", 1)[1].splitlines()
+    # The long item wraps; its continuation lines hang under the item text.
+    assert any(line.startswith("      ") and line[6] != " " for line in section)
+    assert max(len(line) for line in section) <= doctor_cron.MAIL_WIDTH

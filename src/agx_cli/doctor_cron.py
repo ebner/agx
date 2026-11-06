@@ -34,10 +34,13 @@ Design:
 from __future__ import annotations
 
 import datetime
+import email.utils
 import json
 import shutil
 import subprocess
 import sys
+import textwrap
+from email.message import EmailMessage
 from pathlib import Path
 from typing import Any
 
@@ -165,10 +168,7 @@ def run(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> dict[str, Any]:
 
     notified = False
     if changed and cfg.doctor_cron.mail_to:
-        if failing:
-            subject = f"[agents] doctor: {len(failing)} check(s) failing"
-        else:
-            subject = "[agents] doctor: recovered — all checks green"
+        subject = _mail_subject(failing)
         body = _mail_body(cfg, failing=failing, warning=warning, previous=prev_failing, when=now)
         _send_mail(cfg.doctor_cron.mail_to, subject, body)
         notified = True
@@ -224,6 +224,18 @@ def _write_state(cfg: cfg_mod.AgentsConfig, state: dict[str, Any]) -> None:
     tmp.replace(p)
 
 
+MAIL_WIDTH = 76
+
+
+def _mail_subject(failing: dict[str, str]) -> str:
+    """ASCII-only (no RFC 2047 encoding) and names the failing checks."""
+    if not failing:
+        return "[agents] doctor: recovered - all checks green"
+    names = sorted(failing)
+    shown = ", ".join(names[:3]) + (f" +{len(names) - 3} more" if len(names) > 3 else "")
+    return f"[agents] doctor: {len(names)} check(s) failing ({shown})"
+
+
 def _mail_body(
     cfg: cfg_mod.AgentsConfig,
     *,
@@ -232,22 +244,40 @@ def _mail_body(
     previous: set[str],
     when: str,
 ) -> str:
-    lines = [f"agx doctor on {cfg.vm.name} ({cfg.paths.host_data_dir}) at {when}", ""]
+    """Plain-text body: one titled section per state, one block per check,
+    detail wrapped below the check name (multi-line details keep their
+    ``- item`` lines, each wrapped with a hanging indent)."""
+    lines = [
+        f"agx doctor on VM {cfg.vm.name}",
+        f"data dir: {cfg.paths.host_data_dir}",
+        f"checked:  {when}",
+    ]
+
+    def section(title: str, checks: dict[str, str]) -> None:
+        lines.extend(["", title, "=" * len(title)])
+        for name, detail in sorted(checks.items()):
+            lines.extend(["", name])
+            for para in (detail or "").splitlines():
+                lines.extend(
+                    textwrap.wrap(
+                        para,
+                        width=MAIL_WIDTH,
+                        initial_indent="    ",
+                        subsequent_indent="      " if para.startswith("- ") else "    ",
+                        break_on_hyphens=False,
+                    )
+                )
+
     if failing:
-        lines.append("FAILING:")
-        for name, detail in sorted(failing.items()):
-            lines.append(f"  - {name}: {detail or '(no detail)'}")
+        section(f"FAILING ({len(failing)})", failing)
     else:
-        lines.append("All checks green.")
+        lines.extend(["", "All checks green."])
     recovered = sorted(previous - set(failing))
     if recovered:
-        lines += ["", "Recovered since last notice:"]
-        lines += [f"  - {name}" for name in recovered]
+        section(f"RECOVERED since last notice ({len(recovered)})", dict.fromkeys(recovered, ""))
     if warning:
-        lines += ["", "Warnings (informational, no mail on their own):"]
-        for name, detail in sorted(warning.items()):
-            lines.append(f"  - {name}: {detail or '(no detail)'}")
-    lines += ["", "Full report: agx doctor"]
+        section(f"Warnings ({len(warning)}, informational: never mailed on their own)", warning)
+    lines.extend(["", "-- ", "Full report: agx doctor"])
     return "\n".join(lines) + "\n"
 
 
@@ -262,15 +292,16 @@ def _send_mail(recipients: list[str], subject: str, body: str) -> None:
     sendmail = _sendmail_path()
     if sendmail is None:
         raise RuntimeFailure("no `sendmail` binary on PATH; cannot deliver doctor-cron mail")
-    message = (
-        f"To: {', '.join(recipients)}\n"
-        f"Subject: {subject}\n"
-        f"Content-Type: text/plain; charset=utf-8\n"
-        f"\n{body}"
-    )
+    # EmailMessage adds MIME-Version + a Content-Transfer-Encoding that
+    # matches the body (the hand-built header block declared neither).
+    message = EmailMessage()
+    message["To"] = ", ".join(recipients)
+    message["Subject"] = subject
+    message["Date"] = email.utils.formatdate(localtime=True)
+    message.set_content(body, charset="utf-8")
     proc = subprocess.run(
         [sendmail, "-t", "-oi"],
-        input=message.encode("utf-8"),
+        input=message.as_bytes(),
         capture_output=True,
         check=False,
     )

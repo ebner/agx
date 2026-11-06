@@ -915,7 +915,8 @@ def _check_hermes_data_dir_accessible(
 
 
 _HERMES_DOCTOR_ISSUES_RE = re.compile(r"Found (\d+) issue\(s\)")
-_HERMES_DOCTOR_MAX_DETAIL_LINES: Final = 4
+_HERMES_DOCTOR_ITEM_RE = re.compile(r"^\s*\d+\.\s+(\S.*)$", re.MULTILINE)
+_HERMES_DOCTOR_MAX_DETAIL_LINES: Final = 8
 
 
 def _check_hermes_doctor(
@@ -952,14 +953,26 @@ def _check_hermes_doctor(
             result.stderr.strip() or result.stdout.strip(),
         )
         return
-    flagged = [line.strip() for line in output.splitlines() if line.strip().startswith(("✗", "⚠"))]
-    shown = "; ".join(line[:160] for line in flagged[:_HERMES_DOCTOR_MAX_DETAIL_LINES])
-    more = len(flagged) - _HERMES_DOCTOR_MAX_DETAIL_LINES
-    detail = f"`hermes doctor` reported {issues.group(1)} issue(s)"
-    if shown:
-        detail += f": {shown}" + (f" (+{more} more)" if more > 0 else "")
-    detail += f" — full list: `agx exec {agent_name} -- hermes doctor`"
-    report.add(f"{agent_name}.hermes_doctor", "warn", detail)
+    # Prefer Hermes' own numbered "Found N issue(s) to address:" list —
+    # those ARE the N issues. The ⚠/✗ lines are a superset (every
+    # unconfigured optional integration is a ⚠), only a fallback for
+    # output without the list.
+    tail = output[issues.end() :]
+    items = [m.group(1).strip() for m in _HERMES_DOCTOR_ITEM_RE.finditer(tail)]
+    if not items:
+        items = [
+            line.strip() for line in output.splitlines() if line.strip().startswith(("✗", "⚠"))
+        ]
+    shown = items[:_HERMES_DOCTOR_MAX_DETAIL_LINES]
+    more = len(items) - len(shown)
+    lines = [
+        f"`hermes doctor` reported {issues.group(1)} issue(s):",
+        *(f"- {item[:240]}" for item in shown),
+    ]
+    if more > 0:
+        lines.append(f"- (+{more} more)")
+    lines.append(f"full list: `agx exec {agent_name} -- hermes doctor`")
+    report.add(f"{agent_name}.hermes_doctor", "warn", "\n".join(lines))
 
 
 # One in-container pass over every secondary Hermes profile: emit one
@@ -1613,7 +1626,11 @@ def _emit_doctor_table(report: DoctorReport) -> None:
     indent = f"{'':<{check_w}}{sep}{'':<{status_w}}{sep}"
 
     def row_lines(check: str, status: str, detail: str) -> list[str]:
-        wrapped = textwrap.wrap(detail or "", width=detail_w) or [""]
+        wrapped = [
+            out
+            for para in (detail or "").splitlines()
+            for out in textwrap.wrap(para, width=detail_w, subsequent_indent=_item_indent(para))
+        ] or [""]
         first = f"{check:<{check_w}}{sep}{status:<{status_w}}{sep}{wrapped[0]}"
         return [first, *(f"{indent}{cont}" for cont in wrapped[1:])]
 
@@ -1622,3 +1639,8 @@ def _emit_doctor_table(report: DoctorReport) -> None:
     for r in rows:
         for line in row_lines(r["check"], r["status"], r["detail"]):
             ui.echo_human(line)
+
+
+def _item_indent(line: str) -> str:
+    """Hanging indent for a wrapped ``- item`` line of a multi-line check detail."""
+    return "  " if line.startswith("- ") else ""

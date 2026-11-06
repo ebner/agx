@@ -894,6 +894,36 @@ def test_hermes_doctor_issue_report_is_warn_not_fail(cfg: AgentsConfig, mocker) 
     assert "executable file not found" in report.checks[0].detail
 
 
+def test_hermes_doctor_detail_lists_numbered_issues_one_per_line(cfg: AgentsConfig, mocker) -> None:
+    """Hermes' own "Found N issue(s) to address:" list is what the detail
+    shows (one ``- item`` line each) — not the much longer ⚠ list, where
+    every unconfigured optional integration is a line."""
+    from agx_cli.ops import DoctorReport, _check_hermes_doctor
+
+    out = (
+        "  ⚠ discord.py (optional, not installed)\n"
+        "  ⚠ Nous Portal auth (not logged in)\n"
+        "\n"
+        "  Found 2 issue(s) to address:\n"
+        "\n"
+        "  1. Run 'hermes setup' to configure missing API keys for full tool access\n"
+        "  2. WhatsApp bridge has 3 npm vulnerabilities; wait for an upstream lockfile fix\n"
+        "\n"
+        "  Tip: run 'hermes doctor --fix' to auto-fix what's possible.\n"
+    )
+    mocker.patch("agx_cli.mp.exec_in_vm", return_value=MpResult(out, "", 1))
+    report = DoctorReport()
+    _check_hermes_doctor(cfg, "hermes-coder", "coder", report)
+    [check] = report.checks
+    assert check.status == "warn"
+    assert check.detail.splitlines() == [
+        "`hermes doctor` reported 2 issue(s):",
+        "- Run 'hermes setup' to configure missing API keys for full tool access",
+        "- WhatsApp bridge has 3 npm vulnerabilities; wait for an upstream lockfile fix",
+        "full list: `agx exec coder -- hermes doctor`",
+    ]
+
+
 def test_doctor_arm64_emulation_warns_when_firecrawl_running_on_arm64(
     with_coder: Path, mocker, cfg: AgentsConfig
 ) -> None:
