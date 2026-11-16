@@ -75,10 +75,12 @@ def test_tag_rebuildable_dirs_tags_existing_dirs_only(cfg: AgentsConfig) -> None
     assert not (root / ".upgrades").exists()  # never created
 
 
-def test_host_staging_dir_is_tagged_when_created(cfg: AgentsConfig) -> None:
+def test_host_staging_dir_is_tagged_when_created(cfg: AgentsConfig, mocker: Any) -> None:
     d = compose.host_staging_dir(cfg)
     assert (d / "CACHEDIR.TAG").is_file()
-    # The stale-temp sweep only removes *.yml — the tag survives it.
+    # The stale-temp sweep only removes *.yml — the tag survives it. Its
+    # VM-side half would run the real multipass binary (absent in CI).
+    mocker.patch("agx_cli.mp.exec_bash")
     compose.cleanup_stale_temps(cfg)
     assert (d / "CACHEDIR.TAG").is_file()
 
