@@ -95,7 +95,7 @@ def _stub_happy_upgrade(mocker, cfg: AgentsConfig | None = None) -> dict:
     # host path. Dedicated tests below exercise the real tar+transfer
     # argv shape against the multipass + libvirt backends.
 
-    def _fake_snap(_cfg, _name):
+    def _fake_snap(_cfg, _name, _agent_type=None):
         archives = _cfg.paths.host_data_dir / ".upgrades"
         archives.mkdir(parents=True, exist_ok=True)
         out = archives / f"{_name}-stub.tar.zst"
@@ -1426,11 +1426,14 @@ def test_host_data_snapshot_data_dir_in_vm_also_tars_as_root(
     mocker.patch("agx_cli.mp.transfer_from_vm", return_value=_ok())
     mocker.patch("agx_cli.mp.exec_in_vm", return_value=_ok())
 
-    upgrades._host_data_snapshot(cfg, "coder")
+    upgrades._host_data_snapshot(cfg, "coder", "hermes")
 
     script = exec_bash.call_args.args[1]
     assert "sudo tar --zstd" in script
     assert 'sudo chown "$(id -u):$(id -g)"' in script
+    # Package caches stay out of rollback snapshots too.
+    assert "--anchored --exclude=coder/.data/.npm" in script
+    assert "--exclude-caches" not in script  # would empty uv-tagged venvs
 
 
 def test_vm_snapshot_waits_for_ssh_on_libvirt_after_start(

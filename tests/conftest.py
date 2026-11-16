@@ -231,6 +231,7 @@ def install_vm_fs_simulation(mocker, cfg: AgentsConfig) -> dict:
         # ``sudo`` since we're already in the test runner's user
         # namespace and the seeded files are user-owned.
         import re as _re
+        import shlex as _shlex
         import subprocess as _subprocess
 
         # Tar EXTRACT (used by `agx import` + `agx rollback`)
@@ -264,11 +265,14 @@ def install_vm_fs_simulation(mocker, cfg: AgentsConfig) -> dict:
         # tar flags before ``-cf`` so future flag additions don't
         # silently break the test simulator.
         m = _re.search(
-            r"cd\s+(\S+)\s*\n[^\n]*?tar\s+(?:[^\n]*?\s)?-cf\s+(\S+)\s+([^\n]+)",
+            r"cd\s+(\S+)\s*\n[^\n]*?tar\s+((?:[^\n]*?\s)?)-cf\s+(\S+)\s+([^\n]+)",
             script,
         )
         if m:
-            vm_cwd, vm_archive, files_blob = m.groups()
+            vm_cwd, flags_blob, vm_archive, files_blob = m.groups()
+            # Pass the production flags through (exclusions must really
+            # apply), minus --zstd which the simulator adds itself.
+            flags = [f for f in _shlex.split(flags_blob) if f != "--zstd"]
             try:
                 rel = Path(vm_cwd).relative_to(vm_root)
                 host_cwd = host_root / rel
@@ -284,7 +288,7 @@ def install_vm_fs_simulation(mocker, cfg: AgentsConfig) -> dict:
             existing = [t for t in tokens if (host_cwd / t).exists()]
             if existing:
                 _subprocess.run(
-                    ["tar", "--zstd", "-cf", vm_archive, *existing],
+                    ["tar", "--zstd", *flags, "-cf", vm_archive, *existing],
                     cwd=str(host_cwd),
                     check=False,
                 )

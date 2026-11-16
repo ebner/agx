@@ -720,6 +720,10 @@ tar --exclude-caches …                               # tar
 
 Skipping `.disks/` matters most: with it, every run re-reads (and depending on the tool, re-stores) the whole VM disk. Losing it costs a `vm rebuild` (re-pull images, `agx tailscale up` again), not agent state — in host-mount mode that lives under `<data-dir>/<name>/`. Under `--data-dir-in-vm` agent state DOES live on the VM disk; the `agx export` archives in `backups/` are then the backup.
 
+**Inside the agent's data dir**, package-manager caches are disposable too: npm's (`.data/.npm`, GBs on a long-lived agent), uv's (`.data/cache/uv`) and the XDG caches (`.data/.cache`, `.data/home/.cache`, per profile as well). The Hermes container tags them with `CACHEDIR.TAG` on every boot (after `agx reseat` / `agx upgrade` on agents created before this), and `agx export` and the pre-upgrade snapshots leave them out by name — on a live agent that took an archive from 1.4 GB to 0.5 GB.
+
+One trap with `--exclude-caches` on the **live** data dir: uv also writes a `CACHEDIR.TAG` into every virtualenv it creates, so the tool skips Hermes' `.data/installs/*/environments/*/venv/` contents too. A restore from that copy alone has empty venvs. The `agx export` archives in `backups/` keep them complete (exports exclude named caches only, never by tag) — another reason to keep one daily export inside the backup.
+
 If you browse agent state through `agx access mount`, also exclude the view root (default `~/agents-view`): it is a bind mount of the same filesystem, so `--one-file-system` does not stop the tool from storing the agent's files a second time.
 
 For crash-consistent snapshots, run `agx export <name>` first — that writes a clean tarball into `<data-dir>/backups/` that the host backup will pick up on its next run.

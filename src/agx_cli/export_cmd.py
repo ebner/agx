@@ -89,6 +89,8 @@ def export(
     # a valid host path that the host backup (duplicity etc.) sees; the
     # toolkit ``multipass transfer``s the archive there from the VM.
     archive_name = f"{name}-{_utc_stamp()}{archive_mod.ARCHIVE_SUFFIX}"
+    # Package-manager caches are re-downloaded on demand — never archived.
+    excludes = archive_mod.cache_exclude_args(name, agent_type)
 
     if cfg.paths.data_dir_in_vm:
         # Tar+zstd inside the VM, then multipass transfer the archive out.
@@ -114,7 +116,7 @@ def export(
                 f"set -eu\n"
                 f"cd {cfg.paths.vm_agents_root}\n"
                 f"sudo tar --zstd --warning=no-file-changed --ignore-failed-read "
-                f"-cf {vm_archive} {name}\n"
+                f"{excludes} -cf {vm_archive} {name}\n"
                 f'sudo chown "$(id -u):$(id -g)" {vm_archive}\n'
             ),
         )
@@ -160,7 +162,7 @@ def export(
                 f"set -eu\n"
                 f"cd {cfg.paths.vm_agents_root}\n"
                 f"sudo tar --zstd --warning=no-file-changed --ignore-failed-read "
-                f"-cf {vm_archive} {name}\n"
+                f"{excludes} -cf {vm_archive} {name}\n"
                 f'sudo chown "$(id -u):$(id -g)" {vm_archive}\n'
             ),
         )

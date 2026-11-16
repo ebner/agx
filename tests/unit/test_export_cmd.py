@@ -109,6 +109,41 @@ def test_export_in_vm_mode_tars_as_root_and_captures_agent_state(
     assert (dest / "coder" / ".data" / "state.db").read_text() == "fake-db"
 
 
+def test_export_leaves_package_caches_out(with_coder: Path, cfg: AgentsConfig) -> None:
+    """npm/uv/XDG caches are re-downloaded on demand and were ~60% of a
+    live agent's archive; they stay out, everything else (incl. Hermes'
+    own ``cache/`` scratch files and tagged-vs-untagged lookalikes) stays in."""
+    data = cfg.paths.host_data_dir / "coder" / ".data"
+    files = {
+        ".npm/_cacache/blob": False,
+        ".cache/fontconfig/x": False,
+        "home/.cache/uv/wheel": False,
+        "cache/uv/archive": False,
+        "profiles/work/home/.cache/pip/x": False,
+        "cache/scratch/summary.txt": True,  # Hermes scratch work — kept
+        "skills/notes/SKILL.md": True,
+        "notes/home/.cache": True,  # same tail, not anchored at the agent root
+        # uv tags every venv it creates — a tagged dir OUTSIDE the named
+        # cache paths must stay complete, or restored venvs are empty.
+        "installs/abc/environments/def/venv/bin/python": True,
+    }
+    for rel in files:
+        (data / rel).parent.mkdir(parents=True, exist_ok=True)
+        (data / rel).write_text("x", encoding="utf-8")
+    (data / "installs/abc/environments/def/venv/CACHEDIR.TAG").write_text(
+        "Signature: 8a477f597d28d172789f06886806bc55\n", encoding="utf-8"
+    )
+
+    archive = export_cmd.export("coder", config_path=with_coder)
+    dest = cfg.paths.host_data_dir / ".test-extract-caches"
+    dest.mkdir()
+    extract_tar_zst(archive, dest)
+    out = dest / "coder" / ".data"
+    for rel, kept in files.items():
+        assert (out / rel).exists() is kept, rel
+    assert (out / "state.db").read_text() == "fake-db"
+
+
 def test_export_respects_to_directory(with_coder: Path, cfg: AgentsConfig, tmp_path: Path) -> None:
     elsewhere = tmp_path / "elsewhere"
     archive = export_cmd.export("coder", to=elsewhere, config_path=with_coder)

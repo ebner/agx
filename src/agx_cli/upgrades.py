@@ -299,7 +299,7 @@ def upgrade(
                     "host data snapshot: tarring compose + .env + agent dir...",
                 )
                 t0 = time.monotonic()
-                host_snap = _host_data_snapshot(cfg, name)
+                host_snap = _host_data_snapshot(cfg, name, agent_type)
                 _step(
                     "host_data_snapshot",
                     f"host data snapshot: {host_snap.name} "
@@ -815,7 +815,7 @@ def _fmt_size(n: int) -> str:
     return f"{n / 1024**2:.0f} MiB"
 
 
-def _host_data_snapshot(cfg: AgentsConfig, name: str) -> Path:
+def _host_data_snapshot(cfg: AgentsConfig, name: str, agent_type: str | None = None) -> Path:
     """Tar+zstd the agent's data dir + compose + .env.
 
     Always tarred inside the VM as root, in both data-dir modes:
@@ -829,6 +829,10 @@ def _host_data_snapshot(cfg: AgentsConfig, name: str) -> Path:
 
     Bare-metal: no VM, so the ``sudo tar`` runs on the host directly
     (prompting the user).
+
+    Package-manager caches are left out (``archive.cache_exclude_args``).
+    The restore extracts OVER the live dir without wiping it, so a
+    rollback keeps whatever caches exist and re-downloads the rest.
     """
     upgrades_dir = cfg.paths.host_data_dir / ".upgrades"
     upgrades_dir.mkdir(parents=True, exist_ok=True)
@@ -857,6 +861,7 @@ def _host_data_snapshot(cfg: AgentsConfig, name: str) -> Path:
             f"set -eu\n"
             f"cd {cfg.paths.vm_agents_root}\n"
             f"sudo tar --zstd --warning=no-file-changed --ignore-failed-read "
+            f"{archive_mod.cache_exclude_args(name, agent_type)} "
             f"-cf {vm_archive} "
             f"$([ -d {name} ] && echo {name} || true) "
             f"$([ -f docker-compose.yml ] && echo docker-compose.yml || true) "

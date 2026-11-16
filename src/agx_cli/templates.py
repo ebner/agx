@@ -306,6 +306,16 @@ HERMES_CONT_INIT_FIXPERMS: Final = r"""#!/command/with-contenv sh
 #      Every failure path logs a line (as hermes) or falls back silently;
 #      none of them can affect the script's exit status.
 #
+#   4. Backup exclusion tags. npm's cache (~/.npm), the XDG caches
+#      (~/.cache, the tool HOME's home/.cache, per profile too) are
+#      re-downloadable and can reach GBs. Drop a CACHEDIR.TAG into each
+#      existing one so host backups of the live data dir skip them
+#      (borg/restic/tar --exclude-caches); `agx export` and upgrade
+#      snapshots exclude the same paths by name (archive.HERMES_CACHE_PATHS
+#      — keep in sync). Written AS hermes (9p split-privilege rule, as in
+#      2); an existing tag is left alone; a dir that doesn't exist yet is
+#      skipped and gets its tag on a later boot.
+#
 # Idempotent. Ends with `exit 0`: a non-zero cont-init.d exit can abort
 # container init depending on S6_BEHAVIOUR_IF_STAGE2_FAILS, so the hook must
 # never let a best-effort chown/mkdir/npm failure surface.
@@ -384,6 +394,18 @@ if [ -n "$HUID" ] && [ -n "$HGID" ] && bridge_needs_heal; then
             npm_ci_log "backgrounded npm ci (pid $!) in $BRIDGE, log: $NPM_LOG"
         fi
     fi
+fi
+
+# --- 4. Backup exclusion tags (rationale in the header) ---------------------
+if [ -n "$HUID" ] && [ -n "$HGID" ]; then
+    for _cache_dir in /opt/data/.npm /opt/data/.cache /opt/data/home/.cache \
+            /opt/data/profiles/*/home/.cache; do
+        [ -d "$_cache_dir" ] || continue
+        [ -f "$_cache_dir/CACHEDIR.TAG" ] && continue
+        /command/s6-setuidgid "$HUID:$HGID" sh -c \
+            'printf "%s\n" "Signature: 8a477f597d28d172789f06886806bc55" "# agx toolkit: package-manager cache, re-downloaded on demand; safe to skip in backups." > "$1/CACHEDIR.TAG"' \
+            _ "$_cache_dir" 2>/dev/null
+    done
 fi
 
 exit 0
