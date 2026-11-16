@@ -1,10 +1,8 @@
-"""libvirt / KVM backend (Phase B — EXPERIMENTAL, see GH #2).
+"""libvirt / KVM backend — the default on Linux (see GH #2 for its origin).
 
-⚠️  Untested on real hardware in the merging session — every code
-path here is docs-driven. Smoke-test on a Linux + libvirt host
-before relying on it; expect minor quirks around virsh output
-formats, cloud-init seed ISO, and GPU IOMMU-group handling that
-will surface only when actually exercised.
+Lifecycle, virtiofs mounts, snapshots and restore run on real hardware;
+GPU passthrough is validated only up to the generated hostdev XML (no
+discrete GPU separable from the host display was available).
 
 Architecture:
 
@@ -19,9 +17,9 @@ Architecture:
 - Mounts use virtiofs attached via domain-XML ``<filesystem>``
   elements. 9p is documented as a manual fallback if virtiofsd is
   unavailable.
-- Snapshots use ``virsh snapshot-create-as`` ``--disk-only``
-  (external snapshots / qcow2 backing chain) so the disk isn't
-  paused during creation.
+- Snapshots are internal qcow2 snapshots (``virsh snapshot-create-as``),
+  taken with the VM stopped while the virtiofs share is attached —
+  external ``--disk-only`` snapshots aren't revertible.
 - GPU passthrough: PCI device detected via ``lspci -nn``
   (vendor IDs ``10de`` NVIDIA, ``1002`` AMD, ``8086`` Intel),
   IOMMU groups validated under ``/sys/kernel/iommu_groups/``,
@@ -71,6 +69,8 @@ SCP: Final = "scp"
 QEMU_IMG: Final = "qemu-img"
 CLOUD_LOCALDS: Final = "cloud-localds"
 LSPCI: Final = "lspci"
+# libvirt starts virtiofsd itself; Debian/Ubuntu ship it in libexec.
+VIRTIOFSD_PATHS: Final = ("/usr/libexec/virtiofsd", "/usr/lib/qemu/virtiofsd")
 
 CLOUD_IMAGE_URL_FMT: Final = (
     "https://cloud-images.ubuntu.com/releases/{release}/release/"
@@ -129,8 +129,7 @@ def _run(
     except FileNotFoundError as e:
         raise RuntimeFailure(
             f"command not found: {argv[0]} ({e}). "
-            f"Install libvirt: sudo apt install libvirt-clients libvirt-daemon-system "
-            f"virtinst genisoimage cloud-image-utils openssh-client qemu-utils."
+            f"Install libvirt: sudo apt install {_host_packages()}"
         ) from e
     except subprocess.TimeoutExpired as e:
         raise RuntimeFailure(f"{' '.join(argv)} timed out after {timeout}s") from e
@@ -146,6 +145,59 @@ def _run(
 
 def _virsh(*args: str, check: bool = True, timeout: float | None = 60.0) -> MpResult:
     return _run([VIRSH, "-c", LIBVIRT_URI, *args], check=check, timeout=timeout)
+
+
+def _host_packages() -> str:
+    """The Debian/Ubuntu packages this backend needs, for install hints."""
+    if platform.machine() in ("aarch64", "arm64"):
+        qemu = "qemu-system-arm qemu-efi-aarch64"
+    else:
+        qemu = "qemu-system-x86 ovmf"
+    return (
+        "libvirt-clients libvirt-daemon-system virtinst genisoimage "
+        f"cloud-image-utils openssh-client qemu-utils {qemu} virtiofsd"
+    )
+
+
+def verify_host() -> None:
+    """Refuse up front, naming every missing piece of the libvirt stack
+    at once: commands, virtiofsd, KVM, daemon access, the ``default``
+    network. Without it a fresh host fails deep inside virt-install."""
+    problems: list[str] = []
+    missing = [
+        c
+        for c in (VIRSH, VIRT_INSTALL, QEMU_IMG, CLOUD_LOCALDS, SSH, SCP)
+        if shutil.which(c) is None
+    ]
+    if missing:
+        problems.append(f"commands not found: {', '.join(missing)}")
+    if shutil.which("virtiofsd") is None and not any(Path(p).exists() for p in VIRTIOFSD_PATHS):
+        problems.append("virtiofsd not found (the host data-dir share needs it)")
+    if not Path("/dev/kvm").exists():
+        problems.append("/dev/kvm is missing: enable virtualization (VT-x / AMD-V) in the firmware")
+    if VIRSH not in missing:
+        uri = _virsh("uri", check=False, timeout=30)
+        if uri.returncode != 0:
+            detail = (uri.stderr.strip().splitlines() or ["no error output"])[0]
+            problems.append(
+                f"cannot connect to {LIBVIRT_URI} ({detail}): is libvirtd running and are you "
+                "in the libvirt group? (sudo usermod -aG libvirt $USER, then log in again)"
+            )
+        else:
+            net = _virsh("net-info", "default", check=False, timeout=30)
+            if net.returncode != 0 or not re.search(r"^Active:\s+yes", net.stdout, re.M):
+                problems.append(
+                    "libvirt network 'default' is not defined or not active: "
+                    f"virsh -c {LIBVIRT_URI} net-start default && "
+                    f"virsh -c {LIBVIRT_URI} net-autostart default"
+                )
+    if problems:
+        raise UserError(
+            "libvirt host prerequisites missing:\n"
+            + "\n".join(f"  - {p}" for p in problems)
+            + f"\nInstall the stack: sudo apt install {_host_packages()}\n"
+            'See docs/runbook.md ("Using the libvirt backend"); on macOS use --backend multipass.'
+        )
 
 
 # ---------- SSH layer ----------

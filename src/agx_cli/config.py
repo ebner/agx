@@ -11,6 +11,7 @@ by BOOTSTRAP_OK, and pinned image tags managed by `vm init`.
 from __future__ import annotations
 
 import os
+import platform
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -32,6 +33,13 @@ def _refuse_forbidden_data_dir(path: Path) -> None:
         raise ValueError(f"data-dir under /home/*/snap is unreadable by multipass-snap: {path}")
 
 
+def default_backend() -> str:
+    """Backend ``agx vm init`` uses when ``--backend`` is omitted:
+    ``libvirt`` on Linux (virtiofs share, GPU passthrough, no snap),
+    ``multipass`` elsewhere (macOS)."""
+    return "libvirt" if platform.system() == "Linux" else "multipass"
+
+
 class VmConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -44,12 +52,13 @@ class VmConfig(BaseModel):
     # given moment (newer LTS releases lag a few months); opt in with
     # `vm init --ubuntu-release 26.04` once that's no longer the case.
     ubuntu_release: str = "24.04"
-    # VM hypervisor backend. ``multipass`` is the cross-platform
-    # default; ``libvirt`` is Linux-only and adds GPU-passthrough
-    # capability (the motivation for the abstraction — see GH #2).
-    # The choice persists at ``agx vm init`` time and dispatches
-    # every host↔VM call in ``mp.py`` to the matching backend module
-    # under ``agx_cli.backends``.
+    # VM hypervisor backend, chosen at ``agx vm init`` (without
+    # ``--backend``: :func:`default_backend`) and persisted here; every
+    # host↔VM call in ``mp.py`` dispatches to the matching module under
+    # ``agx_cli.backends``. The field default stays ``multipass`` on
+    # purpose: a config.toml without a ``backend`` key predates the
+    # libvirt backend and describes a multipass deployment. Making it
+    # platform-dependent would silently switch those deployments.
     backend: str = "multipass"
     # GPU PCI IDs to pass through (libvirt backend only). Form:
     # ``["0000:01:00.0", "0000:01:00.1"]``. Populated by

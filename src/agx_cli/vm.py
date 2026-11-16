@@ -30,7 +30,7 @@ def init(
     memory_gb: int | None = None,
     disk_gb: int | None = None,
     ubuntu_release: str | None = None,
-    backend: str = "multipass",
+    backend: str | None = None,
     gpu: list[str] | None = None,
     config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH,
     emit: bool = True,
@@ -47,8 +47,9 @@ def init(
       7. Populate `[vm_runtime]` and pinned image tags.
       8. Seed an empty docker-compose.yml and .env on the data-dir.
 
-    ``backend`` selects the hypervisor (``"multipass"`` default,
-    ``"libvirt"`` experimental Linux-only). ``gpu`` is a list of PCI
+    ``backend`` selects the hypervisor (``None``:
+    :func:`agx_cli.config.default_backend` — libvirt on Linux, multipass
+    on macOS). ``gpu`` is a list of PCI
     IDs to pass through on libvirt — ``["auto"]`` triggers vendor-
     aware autodetect (NVIDIA / AMD / Intel) and fills the config with
     every GPU bound to vfio-pci.
@@ -58,6 +59,7 @@ def init(
     stdout object; stage narration still goes to stderr via
     ``ui.progress``.
     """
+    backend = backend or cfg_mod.default_backend()
     cfg = _load_or_default_config(config_path)
 
     cfg.paths = PathsConfig.model_validate(
@@ -113,6 +115,9 @@ def init(
         from agx_cli.backends import libvirt as libvirt_mod
 
         libvirt_mod.configure(cfg.paths.host_data_dir)
+        # libvirt is the Linux default, so a fresh host often lacks part
+        # of the stack; name every gap now instead of a virt-install error.
+        libvirt_mod.verify_host()
 
     cfg.host = HostConfig(uid=os.getuid(), gid=os.getgid())
 
@@ -807,9 +812,10 @@ def rebuild(
         if not journal.is_phase_done("vm_initted"):
             # Re-init from scratch with the chosen sizing. init() persists
             # the new values back to config.toml. Backend + GPU passthrough
-            # are carried over explicitly: init() defaults to multipass and
-            # writes cfg.vm.backend unconditionally, so omitting them would
-            # silently migrate a libvirt user to multipass and drop GPUs.
+            # are carried over explicitly: init() falls back to the
+            # platform default and writes cfg.vm.backend unconditionally,
+            # so omitting them would silently switch a deployment's
+            # backend (e.g. multipass on Linux → libvirt) and drop GPUs.
             ui.progress("re-initializing the VM (launch + bootstrap — takes minutes)...")
             init(
                 data_dir=cfg.paths.host_data_dir,

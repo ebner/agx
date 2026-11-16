@@ -24,8 +24,8 @@ only the outer boundary changes:
 
 | Backend | Outer trust boundary | Notes |
 |---|---|---|
-| `multipass` (default) | **The VM.** A whole Ubuntu instance isolated by the platform hypervisor (KVM/qemu on Linux; Multipass's native driver on macOS). | Cross-platform default. Container break-out ends inside the VM. |
-| `libvirt` | **The VM.** Same guarantee as multipass — Ubuntu guest under KVM/qemu. | Linux-only, experimental. Exists for GPU passthrough (vfio-pci hostdev attach). |
+| `multipass` | **The VM.** A whole Ubuntu instance isolated by the platform hypervisor (KVM/qemu on Linux; Multipass's native driver on macOS). | Default on macOS. Container break-out ends inside the VM. |
+| `libvirt` | **The VM.** Same guarantee as multipass — Ubuntu guest under KVM/qemu. | Linux-only, the default there. Also enables GPU passthrough (vfio-pci hostdev attach, experimental). |
 | `bare_metal` | **The host itself — there is no VM.** A compromised agent that escapes its container reaches the host directly. | Linux-only, opt-in. `vm init` warns explicitly: *"the VM trust boundary is forfeited … Only use this on single-user dev workstations where the host is already trusted."* Rootless Docker (never rootful — the toolkit refuses a rootful socket) is the only remaining isolation layer. |
 
 The defense-in-depth rationale in the rest of this document leans on

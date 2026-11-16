@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 import tomlkit
@@ -95,6 +96,27 @@ def test_vm_backend_rejects_unknown() -> None:
 
     with pytest.raises(ValueError, match="bare_metal"):
         VmConfig(backend="podman")
+
+
+@pytest.mark.parametrize(
+    ("system", "expected"),
+    [("Linux", "libvirt"), ("Darwin", "multipass"), ("Windows", "multipass")],
+)
+def test_default_backend_follows_host_os(mocker: Any, system: str, expected: str) -> None:
+    mocker.patch("platform.system", return_value=system)
+    assert cfg_mod.default_backend() == expected
+
+
+def test_config_without_backend_key_stays_multipass(mocker: Any, tmp_path: Path) -> None:
+    """A config.toml without `backend` predates the libvirt backend; the
+    Linux default for new inits must not switch such a deployment."""
+    mocker.patch("platform.system", return_value="Linux")
+    p = tmp_path / "config.toml"
+    p.write_text(
+        tomlkit.dumps({"vm": {"name": "agents"}, "paths": {"host_data_dir": str(tmp_path)}}),
+        encoding="utf-8",
+    )
+    assert load(p).vm.backend == "multipass"
 
 
 def test_export_cron_time_validation() -> None:

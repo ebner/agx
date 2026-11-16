@@ -273,7 +273,10 @@ def test_vm_init_emits_exactly_one_json_object(mocker: Any, tmp_path: Path) -> N
         side_effect=lambda **kw: real_init(**{**kw, "config_path": config_path}),
     )
 
-    result = invoke(mocker, ["--json", "vm", "init", "--data-dir", str(tmp_path / "data")])
+    result = invoke(
+        mocker,
+        ["--json", "vm", "init", "--backend", "multipass", "--data-dir", str(tmp_path / "data")],
+    )
 
     assert result.exit_code == 0, result.output
     payload = single_json_object(result)  # a second object would fail the parse
@@ -282,6 +285,41 @@ def test_vm_init_emits_exactly_one_json_object(mocker: Any, tmp_path: Path) -> N
     # Narration went to stderr as structured progress events.
     assert "launching VM" in result.stderr
     assert "provisioning rootless Docker" in result.stderr
+
+
+@pytest.mark.parametrize(("system", "expected"), [("Linux", "libvirt"), ("Darwin", "multipass")])
+def test_vm_init_without_backend_uses_the_host_default(
+    mocker: Any, tmp_path: Path, system: str, expected: str
+) -> None:
+    mocker.patch("platform.system", return_value=system)
+    init = mocker.patch("agx_cli.vm.init")
+
+    result = invoke(mocker, ["vm", "init", "--data-dir", str(tmp_path / "data")])
+
+    assert result.exit_code == 0, result.output
+    assert init.call_args.kwargs["backend"] == expected
+
+
+def test_vm_init_gpu_needs_no_backend_flag_on_linux(mocker: Any, tmp_path: Path) -> None:
+    mocker.patch("platform.system", return_value="Linux")
+    init = mocker.patch("agx_cli.vm.init")
+
+    result = invoke(mocker, ["vm", "init", "--gpu", "auto", "--data-dir", str(tmp_path / "d")])
+
+    assert result.exit_code == 0, result.output
+    assert init.call_args.kwargs["backend"] == "libvirt"
+    assert init.call_args.kwargs["gpu"] == ["auto"]
+
+
+def test_vm_init_gpu_refused_with_the_macos_default(mocker: Any, tmp_path: Path) -> None:
+    mocker.patch("platform.system", return_value="Darwin")
+    init = mocker.patch("agx_cli.vm.init")
+
+    result = invoke(mocker, ["vm", "init", "--gpu", "auto", "--data-dir", str(tmp_path / "d")])
+
+    assert result.exit_code != 0
+    assert "--gpu requires --backend libvirt" in result.output
+    init.assert_not_called()
 
 
 # ---------- ollama clear (item: confirm like sibling wipe commands) ----------

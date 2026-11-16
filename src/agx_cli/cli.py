@@ -237,10 +237,11 @@ def vm() -> None:
 @click.option(
     "--backend",
     type=click.Choice(["multipass", "libvirt", "bare_metal"]),
-    default="multipass",
+    default=None,
     help=(
-        "VM hypervisor backend. libvirt is Linux-only + experimental; enables GPU passthrough. "
-        "bare_metal runs containers directly on the host (Linux-only, opt-in trust trade-off)."
+        "VM hypervisor backend. Default: libvirt on Linux (enables GPU passthrough), "
+        "multipass on macOS. bare_metal runs containers directly on the host "
+        "(Linux-only, opt-in trust trade-off)."
     ),
 )
 @click.option(
@@ -257,16 +258,17 @@ def vm_init(
     memory_gb: int | None,
     disk_gb: int | None,
     ubuntu_release: str | None,
-    backend: str,
+    backend: str | None,
     gpu: tuple[str, ...],
 ) -> None:
-    """Provision the VM (Multipass or libvirt) and mount the host data dir.
+    """Provision the VM (libvirt on Linux, Multipass on macOS) and mount the host data dir.
 
     With ``--backend bare_metal`` no VM is provisioned: the toolkit
     verifies that rootless Docker is installed on the host and treats the
     host as the runtime. The VM trust boundary is forfeited; only use
     bare_metal on single-user dev workstations.
     """
+    backend = backend or cfg_mod.default_backend()
     if gpu and backend != "libvirt":
         raise click.UsageError("--gpu requires --backend libvirt")
     if backend == "bare_metal":

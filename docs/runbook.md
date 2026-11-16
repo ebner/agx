@@ -10,7 +10,8 @@ pipx install -e .                 # macOS: brew install pipx first if missing
 # (Optional) Codex CLI on host — only needed for `agx codex login` (the Codex sandbox skill)
 npm install -g @openai/codex
 
-# Bring up the VM. Pick any path your duplicity (or other host backup) covers.
+# Bring up the VM (libvirt on Linux, multipass on macOS; --backend overrides).
+# Pick any path your duplicity (or other host backup) covers.
 agx vm init --data-dir /data/agents
 
 # (Optional) Authenticate the toolkit-scoped Codex account (only for the Codex sandbox skill;
@@ -972,15 +973,16 @@ If your RPi5 has an NVMe HAT and you're booting from NVMe, microSD consideration
 - **OpenViking memory sidecar** — `volcengine/openviking` arm64 status not verified by the toolkit; manifest fetch failed during investigation. If you need OpenViking memory on arm64, check that the image actually ships your arch before enabling the backend. `holographic` and `mem0` memory backends are pure-Python and arch-agnostic.
 - **OpenClaw image registry** — pull access denied at investigation time (the public registry path may differ from what the toolkit's allowlist expects). Verify OpenClaw publishes arm64 builds before relying on it on RPi5; Hermes-only deployments are unaffected.
 
-## Using the libvirt backend (experimental — Linux + GPU passthrough)
+## Using the libvirt backend (Linux default)
 
-The default `multipass` backend works everywhere and is the right choice for 95% of deployments. The `libvirt` backend exists for one reason: **GPU passthrough**, which Multipass doesn't support and which is required for vLLM (and helpful for accelerated Ollama/llama.cpp inference on workstations with discrete GPUs). See [GH #2](https://github.com/ebner/agx/issues/2) for the design rationale.
+`agx vm init` uses `libvirt` on Linux unless you pass `--backend`. Compared with Multipass on Linux it shares the data dir over virtiofs instead of 9p, needs no snap (no `/tmp` or dotfile confinement, no `/dev/kvm` group fight), and supports **GPU passthrough**, which vLLM requires and which speeds up Ollama/llama.cpp on workstations with discrete GPUs. See [GH #2](https://github.com/ebner/agx/issues/2) for the original design rationale. Multipass stays available on Linux with `--backend multipass`, and is the default on macOS.
 
-⚠️  **Experimental status**: lifecycle + mount + snapshot + restore validated on a real Linux + libvirt host (Ubuntu 24.04, kernel 6.17, AMD Strix Halo, 2026-05-16). GPU attach validated only via XML dry-run — actual hostdev attach has not been exercised yet because the test machine has no discrete GPU separable from the host display. Expect the GPU path may surface minor quirks on first use.
+**Status:** lifecycle, mounts, snapshots and restore run daily on real hardware (first validated on Ubuntu 24.04, kernel 6.17, AMD Strix Halo, 2026-05-16). ⚠️ **GPU passthrough is still experimental:** it is validated only via XML dry-run — an actual hostdev attach has not been exercised because the test machine has no discrete GPU separable from the host display. Expect the GPU path may surface minor quirks on first use.
 
 ### Prerequisites
 
 - **Linux host** (Ubuntu 22.04+ or equivalent). macOS and Windows hosts are explicitly refused — use Multipass there.
+- `agx vm init` checks the commands below, `virtiofsd`, `/dev/kvm`, access to `qemu:///system` and the `default` network before it does anything, and lists every gap with the install command.
 - **libvirt + KVM stack**:
   ```bash
   sudo apt install libvirt-clients libvirt-daemon-system virtinst \
@@ -989,7 +991,7 @@ The default `multipass` backend works everywhere and is the right choice for 95%
   sudo usermod -aG libvirt,kvm $USER     # log out + back in for groups to take effect
   ```
 - **For GPU passthrough**: IOMMU enabled in BIOS AND on the kernel cmdline (`amd_iommu=on iommu=pt` or `intel_iommu=on iommu=pt`), vfio-pci kernel module, and the target GPU bound to vfio-pci at boot. The Arch wiki's [PCI passthrough via OVMF](https://wiki.archlinux.org/title/PCI_passthrough_via_OVMF) is the canonical setup guide; the toolkit doesn't automate the kernel-cmdline / modprobe configuration because that's a host-level change with reboot consequences.
-- **For arm64 (RPi5 etc.)**: KVM works on arm64 Linux; the cloud image arch is auto-detected from `platform.machine()`. No GPU passthrough on RPi5 (no discrete GPU).
+- **For arm64 (RPi5 etc.)**: KVM works on arm64 Linux; the cloud image arch is auto-detected from `platform.machine()`. Install `qemu-system-arm qemu-efi-aarch64` instead of `qemu-system-x86 ovmf`. No GPU passthrough on RPi5 (no discrete GPU).
 
 ### Two host-level gotchas worth fixing once
 

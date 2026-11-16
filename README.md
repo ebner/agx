@@ -6,17 +6,23 @@
 
 The host-side CLI drives one of three isolation backends:
 
-- **`multipass`** (default, cross-platform) — a single Multipass VM; the host shells out only to `multipass`.
-- **`libvirt`** (Linux-only, experimental) — a KVM/qemu VM driven via `virt-install`/`virsh` + ssh/scp; enables GPU passthrough.
+- **`libvirt`** (default on Linux) — a KVM/qemu VM driven via `virt-install`/`virsh` + ssh/scp; the data dir is shared over virtiofs, and GPUs can be passed through.
+- **`multipass`** (default on macOS) — a single Multipass VM; the host shells out only to `multipass`.
 - **`bare_metal`** (Linux-only, opt-in) — no VM at all; containers run on the host's rootless Docker. Forfeits the VM trust boundary — single-user dev workstations only.
 
-Defense in depth (VM backends): outer isolation = VM, inner isolation = one rootless container per agent. Pick the backend at `agx vm init --backend …`; see [docs/threat-model.md](docs/threat-model.md) for what each trades away and [docs/runbook.md](docs/runbook.md) for the libvirt / bare-metal setup guides.
+Defense in depth (VM backends): outer isolation = VM, inner isolation = one rootless container per agent. `agx vm init` picks libvirt on Linux and multipass on macOS unless you pass `--backend …`; see [docs/threat-model.md](docs/threat-model.md) for what each trades away and [docs/runbook.md](docs/runbook.md) for the libvirt / bare-metal setup guides.
 
 ## Requirements
 
 - A Linux or macOS host with Python 3.11+.
-- For the default backend: [Multipass](https://canonical.com/multipass) (`sudo snap install multipass` / `brew install --cask multipass`). The VM defaults to 4 vCPUs, 8 GB RAM and a 25 GB disk (`agx vm init --cpus/--memory/--disk`).
-- For `libvirt` or `bare_metal`: see the setup guides linked under [Choosing a backend](#choosing-a-backend).
+- **Linux** (default backend `libvirt`): the KVM/libvirt stack, and your user in the `libvirt` group (log in again afterwards). `agx vm init` checks all of this and names whatever is missing.
+  ```bash
+  sudo apt install libvirt-clients libvirt-daemon-system virtinst genisoimage \
+                   cloud-image-utils openssh-client qemu-utils qemu-system-x86 ovmf virtiofsd
+  sudo usermod -aG libvirt $USER
+  ```
+- **macOS** (default backend `multipass`): [Multipass](https://canonical.com/multipass) (`brew install --cask multipass`).
+- The VM defaults to 4 vCPUs, 8 GB RAM and a 25 GB disk (`agx vm init --cpus/--memory/--disk`). For `bare_metal`, see the setup guide linked under [Choosing a backend](#choosing-a-backend).
 
 ## Quickstart
 
@@ -32,12 +38,15 @@ npm install -g @openai/codex
 # 3. Bring up the VM. Pick a host path for all agent state — duplicity or whatever
 #    host backup you run will back this up directly.
 #
+#    Without --backend, Linux gets libvirt and macOS gets multipass.
+#
 #    For SQLite-heavy use (Hermes' kanban/sessions/insights stores use SQLite
-#    WAL, which doesn't work across multipass's 9p share), pass --data-dir-in-vm
-#    so per-agent state lives on the VM's ext4 disk where WAL is native. The
-#    host then sees agent state only via `agx export` archives (next step
-#    below shows how to schedule those for multi-times-a-day backups).
-agx vm init --data-dir /data/agents                      # SQLite WAL falls back to JSONL; files live on host
+#    WAL, which doesn't work reliably across the VM's shared folder — virtiofs
+#    or 9p), pass --data-dir-in-vm so per-agent state lives on the VM's ext4
+#    disk where WAL is native. The host then sees agent state only via
+#    `agx export` archives (next step below shows how to schedule those for
+#    multi-times-a-day backups).
+agx vm init --data-dir /data/agents                      # files live on the host
 agx vm init --data-dir /data/agents --data-dir-in-vm     # SQLite WAL works; files visible only via archives
 agx vm init --backend bare_metal --data-dir /data/agents # Linux only: no VM — see "Choosing a backend"
 
@@ -73,9 +82,9 @@ For the full lifecycle — Hermes profiles vs. personalities vs. skills, connect
 
 All three backends run the same compose project through the same commands — `create`, `start`/`stop`, `logs`, `exec`, `setup`, `doctor`, `upgrade`/`rollback`, `export`/`import`, `reseat`, `secret`, `firecrawl`, `inference`, `model`, `memory`, `profile`, `edit` behave identically. What differs:
 
-| | `multipass` (default) | `libvirt` | `bare_metal` |
+| | `multipass` | `libvirt` | `bare_metal` |
 |---|---|---|---|
-| Host OS | Linux / macOS | Linux, experimental | Linux |
+| Host OS | macOS (default), Linux | Linux (default) | Linux |
 | Outer trust boundary | VM | VM | **none — the host** |
 | Bootstrap | installs rootless Docker in the VM | same | **verify-only**: you install the prerequisites, the toolkit checks them |
 | Container-log rotation | written by the bootstrap | same | **you** write `~/.config/docker/daemon.json` (`vm init` and `doctor` warn until you do) |
@@ -89,7 +98,7 @@ All three backends run the same compose project through the same commands — `c
 | `mount add` | VM share (multipass: ~30 s VM restart) + bind | virtiofs hot-attach + bind | direct bind of the host folder |
 | `access mount` | yes (not with `--data-dir-in-vm`) | same | yes |
 
-Pick `bare_metal` only where the host is already trusted (single-user workstation, dedicated LLM box) — see [docs/threat-model.md](docs/threat-model.md). Setup guides: [libvirt](docs/runbook.md#using-the-libvirt-backend-experimental--linux--gpu-passthrough), [bare-metal](docs/runbook.md#using-the-bare_metal-backend-no-vm-linux-only).
+Pick `bare_metal` only where the host is already trusted (single-user workstation, dedicated LLM box) — see [docs/threat-model.md](docs/threat-model.md). Setup guides: [libvirt](docs/runbook.md#using-the-libvirt-backend-linux-default), [bare-metal](docs/runbook.md#using-the-bare_metal-backend-no-vm-linux-only).
 
 **One backend per host user.** `~/.config/agx/config.toml` selects exactly one backend, and the cron entries (`export-cron`, `doctor-cron`) are per-user singletons, so one user cannot run a VM deployment and a bare-metal deployment side by side. Two separate Linux users (each with its own config, data dir, crontab and rootless Docker) can — see [the runbook](docs/runbook.md#running-a-vm-deployment-and-bare-metal-side-by-side).
 
@@ -202,7 +211,7 @@ See [docs/threat-model.md](docs/threat-model.md). Short version:
 
 ## Status
 
-A personal, single-maintainer project that the author runs daily. The `libvirt` backend (Linux) is the most exercised path; `multipass` is the cross-platform default, `bare_metal` is opt-in, and macOS has seen less testing. Before 1.0, expect breaking changes — run `agx reseat <name>` after upgrading the toolkit. Issues and pull requests are welcome and handled on a best-effort basis.
+A personal, single-maintainer project that the author runs daily. The `libvirt` backend (the Linux default) is the most exercised path; `multipass` (the macOS default) has seen less testing, GPU passthrough is still experimental, and `bare_metal` is opt-in. Before 1.0, expect breaking changes — run `agx reseat <name>` after upgrading the toolkit. Issues and pull requests are welcome and handled on a best-effort basis.
 
 The architecture rules and their rationale live in [`docs/architecture.md`](docs/architecture.md) and [`AGENTS.md`](AGENTS.md) (the engineering guide, also used by AI coding assistants).
 

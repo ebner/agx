@@ -49,9 +49,11 @@ applies unchanged.
 
 ## The pluggable-backend layer
 
-`cfg.vm.backend` selects `multipass` (cross-platform default),
-`libvirt` (Linux-only, experimental — enables GPU passthrough), or
-`bare_metal` (Linux-only, no VM). `mp.py` is a **dispatcher**: every
+`cfg.vm.backend` selects `libvirt` (Linux-only, the default there;
+GPU passthrough is experimental), `multipass` (the default on macOS),
+or `bare_metal` (Linux-only, no VM). `vm init` without `--backend` asks
+`config.default_backend()`; the config field itself still defaults to
+`multipass`, because a config file without the key predates libvirt. `mp.py` is a **dispatcher**: every
 host↔VM primitive (`exec_in_vm`, `transfer_to_vm`, `mount`,
 `snapshot`, …) delegates to whichever backend module is active.
 Backend modules are duck-typed — free functions matching the
@@ -73,7 +75,7 @@ plus the dispatcher, never to `mp.py` alone.
 
 ## Data flow
 
-1. **`agx vm init`** provisions the runtime for the selected `--backend`: `multipass launch` on the default backend, cloud-image download + seed ISO + `virt-install` + SSH-wait on libvirt, and *no VM at all* on bare-metal (a verify-only probe of the host's rootless-Docker prerequisites). VM backends mount the host `<data-dir>` at `/home/ubuntu/agents` with explicit UID/GID mapping (host-mount mode) or skip the mount (`--data-dir-in-vm`), then run the bootstrap script (`templates.VM_BOOTSTRAP_SCRIPT`). The script emits a final `BOOTSTRAP_OK ...` line; `mp.parse_bootstrap_ok` reads it. Captured fields (rootless docker socket path, ubuntu UID/GID, etc.) land in `~/.config/agx/config.toml` under `[vm_runtime]`. Seed files (`docker-compose.yml`, `.env`, `.codex/`, `backups/`, `.upgrades/`) are written host-side in host-mount mode; in `--data-dir-in-vm` mode they're written VM-side via `exec_bash` and only `.journal/` lives on the host. On bare-metal, `vm_agents_root` is set to the host data-dir so compose paths need no translation.
+1. **`agx vm init`** provisions the runtime for the selected `--backend`: `multipass launch` on multipass, cloud-image download + seed ISO + `virt-install` + SSH-wait on libvirt, and *no VM at all* on bare-metal (a verify-only probe of the host's rootless-Docker prerequisites). VM backends mount the host `<data-dir>` at `/home/ubuntu/agents` with explicit UID/GID mapping (host-mount mode) or skip the mount (`--data-dir-in-vm`), then run the bootstrap script (`templates.VM_BOOTSTRAP_SCRIPT`). The script emits a final `BOOTSTRAP_OK ...` line; `mp.parse_bootstrap_ok` reads it. Captured fields (rootless docker socket path, ubuntu UID/GID, etc.) land in `~/.config/agx/config.toml` under `[vm_runtime]`. Seed files (`docker-compose.yml`, `.env`, `.codex/`, `backups/`, `.upgrades/`) are written host-side in host-mount mode; in `--data-dir-in-vm` mode they're written VM-side via `exec_bash` and only `.journal/` lives on the host. On bare-metal, `vm_agents_root` is set to the host data-dir so compose paths need no translation.
 2. **`agx create`** allocates a free port (inside the flock), ensures the pinned image is pulled (the Hermes fragment pins `HOME` and `PATH` to the image's own values and deliberately sets no `user:` override under rootless Docker), writes a service fragment into `docker-compose.yml` via the staged-transfer mutation pattern, then `docker compose up -d <service>` inside the VM. Per-agent paths are bind-mounted from the host so backups round-trip cleanly. `--reuse-data` is allowed only if no live container currently maps the dir.
 3. **`agx upgrade`** resolves the target tag first — bare `upgrade <name>` implicitly fetches the latest upstream tag from GitHub Releases (`--tag` pins explicitly, `--recreate` force-refreshes at the current pin) and no-ops without downtime when the agent is already at the target. Otherwise it takes two snapshots (host-data `.tar.zst` + VM snapshot), pins the new tag via compose mutation, pulls, verifies via `docker image inspect`, recreates, runs `hermes config migrate` (Hermes only), then runs `doctor`. Auto-reverts the compose tag on any failure; both snapshot ids are reported so the user can `agx rollback <name>` (or `--snapshot <id>` to pick a specific one). Interrupted upgrades resume from a journal that recorded the original old→new tags.
 4. **`agx doctor`** runs a layered health probe (VM reachable, mount round-trip, rootless docker service active, disk/memory/load, port conflicts, dangling journals, Codex auth + token expiry; per-agent: container state, docker socket, `hermes doctor`, `/opt/data` access, Codex mount, version pin-vs-running drift; project-level: firecrawl and inference stack health when installed, registered host views mounted).
@@ -98,8 +100,8 @@ The cost is 9p/virtiofs mount overhead for SQLite-heavy workloads. The opt-out i
 | `config.py` | pydantic v2 schema + tomlkit round-trip. |
 | `mp.py` | **VM-backend dispatcher** (historically the Multipass primitives module). Thin wrappers over the active backend; re-exports `MpResult` / `BootstrapStatus` / `parse_bootstrap_ok` for backward compat. |
 | `backends/__init__.py` | `VmBackend` Protocol, value types, `parse_bootstrap_ok`, `get_backend_module`. |
-| `backends/multipass.py` | Multipass implementation (cross-platform default): launch / exec / transfer / mount with -u/-g / snapshot / restore / find / list. |
-| `backends/libvirt.py` | libvirt/KVM implementation, Linux-only, experimental. Cloud-init seed ISO + virt-install + ssh/scp; GPU passthrough autodetect + IOMMU validation + hostdev XML attach. |
+| `backends/multipass.py` | Multipass implementation (default on macOS): launch / exec / transfer / mount with -u/-g / snapshot / restore / find / list. |
+| `backends/libvirt.py` | libvirt/KVM implementation, Linux-only, the default there. `verify_host` preflight at `vm init`; cloud-init seed ISO + virt-install + ssh/scp; GPU passthrough (experimental) autodetect + IOMMU validation + hostdev XML attach. |
 | `backends/bare_metal.py` | No-VM implementation, Linux-only. exec/transfer collapse to host subprocess + file copy; mount/launch/snapshot are no-ops or explicit refusals; verify-only bootstrap. |
 | `templates.py` | Bootstrap script, sandbox Dockerfile, cont-init fix-perms hook, fallback image tags. |
 | `vm.py` | VM lifecycle: init / start / stop / shell / status / resize / rebuild / snapshot / restore / destroy. |

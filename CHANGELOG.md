@@ -6,6 +6,9 @@ Entries marked **reseat** need `agx reseat <name>` on existing agents to take ef
 
 ## [Unreleased]
 
+### Changed
+- `agx vm init` uses the `libvirt` backend on Linux and `multipass` on macOS when `--backend` is omitted (before: `multipass` everywhere). Existing deployments keep their configured backend. On Linux, `agx vm init` first checks the libvirt stack (commands, `virtiofsd`, `/dev/kvm`, access to `qemu:///system`, the `default` network) and lists everything that is missing.
+
 ## [0.2.0] - 2026-10-13
 
 ### Changed

@@ -284,7 +284,7 @@ def test_init_full_flow(mocker, tmp_path: Path) -> None:
     data_dir = tmp_path / "data"
     config_path = _saved_config(tmp_path)
 
-    vm.init(data_dir=data_dir, config_path=config_path)
+    vm.init(backend="multipass", data_dir=data_dir, config_path=config_path)
 
     mocks["launch"].assert_called_once()
     mocks["mount"].assert_called_once()
@@ -308,7 +308,7 @@ def test_init_skips_launch_when_vm_already_exists(mocker, tmp_path: Path) -> Non
     mocks = _stub_all_mp(mocker)
     mocks["list_vms"].return_value = _ok(json.dumps({"list": [{"name": "agents"}]}))
 
-    vm.init(data_dir=tmp_path / "data", config_path=_saved_config(tmp_path))
+    vm.init(backend="multipass", data_dir=tmp_path / "data", config_path=_saved_config(tmp_path))
 
     mocks["launch"].assert_not_called()
     mocks["mount"].assert_called_once()
@@ -317,7 +317,7 @@ def test_init_skips_launch_when_vm_already_exists(mocker, tmp_path: Path) -> Non
 def test_init_uses_baked_in_fallback_tags_when_github_unreachable(mocker, tmp_path: Path) -> None:
     _stub_all_mp(mocker)  # `_fetch_latest_tag` already stubbed to None
     config_path = _saved_config(tmp_path)
-    vm.init(data_dir=tmp_path / "data", config_path=config_path)
+    vm.init(backend="multipass", data_dir=tmp_path / "data", config_path=config_path)
     cfg = cfg_mod.load(config_path)
     from agx_cli.templates import FALLBACK_HERMES_IMAGE_TAG, FALLBACK_OPENCLAW_IMAGE_TAG
 
@@ -329,7 +329,7 @@ def test_init_uses_live_tags_when_github_succeeds(mocker, tmp_path: Path) -> Non
     mocks = _stub_all_mp(mocker)
     mocks["fetch"].side_effect = lambda repo: f"v{repo}.live"
     config_path = _saved_config(tmp_path)
-    vm.init(data_dir=tmp_path / "data", config_path=config_path)
+    vm.init(backend="multipass", data_dir=tmp_path / "data", config_path=config_path)
     cfg = cfg_mod.load(config_path)
     assert cfg.defaults.hermes_image_tag == "vhermes.live"
     assert cfg.defaults.openclaw_image_tag == "vopenclaw.live"
@@ -343,14 +343,16 @@ def test_init_refuses_when_bootstrap_fails(mocker, tmp_path: Path) -> None:
     )
     _stub_all_mp(mocker, bootstrap_output=bad)
     with pytest.raises(RuntimeFailure, match="bootstrap failed"):
-        vm.init(data_dir=tmp_path / "data", config_path=_saved_config(tmp_path))
+        vm.init(
+            backend="multipass", data_dir=tmp_path / "data", config_path=_saved_config(tmp_path)
+        )
 
 
 def test_init_falls_back_when_release_not_in_catalog(mocker, tmp_path: Path) -> None:
     mocks = _stub_all_mp(mocker)
     mocks["find"].return_value = _ok(json.dumps({"images": {"x": {"aliases": ["24.04"]}}}))
     config_path = _saved_config(tmp_path)
-    vm.init(data_dir=tmp_path / "data", config_path=config_path)
+    vm.init(backend="multipass", data_dir=tmp_path / "data", config_path=config_path)
     cfg = cfg_mod.load(config_path)
     assert cfg.vm.ubuntu_release == "24.04"
 
@@ -361,7 +363,12 @@ def test_init_respects_ubuntu_release_override(mocker, tmp_path: Path) -> None:
     catalog = json.dumps({"images": {"x": {"aliases": ["24.04", "26.04"]}}})
     mocks["find"].return_value = _ok(catalog)
     config_path = _saved_config(tmp_path)
-    vm.init(data_dir=tmp_path / "data", ubuntu_release="26.04", config_path=config_path)
+    vm.init(
+        backend="multipass",
+        data_dir=tmp_path / "data",
+        ubuntu_release="26.04",
+        config_path=config_path,
+    )
     cfg = cfg_mod.load(config_path)
     assert cfg.vm.ubuntu_release == "26.04"
 
@@ -377,7 +384,9 @@ def test_init_dumps_bootstrap_output_on_failure(mocker, tmp_path: Path) -> None:
     )
     _stub_all_mp(mocker, bootstrap_output=bad)
     with pytest.raises(RuntimeFailure) as exc:
-        vm.init(data_dir=tmp_path / "data", config_path=_saved_config(tmp_path))
+        vm.init(
+            backend="multipass", data_dir=tmp_path / "data", config_path=_saved_config(tmp_path)
+        )
     msg = str(exc.value)
     assert "curl: (28) Connection timed out" in msg
     assert "bootstrap stdout" in msg
@@ -391,7 +400,7 @@ def test_init_emits_exactly_one_object_and_narrates_stages(mocker, tmp_path: Pat
     emit = mocker.patch("agx_cli.ui.emit")
     progress = mocker.patch("agx_cli.ui.progress")
 
-    vm.init(data_dir=tmp_path / "data", config_path=_saved_config(tmp_path))
+    vm.init(backend="multipass", data_dir=tmp_path / "data", config_path=_saved_config(tmp_path))
 
     emit.assert_called_once()
     payload = emit.call_args.args[0]
@@ -408,7 +417,12 @@ def test_init_emit_false_suppresses_final_object(mocker, tmp_path: Path) -> None
     object — init's "ready" payload must be suppressible."""
     _stub_all_mp(mocker)
     emit = mocker.patch("agx_cli.ui.emit")
-    vm.init(data_dir=tmp_path / "data", config_path=_saved_config(tmp_path), emit=False)
+    vm.init(
+        backend="multipass",
+        data_dir=tmp_path / "data",
+        config_path=_saved_config(tmp_path),
+        emit=False,
+    )
     emit.assert_not_called()
 
 
@@ -422,6 +436,7 @@ def test_init_hints_at_ubuntu_release_when_net_fails_on_non_24_04(mocker, tmp_pa
     mocks["find"].return_value = _ok(json.dumps({"images": {"x": {"aliases": ["26.04"]}}}))
     with pytest.raises(RuntimeFailure, match="ubuntu_release"):
         vm.init(
+            backend="multipass",
             data_dir=tmp_path / "data",
             ubuntu_release="26.04",
             config_path=_saved_config(tmp_path),
@@ -647,8 +662,8 @@ def test_rebuild_overrides_sizing(mocker, tmp_path: Path) -> None:
 
 def test_rebuild_preserves_backend_and_gpu(mocker, tmp_path: Path) -> None:
     """A libvirt user's rebuild must not silently migrate to multipass or
-    drop GPU passthrough — init() defaults backend='multipass' and writes
-    cfg.vm.backend unconditionally, so rebuild has to pass both through.
+    drop GPU passthrough — init() falls back to the platform default and
+    writes cfg.vm.backend unconditionally, so rebuild has to pass both through.
     """
     cfg = _make_config(tmp_path)
     cfg.vm.backend = "libvirt"

@@ -323,3 +323,92 @@ def test_filesystem_element_for_tag_carries_source_for_detach() -> None:
     assert 'dir="/srv/shared"' in el and 'dir="agx-abc"' in el
     assert "home_ubuntu_agents" not in el
     assert libvirt_mod._filesystem_element_for_tag(domain, "missing") is None
+
+
+# ---------- verify_host: preflight before vm init ----------
+
+
+def _stub_host(
+    mocker: Any,
+    libvirt: Any,
+    *,
+    missing: tuple[str, ...] = (),
+    virtiofsd: bool = True,
+    kvm: bool = True,
+    uri_rc: int = 0,
+    net_active: bool = True,
+) -> Any:
+    from agx_cli.backends import MpResult
+
+    mocker.patch("shutil.which", side_effect=lambda c: None if c in missing else f"/usr/bin/{c}")
+    present = {p for p, ok in (("/usr/libexec/virtiofsd", virtiofsd), ("/dev/kvm", kvm)) if ok}
+    mocker.patch("pathlib.Path.exists", lambda self: str(self) in present)
+
+    def virsh(*args: str, check: bool = True, timeout: float | None = None) -> MpResult:
+        if args[0] == "uri":
+            err = (
+                "" if uri_rc == 0 else "error: failed to connect\nerror: authentication unavailable"
+            )
+            return MpResult(stdout="qemu:///system\n", stderr=err, returncode=uri_rc)
+        state = "yes" if net_active else "no"
+        return MpResult(
+            stdout=f"Name:  default\nActive:         {state}\n", stderr="", returncode=0
+        )
+
+    return mocker.patch.object(libvirt, "_virsh", side_effect=virsh)
+
+
+def test_verify_host_passes_on_a_complete_host(mocker: Any, libvirt: Any) -> None:
+    virsh = _stub_host(mocker, libvirt)
+    libvirt.verify_host()
+    assert [c.args[0] for c in virsh.call_args_list] == ["uri", "net-info"]
+
+
+def test_verify_host_lists_every_gap_of_a_fresh_host(mocker: Any, libvirt: Any) -> None:
+    from agx_cli.errors import UserError
+
+    virsh = _stub_host(
+        mocker,
+        libvirt,
+        missing=("virsh", "virt-install", "cloud-localds", "virtiofsd"),
+        virtiofsd=False,
+        kvm=False,
+    )
+    with pytest.raises(UserError) as exc:
+        libvirt.verify_host()
+    msg = str(exc.value)
+    assert "commands not found: virsh, virt-install, cloud-localds" in msg
+    assert "virtiofsd not found" in msg
+    assert "/dev/kvm is missing" in msg
+    assert "sudo apt install libvirt-clients" in msg and "virtiofsd" in msg
+    virsh.assert_not_called()  # no daemon probe without virsh
+
+
+def test_verify_host_names_the_libvirt_group_when_the_daemon_refuses(
+    mocker: Any, libvirt: Any
+) -> None:
+    from agx_cli.errors import UserError
+
+    _stub_host(mocker, libvirt, uri_rc=1)
+    with pytest.raises(UserError, match="libvirt group") as exc:
+        libvirt.verify_host()
+    assert "failed to connect" in str(exc.value)
+
+
+def test_verify_host_flags_an_inactive_default_network(mocker: Any, libvirt: Any) -> None:
+    from agx_cli.errors import UserError
+
+    _stub_host(mocker, libvirt, net_active=False)
+    with pytest.raises(UserError, match="net-start default"):
+        libvirt.verify_host()
+
+
+@pytest.mark.parametrize(
+    ("machine", "qemu"),
+    [("x86_64", "qemu-system-x86 ovmf"), ("aarch64", "qemu-system-arm qemu-efi-aarch64")],
+)
+def test_host_packages_match_the_architecture(
+    mocker: Any, libvirt: Any, machine: str, qemu: str
+) -> None:
+    mocker.patch("platform.machine", return_value=machine)
+    assert qemu in libvirt._host_packages()
