@@ -150,6 +150,7 @@ src/agx_cli/
   upgrades.py     # state machine: host-data-snapshot → vm-snapshot → pull → recreate → doctor → rollback; auto-prunes old upgrade artifacts after success (see prune_cmd)
   prune_cmd.py    # `agx prune [name] [--keep N] [--dry-run]` — generation-counted retention of upgrade artifacts (host tarballs in .upgrades/, pre-upgrade VM snapshots, superseded agent image tags). Also `auto_prune_after_upgrade`, called by upgrades.upgrade INSIDE its flock (do not re-acquire). Image pruning is repo-scoped and only ever touches hermes/openclaw repos; compose-referenced tags + defaults.*_image_tag baseline are always protected.
   export_cmd.py   # export/import/export-cron (host-cron, idempotent)
+  backup_tags.py  # CACHEDIR.TAG markers on the data dir's rebuildable dirs (REBUILDABLE_DIRS) so host backups skip them; best-effort, never creates a dir, never fails a command
   codex.py        # login/status/skill-enable/skill-disable — the sandbox SKILL only (never provider auth)
   doctor_cron.py  # `agx doctor-cron {install,uninstall,status,run}` — host cron: ops.doctor(raise_on_fail=False) every N min, diff the failing set against <data-dir>/.doctor-cron/state.json, mail on CHANGE only via host `sendmail -t` (no SMTP config in the toolkit; install refuses without a sendmail binary). Also drives the upstream-release mail (update_notify) on its own interval; state.json keeps `updates_checked_at` + per-agent `updates_notified` tag, carried over by every doctor poll
   update_notify.py # upstream-release notices for doctor-cron: pending updates via outdated_cmd.collect (skips already-notified tags and releases without a pullable image), the release range between pinned and latest (positional in GitHub's created order — never version-sorted), condensed notes (lead + full upgrade/breaking bullets + highlight titles; minors run >100 KB) and the plain-text mail
@@ -179,7 +180,7 @@ scripts/vm-bootstrap.sh   # idempotent rootless Docker + Node-less / Codex-less 
 
 ## Backups
 
-Backups are the host's job (duplicity, restic, borg, …). The toolkit does NOT implement an internal backup engine — don't add restic, borg, or off-site replication. Agent state lives under a host directory the user's backup covers; `agx export` produces clean archives in `<data-dir>/backups/` for it.
+Backups are the host's job (duplicity, restic, borg, …). The toolkit does NOT implement an internal backup engine — don't add restic, borg, or off-site replication. Agent state lives under a host directory the user's backup covers; `agx export` produces clean archives in `<data-dir>/backups/` for it. The rebuildable top-level dirs (`.disks/` — the libvirt VM disk, tens of GB — `.images/`, `.seeds/`, `.staging/`, `.rebuild-staging/`, `.upgrades/`, `models/`) carry a `CACHEDIR.TAG` (`backup_tags.py`; written at `vm init`/`vm start` and where the toolkit creates them) so `borg/restic/tar --exclude-caches` skip them. Any new top-level dir that holds no agent state belongs in `backup_tags.REBUILDABLE_DIRS`; one that holds state must never be added.
 
 ## Testing
 

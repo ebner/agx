@@ -299,8 +299,12 @@ def host_staging_dir(cfg: AgentsConfig) -> Path:
       which means multipass has explicit access to it — guaranteed
       readable across both snap and deb installs of multipass.
     """
+    from agx_cli import backup_tags
+
     d = cfg.paths.host_data_dir / ".staging"
-    d.mkdir(parents=True, exist_ok=True)
+    if not d.is_dir():
+        d.mkdir(parents=True, exist_ok=True)
+        backup_tags.tag_dir(d)
     return d
 
 

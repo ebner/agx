@@ -36,7 +36,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from agx_cli import compose, compose_runner, mp, sidecar, ui
+from agx_cli import backup_tags, compose, compose_runner, mp, sidecar, ui
 from agx_cli import config as cfg_mod
 from agx_cli.compose import (
     LLAMACPP_IMAGE_BASE,
@@ -585,6 +585,7 @@ def _ensure_models_dir(cfg: AgentsConfig, engine: str) -> None:
         mp.exec_in_vm(cfg.vm.name, "mkdir", "-p", target, check=False)
         return
     (cfg.paths.host_data_dir / "models" / engine).mkdir(parents=True, exist_ok=True)
+    backup_tags.tag_dir(cfg.paths.host_data_dir / "models")
 
 
 def _validate_slug(slug: str) -> None:

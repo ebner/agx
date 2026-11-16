@@ -35,7 +35,7 @@ if TYPE_CHECKING:
     from agx_cli import prune_cmd as prune_cmd_mod
 
 from agx_cli import archive as archive_mod
-from agx_cli import compose, compose_runner, mp, ops, ui
+from agx_cli import backup_tags, compose, compose_runner, mp, ops, ui
 from agx_cli import config as cfg_mod
 from agx_cli import vm as vm_mod
 from agx_cli.agents_cmd import _detect_type_from_compose
@@ -832,6 +832,7 @@ def _host_data_snapshot(cfg: AgentsConfig, name: str) -> Path:
     """
     upgrades_dir = cfg.paths.host_data_dir / ".upgrades"
     upgrades_dir.mkdir(parents=True, exist_ok=True)
+    backup_tags.tag_dir(upgrades_dir)
     archive_path = upgrades_dir / f"{name}-{_utc_stamp()}{archive_mod.ARCHIVE_SUFFIX}"
 
     # Both data-dir modes: tar inside the VM as root so subuid-owned

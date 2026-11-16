@@ -259,6 +259,10 @@ def init(
             f"  hermes image: nousresearch/hermes-agent:{cfg.defaults.hermes_image_tag}\n"
             f"  openclaw image: openclaw/openclaw:{cfg.defaults.openclaw_image_tag}"
         )
+    # VM disk, image cache, seeds, staging: keep them out of host backups.
+    from agx_cli import backup_tags
+
+    backup_tags.tag_rebuildable_dirs(cfg)
     if emit:
         ui.emit(
             {
@@ -277,7 +281,7 @@ def init(
 
 
 def start(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> None:
-    from agx_cli import compose
+    from agx_cli import backup_tags, compose
 
     cfg = cfg_mod.load(config_path)
     if cfg.vm.backend == "bare_metal":
@@ -285,6 +289,7 @@ def start(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> None:
         # stale staging files so the next mutation isn't tripped up by
         # a prior crashed write.
         compose.cleanup_stale_temps(cfg)
+        backup_tags.tag_rebuildable_dirs(cfg)
         ui.emit(
             {"vm": cfg.vm.name, "status": "running", "backend": "bare_metal"},
             human=f"{cfg.vm.name}: running (bare_metal — host is always 'on')",
@@ -311,6 +316,7 @@ def start(*, config_path: Path = cfg_mod.DEFAULT_CONFIG_PATH) -> None:
     # Sweep stale .compose.*.new in the VM and host-side compose-staging
     # files from prior crashes.
     compose.cleanup_stale_temps(cfg)
+    backup_tags.tag_rebuildable_dirs(cfg)
     ui.emit({"vm": cfg.vm.name, "status": "running"}, human=f"{cfg.vm.name}: running")
 
 
