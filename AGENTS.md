@@ -200,6 +200,7 @@ The integration smoke suite lives at `tests/integration/` (marker `multipass`; a
 - Exit codes are load-bearing: 0 / 1 / 2 / 3.
 - No `print()` — everything goes through `ui.py` so `--json` works.
 - Subprocess invocations use list-form argv (never `shell=True`).
+- GitHub Actions are pinned to full commit SHAs with the version as a comment (`uses: owner/action@<sha> # v1.2.3`); the repo setting requires it, and Dependabot bumps SHA and comment together. Workflows keep `permissions: contents: read` unless a job needs more.
 - New cross-layer mistakes get added to the "Critical cross-layer pitfalls" section above.
 
 ## Publication hygiene (this is a public repository)
