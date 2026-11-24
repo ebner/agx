@@ -199,7 +199,7 @@ def doctor(
             _check_hermes_model_set(cfg, svc, agent_name, report)
             _check_hermes_credential_pool(cfg, svc, agent_name, report)
             _check_profile_gateways(cfg, svc, agent_name, report)
-            _check_profile_dashboard_bindings(cfg, svc, agent_name, report)
+            _check_web_access(cfg, svc, agent_name, report)
 
     if emit:
         _emit_doctor_table(report)
@@ -1001,48 +1001,80 @@ def _svstat_seconds(stat: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
-# Scans every profile home (default + named) for a dashboard.address
-# outside the loopback set. Toolkit writes are refused at write time
-# (hermes_config.validate_dashboard_binding), but hand edits inside the
-# container and imported profile distributions bypass that — and a
-# non-loopback bind in ANY profile is reachable from sibling containers
-# on the compose network even without a published port (GH #6 tier 2).
-_PROFILE_DASHBOARD_PROBE = """\
-import glob, json
+# Every Hermes web listener the container configures: the image's
+# dashboard slot (HERMES_DASHBOARD=1 in the container env; bind from
+# HERMES_DASHBOARD_HOST/_PORT, which default to 0.0.0.0:9119) and the
+# gateway Webapp of each profile home (webapp.enabled: true plus
+# webapp.host/port, default 127.0.0.1:9120). Hermes reads the dashboard
+# bind only from --host, never from config.yaml. An off-loopback listener
+# is reachable from sibling containers on the compose network even without
+# a published port, so it must have Hermes' sign-in gate on: the probe asks
+# the listener itself (/api/status, unauthenticated by design) instead of
+# re-deriving the sign-in providers from env, .env and config.yaml.
+_WEB_ACCESS_PROBE = """\
+import glob, json, os, urllib.error, urllib.request
 try:
-    import yaml
-except Exception:
-    print(json.dumps({"error": "no yaml"}))
-    raise SystemExit(0)
+    from yaml import safe_load
+except ImportError:  # Hermes >= v0.23.4 images ship ruamel.yaml only
+    try:
+        from ruamel.yaml import YAML
+        safe_load = YAML(typ="safe").load
+    except ImportError:
+        print(json.dumps({"error": "no yaml"}))
+        raise SystemExit(0)
+LOOPBACK = {"127.0.0.1", "localhost", "::1"}
 rows = []
+if (os.environ.get("HERMES_DASHBOARD") or "").strip().lower() in {"1", "true", "yes"}:
+    rows.append({"source": "dashboard slot",
+                 "host": os.environ.get("HERMES_DASHBOARD_HOST") or "0.0.0.0",
+                 "port": os.environ.get("HERMES_DASHBOARD_PORT") or "9119"})
 paths = ["/opt/data/config.yaml"] + sorted(glob.glob("/opt/data/profiles/*/config.yaml"))
 for path in paths:
     name = "default" if path == "/opt/data/config.yaml" else path.split("/")[-2]
     try:
-        doc = yaml.safe_load(open(path)) or {}
+        doc = safe_load(open(path)) or {}
     except Exception:
         continue
-    addr = ((doc.get("dashboard") or {}).get("address"))
-    if addr is not None:
-        rows.append({"profile": name, "address": str(addr)})
+    webapp = doc.get("webapp") if isinstance(doc, dict) else None
+    if isinstance(webapp, dict) and webapp.get("enabled") is True:
+        rows.append({"source": "webapp (" + name + ")",
+                     "host": str(webapp.get("host", "127.0.0.1")),
+                     "port": str(webapp.get("port", 9120))})
+for r in rows:
+    host = r["host"].strip("[]")
+    if host in LOOPBACK:
+        r["state"] = "loopback"
+        continue
+    target = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
+    if ":" in target:
+        target = "[" + target + "]"
+    try:
+        with urllib.request.urlopen(
+            "http://" + target + ":" + r["port"] + "/api/status", timeout=5
+        ) as resp:
+            status = json.load(resp)
+        r["state"] = "gated" if status.get("auth_required") else "open"
+        r["providers"] = status.get("auth_providers") or []
+    except urllib.error.HTTPError as exc:
+        r["state"] = "gated" if exc.code in (401, 403) else "http " + str(exc.code)
+    except Exception:
+        r["state"] = "down"
 print(json.dumps({"rows": rows}))
 """
 
 
-def _check_profile_dashboard_bindings(
-    cfg: AgentsConfig, svc: str, agent_name: str, report: DoctorReport
-) -> None:
-    """Warn when any profile's config binds the dashboard off-loopback.
-
-    Complements the write-time refusal in ``hermes_config`` — that guard
-    only covers toolkit-driven writes to the profile being edited; this
-    check sweeps every profile home in the container, catching hand
-    edits and imported profile distributions.
+def _check_web_access(cfg: AgentsConfig, svc: str, agent_name: str, report: DoctorReport) -> None:
+    """Rule 6: every off-loopback dashboard or Webapp listener must have
+    Hermes' sign-in gate on (``fail`` when one answers without it). Also
+    warns about a configured listener that doesn't answer — typically a
+    Webapp that refused to start for lack of a sign-in provider — and
+    about the dashboard slot and a Webapp claiming the same port, the
+    leftover of a half-done move from the dashboard to the Webapp.
     """
     result = mp.exec_in_vm(
         cfg.vm.name,
         *_compose_exec_in_vm_argv(
-            cfg, svc, "python3", "-c", _PROFILE_DASHBOARD_PROBE, no_tty=True, as_root=True
+            cfg, svc, "python3", "-c", _WEB_ACCESS_PROBE, no_tty=True, as_root=True
         ),
         check=False,
     )
@@ -1054,20 +1086,56 @@ def _check_profile_dashboard_bindings(
         return
     if not isinstance(data, dict):
         return
-    offenders = [
-        r
-        for r in data.get("rows", [])
-        if isinstance(r, dict) and r.get("address") not in ("127.0.0.1", "localhost", "::1")
-    ]
-    if offenders:
-        detail = ", ".join(f"{r['profile']}={r['address']!r}" for r in offenders)
+    rows = [r for r in data.get("rows", []) if isinstance(r, dict)]
+    if not rows:
+        return
+    name = f"{agent_name}.web_access"
+
+    def where(r: dict[str, object]) -> str:
+        return f"{r.get('source')} on {r.get('host')}:{r.get('port')}"
+
+    open_ = [r for r in rows if r.get("state") == "open"]
+    if open_:
         report.add(
-            f"{agent_name}.profile_dashboards",
-            "warn",
-            f"non-loopback dashboard.address in profile config(s): {detail} — "
-            f"reachable from sibling containers on the compose network; "
-            f"bind 127.0.0.1 and publish via the override file instead",
+            name,
+            "fail",
+            "reachable without sign-in: "
+            + ", ".join(where(r) for r in open_)
+            + " — configure a sign-in provider (HERMES_DASHBOARD_BASIC_AUTH_* via "
+            "`agx secret set`) or bind it to 127.0.0.1",
         )
+        return
+    problems: list[str] = []
+    ports: dict[str, list[str]] = {}
+    for r in rows:
+        ports.setdefault(str(r.get("port")), []).append(str(r.get("source")))
+    for port, sources in sorted(ports.items()):
+        if "dashboard slot" in sources and any(s.startswith("webapp") for s in sources):
+            problems.append(
+                f"the dashboard slot and the {', '.join(s for s in sources if s != 'dashboard slot')}"
+                f" both claim port {port}; once the Webapp serves it, remove the slot with "
+                f"`agx secret unset {agent_name} HERMES_DASHBOARD`"
+            )
+    for r in rows:
+        state = r.get("state")
+        if state not in ("gated", "loopback", "open"):
+            problems.append(f"{where(r)} is configured but not answering ({state})")
+    if problems:
+        report.add(name, "warn", "; ".join(problems))
+        return
+    report.add(
+        name,
+        "ok",
+        ", ".join(
+            f"{where(r)}: "
+            + (
+                "loopback only"
+                if r.get("state") == "loopback"
+                else f"sign-in required ({', '.join(map(str, r.get('providers') or [])) or 'gate on'})"
+            )
+            for r in rows
+        ),
+    )
 
 
 def _check_profile_gateways(

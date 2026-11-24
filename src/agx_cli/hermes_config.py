@@ -20,9 +20,10 @@ this one goes THROUGH the container):
 4. Atomic same-fs rename inside the container: ``mv <staged> config.yaml``.
 5. RM the staged file on any error path.
 
-The CLI refuses any change that would bind the dashboard to anything
-other than ``127.0.0.1`` / ``localhost`` / ``::1`` — one of the toolkit's
-locked security invariants (see AGENTS.md and docs/threat-model.md).
+Web exposure (dashboard / Webapp binds) is not guarded here: Hermes takes
+the dashboard bind from ``--host`` only, and gates every off-loopback
+listener behind sign-in itself. ``agx doctor``'s ``web_access`` check
+verifies that gate on the live listeners (AGENTS.md rule 6).
 """
 
 from __future__ import annotations
@@ -40,8 +41,6 @@ from ruamel.yaml import YAML
 from agx_cli import mp
 from agx_cli.config import AgentsConfig
 from agx_cli.errors import UserError
-
-ALLOWED_DASHBOARD_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 # What ``read_doc`` saw, per returned doc: id(doc) -> (doc, (agent,
 # profile), sha256 of the file text or None when absent). The doc itself
@@ -228,8 +227,6 @@ def write_atomically(
     later caller (``codex skill-enable``, memory plugin enable,
     ``agx secret set``) runs against an already-running container.
     """
-    validate_dashboard_binding(doc)
-
     if not cfg.vm_runtime.is_populated():
         raise UserError("vm_runtime fields not populated; run `agx vm init` first")
 
@@ -299,9 +296,9 @@ def _validate_in_container(
 
     Hermes' CLI evolved here — older versions had ``hermes config
     validate``, newer ones use ``hermes config check``. We try each;
-    if NEITHER is available the structural ``validate_dashboard_binding``
-    upstream is the only guard, which is acceptable: every writer
-    goes through this module's helpers that produce well-formed YAML.
+    if NEITHER is available the write goes ahead unvalidated, which is
+    acceptable: every writer goes through this module's helpers that
+    produce well-formed YAML.
 
     Skipped silently when the container isn't running.
     """
@@ -350,21 +347,6 @@ def _validate_in_container(
         raise UserError(
             f"hermes config {sub} failed for {agent_name!r}: "
             f"{result.stderr.strip() or result.stdout.strip()}"
-        )
-
-
-def validate_dashboard_binding(doc: Any) -> None:
-    """Refuse any dashboard.address that isn't localhost — the dashboard
-    is meant to be accessible only via SSH tunnel.
-    """
-    dashboard = doc.get("dashboard") or {}
-    addr = dashboard.get("address")
-    if addr is None:
-        return
-    if addr not in ALLOWED_DASHBOARD_HOSTS:
-        raise UserError(
-            f"refusing to set dashboard.address={addr!r}; allowed: "
-            f"{sorted(ALLOWED_DASHBOARD_HOSTS)}"
         )
 
 

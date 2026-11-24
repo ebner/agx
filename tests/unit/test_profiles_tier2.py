@@ -133,16 +133,6 @@ def test_write_atomically_targets_profile_home(
     assert default["model"] == "untouched"
 
 
-def test_write_atomically_profile_applies_dashboard_refusal(
-    with_coder: Path, cfg: AgentsConfig, mocker: Any
-) -> None:
-    _seed_profile(cfg, "work")
-    doc = hermes_config.read_doc(cfg, "coder", "work")
-    doc["dashboard"] = {"address": "0.0.0.0"}
-    with pytest.raises(UserError, match=r"refusing to set dashboard\.address"):
-        hermes_config.write_atomically(cfg, "coder", doc, "work")
-
-
 # ---------- secrets: passthrough lands in the profile config ----------
 
 
@@ -260,34 +250,70 @@ def test_memory_openviking_refuses_profile(
         memory_mod.enable("openviking", "coder", profile="work", config_path=with_coder)
 
 
-# ---------- doctor: profile dashboard-binding sweep ----------
+# ---------- doctor: web_access (rule 6) ----------
 
 
-def test_doctor_profile_dashboards_warns_on_non_loopback(cfg: AgentsConfig, mocker: Any) -> None:
-    from agx_cli.ops import DoctorReport, _check_profile_dashboard_bindings
+def _web_access(cfg: AgentsConfig, mocker: Any, rows: list[dict[str, Any]]) -> Any:
+    from agx_cli.ops import DoctorReport, _check_web_access
 
-    probe = {
-        "rows": [
-            {"profile": "work", "address": "0.0.0.0"},
-            {"profile": "default", "address": "127.0.0.1"},
-        ]
-    }
-    mocker.patch("agx_cli.mp.exec_in_vm", return_value=_ok(json.dumps(probe)))
+    mocker.patch("agx_cli.mp.exec_in_vm", return_value=_ok(json.dumps({"rows": rows})))
     report = DoctorReport()
-    _check_profile_dashboard_bindings(cfg, "hermes-coder", "coder", report)
+    _check_web_access(cfg, "hermes-coder", "coder", report)
+    return report
+
+
+_SLOT = {"source": "dashboard slot", "host": "0.0.0.0", "port": "9119"}
+_WEBAPP = {"source": "webapp (default)", "host": "0.0.0.0", "port": "9119"}
+
+
+def test_doctor_web_access_fails_on_a_listener_without_sign_in(
+    cfg: AgentsConfig, mocker: Any
+) -> None:
+    report = _web_access(cfg, mocker, [{**_SLOT, "state": "open"}])
     [check] = report.checks
+    assert (check.name, check.status) == ("coder.web_access", "fail")
+    assert "dashboard slot on 0.0.0.0:9119" in check.detail
+    assert "agx secret set" in check.detail
+
+
+def test_doctor_web_access_warns_when_slot_and_webapp_share_a_port(
+    cfg: AgentsConfig, mocker: Any
+) -> None:
+    rows = [{**_SLOT, "state": "gated"}, {**_WEBAPP, "state": "gated"}]
+    [check] = _web_access(cfg, mocker, rows).checks
     assert check.status == "warn"
-    assert "work='0.0.0.0'" in check.detail
-    assert "default" not in check.detail
+    assert "both claim port 9119" in check.detail
+    assert "agx secret unset coder HERMES_DASHBOARD" in check.detail
 
 
-def test_doctor_profile_dashboards_quiet_when_loopback(cfg: AgentsConfig, mocker: Any) -> None:
-    from agx_cli.ops import DoctorReport, _check_profile_dashboard_bindings
+def test_doctor_web_access_warns_on_a_configured_listener_that_is_down(
+    cfg: AgentsConfig, mocker: Any
+) -> None:
+    [check] = _web_access(cfg, mocker, [{**_WEBAPP, "state": "down"}]).checks
+    assert check.status == "warn"
+    assert "webapp (default) on 0.0.0.0:9119 is configured but not answering" in check.detail
 
-    probe = {"rows": [{"profile": "default", "address": "127.0.0.1"}]}
-    mocker.patch("agx_cli.mp.exec_in_vm", return_value=_ok(json.dumps(probe)))
+
+def test_doctor_web_access_ok_names_the_sign_in_providers(cfg: AgentsConfig, mocker: Any) -> None:
+    rows = [
+        {**_WEBAPP, "state": "gated", "providers": ["basic"]},
+        {"source": "webapp (work)", "host": "127.0.0.1", "port": "9121", "state": "loopback"},
+    ]
+    [check] = _web_access(cfg, mocker, rows).checks
+    assert check.status == "ok"
+    assert "webapp (default) on 0.0.0.0:9119: sign-in required (basic)" in check.detail
+    assert "webapp (work) on 127.0.0.1:9121: loopback only" in check.detail
+
+
+def test_doctor_web_access_quiet_without_listeners_or_container(
+    cfg: AgentsConfig, mocker: Any
+) -> None:
+    assert _web_access(cfg, mocker, []).checks == []
+    from agx_cli.ops import DoctorReport, _check_web_access
+
+    mocker.patch("agx_cli.mp.exec_in_vm", return_value=MpResult(stdout="", stderr="", returncode=1))
     report = DoctorReport()
-    _check_profile_dashboard_bindings(cfg, "hermes-coder", "coder", report)
+    _check_web_access(cfg, "hermes-coder", "coder", report)
     assert report.checks == []
 
 

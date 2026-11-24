@@ -79,9 +79,9 @@ For Hermes' nested-sandbox feature to work, the rootless Docker socket (`/run/us
 
 The CLI refuses any image whose `(registry, repo)` isn't on the explicit allowlist in `compose.py`: the agent runtimes (`nousresearch/hermes-agent`, `openclaw/openclaw`), the OpenViking memory sidecar (`volcengine/openviking`), the self-hosted Firecrawl stack (`ghcr.io/firecrawl/firecrawl`, `ghcr.io/firecrawl/playwright-service`, `ghcr.io/firecrawl/nuq-postgres`, plus `redis` and `rabbitmq`), and the in-VM inference engines (`ollama/ollama`, `ghcr.io/ggml-org/llama.cpp`). Registry-prefixed lookalikes (e.g. `ghcr.io/evil/nousresearch/hermes-agent`) are rejected by the parsed-tuple match; `repo:tag` and `repo@sha256:…` digest-pin forms are both validated. `hermes-agent.org` is rejected anywhere. New sibling services require explicit allowlist additions.
 
-### 5. Dashboard binding
+### 5. Web UI exposure
 
-Hermes' web dashboard always binds `127.0.0.1` only. The CLI refuses any `dashboard.address` change to `0.0.0.0` (or anything else than `127.0.0.1` / `localhost` / `::1`). Remote access goes through SSH port-forwarding or the VM's Tailscale node (`agx tailscale up`).
+Hermes' browser UI (the gateway's Webapp, or the older dashboard slot) runs inside the agent container. Inside a container it binds `0.0.0.0` to be reachable through Docker's port publishing at all, which also makes it reachable from sibling containers on the compose network. Two layers limit that: agx publishes nothing for it by default (a published port is the user's opt-in in `docker-compose.override.yml`; agx's own ports go to `127.0.0.1` in the VM), and every listener outside loopback must require sign-in. Hermes enforces the latter itself (it refuses a non-loopback bind without a sign-in provider); `agx doctor`'s `web_access` check asks each configured listener for its `/api/status` and fails when one answers without sign-in. Remote access goes through SSH port-forwarding or the VM's Tailscale node (`agx tailscale up`).
 
 ### 6. Compose-file mutation
 

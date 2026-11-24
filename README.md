@@ -207,7 +207,7 @@ See [docs/threat-model.md](docs/threat-model.md). Short version:
 - Outer trust boundary: the VM (multipass or libvirt backends). Under `--backend bare_metal` there is no VM — the host is the boundary, which is why bare-metal is opt-in for single-user workstations only.
 - Inner trust boundary: one Docker container per agent, rootless.
 - Hermes mounts the rootless Docker socket so it can spawn its nested sandbox — bounded by the rootless `ubuntu` user, not root.
-- Dashboards bind 127.0.0.1 only.
+- The web UI is off by default; once published, it must require sign-in (`agx doctor` checks).
 
 ## Status
 

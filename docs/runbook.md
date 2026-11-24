@@ -288,9 +288,51 @@ If you ever see an `EACCES` on a path inside `/opt/hermes/` that
 *isn't* covered, add it to `fixperms_cmd.HERMES_WRITABLE_PATHS`
 rather than chowning manually.
 
+## The web UI: gateway Webapp (and the older dashboard)
+
+Hermes' browser UI runs inside the agent's container. Since Hermes v0.23.4 the gateway serves it itself, as the **Webapp** (`webapp.*` in `config.yaml`); before that it was a second process, the image's `dashboard` slot (`HERMES_DASHBOARD=1` in the container's environment). agx publishes neither by default. You publish the port in `docker-compose.override.yml`, and any listener outside loopback needs sign-in: Hermes refuses to serve one without a sign-in provider, and `agx doctor` checks the live listeners (`<name>.web_access`: `fail` when one answers without sign-in, `warn` when one is configured but not answering, or when the dashboard slot and a Webapp claim the same port).
+
+**Turning on the Webapp** (Hermes v0.23.4+). Inside the container it must bind `0.0.0.0`, or Docker's port publishing cannot reach it; the published port decides who can:
+
+```bash
+# 1. Publish the port in <data-dir>/docker-compose.override.yml:
+#      services:
+#        hermes-coder:
+#          ports:
+#            - "127.0.0.1:9119:9119"   # VM only; use "9119:9119" to reach it over Tailscale
+# 2. Point the gateway's Webapp at it:
+agx exec coder -- hermes config set webapp.enabled true
+agx exec coder -- hermes config set webapp.host 0.0.0.0
+agx exec coder -- hermes config set webapp.port 9119
+# 3. Sign-in (the same variables the dashboard uses). Each `secret set` recreates the container,
+#    which also applies the override's port and restarts the gateway with the new config:
+agx secret set coder HERMES_DASHBOARD_BASIC_AUTH_USERNAME admin
+agx secret set coder HERMES_DASHBOARD_BASIC_AUTH_PASSWORD '<a strong password>'
+agx secret set coder HERMES_DASHBOARD_BASIC_AUTH_SECRET "$(openssl rand -base64 32)"
+# 4. Check:
+agx exec coder -- hermes webapp --status
+agx doctor coder                         # coder.web_access ok: sign-in required (basic)
+```
+
+If the sign-in variables were already set, apply an override change with `agx upgrade coder --tag <its current tag> --recreate --no-snapshot`; `agx restart` does not pick up port changes.
+
+**Moving from the dashboard slot to the Webapp.** Hermes' own `hermes gateway migrate --backends --apply` cannot do this in a container (it exits 6 and prints manual steps). With agx the steps are:
+
+```bash
+agx exec coder -- hermes gateway migrate --backends --dry-run   # shows the s6 dashboard and its address
+agx exec coder -- hermes config set webapp.enabled true
+agx exec coder -- hermes config set webapp.host 0.0.0.0          # the dashboard slot's HERMES_DASHBOARD_HOST, default 0.0.0.0
+agx exec coder -- hermes config set webapp.port 9119             # its HERMES_DASHBOARD_PORT, default 9119
+agx secret unset coder HERMES_DASHBOARD                          # recreates the container without the slot
+agx exec coder -- hermes webapp --status                         # "Serving at …" (retry after 5 s if the gateway is still starting)
+agx exec coder -- hermes gateway migrate --backends --dry-run   # "No running or enabled … backend found"
+```
+
+The published port and the `HERMES_DASHBOARD_BASIC_AUTH_*` secrets stay as they are: the Webapp signs in with the same providers, and agx's per-agent secrets reach the whole container, so nothing needs copying into `/opt/data/.env`. A dashboard reached through a proxy at its own `https://` address needs that address in `webapp.public_url` (Hermes' Docker docs list where to find it). Browsers sign in once more after the move. To go back: `agx exec coder -- hermes config set webapp.enabled false`, then `agx secret set coder HERMES_DASHBOARD 1`. Upstream's `--restore` only undoes moves its own `--apply` made.
+
 ## Remote access with Tailscale
 
-Dashboards and agent ports bind to `127.0.0.1` inside the VM. To reach them from your other devices without SSH tunnels, put the VM on your tailnet (VM backends only — on bare metal, install Tailscale on the host yourself):
+Agent ports are published on `127.0.0.1` inside the VM. To reach them (and the web UI, see above) from your other devices without SSH tunnels, put the VM on your tailnet (VM backends only — on bare metal, install Tailscale on the host yourself):
 
 ```bash
 agx tailscale up                        # prints a login URL; or --auth-key <key> for a non-interactive join
@@ -299,7 +341,7 @@ agx tailscale down                      # leave the tailnet (tailscaled stays in
 agx tailscale upgrade                   # upgrade the tailscale package in the VM
 ```
 
-Tailscale runs as a system service in the VM, not as a container. Ports the toolkit publishes are bound to `127.0.0.1` and stay private; to expose one on the tailnet, publish it without that prefix in `docker-compose.override.yml` (for example `9119:9119` for the Hermes dashboard).
+Tailscale runs as a system service in the VM, not as a container. Ports the toolkit publishes are bound to `127.0.0.1` and stay private; to expose one on the tailnet, publish it without that prefix in `docker-compose.override.yml` (for example `9119:9119` for the Hermes Webapp or dashboard, which then requires sign-in).
 
 ## Observability
 
@@ -316,7 +358,9 @@ alert on warn+ exit codes. Currently checks:
   Hermes' auth store — the "Provider authentication failed" class; detail
   carries the in-container re-auth one-liner) +
   data-dir-access + version (compose-pin vs running-image drift) +
-  host_view (a registered `agx access mount` view that isn't mounted, or is stale).
+  host_view (a registered `agx access mount` view that isn't mounted, or is stale) +
+  web_access (every configured web UI listener outside loopback requires sign-in;
+  see "The web UI").
 - `firecrawl_running` — warns when firecrawl is defined in compose and
   agents are still wired to it but the containers aren't running (the
   state a VM rebuild/migration leaves behind). A stack that's stopped
@@ -443,7 +487,7 @@ agx edit coder SOUL.md --profile work      # path relative to the profile's home
 
 - Hermes only; the container must be running (`agx start <name>`). For a stopped agent or OpenClaw, use `agx exec` / `agx export`.
 - `PATH` is relative to `/opt/data` (or the `--profile` home). It is resolved once inside the container and must stay inside that home; regular UTF-8 text files up to 1 MiB only — it will refuse `state.db` and friends.
-- Anything that *resolves* to a `config.yaml` (default or profile, including through a symlink) is written by the same validated writer as the rest of the toolkit: a `0.0.0.0` dashboard bind is refused and `hermes config validate` runs. A YAML error re-opens the editor.
+- Anything that *resolves* to a `config.yaml` (default or profile, including through a symlink) is written by the same validated writer as the rest of the toolkit: staged, re-read for conflicts, and checked with `hermes config validate`. A YAML error re-opens the editor.
 - The edit buffer lives in a private directory under `$XDG_RUNTIME_DIR` (tmpfs), never in the VM-shared data dir. If the write is refused — the file changed inside the agent meanwhile, validation failed, the editor crashed after saving — the buffer is **kept** and its path printed.
 - The conflict check is optimistic: the file is re-read under the toolkit lock right before writing. That protects against other `agx` commands, not against Hermes rewriting the same file in that instant.
 - `/opt/data/.env` is Hermes' own env file. Toolkit-managed per-agent secrets live in `<data-dir>/<name>/.env` — use `agx secret` for those.

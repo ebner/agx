@@ -62,8 +62,12 @@ _QUERY_SCRIPT = (
 import json, os, sqlite3, time
 home = os.environ.get("H_HOME", "/opt/data")
 try:
-    import yaml
-    cfg = yaml.safe_load(open(home + "/config.yaml")) or {}
+    try:
+        from yaml import safe_load
+    except ImportError:  # Hermes >= v0.23.4 images ship ruamel.yaml only
+        from ruamel.yaml import YAML
+        safe_load = YAML(typ="safe").load
+    cfg = safe_load(open(home + "/config.yaml")) or {}
     fresh = int((cfg.get("agent") or {}).get(
         "gateway_auto_continue_freshness", DEFAULT_FRESH))
 except Exception:

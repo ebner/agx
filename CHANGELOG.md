@@ -6,8 +6,17 @@ Entries marked **reseat** need `agx reseat <name>` on existing agents to take ef
 
 ## [Unreleased]
 
+### Added
+- `agx doctor` checks Hermes' web UI (`<name>.web_access`): every gateway Webapp or dashboard listener outside loopback must require sign-in (`fail` otherwise); it also warns about a configured listener that doesn't answer, and about the dashboard slot and a Webapp claiming the same port. The runbook describes turning on the Webapp (Hermes v0.23.4+) and moving from the dashboard slot to it.
+
 ### Changed
 - `agx vm init` uses the `libvirt` backend on Linux and `multipass` on macOS when `--backend` is omitted (before: `multipass` everywhere). Existing deployments keep their configured backend. On Linux, `agx vm init` first checks the libvirt stack (commands, `virtiofsd`, `/dev/kvm`, access to `qemu:///system`, the `default` network) and lists everything that is missing.
+
+### Fixed
+- On Hermes v0.23.4+ images (no PyYAML), the doctor's web UI check reported nothing and `agx conversations` ignored the agent's freshness window; both now read `config.yaml` with ruamel.yaml as well.
+
+### Removed
+- The refusal of `dashboard.address` values other than loopback in toolkit config writes and `agx edit`: Hermes takes the dashboard address only from `--host`, so the setting it guarded had no effect. The doctor's `web_access` check replaces it.
 
 ## [0.2.0] - 2026-10-13
 

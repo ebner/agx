@@ -1321,8 +1321,8 @@ def edit(agent: str, path: str, profile: str | None) -> None:
     ``skills/<id>/SKILL.md``). The file is read and written through the
     running container as its runtime user — no sudo and no host access to
     the subuid-owned data dir needed. ``config.yaml`` edits go through the
-    same validation as every other toolkit config write (a ``0.0.0.0``
-    dashboard bind is refused). Needs an interactive terminal.
+    same validated writer as every other toolkit config write. Needs an
+    interactive terminal.
     """
     _run(edit_cmd.edit, agent=agent, path=path, profile=profile)
 

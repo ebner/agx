@@ -261,7 +261,7 @@ agx exec coder hermes whatsapp         # pairing code flow
 
 #### Networking considerations
 
-By design the toolkit refuses to bind any Hermes dashboard or service to `0.0.0.0`. That's fine for:
+Ports the toolkit publishes are bound to `127.0.0.1` in the VM; nothing is reachable from outside unless you publish it yourself in the override file. That's fine for:
 
 - Bot integrations using outbound websockets / long-polling (Slack Socket Mode, Discord gateway, Mattermost websocket, Matrix federation client) — no inbound port needed.
 - Cloud-hosted webhooks that POST to a public URL — needs a tunnel (Cloudflare Tunnel, ngrok, tailscale-funnel) which terminates on the host and forwards into the VM.
@@ -270,9 +270,9 @@ If a connector strictly needs an inbound port on a public interface, expose it v
 
 ```yaml
 services:
-  agent-coder:
+  hermes-coder:
     ports:
-      - "127.0.0.1:8642:8642"   # dashboard — keep on loopback
+      - "127.0.0.1:8642:8642"   # Hermes API server — keep on loopback
       - "8765:8765"             # gateway webhook — only if you understand the exposure
 ```
 
@@ -281,10 +281,10 @@ services:
 ```bash
 agx exec coder hermes chat                           # interactive
 agx exec coder hermes chat -q "summarize today's PRs"  # one-shot, no TTY
-agx exec coder hermes dashboard --no-open            # open the web UI URL
+agx exec coder -- hermes webapp --status            # where the web UI is served, once enabled
 ```
 
-Dashboards are reachable from the host at `http://127.0.0.1:<port>/` — the port is what `agx list` prints for that agent. The dashboard is only ever bound to loopback (toolkit enforces this).
+The browser UI is the gateway's **Webapp** (Hermes v0.23.4+). It is off by default; turning it on means publishing a port and configuring sign-in — see [the runbook](runbook.md#the-web-ui-gateway-webapp-and-the-older-dashboard). `agx doctor` checks that any web UI reachable beyond loopback requires sign-in.
 
 ### 4.6 Monitor, debug
 
@@ -391,7 +391,7 @@ The toolkit backs this with two guardrails (GH #6 tier 1):
 Management goes through the same commands as for the default profile, with `--profile <name>` (see the list above). Two things to keep in mind:
 
 1. **Bot tokens.** Independent profile gateways need one bot account each; Hermes' multiplexed mode (`profile_routes`) lets one token serve several profiles instead.
-2. **Dashboard.** One dashboard instance (`HERMES_DASHBOARD=1`, port 9119) serves all profiles in the container, switching per request — no extra ports needed.
+2. **Web UI.** One web UI — the default profile's Webapp, or on older setups the dashboard slot (`HERMES_DASHBOARD=1`) — serves all profiles in the container, switching per request; no extra ports needed.
 
 If a second gateway-exposed persona is worth a bot token, it's usually worth a container: `agx create <name> --type hermes` buys full doctor coverage, independent upgrade/rollback, resource caps, and a real isolation boundary. The sweet spot for profile gateways is a **pod**: several same-trust-domain personas sharing one container, with containers still separating trust domains.
 

@@ -66,42 +66,6 @@ def test_round_trip_preserves_comments_and_key_order(tmp_path: Path) -> None:
     assert dumped.index("model:") < dumped.index("terminal:")
 
 
-# ---------- dashboard binding refusal ----------
-
-
-def test_validate_dashboard_refuses_0_0_0_0(tmp_path: Path) -> None:
-    doc = hermes_config.load(tmp_path / "x.yaml")
-    doc["dashboard"] = {"address": "0.0.0.0"}
-    with pytest.raises(UserError, match=r"dashboard\.address"):
-        hermes_config.validate_dashboard_binding(doc)
-
-
-def test_validate_dashboard_refuses_public_ip(tmp_path: Path) -> None:
-    doc = hermes_config.load(tmp_path / "x.yaml")
-    doc["dashboard"] = {"address": "10.0.0.5"}
-    with pytest.raises(UserError, match=r"dashboard\.address"):
-        hermes_config.validate_dashboard_binding(doc)
-
-
-def test_validate_dashboard_accepts_localhost_variants(tmp_path: Path) -> None:
-    for addr in ["127.0.0.1", "localhost", "::1"]:
-        doc = hermes_config.load(tmp_path / "x.yaml")
-        doc["dashboard"] = {"address": addr}
-        hermes_config.validate_dashboard_binding(doc)  # no raise
-
-
-def test_validate_dashboard_accepts_missing_address(tmp_path: Path) -> None:
-    doc = hermes_config.load(tmp_path / "x.yaml")
-    hermes_config.validate_dashboard_binding(doc)  # no raise
-
-
-def test_write_atomically_refuses_zero_address(cfg: AgentsConfig) -> None:
-    doc = hermes_config.load(hermes_config.config_path(cfg, "coder"))
-    doc["dashboard"] = {"address": "0.0.0.0"}
-    with pytest.raises(UserError, match=r"dashboard\.address"):
-        hermes_config.write_atomically(cfg, "coder", doc)
-
-
 # ---------- atomic write ----------
 
 

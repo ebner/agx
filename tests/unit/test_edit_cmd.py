@@ -287,15 +287,15 @@ def test_edit_config_yaml_goes_through_write_atomically_with_derived_profile(env
 
 def test_edit_config_yaml_via_symlink_is_still_routed_to_the_validated_writer(env, mocker) -> None:
     box, config_path, _ = env
-    box.files["/opt/data/config.yaml"] = b"dashboard:\n  address: 127.0.0.1\n"
+    box.files["/opt/data/config.yaml"] = b"a: 1\n"
     box.links["/opt/data/innocent.md"] = "/opt/data/config.yaml"
-    _editor(mocker, b"dashboard:\n  address: 0.0.0.0\n")
+    _editor(mocker, b"a: [unclosed\n")  # only a config.yaml edit is YAML-checked
     mocker.patch("agx_cli.ui.confirm", return_value=False)
     write = mocker.patch("agx_cli.hermes_config.write_atomically")
     with pytest.raises(UserError, match="not changed"):
         edit_cmd.edit(agent="coder", path="innocent.md", config_path=config_path)
     write.assert_not_called()
-    assert box.files["/opt/data/config.yaml"] == b"dashboard:\n  address: 127.0.0.1\n"
+    assert box.files["/opt/data/config.yaml"] == b"a: 1\n"
 
 
 def test_edit_config_yaml_reopens_editor_after_a_yaml_error(env, mocker) -> None:
@@ -326,9 +326,9 @@ def test_edit_detects_config_behind_a_symlinked_config_yaml(env, mocker) -> None
     """config.yaml -> settings.yaml: the edit resolves to settings.yaml,
     whose NAME says nothing — it must still get the validated writer."""
     box, config_path, _ = env
-    box.files["/opt/data/settings.yaml"] = b"dashboard:\n  address: 127.0.0.1\n"
+    box.files["/opt/data/settings.yaml"] = b"a: 1\n"
     box.links["/opt/data/config.yaml"] = "/opt/data/settings.yaml"
-    bad = b"dashboard:\n  address: 0.0.0.0\n"
+    bad = b"a: [unclosed\n"  # only a config.yaml edit is YAML-checked
     _editor(mocker, bad, bad)
     mocker.patch("agx_cli.ui.confirm", return_value=False)
     write = mocker.patch("agx_cli.hermes_config.write_atomically")

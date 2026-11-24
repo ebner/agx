@@ -15,9 +15,9 @@ Contract:
   ``--profile`` home). Symlinks are resolved once inside the container
   and must stay inside that base.
 - A path that resolves to a ``config.yaml`` (default or any profile) is
-  written via :func:`hermes_config.write_atomically`, so the
-  ``0.0.0.0`` dashboard refusal and ``hermes config validate`` apply —
-  there is deliberately no way around that here.
+  YAML-checked here and written via :func:`hermes_config.write_atomically`,
+  so its staged write, optimistic re-read and ``hermes config validate``
+  apply — there is deliberately no way around that here.
 - Conflict check is optimistic: the file is re-read under
   ``<data-dir>/.agents.lock`` right before the write and compared by
   hash. That serializes against other toolkit commands; it is NOT a
@@ -315,7 +315,6 @@ def edit(
                 break
             try:
                 doc = _parse_config(edited.decode("utf-8"))
-                hermes_config.validate_dashboard_binding(doc)
                 break
             except (YAMLError, UserError) as exc:
                 ui.warn(f"config.yaml rejected: {exc}")
